@@ -1,10 +1,11 @@
-# Delta compilation (`--watch`)
+# Delta compilation (`--watch --rad`)
 
-Delta compilation is a `--watch` optimization. With a cold output cache, the first watch
-cycle performs a normal full compile and records a baseline for each source app. A
-cache-hit first cycle loads the cached DLL; the first later edit performs one full-bundle
-compile to establish every app's baseline. Subsequent cycles use those baselines when an
-edit is safe to load as a small overlay. Other runner modes use the normal compile path.
+Delta compilation is opt-in: plain `--watch` keeps the full-reload behaviour, and `--rad`
+turns on object-granular compilation. With a cold output cache, the first watch cycle
+performs a normal full compile and records a baseline for each source app. A cache-hit
+first cycle loads the cached DLL; the first later edit performs one full-bundle compile to
+establish every app's baseline. Subsequent cycles use those baselines when an edit is safe
+to load as a small overlay. Other runner modes use the normal compile path.
 
 ## Cycle behavior
 
@@ -12,24 +13,27 @@ Every watch cycle computes a content hash for every `.al` file in the app's sour
 This is whole-tree change detection, not an O(changed-files) operation. It avoids a
 compile when files were only touched or rewritten with identical bytes.
 
-After hashing, each app takes one of these paths:
+After hashing, the changed files alone are parsed and a declaration-only compilation over
+them answers what they declare NOW. Diffing that against the workspace's object map
+classifies the cycle:
 
 | Change | Compile path |
 |---|---|
 | No content changed | Reuse the loaded module; do not compile |
-| Only existing codeunits changed, with the same callable surface | Re-emit those codeunits with `Compilation.CreateForRad` and compile a C# overlay |
-| An object was added or deleted | Normal full compile |
-| A table, tableextension, page, report, query, enum, or any other non-codeunit changed | Normal full compile |
-| A codeunit's callable or binding-visible surface changed | Normal full compile |
+| An object of any kind was edited, added or removed | Re-emit exactly those objects with `Compilation.CreateForRad` and compile a C# overlay; a removal-only cycle produces no C# at all |
+| A modified codeunit's callable surface moved, or an object was removed | Also re-emit the objects that directly reference it — one hop, not the transitive closure |
+| A changed file declares an id-less object (`controladdin`, `profile`, `pagecustomization`, …) | Normal full compile — `RadObjectKey` cannot identify it |
 | Dependencies, app identity, version, or preprocessor symbols changed | Normal full compile |
 
-A body-only codeunit edit can change statements, expressions, local implementation, or
-comments without changing the callable surface. Procedure signatures, access, subtype,
-subscriber metadata, namespace, and other symbol-visible details are structural changes
-and therefore refresh the whole module.
+Modified and removed objects are stripped from the packaged baseline before
+`CreateForRad` binds the new source, and Microsoft's own `WriteSymbolReference` merges the
+result back into the previous module definition to produce the next baseline.
 
-If the runner cannot classify or emit an eligible delta safely, it falls back to a normal
-full compile. An AL or generated-C# error never advances the last good baseline.
+If the runner cannot classify or emit an eligible delta safely — a RAD emit that throws, a
+callback count that disagrees with the change model, a symbol merge that fails — it falls
+back to a normal full compile. An AL or generated-C# error never advances the last good
+baseline: the emit prepares a commit token that is applied only after the overlay assembly
+loads.
 
 ## What the baseline contains
 
@@ -40,11 +44,14 @@ full compile. An AL or generated-C# error never advances the last good baseline.
 - the compiler's full-emit symbol baseline (accepted overlays preserve that surface);
 - the loaded baseline and overlay assembly generations.
 
-For an eligible edit, changed codeunits are removed from the old symbol baseline before
-`Compilation.CreateForRad` binds their new source. Their generated C# is compiled into a
-small, uniquely named generation assembly and loaded beside the current
-module. A later full compile replaces that generation chain and establishes a fresh
-baseline.
+plus the reverse one-hop reference graph and the extension→target edges, both read off
+Microsoft's bound semantic models during a full compile.
+
+Generated C# for the changed objects is compiled into a small, uniquely named generation
+assembly and loaded beside the current module. `AlRunner/Rad/AlObjectResolution.cs` records
+which generation owns each AL object type and tombstones the names a committed deletion
+removed, so a still-loaded previous generation cannot answer for a deleted object. A later
+full compile replaces the whole generation chain and establishes a fresh baseline.
 
 ## Measured body-only case
 
@@ -74,10 +81,38 @@ cycle spent 1.8 s in AL emit, 0.4 s in C# compile, and 108.3 s running tests (11
 total), with zero bundle compile or execution failures and the same test-result counts
 as its baseline cycle.
 
-These timings demonstrate the existing-codeunit body-edit path only. Additions,
-deletions, non-codeunit edits, callable-surface changes, and reference changes deliberately
-take the normal full-compile path. Every cycle still pays for whole-tree hashing and runs
-the selected tests.
+These timings were measured on the earlier codeunit-body-only implementation, before
+additions, deletions and non-codeunit edits joined the delta path. Every cycle still pays
+for whole-tree hashing and runs the selected tests.
+
+## What the tests pin
+
+Timings drift with the machine, so the executable contract is stated as identities and
+counts instead. All four suites share one real 20-object app,
+`AlRunner.Tests/Fixtures/RadTwentyObject`, so "all of it" and "the one that changed" are
+different numbers:
+
+| Suite | Claim |
+|---|---|
+| `RadObjectDeltaTests` | One edit → exactly which objects re-emit and which CLR types change owner, for ten object kinds plus schema additions, a rename, a callable-surface change, an id-less fallback, and a rejected or abandoned candidate |
+| `RadDeletionDeltaTests` | One deletion → zero objects re-emitted, exactly those object identities removed, exactly those CLR names tombstoned, every survivor still the identical baseline `Type` |
+| `RadMetadataDeltaTests` | One edit → exactly one page/report/xmlport/enum metadata entry moves; a deletion drops its entry; a rejected candidate leaves none behind |
+| `RadWatchTwentyObjectTests` | The same claims against the real `--watch --rad` process, via its own `[rad]` log lines, with the AL test outcome proving the new code actually ran |
+
+Known gaps these suites currently fail on, in the order they matter:
+
+1. **Metadata is not dropped on deletion.** A deleted page, report, xmlport or
+   enumextension leaves its runtime metadata registered, so BC can still resolve an object
+   that no longer exists in the source tree.
+2. **Metadata is not transactional.** The AL emitter writes those registries before Roslyn
+   runs, so a candidate whose generated C# is rejected still mutates the live runtime.
+   `AlRunner/Rad/RadMetadataCapture.cs` exists for this and is not wired up yet.
+3. **A dangling reference is rejected the expensive way.** Deleting an object something
+   still calls makes BC's RAD emit throw out of code generation instead of reporting the
+   binding error, so the runner falls back to a full compile whose emit-retry then excludes
+   the caller from the module. Nothing is committed and the retry is stable, but the
+   developer is told "1 broken object unrelated to the rest of the module" instead of
+   "RAD Perf Service is missing".
 
 ## Reloaded dependency tableextensions
 
@@ -89,5 +124,6 @@ can therefore resolve fields supplied by a warm precompiled dependency; the form
 
 ## Control
 
-`AL_RUNNER_RAD=0` disables the watch optimization. Eligibility and fallback are otherwise
-automatic; structural changes are never forced through an overlay.
+`--rad` (with `--watch`) is the only switch: without it, `--watch` compiles and reloads the
+whole bundle exactly as before. Eligibility and fallback are otherwise automatic; a change
+the delta path cannot classify is never forced through an overlay.

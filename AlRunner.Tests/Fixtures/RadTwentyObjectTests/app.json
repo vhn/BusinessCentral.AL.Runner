@@ -1,0 +1,23 @@
+{
+  "id": "2f1b8b4c-5d3a-4f7e-9a61-0c8d7e6b5a42",
+  "name": "RAD Perf Tests",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [
+    {
+      "from": 71200,
+      "to": 71299
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "e23cd601-abba-46f2-8d5e-d1ca75615f9e",
+      "publisher": "AlRunner Tests",
+      "name": "RAD Twenty Object Fixture",
+      "version": "1.0.0.0"
+    }
+  ]
+}

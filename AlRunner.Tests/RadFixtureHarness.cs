@@ -205,16 +205,16 @@ internal sealed record MetadataSnapshot(
     IReadOnlyDictionary<int, string> Enums)
 {
     internal static MetadataSnapshot Take() => new(
-        AlPageMetadataRegistry.Ids.ToDictionary(id => id, id =>
+        Own(AlPageMetadataRegistry.Ids).ToDictionary(id => id, id =>
             AlPageMetadataRegistry.TryGet(id, out var xml) ? xml : string.Empty),
-        AlReportMetadataRegistry.Ids.ToDictionary(id => id, id =>
+        Own(AlReportMetadataRegistry.Ids).ToDictionary(id => id, id =>
             AlReportMetadataRegistry.TryGet(id, out var xml) ? xml : string.Empty),
-        AlXmlPortMetadataRegistry.Ids.ToDictionary(id => id, id =>
+        Own(AlXmlPortMetadataRegistry.Ids).ToDictionary(id => id, id =>
             AlXmlPortMetadataRegistry.TryGet(id, out var xml) ? xml : string.Empty),
-        EnumIds().ToDictionary(id => id, RenderEnum));
+        Own(AlEnumMetadataRegistry.Ids).ToDictionary(id => id, RenderEnum));
 
     /// <summary>
-    /// Ids whose entry differs from <paramref name="other"/> in either direction —
+    /// The `Kind:Id` entries that differ between the two snapshots in either direction —
     /// added, removed or changed. This is the metadata delta a cycle actually performed.
     /// </summary>
     internal static string[] Diff(MetadataSnapshot before, MetadataSnapshot after) =>
@@ -238,12 +238,11 @@ internal sealed record MetadataSnapshot(
             })
             .Select(id => $"{kind}:{id}");
 
-    // The fixture's own ids. AlEnumMetadataRegistry has no id enumerator (base and
-    // extension registrations live in two dictionaries and merge on read), and the
-    // process-wide registry also holds every other suite's enums, so the snapshot is
-    // scoped to the ids this fixture can possibly touch.
-    private static IEnumerable<int> EnumIds() =>
-        Enumerable.Range(71000, 200).Where(id => AlEnumMetadataRegistry.TryGet(id, out _));
+    // Scoped to the fixture's own id range: these registries are process-wide, so every
+    // other suite that ran first in this test host has entries in them too, and a diff
+    // over all of them would be neither stable nor about this fixture.
+    private static IEnumerable<int> Own(IEnumerable<int> ids) =>
+        ids.Where(id => id is >= 71000 and <= 71199);
 
     private static string RenderEnum(int id)
     {

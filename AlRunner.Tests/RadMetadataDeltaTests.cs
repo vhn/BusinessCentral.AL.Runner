@@ -27,15 +27,18 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
 {
     private const string ScenarioDir = "al-runner-rad-metadata-delta";
 
+    /// <param name="Entry">The one registry entry this edit is allowed to move.</param>
+    /// <param name="Marker">Text that must appear in it afterwards, and must not before.</param>
+    private sealed record MetadataEdit(
+        string Scenario, string FileName, string Before, string After, string Entry, string Marker);
+
     /// <summary>
     /// Metadata-visible edits: each changes what BC would read back for that object, so
     /// each must move exactly one registry entry.
     /// </summary>
-    public static IEnumerable<object[]> MetadataEdits()
-    {
-        yield return
-        [
-            "page control added",
+    private static readonly MetadataEdit[] Edits =
+    [
+        new("page control added",
             "RadPerfLineList.Page.al",
             "field(HeaderNo; Rec.\"Header No.\") { ApplicationArea = All; }",
             """
@@ -43,12 +46,9 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
                             field(HeaderNoAgain; Rec."Header No.") { ApplicationArea = All; }
             """,
             "Page:71001",
-            "HeaderNoAgain",
-        ];
+            "HeaderNoAgain"),
 
-        yield return
-        [
-            "report column added",
+        new("report column added",
             "RadPerfHeaderReport.Report.al",
             "column(Description; Description) { }",
             """
@@ -56,12 +56,9 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
                         column(DescriptionAgain; Description) { }
             """,
             "Report:71000",
-            "DescriptionAgain",
-        ];
+            "DescriptionAgain"),
 
-        yield return
-        [
-            "xmlport element added",
+        new("xmlport element added",
             "RadPerfHeaderXml.XmlPort.al",
             "fieldelement(Description; Header.Description) { }",
             """
@@ -69,15 +66,12 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
                             fieldelement(DescriptionAgain; Header.Description) { }
             """,
             "XmlPort:71000",
-            "DescriptionAgain",
-        ];
+            "DescriptionAgain"),
 
         // Enumextension values are registered against the BASE enum's id, so this proves
         // an extension edit refreshes its target's merged entry — the metadata equivalent
         // of the tableextension case, where the extension alone re-emits.
-        yield return
-        [
-            "enumextension value added",
+        new("enumextension value added",
             "RadPerfStatusExt.EnumExt.al",
             "value(71000; Archived) { Caption = 'Archived'; }",
             """
@@ -85,9 +79,11 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
                 value(71001; Retired) { Caption = 'Retired'; }
             """,
             "Enum:71000",
-            "71001=Retired",
-        ];
-    }
+            "71001=Retired"),
+    ];
+
+    public static IEnumerable<object[]> MetadataEdits() => Edits.Select(edit =>
+        new object[] { edit.Scenario, edit.FileName, edit.Before, edit.After, edit.Entry, edit.Marker });
 
     [Theory]
     [MemberData(nameof(MetadataEdits))]
@@ -128,9 +124,9 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
                 baseline.Workspace,
                 RadFixture.AssembleAndLoad(baseline.Workspace, delta.Emit.Sources));
 
-            var after_ = MetadataSnapshot.Take();
-            Assert.Equal([expectedMovedEntry], MetadataSnapshot.Diff(baseline.Metadata, after_));
-            Assert.Contains(expectedMarker, Rendered(expectedMovedEntry, after_));
+            var refreshed = MetadataSnapshot.Take();
+            Assert.Equal([expectedMovedEntry], MetadataSnapshot.Diff(baseline.Metadata, refreshed));
+            Assert.Contains(expectedMarker, Rendered(expectedMovedEntry, refreshed));
             baseline.AssertSettled(tempRoot);
         }
         finally
@@ -139,11 +135,7 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
         }
     }
 
-    /// <summary>
-    /// A deleted object's metadata must go with it. Nothing recompiles, so the removal is
-    /// the ONLY thing the cycle does — if the entry survives, BC can still resolve an
-    /// object that no longer exists in the source tree.
-    /// </summary>
+    /// <summary>One deletion per metadata-bearing object kind, plus the whole enum family.</summary>
     public static IEnumerable<object[]> MetadataDeletions()
     {
         yield return ["page", new[] { "RadPerfLineList.Page.al" }, "Page:71001"];
@@ -160,6 +152,11 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
         ];
     }
 
+    /// <summary>
+    /// A deleted object's metadata must go with it. Nothing recompiles, so the removal is
+    /// the ONLY thing the cycle does — if the entry survives, BC can still resolve an
+    /// object that no longer exists in the source tree.
+    /// </summary>
     [Theory]
     [MemberData(nameof(MetadataDeletions))]
     public void DeletingOneObject_DropsOnlyItsMetadata(
@@ -232,9 +229,9 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
                 RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
             var baseline = RadFixture.Seed(tempRoot);
 
-            foreach (var row in MetadataEdits())
+            foreach (var edit in Edits)
                 RadFixture.ReplaceExactlyOnce(
-                    RadFixture.SourceFile(tempRoot, (string)row[1]), (string)row[2], (string)row[3]);
+                    RadFixture.SourceFile(tempRoot, edit.FileName), edit.Before, edit.After);
 
             // AL-valid, generated C# Roslyn rejects — the same seam RadDeltaWatchTests uses.
             File.WriteAllText(
@@ -258,7 +255,7 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
             Assert.False(candidate.FullRebuild);
             Assert.True(candidate.Emit.Diagnostics.Count == 0,
                 string.Join(Environment.NewLine, candidate.Emit.Diagnostics));
-            Assert.Equal(5, candidate.Emit.Sources.Count);
+            Assert.Equal(Edits.Length + 1, candidate.Emit.Sources.Count);
 
             var compiled = RadFixture.TryAssemble(baseline.Workspace, candidate.Emit.Sources);
             Assert.False(compiled.Success,

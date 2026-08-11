@@ -288,8 +288,6 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             baseline.AssertSettled(tempRoot);
 
             // Read the committed baseline back the way the next delta binds against it.
-            // Both names present would mean source could still bind to the old one — a
-            // compile that succeeds under watch and fails on a cold full build.
             var symbols = File.ReadAllText(BcCompiler.WriteWorkspaceSymbols(
                 baseline.Workspace, Path.Combine(tempRoot, "committed.symbols.json")));
             Assert.Contains("RAD Perf Renamed D", symbols);
@@ -355,6 +353,61 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
                 baseline.Workspace,
                 RadFixture.AssembleAndLoad(baseline.Workspace, fallback.Emit.Sources));
             baseline.AssertSettled(tempRoot);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The guard rail on the other side: a delta is only interchangeable with a full compile
+    /// while both resolve the same external symbols. Change the app's own identity — or its
+    /// dependencies, or its preprocessor symbols — and every cached object was bound against
+    /// a picture that no longer holds, so the workspace must invalidate rather than emit an
+    /// overlay that silently disagrees with the module its dependents compiled against.
+    /// </summary>
+    [Fact]
+    public void ChangingTheReferenceSurface_InvalidatesTheBaseline()
+    {
+        if (!engine.Ready)
+        {
+            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
+            return;
+        }
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            SeededBaseline baseline;
+            using (BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion))
+            {
+                baseline = RadFixture.Seed(tempRoot);
+                RadFixture.ReplaceExactlyOnce(
+                    RadFixture.SourceFile(tempRoot, "RadPerfService.Codeunit.al"),
+                    "exit(40);", "exit(41);");
+            }
+
+            using (BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, new Version(1, 0, 0, 1)))
+            {
+                var rebuilt = baseline.Cycle(tempRoot);
+                Assert.True(rebuilt.FullRebuild,
+                    "a version change left the delta path armed against a stale baseline");
+                Assert.True(rebuilt.Emit.Diagnostics.Count == 0,
+                    string.Join(Environment.NewLine, rebuilt.Emit.Diagnostics));
+                Assert.Equal(RadFixture.ObjectCount, rebuilt.Emit.Sources.Count);
+                Assert.False(baseline.Workspace.HasBaseline);
+
+                var reseeded = RadFixture.AssembleAndLoad(baseline.Workspace, rebuilt.Emit.Sources);
+                rebuilt.Commit(baseline.Workspace, reseeded);
+                Assert.True(baseline.Workspace.HasBaseline);
+                // A full generation supersedes the whole chain, not just the edited object.
+                foreach (var name in baseline.Types.Keys)
+                    Assert.Same(reseeded, AlObjectResolution.FindOwned(name, requiredBase: null)?.Assembly);
+                baseline.AssertSettled(tempRoot);
+            }
         }
         finally
         {
