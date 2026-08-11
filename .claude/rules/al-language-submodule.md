@@ -27,9 +27,13 @@ against real BC and are expected to throw `RunnerOutOfScopeException` here.
 Declare those expectations in [`tests/expectations/`](../../tests/expectations/README.md)
 following the schema in [`docs/expectations.md`](../../docs/expectations.md).
 
-Three modes:
-- `expect-oos` — must throw `RunnerOutOfScopeException` with matching reason
+Four modes:
+- `expect-oos` — must raise an out-of-scope signal with a matching reason anchor,
+  either a typed `RunnerOutOfScopeException` or the documented
+  `out-of-scope: <api> — <reason>` message convention
 - `expect-fail-known-gap` — must fail; links to an open GH issue tracking the work
+- `expect-divergence` — must fail because the runner *intends* to answer
+  differently from BC; carries `Reason` + `Doc`, never an `Issue`
 - `skip` — must not run (last resort, for compile gaps)
 
 Manifest drift in either direction is loud: a test that starts passing despite
@@ -42,8 +46,14 @@ If a test must assert runner-only behaviour (e.g. that a specific surface
 throws `RunnerOutOfScopeException` with reason `email-smtp`), it goes in
 `tests/runner-extras/`, not in the corpus.
 
+The converse is a hard rule too: a test asserting plain BC behaviour may **not**
+be written as a runner-local test just because that is quicker — it goes upstream
+so a real service tier can adjudicate it. See
+`bc-behavior-tests-go-upstream.md`.
+
 ## Sister rules
 
+- `bc-behavior-tests-go-upstream.md` — which repo a new test belongs in, and why
 - `precompiled-dll-respect.md` — what we may not rewrite in BC DLLs
 - `loud-failures.md` — when to throw `RunnerOutOfScopeException`
 - `no-assumption-fixes.md` — investigate before patching

@@ -6,6 +6,20 @@ All notable changes to this project are documented here. Format based on
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-08-10
+
+### Fixed
+- close the seven gaps split out of the parser migration (#1708-#1714)
+
+### Documentation
+- the documented build command fails on a fresh clone
+
+### Changed
+- feat(parser): move the remaining six AL parsers onto BC's syntax tree
+- fix(server): stale-green multi-bundle requests — per-request reset, content-stamped cache key, loud EMIT-EXCLUDED (#1706)
+- feat(parser): parse AL tables with BC's own syntax tree, not regexes
+- fix(loader): serve Microsoft.Dynamics.Nav.CodeAnalysis from the selected artifact dir, not bin
+
 ## [2.1.1] - 2026-08-08
 
 ### Changed

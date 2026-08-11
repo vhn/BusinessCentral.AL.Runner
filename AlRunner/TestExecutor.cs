@@ -8,7 +8,7 @@ using System.Runtime.ExceptionServices;
 
 namespace AlRunner;
 
-public enum TestOutcome { Pass, Fail, Error }
+public enum TestOutcome { Pass, Fail, Error, Skipped }
 
 /// <summary>
 /// Test-isolation granularity. Mirrors the BC "Test Runner" codeunits:
@@ -49,10 +49,29 @@ public static class TestIsolationParser
     }
 }
 
+// Exception is the caught exception object (null for Pass/Skipped) — kept so the
+// expectations manifest can classify typed throws (RunnerOutOfScopeException +
+// reason) that string messages cannot carry. Expectation is set only when the
+// manifest reclassified this result (pass-oos / pass-known-gap / pass-divergence /
+// skipped / manifest drift); null means a plain pass/fail untouched by the manifest.
+//
+// InsideTestProc / TimedOut exist so the failure can be BUCKETED without re-deriving
+// the bucket from Message text — see ErrorClassifier.Classify(TestResult) and the
+// protocol-v2 `errorKind` field (#1641):
+//   InsideTestProc = false marks a failure raised before any [Test] body ran
+//     (codeunit instantiation) → AlErrorKind.Setup rather than Runtime.
+//   TimedOut = true marks the per-test timeout path. That path deliberately carries
+//     NO Exception (the runaway thread is abandoned, nothing is thrown back), so the
+//     flag is the only truthful signal that it was a timeout; synthesising a fake
+//     exception into Exception would corrupt the expectations classifier's input.
 public sealed record TestResult(string Codeunit, string Method, TestOutcome Outcome,
                                 string? Message, string? FullException, TimeSpan Duration,
                                 string? AlCallStack = null,
-                                string? CodeunitDisplayName = null);
+                                string? CodeunitDisplayName = null,
+                                Exception? Exception = null,
+                                Infrastructure.ExpectationResult? Expectation = null,
+                                bool InsideTestProc = true,
+                                bool TimedOut = false);
 
 public sealed class TestExecutor
 {
@@ -76,6 +95,18 @@ public sealed class TestExecutor
     /// Explicit CLI value takes precedence over the env var.
     /// </summary>
     public int? TimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// Expectations manifest (issue #1734). Null = no manifest active, behaviour
+    /// unchanged. Non-null: skip-declared tests are never invoked, and every other
+    /// result runs through <see cref="Infrastructure.ExpectationClassifier.Classify"/>
+    /// here — the one chokepoint the CLI, --watch and --server paths all share — so
+    /// reclassification (pass-oos / pass-known-gap / pass-divergence) and manifest-drift failures reach
+    /// every counter and exit code identically. Lookup is by the codeunit's AL object
+    /// name (the manifest's Microsoft-compatible CodeunitName field), falling back to
+    /// the CLR type name ("CodeunitNNNN") when the display name could not be resolved.
+    /// </summary>
+    public Infrastructure.ExpectationManifest? Expectations { get; set; }
 
     /// <summary>
     /// Runs every [Test] method in <paramref name="assembly"/>. When
@@ -193,8 +224,12 @@ public sealed class TestExecutor
             try { instance = InstantiateCodeunit(t); }
             catch (Exception ex)
             {
+                // InsideTestProc: false — instantiation blew up, so no [Test] body
+                // ever ran. That is what makes this a `setup` errorKind on the wire
+                // rather than a test-runtime failure (see ErrorClassifier).
                 var ctorResult = new TestResult(t.Name, "<ctor>", TestOutcome.Error,
-                    Unwrap(ex).Message, ex.ToString(), TimeSpan.Zero);
+                    Unwrap(ex).Message, ex.ToString(), TimeSpan.Zero,
+                    Exception: Unwrap(ex), InsideTestProc: false);
                 results.Add(ctorResult);
                 onTestComplete?.Invoke(ctorResult);
                 continue;
@@ -217,12 +252,31 @@ public sealed class TestExecutor
                 {
                     if (!IsTestMethod(m)) continue;
                     if (filter != null && !MethodMatchesFilter(t.Name, m.Name, filter)) continue;
+                    var entry = LookupExpectation(t.Name, displayName, m.Name);
+                    if (entry is { Mode: Infrastructure.ExpectationMode.Skip })
+                    {
+                        // skip = "must not be invoked" (docs/expectations.md), so the
+                        // decision has to sit HERE, before the body runs — a post-run
+                        // classification could only hide the result, not the side effects.
+                        var skippedResult = new TestResult(t.Name, m.Name, TestOutcome.Skipped,
+                            $"skipped — declared in {entry.SourceFile}", null, TimeSpan.Zero,
+                            null, displayName, null, Infrastructure.ExpectationResult.Skipped);
+                        results.Add(skippedResult);
+                        onTestComplete?.Invoke(skippedResult);
+                        continue;
+                    }
                     stageSw.Restart();
-                    var result = RunOne(t.Name, m, instance, displayName);
+                    var raw = RunOne(t.Name, m, instance, displayName);
                     methodsMs += stageSw.ElapsedMilliseconds;
+                    var result = Expectations != null
+                        ? ApplyExpectation(raw, displayName, entry)
+                        : raw;
                     results.Add(result);
                     onTestComplete?.Invoke(result);
-                    if (IsTimeout(result))
+                    // Timeout is judged on the RAW outcome: even if a manifest entry
+                    // reclassifies the hung test, its runaway thread still poisons the
+                    // process, so the suite must stop either way.
+                    if (IsTimeout(raw))
                         return results;
                 }
                 methodLoopMs += loopSw.ElapsedMilliseconds;
@@ -248,6 +302,53 @@ public sealed class TestExecutor
         PerfTrace.Log($"TestExecutor stages scan={scanMs}ms instantiate={instMs}ms displayName={dispMs}ms runOneOuter={methodsMs}ms dispose={disposeMs}ms methodLoop={methodLoopMs}ms");
         PerfTrace.Log($"TestExecutor total {results.Count} test(s) {totalSw.ElapsedMilliseconds}ms");
         return results;
+    }
+
+    private Infrastructure.ExpectationEntry? LookupExpectation(
+        string typeName, string displayName, string method)
+    {
+        if (Expectations == null) return null;
+        // Manifest entries hold the AL object name (Microsoft's CodeunitName field);
+        // the CLR type name ("CodeunitNNNN") is the fallback identity when display-name
+        // resolution failed, so honour entries written against either.
+        return Expectations.Lookup(displayName, method)
+            ?? (displayName != typeName ? Expectations.Lookup(typeName, method) : null);
+    }
+
+    private static TestResult ApplyExpectation(
+        TestResult raw, string displayName, Infrastructure.ExpectationEntry? entry)
+    {
+        // The whole exception chain is handed to the classifier: it recognises both
+        // the typed RunnerOutOfScopeException (wherever BC's error machinery
+        // wrapped it) and the `out-of-scope: <api> — <reason>` message convention
+        // that Cecil-injected throw sites carry (#1743).
+        var observed = new Infrastructure.TestOutcome(displayName, raw.Method,
+            raw.Outcome == TestOutcome.Pass, raw.Exception);
+        var classified = Infrastructure.ExpectationClassifier.Classify(observed, entry);
+        switch (classified.Result)
+        {
+            case Infrastructure.ExpectationResult.Pass:
+            case Infrastructure.ExpectationResult.Fail:
+                return raw;   // no entry, no drift — untouched
+            case Infrastructure.ExpectationResult.PassOos:
+            case Infrastructure.ExpectationResult.PassKnownGap:
+            case Infrastructure.ExpectationResult.PassDivergence:
+                // Counts as a pass everywhere (totals, exit code, --strict), reported
+                // distinctly via Expectation so the summary can subdivide.
+                return raw with { Outcome = TestOutcome.Pass, Expectation = classified.Result };
+            case Infrastructure.ExpectationResult.FailManifestDrift:
+                return raw with
+                {
+                    Outcome = TestOutcome.Fail,
+                    Expectation = classified.Result,
+                    Message = raw.Message == null
+                        ? classified.Diagnostic
+                        : $"{classified.Diagnostic} (original result: {raw.Message})",
+                };
+            default:
+                throw new InvalidOperationException(
+                    $"Unhandled ExpectationResult: {classified.Result}");
+        }
     }
 
     private static string? NormaliseFilter(string? raw)
@@ -360,7 +461,8 @@ public sealed class TestExecutor
                 PerfTrace.Log($"TestExecutor.RunOne TIMEOUT {codeunit}.{m.Name} {sw.ElapsedMilliseconds}ms");
                 var alStack = AlRunner.Infrastructure.AlCallStackCapture.CaptureCurrent();
                 return new TestResult(codeunit, m.Name, TestOutcome.Error,
-                    $"Test exceeded {(int)timeout.TotalSeconds}s timeout.", null, sw.Elapsed, alStack, displayName);
+                    $"Test exceeded {(int)timeout.TotalSeconds}s timeout.", null, sw.Elapsed, alStack, displayName,
+                    TimedOut: true);
             }
             invokeResult.Exception?.Throw();
             // The body succeeded — now BC's own check that every handler the test DECLARED was
@@ -380,14 +482,16 @@ public sealed class TestExecutor
             // We can't classify Pass/Fail vs Error perfectly without knowing all of them,
             // so for now: any thrown exception is Fail.
             return new TestResult(codeunit, m.Name, TestOutcome.Fail,
-                $"{inner.GetType().Name}: {inner.Message}", inner.ToString(), sw.Elapsed, alStack, displayName);
+                $"{inner.GetType().Name}: {inner.Message}", inner.ToString(), sw.Elapsed, alStack, displayName,
+                inner);
         }
         catch (Exception ex)
         {
             PerfTrace.Log($"TestExecutor.RunOne ERROR {codeunit}.{m.Name} {sw.ElapsedMilliseconds}ms {ex.GetType().Name}: {ex.Message}");
             var alStack = AlRunner.Infrastructure.AlCallStackCapture.GetCaptured(ex);
             return new TestResult(codeunit, m.Name, TestOutcome.Error,
-                ex.Message, ex.ToString(), sw.Elapsed, alStack, displayName);
+                ex.Message, ex.ToString(), sw.Elapsed, alStack, displayName,
+                ex);
         }
         finally
         {
@@ -425,10 +529,11 @@ public sealed class TestExecutor
         return thread.Join(timeout) ? (true, exception) : (false, null);
     }
 
-    private static bool IsTimeout(TestResult result)
-        => result.Outcome == TestOutcome.Error
-           && result.Message != null
-           && result.Message.StartsWith("Test exceeded ", StringComparison.Ordinal);
+    // Reads the flag the timeout path sets rather than re-deriving the verdict from
+    // the message text: the message is a v1-compatibility STRING contract (see
+    // TestTimeoutFlagTests), not a classification channel, and the same fact now has
+    // to be answered for protocol-v2's `errorKind` too. One source of truth.
+    private static bool IsTimeout(TestResult result) => result.TimedOut;
 
     private static Exception Unwrap(Exception ex)
     {

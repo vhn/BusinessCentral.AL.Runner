@@ -18,7 +18,7 @@ namespace AlRunner.Infrastructure;
 
 public static class NclCecilRewrite
 {
-    private const int CACHE_VERSION = 123;
+    private const int CACHE_VERSION = 124;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Cecil-owned skip registry (JmpHook→Cecil migration enabler).
@@ -151,6 +151,10 @@ public static class NclCecilRewrite
         "Microsoft.Dynamics.Nav.Runtime.NCLMetadata::GetMetaApplicationObject/4",
         "Microsoft.Dynamics.Nav.Runtime.NCLMetadata::GetMetaApplicationObject/3",
         "Microsoft.Dynamics.Nav.Runtime.NCLMetaTable::GetFieldByNo/2",
+        // Referencing-relations reverse index (rename propagation, #1730) — Cecil-forwarded
+        // to RecordPatches.NCLMetaTable_ComputeReferencingRelations over the runner's
+        // metatable cache (BC's body reads the null ObjectLoader and NREs).
+        "Microsoft.Dynamics.Nav.Runtime.NCLMetaTable::ComputeReferencingRelations/2",
         // NavSession getters
         "Microsoft.Dynamics.Nav.Runtime.NavSession::get_DataAccessSource/0",
         "Microsoft.Dynamics.Nav.Runtime.NavSession::get_Database/0",
@@ -169,7 +173,8 @@ public static class NclCecilRewrite
         "Microsoft.Dynamics.Nav.Runtime.NavRecordId::get_CollationAwareStringComparer/0",
         // NavRecord no-ops
         "Microsoft.Dynamics.Nav.Runtime.NavRecord::Dispose/1",
-        "Microsoft.Dynamics.Nav.Runtime.NavRecord::UpdateReferencesOnRenameAsync/2",
+        // NavRecord::UpdateReferencesOnRenameAsync/2 is deliberately NOT here: BC's real
+        // body runs (rename propagation to validated TableRelation fields, issue #1730).
         // RecordLink / management
         "Microsoft.Dynamics.Nav.Runtime.RecordLink::MoveLinksAsync/2",
         "Microsoft.Dynamics.Nav.Runtime.NavManagementTasks::CopyCompany/2",
@@ -284,6 +289,14 @@ public static class NclCecilRewrite
         // NavNCLDotNetCreateException (which is trappable and would be silently swallowed
         // by TryInvokeAsync → TryInitializeFromCurrentApp returns false with no OOS signal).
         "Microsoft.Dynamics.Nav.Runtime.NavDotNet::CreateDotNet/1",
+        // ALTaskScheduler cluster (scope.md §3.6, #1733) — CanCreateTask/ALCanCreateTask
+        // rewritten to return false (no scheduler headlessly) and CheckCodeUnit no-op'd so
+        // ALCreateTaskAsync's real body reaches that CanCreateTask gate instead of throwing
+        // a codeunit-resolution error first. See the RewriteNcl block below for detail.
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALCanCreateTask/0",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALCanCreateTask/1",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::CanCreateTask/1",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::CheckCodeUnit/2",
     };
 
     /// <summary>
@@ -2115,6 +2128,34 @@ public static class NclCecilRewrite
                     ilc.Append(ilc.Create(OpCodes.Ret));
                     body.MaxStackSize = 1;
                     Console.Error.WriteLine($"[Cecil] Rewrote ALTaskScheduler.{m.Name} → return false");
+                }
+
+                // ALTaskScheduler.CheckCodeUnit(NavSession, int) — the ALCreateTaskAsync
+                // state machine calls this TWICE (codeunitId, then failureCodeunitId) BEFORE
+                // it ever reaches the CanCreateTask gate above (#1733). Its real body calls
+                // NCLMetadata.GetMetaCodeunitById, which does not know about a freshly
+                // compiled test bundle's own codeunits, and throws a codeunit-resolution
+                // NavALException naming the calling test codeunit itself — CanCreateTask is
+                // never reached, so the documented scope.md §3.6 contract (unguarded CreateTask
+                // hits BC's own NavCreateScheduledTasksNotAllowedException) never manifests.
+                // The runner resolves codeunits via assembly-scan elsewhere (CreateTarget), so
+                // this metadata check is redundant here; no-op lets execution fall through to
+                // the CanCreateTask gate. A JmpHook no-op for this used to live in BcRuntime.cs
+                // but JmpHook is off by default (Cecil-only) — that registration was silently
+                // dead, which is exactly how this bug presented.
+                foreach (var m in alTaskSchedulerType.Methods
+                    .Where(x => x.Name == "CheckCodeUnit"
+                                && x.ReturnType.FullName == "System.Void"
+                                && x.HasBody))
+                {
+                    var body = m.Body;
+                    body.Instructions.Clear();
+                    body.Variables.Clear();
+                    body.ExceptionHandlers.Clear();
+                    var ilc = body.GetILProcessor();
+                    ilc.Append(ilc.Create(OpCodes.Ret));
+                    body.MaxStackSize = 0;
+                    Console.Error.WriteLine($"[Cecil] Rewrote ALTaskScheduler.{m.Name} → no-op");
                 }
             }
         }
@@ -4753,16 +4794,23 @@ public static class NclCecilRewrite
             int factoryRewrites = 0;
             foreach (var m in factoryT.Methods.Where(mm => mm.HasBody).ToList())
             {
+                // Message shape is the documented convention
+                //     out-of-scope: <api> — <reason> — see docs/scope.md#<anchor>
+                // (Infrastructure.OutOfScopeMessage). The <api> slot must name the
+                // BC API that was touched and the <reason> slot must LEAD with the
+                // scope.md anchor, because tests/expectations/ matches expect-oos
+                // entries on that anchor (#1743). Free-text detail goes after a
+                // further em-dash.
                 string? reason = m.Name switch
                 {
                     "GetRdlcResultSetProcessor" =>
-                        "out-of-scope: report-rendering-external — RDLC layout processing requires an external renderer — see docs/scope.md#report-rendering",
+                        "out-of-scope: ReportResultSetProcessorFactory.GetRdlcResultSetProcessor — report-rendering-external — RDLC layout processing requires an external renderer — see docs/scope.md#report-rendering",
                     "GetWordResultSetProcessor" =>
-                        "out-of-scope: report-rendering-external — Word layout merge (Aspose) requires an external renderer — see docs/scope.md#report-rendering",
+                        "out-of-scope: ReportResultSetProcessorFactory.GetWordResultSetProcessor — report-rendering-external — Word layout merge (Aspose) requires an external renderer — see docs/scope.md#report-rendering",
                     "GetExcelResultSetProcessor" =>
-                        "out-of-scope: report-rendering-external — Excel layout rendering (Aspose) requires an external renderer — see docs/scope.md#report-rendering",
+                        "out-of-scope: ReportResultSetProcessorFactory.GetExcelResultSetProcessor — report-rendering-external — Excel layout rendering (Aspose) requires an external renderer — see docs/scope.md#report-rendering",
                     "GetExcelDatasetResultSetProcessor" =>
-                        "out-of-scope: report-rendering-external — Excel dataset rendering (Aspose) requires an external renderer — see docs/scope.md#report-rendering",
+                        "out-of-scope: ReportResultSetProcessorFactory.GetExcelDatasetResultSetProcessor — report-rendering-external — Excel dataset rendering (Aspose) requires an external renderer — see docs/scope.md#report-rendering",
                     _ => null,
                 };
                 if (reason == null) continue;
@@ -4780,7 +4828,7 @@ public static class NclCecilRewrite
                 foreach (var ctor in printProcT.Methods.Where(mm => mm.IsConstructor && !mm.IsStatic && mm.HasBody).ToList())
                 {
                     ThrowBody(ctor,
-                        "out-of-scope: printing — physical/print-server printing requires an external print service — see docs/scope.md#report-rendering");
+                        "out-of-scope: ReportServerResultSetProcessor..ctor — printing — physical/print-server printing requires an external print service — see docs/scope.md#report-rendering");
                     printCtorRewrites++;
                 }
             }
@@ -4791,7 +4839,7 @@ public static class NclCecilRewrite
                 foreach (var ctor in docSvcT.Methods.Where(mm => mm.IsConstructor && !mm.IsStatic && mm.HasBody).ToList())
                 {
                     ThrowBody(ctor,
-                        "out-of-scope: document-service — document-service upload requires an external service — see docs/scope.md#report-rendering");
+                        "out-of-scope: ReportResultSetDocumentServiceDecorator..ctor — document-service — document-service upload requires an external service — see docs/scope.md#report-rendering");
                     docSvcCtorRewrites++;
                 }
             }
@@ -6241,9 +6289,8 @@ public static class NclCecilRewrite
                 Console.Error.WriteLine($"[Cecil] NavDialog: {dialogNoOps} progress-dialog method(s) → headless no-op");
             }
 
-            // ── NavRecord no-ops (Dispose / UpdateRefs) ──
-            // Dispose(bool) → NoOp2;
-            // UpdateReferencesOnRenameAsync(List,NavRecord) instance overload → ReturnValueTask3.
+            // ── NavRecord no-ops (Dispose) ──
+            // Dispose(bool) → NoOp2.
             ReplaceBodyWithHelper(nclMod,
                 ByParams(Rt + "NavRecord", "Dispose", "Boolean"),
                 H(helperShims, "NoOp2"));
@@ -6251,14 +6298,26 @@ public static class NclCecilRewrite
             // `(GlobalTriggers.GetTriggersOnTable(TableID) & wanted) != 0`, which now works
             // because GetTriggersOnTable is real again. It used to be forced to false, so
             // the write pipeline skipped global-trigger dispatch entirely.
-            {
-                var navRec = nclMod.GetType(Rt + "NavRecord")!;
-                var updRefs = navRec.Methods.FirstOrDefault(m =>
-                    m.Name == "UpdateReferencesOnRenameAsync" && m.HasBody && m.HasThis
-                    && m.Parameters.Count == 2 && m.Parameters[1].ParameterType.Name == "NavRecord")
-                    ?? throw new InvalidOperationException("[Cecil] NavRecord.UpdateReferencesOnRenameAsync(List,NavRecord) not found — do not commit");
-                ReplaceBodyWithHelper(nclMod, updRefs, H(helperShims, "ReturnValueTask3"));
-            }
+            //
+            // NavRecord.UpdateReferencesOnRenameAsync(List,NavRecord) is NOT rewritten
+            // either (it was a ReturnValueTask3 no-op until issue #1730): BC's real body
+            // implements rename propagation — for every validated TableRelation pointing
+            // at the renamed table it rewrites the referencing rows via ModifyAllAsync /
+            // RenameAsync with triggers off. That path runs entirely on metaTable relation
+            // metadata and the in-memory DataAccess, both of which the runner populates,
+            // so the real body is the faithful behaviour. No-opping it silently left child
+            // rows pointing at the old key.
+            //
+            // ── NCLMetaTable.ComputeReferencingRelations(NavAppGroup,NCLMetaTable) ──
+            // The one thing that real body needs and the skeleton cannot give it: BC
+            // computes the referencing-relations reverse index over
+            // ObjectLoader.MetadataCache.GetSnapshotOfAllNonVirtualMetaTables(...), and
+            // ObjectLoader is null on runner-built meta tables (NRE). The replacement
+            // computes the identical index over the runner's metatable cache — see the
+            // equivalence note on RecordPatches.NCLMetaTable_ComputeReferencingRelations.
+            ReplaceBodyWithHelper(nclMod,
+                ByParams(Rt + "NCLMetaTable", "ComputeReferencingRelations", "NavAppGroup", "NCLMetaTable"),
+                H(recordPatches, "NCLMetaTable_ComputeReferencingRelations"));
 
             // ── RecordLink.MoveLinksAsync(NavRecord,NavRecord) static → ReturnValueTask2 ──
             ReplaceBodyWithHelper(nclMod,

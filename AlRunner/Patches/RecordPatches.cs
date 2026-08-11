@@ -32,6 +32,8 @@ public static partial class RecordPatches
     private static Type? _tFieldClass;
     private static Type? _tMetaCalcFormula;
     private static Type? _tMetaFilter;
+    private static Type? _tMetaCondition;
+    private static Type? _tMetaFieldRelation;
     private static Type? _tFilterType;
     private static Type? _tNCLMetaTable;
     private static MethodInfo? _mCreateFromMetaTable;
@@ -198,6 +200,8 @@ public static partial class RecordPatches
         _tFieldClass = typesAsm.GetType("Microsoft.Dynamics.Nav.Types.Metadata.FieldClass")!;
         _tMetaCalcFormula = typesAsm.GetType("Microsoft.Dynamics.Nav.Types.Metadata.MetaCalcFormula")!;
         _tMetaFilter  = typesAsm.GetType("Microsoft.Dynamics.Nav.Types.Metadata.MetaFilter")!;
+        _tMetaCondition = typesAsm.GetType("Microsoft.Dynamics.Nav.Types.Metadata.MetaCondition")!;
+        _tMetaFieldRelation = typesAsm.GetType("Microsoft.Dynamics.Nav.Types.Metadata.MetaFieldRelation")!;
         _tFilterType  = typesAsm.GetType("Microsoft.Dynamics.Nav.Types.Metadata.FilterType")!;
 
         // NCLMetaTable and factory (Microsoft.Dynamics.Nav.Runtime / Ncl)
@@ -1283,6 +1287,22 @@ public static partial class RecordPatches
                 }
                 PopulateReportDataItemsVirtualTable(reportDiDa, table);
                 return reportDiDa;
+            }
+
+            // ── Table Metadata (2000000136) ──────────────────────────────────────────────
+            // Virtual on the service tier too: one row per table in the application. An
+            // empty store makes every lookup answer "no such table", which is what broke
+            // Base App "Page Management".GetDefaultLookupPageID on custom tables.
+            // See RecordPatches.TableMetadataVirtualTable.cs.
+            if (IsTableMetadataVirtualTable(table))
+            {
+                if (!perTable.TryGetValue(tableId, out var tableMetaDa))
+                {
+                    var createdTableMeta = _mCreateTempDataAccess!.Invoke(self, new object[] { table })!;
+                    tableMetaDa = perTable.GetOrAdd(tableId, createdTableMeta);
+                }
+                PopulateTableMetadataVirtualTable(tableMetaDa, table);
+                return tableMetaDa;
             }
 
             if (perTable.TryGetValue(tableId, out var cached))

@@ -96,7 +96,24 @@ public static partial class BcRuntime
         foreach (var sub in subs)
         {
             if (!seen.Add(SubscriberAlIdentity(sub))) continue;
-            try { InvokeOneSubscriber(publisherScope, scopeType, pubObj, sub); }
+            try
+            {
+                if (IsManualBindingCodeunitType(sub.DeclaringType!))
+                {
+                    // EventSubscriberInstance = Manual: BC dispatches only to instances
+                    // currently bound via BindSubscription — on those very instances, so
+                    // the binder observes their state afterwards. Unbound → no fire at
+                    // all (container-verified; the unbound default state must never leak
+                    // into an event, e.g. System Application Test Library's 132513
+                    // "Confirm Test Library" answering OnBeforeGuiAllowed with false).
+                    foreach (var bound in BoundInstancesOf(ExtractCodeunitIdFromTypeName(sub.DeclaringType!)))
+                        InvokeOneSubscriber(publisherScope, scopeType, pubObj, sub, bound);
+                }
+                else
+                {
+                    InvokeOneSubscriber(publisherScope, scopeType, pubObj, sub, null);
+                }
+            }
             catch (TargetInvocationException tie)
             {
                 if (Environment.GetEnvironmentVariable("ALRUNNER_DISPATCH_TRACE") == "1")
@@ -106,6 +123,85 @@ public static partial class BcRuntime
                 throw tie.InnerException ?? tie;
             }
         }
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, bool> _manualBindingTypeCache = new();
+
+    /// <summary>Drop the manual-binding type cache on a server-mode bundle reload — its keys
+    /// are Types from the previous bundle's emitted assembly (same reason
+    /// EventSubscriberPatches.ResetForReload clears its codeunit-type cache).</summary>
+    internal static void ResetManualBindingCacheForReload() => _manualBindingTypeCache.Clear();
+
+    /// <summary>
+    /// Does this AL-emitted Codeunit{N} class declare <c>EventSubscriberInstance = Manual</c>?
+    /// Read off [NavCodeunitOptionsAttribute] exactly like
+    /// <see cref="NCLMetaCodeunit_get_IsEventManualBinding"/> (which serves BC's own
+    /// BindSubscription path) so both sides agree on what "manual" is.
+    ///
+    /// The single definition of "Manual" in the runner: the codeunit-event dispatcher below
+    /// consults it directly, and the table-event path reports it out of
+    /// <c>EventSubscriberPatches.AlEventSubscriberAdapter.IsEventManualBinding</c> so BC's own
+    /// NavEventScope dispatch classifies the subscription the same way. Two answers here would
+    /// let the two paths drift on what Manual means.
+    /// </summary>
+    internal static bool IsManualBindingCodeunitType(Type codeunitClrType)
+        => _manualBindingTypeCache.GetOrAdd(codeunitClrType, static t =>
+        {
+            foreach (var attr in t.GetCustomAttributes(inherit: false))
+            {
+                var at = attr.GetType();
+                if (at.Name != "NavCodeunitOptionsAttribute") continue;
+                var isManual = at.GetProperty("IsEventManualBinding",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (isManual != null)
+                {
+                    try { return (bool)isManual.GetValue(attr)!; } catch { }
+                }
+                var optionsProp = at.GetProperty("Options",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var v = optionsProp?.GetValue(attr);
+                if (v != null)
+                    return (Convert.ToInt32(v) & 1) != 0; // EventManualBinding flag = 1
+            }
+            return false;
+        });
+
+    private static PropertyInfo? _piSessionEventBindings;
+    private static bool _eventBindingsLookupFailed;
+
+    /// <summary>
+    /// Instances of codeunit <paramref name="codeunitId"/> currently bound via AL
+    /// BindSubscription. BC's own NavCodeunit.BindSubscription/UnbindSubscription bodies
+    /// maintain <c>Session.EventBindings</c> (a List&lt;NavCodeunit&gt; seeded on the
+    /// skeleton session); reading that list keeps bind/unbind/double-bind semantics BC's
+    /// business, not ours. Snapshot before invoking — a subscriber body may bind/unbind.
+    /// </summary>
+    private static List<object> BoundInstancesOf(int codeunitId)
+    {
+        var result = new List<object>();
+        if (codeunitId == 0) return result;
+        var session = SkeletonSession;
+        if (session == null) return result;
+        if (_piSessionEventBindings == null && !_eventBindingsLookupFailed)
+        {
+            _piSessionEventBindings = session.GetType().GetProperty("EventBindings",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (_piSessionEventBindings == null)
+            {
+                _eventBindingsLookupFailed = true;
+                Console.Error.WriteLine(
+                    "[Dispatch] NavSession.EventBindings NOT FOUND — Ncl shape changed; "
+                    + "manually-bound event subscribers will never fire");
+            }
+        }
+        if (_piSessionEventBindings?.GetValue(session) is not System.Collections.IEnumerable bindings)
+            return result;
+        foreach (var bound in bindings)
+        {
+            if (bound != null && ExtractCodeunitIdFromTypeName(bound.GetType()) == codeunitId)
+                result.Add(bound);
+        }
+        return result;
     }
 
     /// <summary>
@@ -166,7 +262,8 @@ public static partial class BcRuntime
     private static ConstructorInfo? _ciNavCodeunitHandleByInstance;
     private static PropertyInfo? _pNavCodeunitHandle_Target;
 
-    private static void InvokeOneSubscriber(object publisherScope, Type scopeType, object treeObj, MethodInfo subscriberMethod)
+    private static void InvokeOneSubscriber(object publisherScope, Type scopeType, object treeObj, MethodInfo subscriberMethod,
+        object? boundInstance)
     {
         EnsureCodeunitHandleReflection();
 
@@ -174,17 +271,21 @@ public static partial class BcRuntime
         int subscriberCodeunitId = ExtractCodeunitIdFromTypeName(subscriberClrType);
         if (subscriberCodeunitId == 0) return;
 
-        // The subscriber handle is parented on the PUBLISHER, and a publisher can outlive the
-        // scope it was created in — a SingleInstance codeunit is cached for the whole test, so
-        // by the time it publishes again its original tree may be disposed. Everything that
-        // reads the tree off it then throws ObjectDisposedException("Tree"), which took out
-        // event dispatch for the rest of the run (measured on Base App codeunit 43 publishing
-        // OnGetLanguageIdOrDefault). Parenting on the session instead is what BC's own
-        // "resolve this codeunit in the current session" amounts to, and the session is alive
-        // for exactly as long as dispatch can be running.
-        var handle = _ciNavCodeunitHandleByIdInt!.Invoke(
-            new object?[] { LiveParentFor(treeObj), subscriberCodeunitId });
-        var subscriberInstance = _pNavCodeunitHandle_Target!.GetValue(handle);
+        object? subscriberInstance = boundInstance;
+        if (subscriberInstance == null)
+        {
+            // The subscriber handle is parented on the PUBLISHER, and a publisher can outlive the
+            // scope it was created in — a SingleInstance codeunit is cached for the whole test, so
+            // by the time it publishes again its original tree may be disposed. Everything that
+            // reads the tree off it then throws ObjectDisposedException("Tree"), which took out
+            // event dispatch for the rest of the run (measured on Base App codeunit 43 publishing
+            // OnGetLanguageIdOrDefault). Parenting on the session instead is what BC's own
+            // "resolve this codeunit in the current session" amounts to, and the session is alive
+            // for exactly as long as dispatch can be running.
+            var handle = _ciNavCodeunitHandleByIdInt!.Invoke(
+                new object?[] { LiveParentFor(treeObj), subscriberCodeunitId });
+            subscriberInstance = _pNavCodeunitHandle_Target!.GetValue(handle);
+        }
         if (subscriberInstance == null) return;
 
         // Cross-assembly type mismatch: the registry may hold this MethodInfo from a

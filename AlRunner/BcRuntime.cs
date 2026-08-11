@@ -214,7 +214,8 @@ public static partial class BcRuntime
             Assembly? currentAlFrame = null;
             for (int i = 0; i < trace.FrameCount; i++)
             {
-                var type = trace.GetFrame(i)?.GetMethod()?.DeclaringType;
+                var method = trace.GetFrame(i)?.GetMethod();
+                var type = method?.DeclaringType;
                 var asm = type?.Assembly;
                 if (asm == null || !_moduleInfoByAssembly.ContainsKey(asm)) continue;
                 // The polyfill shim is compiled INTO each AL assembly, so its frames pass
@@ -224,6 +225,19 @@ public static partial class BcRuntime
                     && type.Namespace.StartsWith("AlRunnerShim", StringComparison.Ordinal)) continue;
                 // Same AL method, not a caller: fold away the emitted scope frame object.
                 if (type.Name.Contains("_Scope", StringComparison.Ordinal)) continue;
+                // #1722 — the CROSS-APP invocation path. Calling an AL procedure in another
+                // app does not land as one managed frame: the AL emit routes it through a
+                // compiler-generated `Codeunit<N>.OnInvoke` dispatcher, and that dispatcher
+                // lives in the CALLEE's own assembly, one frame above the callee's real
+                // method. It is the same AL method invocation, not a caller — exactly what
+                // `_Scope` frames are folded for — but it is a plain method on the codeunit
+                // type, so neither rule above catches it. Left unfolded it is accepted as
+                // "the immediate caller" and the walk answers with the callee's own module,
+                // making GetCallerModuleInfo indistinguishable from GetCurrentModuleInfo for
+                // every library invoked across an app boundary. `OnInvoke` is emitted by the
+                // AL compiler, never authored (AL's codeunit trigger is `OnRun`), so folding
+                // it cannot swallow a genuine AL caller frame.
+                if (method!.Name == "OnInvoke") continue;
 
                 if (currentAlFrame == null) { currentAlFrame = asm; continue; }
                 // BC breaks on the FIRST frame after the skipped one — even when it
@@ -1434,18 +1448,14 @@ public static partial class BcRuntime
             }
         }
 
-        // ALTaskScheduler.CheckCodeUnit — calls NCLMetadata.GetMetaCodeunitById to verify the
-        // codeunit exists. We resolve codeunits via assembly-scan in CreateTarget; the metadata
-        // verification is redundant. No-op so ALCreateTaskAsync proceeds.
-        var alTaskSchedType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler");
-        if (alTaskSchedType != null && sessType != null)
-        {
-            var checkCu = alTaskSchedType.GetMethod("CheckCodeUnit",
-                BindingFlags.NonPublic | BindingFlags.Static, null,
-                new[] { sessType, typeof(int) }, null);
-            if (checkCu != null)
-                Hook(checkCu, nameof(NoOp2), "ALTaskScheduler.CheckCodeUnit");
-        }
+        // ALTaskScheduler.CheckCodeUnit / ALCanCreateTask / CanCreateTask (scope.md §3.6,
+        // #1733) are now Cecil-owned (see NclCecilRewrite.cs, CecilOwned + the ALTaskScheduler
+        // block in RewriteNcl). This JmpHook registration used to live here as a no-op for
+        // CheckCodeUnit, but JmpHook is off by default (Cecil-only) — the registration was
+        // silently dead, and BC's real CheckCodeUnit body ran and threw a codeunit-resolution
+        // error before ever reaching CanCreateTask. Deleted rather than left as a redundant
+        // Hook(...) call site (JmpHook.Apply auto-skips Cecil-owned keys anyway, but a call
+        // site with no effect either way is dead code the audit would just flag).
 
         // ALMethodScope.AssignScopeId is Cecil-owned (see NclCecilRewrite.cs, "NavMethodScope
         // cluster") — chains through Session.NCLMetadata which is null; no-op leaves scopeId =
@@ -1840,18 +1850,11 @@ public static partial class BcRuntime
             if (lockTODurGet != null) Hook(lockTODurGet, nameof(ReturnZero_0Args), "ALDatabase.get_ALLockTimeoutDuration");
         }
 
-        // ALTaskScheduler.CanCreateTask(NavSession) — checks permissions via the
-        // session that is null on skeleton. Returning true lets the task-scheduler
-        // calls proceed; ALCreateTaskAsync still NREs further in but the immediate
-        // CanCreateTask cluster is drained.
-        var alTaskSchedType_b = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler");
-        if (alTaskSchedType_b != null)
-        {
-            var canCreate = alTaskSchedType_b.GetMethod("CanCreateTask",
-                BindingFlags.NonPublic | BindingFlags.Static);
-            if (canCreate != null)
-                Hook(canCreate, nameof(ReturnTrue_OneArg), "ALTaskScheduler.CanCreateTask");
-        }
+        // ALTaskScheduler.CanCreateTask(NavSession) is Cecil-owned (see NclCecilRewrite.cs,
+        // scope.md §3.6, #1733): rewritten to return false — faithful, the runner has no
+        // scheduler. A JmpHook registration used to live here trying to make it return TRUE
+        // instead, which directly contradicted the documented/Cecil behaviour; it was always
+        // dead (JmpHook is off by default), which is exactly how it went unnoticed.
 
         // NavDialog.ALClose() / ALUpdateAsync are Cecil-owned (see NclCecilRewrite.cs).
 
@@ -1906,19 +1909,12 @@ public static partial class BcRuntime
             // was also wrong: BC's @@DBTS is strictly positive.
         }
 
-        // ALTaskScheduler.ALCreateTaskAsync — 8-arg ValueTask<Guid> static. Hook
-        // to return a fresh Guid; AL test code typically only verifies the
-        // returned id is non-zero or stores it for later cancellation.
-        if (alTaskSchedType_b != null)
-        {
-            foreach (var m in alTaskSchedType_b.GetMethods(
-                         BindingFlags.Public | BindingFlags.Static))
-            {
-                if (m.Name != "ALCreateTaskAsync") continue;
-                if (m.GetParameters().Length == 8)
-                    Hook(m, nameof(ReturnValueTaskGuid_8Args), "ALTaskScheduler.ALCreateTaskAsync");
-            }
-        }
+        // ALTaskScheduler.ALCreateTaskAsync is deliberately LEFT UNMODIFIED (see
+        // NclCecilRewrite.cs, scope.md §3.6, #1733): its real body already throws BC's own
+        // NavCreateScheduledTasksNotAllowedException once CanCreateTask/CheckCodeUnit are
+        // patched to let it reach that gate. A JmpHook registration used to live here trying
+        // to make it return a fresh Guid instead — a silent fake suppressing BC's own guard —
+        // and was always dead (JmpHook is off by default).
 
         // SessionTransactionExtensions.SetRecordConsistent / SetRecordInconsistent
         // — extension methods on NavSession that reach DataAccessSource (null on

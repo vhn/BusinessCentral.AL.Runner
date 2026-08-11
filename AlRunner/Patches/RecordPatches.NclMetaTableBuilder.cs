@@ -375,6 +375,13 @@ public static partial class RecordPatches
             ? BuildMetaCalcFormula(f.CalcFormula, parentTable)
             : null;
 
+        // TableRelation → ImmutableArray<MetaFieldRelation>, one element per arm. NCLMetaField
+        // turns each into the NCLMetaFieldRelation that GetReferencingRelations' reverse
+        // index — and therefore Rename propagation (#1730, #1737) — is built from.
+        object? relationsObj = f.RelationArms is { Count: > 0 }
+            ? BuildMetaFieldRelations(f.RelationArms, parentTable, f.FieldName)
+            : null;
+
         for (int i = 0; i < ps.Length; i++)
         {
             var p = ps[i];
@@ -401,14 +408,34 @@ public static partial class RecordPatches
                 if (ml != null) { args[i] = ml; continue; }
             }
             if (p.Name == "enabled") { args[i] = (bool?)true; continue; }
-            if (p.Name == "fieldClass" && f.IsFlowField && _tFieldClass != null)
+            if (p.Name == "fieldClass" && _tFieldClass != null && (f.IsFlowField || f.IsFlowFilter))
             {
-                args[i] = Enum.Parse(_tFieldClass, "FlowField");
+                // #1716 — FlowFilter must reach the metadata as FlowFilter. NCLMetaTable
+                // orders FlowFilter fields after the Normal ones (so field indexes shift,
+                // which is fine — every consumer here is metadata-driven), and both
+                // DataHelper.PassesFieldFilters and FlowFieldsHelper key their behaviour off
+                // this enum. Declaring it Normal is what made a flow filter exclude its own
+                // table's rows and made `field("Date Filter")` a blank-equality test.
+                args[i] = Enum.Parse(_tFieldClass, f.IsFlowField ? "FlowField" : "FlowFilter");
                 continue;
             }
             if (p.Name == "calcFormula" && calcFormulaObj != null)
             {
                 args[i] = calcFormulaObj;
+                continue;
+            }
+            if (p.Name == "relations" && relationsObj != null)
+            {
+                args[i] = relationsObj;
+                continue;
+            }
+            // ValidateTableRelation: AL's default is true (MetaField's own null-default also
+            // resolves to true), so only the explicit opt-out needs passing. It matters even
+            // when the relation itself was not captured — the flag alone is what suppresses
+            // rename propagation on a field whose relation a tableextension adds later.
+            if (p.Name == "validateRelation" && !f.RelationValidate)
+            {
+                args[i] = (bool?)false;
                 continue;
             }
             if (p.Name == "optionString" && !string.IsNullOrEmpty(f.OptionMembers))
@@ -456,6 +483,142 @@ public static partial class RecordPatches
                 args[i] = iv;
                 continue;
             }
+            if (p.HasDefaultValue) { args[i] = p.DefaultValue; continue; }
+            args[i] = p.ParameterType.IsValueType ? Activator.CreateInstance(p.ParameterType) : null;
+        }
+        return ctor.Invoke(args)!;
+    }
+
+    /// <summary>
+    /// Builds the ImmutableArray&lt;MetaFieldRelation&gt; for a field's parsed TableRelation —
+    /// one element per arm of an if/else chain (#1737); the plain shape is one condition-less
+    /// arm. If-conditions become MetaConditions keyed on the REFERENCING table's fields,
+    /// where() entries become MetaFilters keyed on the related table's fields; NavRecord's
+    /// own UpdateReferencesOnRenameAsync then evaluates both exactly as real BC does —
+    /// including the container-verified asymmetry that an else arm carries no conditions.
+    /// The parser hands each arm 1 or 2 name parts; two parts are AL-ambiguous between
+    /// `Table.Field` and `Namespace.Table`, so resolution tries `Table.Field` first and falls
+    /// back to treating the last part as a namespace-qualified table. Any name — table,
+    /// condition field, or filter field — that does not resolve refuses the WHOLE relation
+    /// (null, pre-#1730 behaviour: no propagation) rather than guessing: fieldId 0 means
+    /// "the primary key", and a half-built arm would propagate renames real BC does not.
+    /// </summary>
+    private static object? BuildMetaFieldRelations(
+        List<ParsedRelationArm> arms, ParsedTable? referencingTable, string forFieldName)
+    {
+        if (_tMetaFieldRelation == null || _tMetaFilter == null || _tMetaCondition == null
+            || _tFilterType == null)
+            return null;
+
+        ParsedTable? Resolve(string name) =>
+            _parsedTables.Values.FirstOrDefault(t =>
+                string.Equals(t.TableName, name, StringComparison.OrdinalIgnoreCase))
+            ?? TryPopulateParsedTableByName(name);
+
+        var relationObjects = new List<object>();
+        foreach (var arm in arms)
+        {
+            var target = Resolve(arm.TableName);
+            int fieldId = 0;
+            if (target != null && arm.FieldName != null)
+            {
+                var tf = target.Fields.FirstOrDefault(x =>
+                    string.Equals(x.FieldName, arm.FieldName, StringComparison.OrdinalIgnoreCase));
+                if (tf != null)
+                {
+                    fieldId = tf.FieldId;
+                }
+                else
+                {
+                    // `A.B` where A is a table but B is not its field — try B as the table
+                    // (`Namespace.Table` reading) before giving up.
+                    target = null;
+                }
+            }
+            if (target == null && arm.FieldName != null)
+            {
+                target = Resolve(arm.FieldName);
+                fieldId = 0;
+            }
+            if (target == null)
+            {
+                Console.Error.WriteLine(
+                    $"[RecordPatches] TableRelation target '{arm.TableName}{(arm.FieldName != null ? "." + arm.FieldName : "")}' did not resolve to a parsed table — relation dropped");
+                return null;
+            }
+
+            var conditionObjects = new List<object>();
+            foreach (var c in arm.Conditions)
+            {
+                var localField = referencingTable?.Fields.FirstOrDefault(x =>
+                    string.Equals(x.FieldName, c.SourceFieldName, StringComparison.OrdinalIgnoreCase));
+                if (localField == null)
+                {
+                    Console.Error.WriteLine(
+                        $"[RecordPatches] TableRelation on '{forFieldName}': condition field '{c.SourceFieldName}' not found on '{referencingTable?.TableName}' — relation dropped");
+                    return null;
+                }
+                conditionObjects.Add(BuildMetaCondition(localField.FieldId,
+                    c.Kind == ParsedCalcFilterKind.Const ? "CONST" : "FILTER", c.Value ?? ""));
+            }
+
+            var filterObjects = new List<object>();
+            foreach (var w in arm.Filters)
+            {
+                var srcField = target.Fields.FirstOrDefault(x =>
+                    string.Equals(x.FieldName, w.SourceFieldName, StringComparison.OrdinalIgnoreCase));
+                if (srcField == null)
+                {
+                    Console.Error.WriteLine(
+                        $"[RecordPatches] TableRelation on '{forFieldName}': where() field '{w.SourceFieldName}' not found on '{target.TableName}' — relation dropped");
+                    return null;
+                }
+                filterObjects.Add(BuildMetaFilter(srcField.FieldId,
+                    w.Kind == ParsedCalcFilterKind.Const ? "CONST" : "FILTER", w.Value ?? ""));
+            }
+
+            var ctor = _tMetaFieldRelation.GetConstructors()
+                .OrderByDescending(c => c.GetParameters().Length)
+                .First(c => c.GetParameters().Any(p => p.Name == "tableId"));
+            var ps = ctor.GetParameters();
+            var args = new object?[ps.Length];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                var p = ps[i];
+                if (p.Name == "tableId") { args[i] = target.TableId; continue; }
+                if (p.Name == "tableName") { args[i] = target.TableName; continue; }
+                if (p.Name == "fieldId") { args[i] = fieldId; continue; }
+                if (p.Name == "filters") { args[i] = MakeImmutableArray(_tMetaFilter!, filterObjects.ToArray()); continue; }
+                if (p.Name == "conditions") { args[i] = MakeImmutableArray(_tMetaCondition!, conditionObjects.ToArray()); continue; }
+                if (p.HasDefaultValue) { args[i] = p.DefaultValue; continue; }
+                args[i] = p.ParameterType.IsValueType ? Activator.CreateInstance(p.ParameterType) : null;
+            }
+            relationObjects.Add(ctor.Invoke(args)!);
+        }
+        return MakeImmutableArray(_tMetaFieldRelation, relationObjects.ToArray());
+    }
+
+    /// <summary>
+    /// One <c>MetaCondition</c> — the metadata form of a single <c>if (...)</c> arm
+    /// condition on a TableRelation. Mirrors <see cref="BuildMetaFilter"/>: the type name is
+    /// a <c>FilterType</c> member (CONST / FILTER — FIELD is not a condition shape, BC's own
+    /// NCLMetaFilter.CreateFromMetaCondition throws on it), and the value is the literal /
+    /// filter-expression TEXT, which NCLMetaFilterConst / NCLMetaFilterExpression evaluate
+    /// against the referencing field's own type exactly as for a user-typed filter.
+    /// </summary>
+    private static object BuildMetaCondition(int fieldId, string conditionTypeName, string conditionValue)
+    {
+        // MetaCondition(int fieldId, FilterType conditionType, string conditionValue)
+        var ctor = _tMetaCondition!.GetConstructors()
+            .First(c => c.GetParameters().Any(p => p.Name == "fieldId"));
+        var ps = ctor.GetParameters();
+        var args = new object?[ps.Length];
+        for (int i = 0; i < ps.Length; i++)
+        {
+            var p = ps[i];
+            if (p.Name == "fieldId") { args[i] = fieldId; continue; }
+            if (p.Name == "conditionType") { args[i] = Enum.Parse(_tFilterType!, conditionTypeName); continue; }
+            if (p.Name == "conditionValue") { args[i] = conditionValue; continue; }
             if (p.HasDefaultValue) { args[i] = p.DefaultValue; continue; }
             args[i] = p.ParameterType.IsValueType ? Activator.CreateInstance(p.ParameterType) : null;
         }
@@ -525,8 +688,14 @@ public static partial class RecordPatches
                         Console.Error.WriteLine($"[RecordPatches] BuildMetaCalcFormula: filter parent field '{filter.ParentFieldName}' not found in '{parentTable.TableName}'");
                         continue;
                     }
+                    // #1716: the two mode flags ride along on the FIELD filter.
+                    // NCLMetaFilterField.CreateFromMetaFilter turns them into
+                    // NCLMetaFilterModes, and FlowFieldsHelper then reads the parent field as
+                    // a filter expression (ValueIsFilter) and/or keeps only the upper bound
+                    // of the resolved range (OnlyMaxLimit). Nothing here interprets them.
                     filterObjects.Add(BuildMetaFilter(srcFilterField.FieldId, "FIELD",
-                        parentFilterField.FieldId.ToString()));
+                        parentFilterField.FieldId.ToString(),
+                        filter.ValueIsFilter, filter.OnlyMaxLimit));
                     break;
 
                 case ParsedCalcFilterKind.Const:
@@ -535,20 +704,6 @@ public static partial class RecordPatches
 
                 case ParsedCalcFilterKind.Filter:
                     filterObjects.Add(BuildMetaFilter(srcFilterField.FieldId, "FILTER", filter.Value ?? ""));
-                    break;
-
-                case ParsedCalcFilterKind.FlowFilter:
-                    // `field(filter(X))` / `field(upperlimit(X))` — MetaFilter models these as
-                    // FIELD plus valueIsFilter / onlyMaxLimit, but evaluating them means
-                    // reading the PARENT field as a filter string (or as the upper bound of
-                    // one), which FlowFieldPatches does not do. Emitting a plain FIELD filter
-                    // instead would apply an equality BC never wrote — the silent wrong value
-                    // this is all about — so the condition is left out, as it always has been,
-                    // and said out loud. Runner gap, not an AL problem.
-                    Console.Error.WriteLine(
-                        $"[RecordPatches] BuildMetaCalcFormula: RUNNER GAP — FlowFilter condition on " +
-                        $"'{cf.SourceTableName}'.'{filter.SourceFieldName}' is not applied; " +
-                        $"'{parentTable.TableName}' FlowField may aggregate more rows than AL declared");
                     break;
             }
         }
@@ -594,10 +749,17 @@ public static partial class RecordPatches
     /// id for FIELD, the literal's text for CONST, the filter expression's text for FILTER.
     /// This is the same shape BC's compiled table metadata carries, which is why NCL can build
     /// the right NCLMetaFilter subclass from it without any further help.</para>
+    /// <para><paramref name="valueIsFilter"/> / <paramref name="onlyMaxLimit"/> are AL's
+    /// <c>field(filter(X))</c> and <c>field(upperlimit(X))</c> (#1716). They only ever apply
+    /// to a FIELD filter and are passed straight through to
+    /// <c>NCLMetaFilterField.CreateFromMetaFilter</c>, which is the only code that decides
+    /// what they mean.</para>
     /// </summary>
-    private static object BuildMetaFilter(int sourceFieldId, string filterTypeName, string filterValue)
+    private static object BuildMetaFilter(int sourceFieldId, string filterTypeName, string filterValue,
+        bool valueIsFilter = false, bool onlyMaxLimit = false)
     {
-        // MetaFilter(int fieldId, FilterType filterType, string filterValue, ...)
+        // MetaFilter(int fieldId, FilterType filterType, string filterValue, int filterGroup,
+        //            bool valueIsFilter, bool onlyMaxLimit)
         var ctor = _tMetaFilter!.GetConstructors()
             .OrderByDescending(c => c.GetParameters().Length).First();
         var ps = ctor.GetParameters();
@@ -608,6 +770,8 @@ public static partial class RecordPatches
             if (p.Name == "fieldId") { args[i] = sourceFieldId; continue; }
             if (p.Name == "filterType") { args[i] = Enum.Parse(_tFilterType!, filterTypeName); continue; }
             if (p.Name == "filterValue") { args[i] = filterValue; continue; }
+            if (p.Name == "valueIsFilter") { args[i] = valueIsFilter; continue; }
+            if (p.Name == "onlyMaxLimit") { args[i] = onlyMaxLimit; continue; }
             if (p.HasDefaultValue) { args[i] = p.DefaultValue; continue; }
             args[i] = p.ParameterType.IsValueType ? Activator.CreateInstance(p.ParameterType) : null;
         }

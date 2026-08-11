@@ -227,6 +227,11 @@ string? artifactPathArg = null;
 // Extra preprocessor symbols supplied via --define SYM / --preprocessor-symbols A,B,C.
 // Validated as AL identifiers and merged with CLEANSCHEMA1..25 in BcCompiler.
 var extraPreprocessorSymbols = new List<string>();
+// --expectations DIR: test-expectations manifest directory (issue #1734; schema in
+// docs/expectations.md). Null = probe the default ./tests/expectations below; only an
+// existing directory activates classification, so ordinary runs outside this repo are
+// untouched.
+string? expectationsDirArg = null;
 // `provision` subcommand: `al-runner provision [<project>]` provisions the BC artifacts
 // for the project's version and exits (no test run). `--auto-provision` provisions on the
 // fly when artifacts are missing, then continues the normal run. Both are the opt-in that
@@ -246,6 +251,7 @@ for (int i = 0; i < args.Length; i++)
     if (args[i] == "--package-cache" && i + 1 < args.Length) { packageCacheArgs.Add(args[++i]); continue; }
     if (args[i] == "--per-suite") { bundledMode = false; continue; }
     if (args[i] == "--bundled") { bundledMode = true; continue; }
+    if (args[i] == "--expectations" && i + 1 < args.Length) { expectationsDirArg = args[++i]; continue; }
     if (args[i] == "--cache" && i + 1 < args.Length) { alCacheDir = args[++i]; continue; }
     if (args[i] == "--no-cache") { alCacheDir = null; continue; }
     if (args[i] == "--watch") { watchMode = true; continue; }
@@ -339,6 +345,36 @@ if (radMode && !watchMode)
     {
         Console.Error.WriteLine(rootProblem);
         return 2;
+    }
+}
+// ── Test-expectations manifest (issue #1734; docs/expectations.md) ────────────────
+// Loaded HERE — at parse time, before BC init — so a malformed manifest aborts the
+// invocation (exit 2, the "bad invocation" ladder entry) without running a single
+// test. An explicit --expectations dir must exist; without the flag, the documented
+// default ./tests/expectations activates only when present (this repo's corpus CI),
+// leaving every other invocation exactly as before.
+AlRunner.Infrastructure.ExpectationManifest? expectations = null;
+{
+    var expectationsDir = expectationsDirArg;
+    if (expectationsDir != null && !Directory.Exists(expectationsDir))
+    {
+        Console.Error.WriteLine($"--expectations: directory not found: {expectationsDir}");
+        return 2;
+    }
+    expectationsDir ??= Directory.Exists(Path.Combine(Environment.CurrentDirectory, "tests", "expectations"))
+        ? Path.Combine(Environment.CurrentDirectory, "tests", "expectations")
+        : null;
+    if (expectationsDir != null)
+    {
+        try
+        {
+            expectations = AlRunner.Infrastructure.ExpectationManifest.LoadFromDirectory(expectationsDir);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.Error.WriteLine($"expectations manifest ({expectationsDir}): {ex.Message}");
+            return 2;
+        }
     }
 }
 // --output-json: stdout must be JSON-only, matching the documented contract ("Replace
@@ -683,7 +719,7 @@ AlRunner.PerfTrace.Log($"BcRuntime.EnsureApplied {t0.ElapsedMilliseconds}ms");
 
 var emitter = new BcCompiler();
 var assembler = new BcAssembler();
-var executor = new TestExecutor { Isolation = isolation, TestFilter = testFilter, TimeoutSeconds = testTimeoutSeconds };
+var executor = new TestExecutor { Isolation = isolation, TestFilter = testFilter, TimeoutSeconds = testTimeoutSeconds, Expectations = expectations };
 var depLoader = new DependencyLoader(emitter, assembler);
 var results = new List<BucketResult>();
 
@@ -2894,6 +2930,15 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("  --dump-csharp DIR       Write the intermediate C# emitted by BC's Compilation.Emit");
     w.WriteLine("                          (one .cs file per AL object) under DIR/<moduleName>/.");
     w.WriteLine("                          Useful for diagnosing codegen issues.");
+    w.WriteLine("  --expectations DIR      Load the test-expectations manifest from DIR (schema:");
+    w.WriteLine("                          docs/expectations.md). Defaults to ./tests/expectations");
+    w.WriteLine("                          when that directory exists; otherwise off. Declared");
+    w.WriteLine("                          outcomes reclassify: expect-oos -> pass-oos,");
+    w.WriteLine("                          expect-fail-known-gap -> pass-known-gap,");
+    w.WriteLine("                          expect-divergence -> pass-divergence, skip -> not");
+    w.WriteLine("                          invoked. Manifest drift is loud: an entry whose test now");
+    w.WriteLine("                          passes, or an out-of-scope throw with no entry, fails");
+    w.WriteLine("                          the run with a diagnostic naming the entry to fix.");
     w.WriteLine();
     w.WriteLine("SUBCOMMANDS");
     w.WriteLine("  provision [<bundle-dir>] Download and install the BC artifacts matching the");

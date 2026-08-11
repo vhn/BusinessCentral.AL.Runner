@@ -284,7 +284,7 @@ internal class LiveNavTestPage : MockITestPage
     {
         if (_page == null) return base.GetAction(actionId);
         if (!_liveActions.TryGetValue(actionId, out var action))
-            _liveActions[actionId] = action = new LiveNavTestAction(_page, actionId);
+            _liveActions[actionId] = action = new LiveNavTestAction(this, _page, actionId);
         return action;
     }
 
@@ -400,6 +400,15 @@ internal class LiveNavTestPage : MockITestPage
     {
         if (!_pendingNewRow) return;
         _pendingNewRow = false;
+        // AutoSplitKey, in BC's own order: SplitKey, then OnInsertRecord, then the record's
+        // Insert (NavForm.SaveRecordAsync / NavForm.InsertAsync(belowXRec) both do exactly
+        // this). Skipping it left the last primary-key field at its Init() default, so a page
+        // whose whole numbering scheme is AutoSplitKey — every editable line grid in BC —
+        // wrote its first row at line no. 0 and could not write a second one at all: the same
+        // key, so the insert failed on a duplicate. It is a no-op inside BC's own guard for a
+        // page that does not declare the property.
+        ProposeAutoSplitKey();
+        _page?.SplitKey();
         // OnInsertRecord is the page's last word before the row exists, and its RETURN VALUE
         // is a veto — a page can refuse the insert outright. Running it and discarding the
         // answer would be worse than not running it: the row lands anyway, but now it also
@@ -414,6 +423,124 @@ internal class LiveNavTestPage : MockITestPage
 
     /// <summary>Abandon an in-progress new row without writing it — how Cancel closes.</summary>
     internal void DiscardPendingNewRow() { _pendingNewRow = false; _pendingModify = false; }
+
+    // BC's AutoSplitKey increment. Named NavForm.AutoSplitKeyIncrement there, and the same
+    // literal in the client's AutoKeyGenerator — both sides of the wire agree on 10000.
+    private const int AutoSplitKeyIncrement = 10000;
+
+    /// <summary>
+    /// Do the CLIENT half of AutoSplitKey: work out the key the new row should get and offer it
+    /// to BC's <c>NavForm.SplitKey()</c> as <c>AutoKeyValue</c>. SplitKey still owns the answer —
+    /// it validates the proposal against the table and falls back to its own arithmetic if the
+    /// key is taken — but without a proposal it has nothing to compute from.
+    ///
+    /// WHY THE RUNNER HAS TO DO THIS AT ALL
+    ///   SplitKey's inputs are all client-supplied: <c>AutoKeyValue</c>, and the
+    ///   <c>InsertLowerBoundBookmark</c> / <c>InsertUpperBoundBookmark</c> pair naming the rows
+    ///   the new one is being inserted between. On a service tier those come off the repeater's
+    ///   loaded rows (<c>NavRecordStateHandler.GetUpperAndLowerRowEntryBookmarks</c> and
+    ///   <c>AutoKeyGenerator.GenerateKey</c>) and travel in <c>NavRecordState</c>. This class IS
+    ///   the client, so all three were null on every insert and
+    ///   <c>CalculateAutoSplitKeyValue(null, null)</c> answered a flat 10000 — the same constant
+    ///   for every row, derived from no data at all. On an empty grid that is one interval low;
+    ///   on a grid whose rows start anywhere else it puts the new row BEFORE them (a grid holding
+    ///   a line at 50000 got 10000, not 60000).
+    ///
+    /// WHAT BC'S CLIENT COMPUTES
+    ///   <c>AutoKeyGenerator.CalculateNumericKeyValue</c> is
+    ///   <c>rangeStart + (draftRowsBefore + 1) * 10000</c>, where <c>rangeStart</c> is the key of
+    ///   the nearest NON-draft row before the insertion point (0 when there is none) and
+    ///   <c>draftRowsBefore</c> counts the unsaved rows between the two.
+    ///
+    /// WHY AN EMPTY GRID STARTS AT 20000 AND NOT 10000
+    ///   Because <c>draftRowsBefore</c> is 1 there, not 0. An insertable repeater always carries a
+    ///   trailing blank row past its data — <c>DraftLinePattern.MakeDraftLines</c> adds one as soon
+    ///   as the binding manager is filled, including when it filled with nothing — and
+    ///   <c>TestPageProxy.InsertEmptyRow</c> inserts the test's row AFTER the current one
+    ///   (<c>InsertBehavior = RowUpdateBehavior.After</c>, whatever <c>beforeCurrent</c> says). On
+    ///   an empty grid the current row is that placeholder, so the test's first row is the SECOND
+    ///   draft and takes the second interval: 0 + 2 * 10000. The placeholder itself is never
+    ///   persisted — nothing edits it — which is why no row at 10000 ever appears. On a grid that
+    ///   already has data the current row is a real one, the placeholder sits after the new row,
+    ///   and the count is 0: last + 1 * 10000. Both are measured on real BC 27.5 and 28.3 by
+    ///   corpus CU60922.
+    ///
+    /// THE RUNNER'S INSERTION POINT
+    ///   <c>InsertEmptyRow</c> here appends: there is no cursor held across a New(), so the row
+    ///   goes after the last row of the page's filtered set. So <c>rangeStart</c> is that last
+    ///   row's key, read with BC's own ALFindLast over the page's own filters, and the draft count
+    ///   is 1 exactly when the set is empty. A test that positions mid-grid and inserts would
+    ///   split an interval on real BC and append here; that is the pre-existing shape of this
+    ///   class's New(), not something this method decides.
+    /// </summary>
+    private void ProposeAutoSplitKey()
+    {
+        if (_page == null || !_page.NeedsAutoSplitKey) return;
+        _page.SetAutoKeyValue(ClientAutoKeyValue());
+    }
+
+    private object? ClientAutoKeyValue()
+    {
+        // The AutoSplitKey field is the LAST field of the primary key — BC picks it the same way
+        // inside SplitKey, so a page whose key shape the runner read differently would number a
+        // different field than BC validates.
+        var primaryKey = _record.MetaTable?.PrimaryKey;
+        if (primaryKey == null || primaryKey.KeyFieldCount == 0) return null;
+        var keyFieldNo = primaryKey.KeyFieldsList[primaryKey.KeyFieldCount - 1].FieldNo;
+
+        // Zero of the key field's own type, straight off the freshly initialised buffer. Used as
+        // the base for an empty rowset so the proposal is typed like the field: SplitKey feeds it
+        // to NavValue.CreateNavValueFromObject, which converts per the field's NCL type, and an
+        // Int32 offered for a BigInteger or Decimal key is a different value than BC's client
+        // would have sent.
+        object? rangeStart = Unwrap(_record.GetFieldValue(keyFieldNo));
+        var draftRowsBefore = 1;
+
+        // The last row of the page's filtered set — BC's non-draft row before the insertion
+        // point. Cloned with reset:false so it carries the page's filters (a subpage part's
+        // SubPageLink above all: without it this would find the last line of SOME OTHER header)
+        // and cannot disturb the cursor the page is on. Same call SplitKey's own collision
+        // fallback makes.
+        using (var probe = _record.CloneRecord(_record.Parent, reset: false, keepCompany: true))
+        {
+            if (probe.ALFindLastAsync(DataError.TrapError).GetAwaiter().GetResult())
+            {
+                rangeStart = Unwrap(probe.GetFieldValue(keyFieldNo));
+                draftRowsBefore = 0;
+            }
+        }
+
+        return Advance(rangeStart, draftRowsBefore + 1);
+    }
+
+    /// <summary>
+    /// <c>value + intervals * 10000</c> in the key field's own CLR type — the arithmetic half of
+    /// <c>AutoKeyGenerator.CalculateNumericKeyValue</c> for the append case.
+    ///
+    /// Answering null means "no proposal", which is a real answer and not a failure: SplitKey then
+    /// computes the key itself. That is the right outcome for a GUID key (BC's client and SplitKey
+    /// both just mint a fresh Guid, so proposing one would add nothing), for a key type SplitKey
+    /// refuses outright (it throws, and it must be the one to throw so the AL sees BC's message),
+    /// and on overflow — where BC's client also gives up and BC's <c>ArithmeticHelper.BoundedAdd</c>
+    /// saturates instead.
+    /// </summary>
+    private static object? Advance(object? value, int intervals)
+    {
+        try
+        {
+            checked
+            {
+                return value switch
+                {
+                    int i     => i + intervals * AutoSplitKeyIncrement,
+                    long l    => l + intervals * (long)AutoSplitKeyIncrement,
+                    decimal d => d + intervals * (decimal)AutoSplitKeyIncrement,
+                    _         => (object?)null,
+                };
+            }
+        }
+        catch (OverflowException) { return null; }
+    }
 
     // The same client model as _pendingNewRow, for the other half of editing: a SetValue on an
     // EXISTING row writes into the record buffer, and the row is persisted when the cursor
@@ -439,15 +566,55 @@ internal class LiveNavTestPage : MockITestPage
         _pendingModify = false;
         // OnModifyRecord vetoes exactly as OnInsertRecord does.
         if (_page != null && !_page.RaiseOnModifyRecord()) return;
-        // ThrowError, not TrapError: a Modify that cannot be performed is something the user of
-        // a real client would be told about. Trapping it turned "this page is not positioned on
-        // a row" into an edit that appeared to succeed and quietly went nowhere.
-        _record.ALModifyAsync(DataError.ThrowError, true).GetAwaiter().GetResult();
+
+        // SystemModifiedAt/By are stamped by a Cecil prepend on NavRecord.ALModifyAsync — the
+        // CODE-driven entry point this method deliberately does NOT use (see below). Real BC
+        // stamps them in the data layer, so they move on a page write too; call the same helper
+        // the prepend calls so switching entry points does not silently freeze them.
+        BcRuntime.StampSystemFieldsOnModify(_record);
+
+        // ModifyAsync, NOT ALModifyAsync — and the difference is the whole xRec contract.
+        //
+        //   NavRecord.ALModifyAsync  (what AL `Rec.Modify()` lowers to) opens with
+        //       OldRecord.ALAssign(this)
+        //   before delegating to ModifyAsync, so a code-driven Modify deliberately makes xRec
+        //   MIRROR Rec — there is no before-image on that path (corpus CU60179
+        //   OnModify_xRec_MirrorsRecValues_WhenCalledFromCode pins exactly that).
+        //
+        //   NavForm.SaveRecordAsync — BC's own page-write path — skips that assignment and calls
+        //       SafeSourceTable.ModifyAsync(DataError.ThrowError, runApplicationTrigger: true,
+        //                                   runGlobalTrigger: true)
+        //   directly, precisely so the before-image the form snapshotted when it loaded the row
+        //   (SnapshotBeforeImage below) survives into the table's OnModify. That is why a
+        //   PAGE-driven Modify sees the PREVIOUS value in xRec (corpus CU60235
+        //   Record_Modify_FromPage_xRecHoldsPreviousValue).
+        //
+        // Same three arguments BC passes, for the same reasons: ThrowError, because a Modify
+        // that cannot be performed is something the user of a real client would be told about —
+        // trapping it turned "this page is not positioned on a row" into an edit that appeared
+        // to succeed and quietly went nowhere; and both trigger flags on, because a page write
+        // runs the table's OnModify and the global-trigger hook exactly like Rec.Modify(true).
+        _record.ModifyAsync(DataError.ThrowError, true, true).GetAwaiter().GetResult();
     }
 
     // Order matters at every flush point: an in-progress new row is finished by an Insert, an
     // edited existing row by a Modify, and only one of the two is ever pending.
     private void FlushRow() { FlushPendingNewRow(); FlushPendingModify(); }
+
+    /// <summary>
+    /// Persist whatever row the page is in the middle of editing — BC's NavForm.SaveRecord,
+    /// the "the cursor is leaving this row" step.
+    ///
+    /// Every OTHER leave-the-row moment in this class already does this (the four cursor
+    /// moves, Close, Dispose, the built-in OK action); invoking a page ACTION is the one that
+    /// did not, and it is the moment BC's client is most obviously at: the client sends the
+    /// edited row to the server before it runs the action, which is why an AL action reads
+    /// <c>Rec</c> as a row that exists. Without it the action ran against a row that was still
+    /// only a buffer — its AutoSplitKey field unassigned and no row of its own in the table —
+    /// so an OnAction that looked the row up, or passed its key to a posting routine, silently
+    /// found nothing.
+    /// </summary>
+    internal void SaveCurrentRow() { FlushParts(); FlushRow(); }
 
     // BC routes TestPage teardown through both Close() and Dispose() depending on whether
     // the AL test calls Close() explicitly or lets the variable go out of scope. Flush on
@@ -530,9 +697,32 @@ internal class LiveNavTestPage : MockITestPage
     /// </summary>
     private bool Loaded(bool found)
     {
-        if (found) _page?.RaiseOnAfterGetRecord();
+        if (found)
+        {
+            _page?.RaiseOnAfterGetRecord();
+            SnapshotBeforeImage();
+        }
         return found;
     }
+
+    /// <summary>
+    /// Take the page's before-image of the current row — what the table's <c>OnModify</c> reads
+    /// as <c>xRec</c> when the edit is driven from a page.
+    ///
+    /// This is the tail of BC's own <c>NavForm.AfterGetRecordAsync</c> AND of
+    /// <c>NavForm.AfterGetCurrRecordAsync</c> — both end with
+    /// <c>OldRecord.ALAssign(SourceTable)</c>, and <c>NavForm.OldRecord</c> is literally
+    /// <c>SafeSourceTable.OldRecord</c>, so the target is this record's own xRec slot. Those two
+    /// are exactly the pair of triggers RaiseOnAfterGetRecord above fires, which is why the
+    /// snapshot belongs here and nowhere else: "a row became the current row" is the only moment
+    /// BC takes it, and nothing on the page-write path overwrites it (see FlushPendingModify),
+    /// so by the time OnModify runs xRec still holds the row AS FETCHED.
+    ///
+    /// Without this the page had no before-image at all: <c>ALModifyAsync</c>'s own
+    /// <c>OldRecord.ALAssign(this)</c> was the only thing that ever populated xRec, which is
+    /// what made a page-driven Modify report the NEW value as the old one.
+    /// </summary>
+    private void SnapshotBeforeImage() => _record.OldRecord.ALAssign(_record);
 
     public override object? GetBookmark() => _record.ALGetPosition();
 
@@ -1039,16 +1229,29 @@ internal sealed class MockITestAction : ITestAction
 /// </summary>
 internal sealed class LiveNavTestAction : ITestAction
 {
+    private readonly LiveNavTestPage _testPage;
     private readonly RunnerPageInstance _page;
     private readonly int _actionId;
 
-    public LiveNavTestAction(RunnerPageInstance page, int actionId)
+    public LiveNavTestAction(LiveNavTestPage testPage, RunnerPageInstance page, int actionId)
     {
+        _testPage = testPage;
         _page = page;
         _actionId = actionId;
     }
 
-    public void Invoke() => _page.RaiseOnAction(_actionId);
+    /// <summary>
+    /// Save the current row, then run OnAction — BC's order, and the order matters. A real
+    /// client sends the row it is on to the server before it invokes an action, so the AL in
+    /// OnAction reads a <c>Rec</c> that exists in the table, with its AutoSplitKey field
+    /// assigned. Dispatching straight to the trigger let the action see the field values a
+    /// test had just set while the row itself was still nowhere.
+    /// </summary>
+    public void Invoke()
+    {
+        _testPage.SaveCurrentRow();
+        _page.RaiseOnAction(_actionId);
+    }
 
     public bool Visible => _page.ActionVisible(_actionId);
     public bool Enabled => _page.ActionEnabled(_actionId);
