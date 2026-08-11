@@ -143,6 +143,8 @@ public static partial class BcRuntime
             .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Ncl");
         Type? xmlPortBase = navNcl?.GetType("Microsoft.Dynamics.Nav.Runtime.NavXmlPort");
         var name = $"XmlPort{id}";
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, xmlPortBase) is { } owned) return owned;
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         if (_currentTestAssembly != null)
         {
             try

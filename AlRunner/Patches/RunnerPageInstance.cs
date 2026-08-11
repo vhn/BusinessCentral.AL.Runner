@@ -649,6 +649,8 @@ internal sealed class RunnerPageInstance
     private static Type? FindPageType(int pageId)
     {
         var name = "Page" + pageId;
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, typeof(NavForm)) is { } owned) return owned;
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             Type?[] types;

@@ -132,7 +132,7 @@ public sealed class CliDocumentationTests
         Assert.True(idx >= 0, "--help should keep a 'NOT YET IMPLEMENTED' section.");
         var notYet = help[idx..];
 
-        foreach (var implemented in new[] { "--server", "--watch", "--define", "--auto-provision", "--output-json", "--output-junit" })
+        foreach (var implemented in new[] { "--server", "--watch", "--rad", "--define", "--auto-provision", "--output-json", "--output-junit" })
             Assert.False(notYet.Contains(implemented, StringComparison.Ordinal),
                 $"{implemented} is implemented but listed under 'NOT YET IMPLEMENTED'.");
     }
@@ -183,5 +183,13 @@ public sealed class CliDocumentationTests
         var (exit, _, stderr) = RunCli("--guied");
         Assert.True(exit != 0, "A misspelled flag must not exit 0.");
         Assert.Contains("--guied", stderr, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Rad_RequiresWatch()
+    {
+        var (exit, _, stderr) = RunCli("--rad");
+        Assert.Equal(2, exit);
+        Assert.Contains("--rad requires --watch", stderr, StringComparison.Ordinal);
     }
 }

@@ -1,0 +1,13 @@
+{
+  "id": "6b93d4e7-1a52-4f6c-9d80-3e7f12a4b560",
+  "name": "Delta Bridge",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [{ "from": 60960, "to": 60979 }],
+  "dependencies": [
+    { "id": "7c4f6c1e-9a2b-4f0d-8f3a-1b2c3d4e5f60", "publisher": "AlRunner Tests", "name": "Delta Lib", "version": "1.0.0.0" }
+  ]
+}

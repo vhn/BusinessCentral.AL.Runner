@@ -7,11 +7,18 @@
 // static type is `T` (a Handle subclass) and the callee expects `ByRef<T>`.
 //
 // Strategy:
-//   1. Run a throw-away Roslyn compile to surface CS1503 diagnostics.
+//   1. Take the CS1503 diagnostics from a compile that ALREADY ran.
 //   2. Filter to "cannot convert from 'T' to 'ByRef<T>'" shape.
 //   3. Rewrite the offending argument expression `expr` to
 //      `new ByRef<T>(() => expr, v => expr = v)`.
 //   4. Return the rewritten trees so BcAssembler.Compile can emit cleanly.
+//
+// The diagnostics come from the REAL emit, not a throw-away bind. BcAssembler used
+// to run this pass unconditionally before emitting, which meant a full Roslyn bind of
+// every tree on every compile whether or not any ByRef gap existed — measured at
+// 79.8 s over 6,947 trees producing 139,495 diagnostics and **0 rewrites** on a
+// 7,000-object app, then binding the identical trees a second time to emit. Emitting
+// first makes the no-gap case free and the rare real case cost one extra emit.
 //
 // This adds NO type renames or identifier rewrites — only argument expressions
 // are wrapped, so the resulting IL stays binary-compatible with Microsoft's
@@ -31,55 +38,44 @@ public static class CallSiteArgWrap
         RegexOptions.Compiled);
 
     /// <summary>
-    /// Iteratively diagnoses + rewrites until either no CS1503/ByRef diagnostics remain
-    /// or no further rewrites land (loop guard). Returns the (possibly new) trees.
+    /// Rewrite the ByRef argument gaps named by <paramref name="diagnostics"/> (the
+    /// diagnostics of a compile that already ran over <paramref name="trees"/>).
+    /// Returns the rewritten tree list, or <c>null</c> when there was nothing to do —
+    /// meaning the caller's failure is a genuine compile error, not a ByRef gap.
     /// </summary>
-    public static IReadOnlyList<SyntaxTree> Apply(
+    public static IReadOnlyList<SyntaxTree>? TryRewrite(
         IReadOnlyList<SyntaxTree> trees,
-        IReadOnlyList<MetadataReference> refs)
+        IEnumerable<Diagnostic> diagnostics)
     {
-        var current = trees.ToList();
-        for (int iter = 0; iter < 5; iter++)
+        var targets = new List<(SyntaxTree Tree, TextSpan Span, string ByRefType)>();
+        foreach (var d in diagnostics)
         {
-            var comp = CSharpCompilation.Create(
-                $"_argwrap_{iter}",
-                current,
-                refs,
-                new CSharpCompilationOptions(
-                    OutputKind.DynamicallyLinkedLibrary,
-                    allowUnsafe: true,
-                    concurrentBuild: false));
-
-            var targets = new List<(SyntaxTree Tree, TextSpan Span, string ByRefType)>();
-            foreach (var d in comp.GetDiagnostics())
-            {
-                if (d.Severity != DiagnosticSeverity.Error) continue;
-                if (d.Id != "CS1503") continue;
-                var m = _byRefMessage.Match(d.GetMessage());
-                if (!m.Success) continue;
-                if (d.Location.SourceTree == null) continue;
-                targets.Add((d.Location.SourceTree, d.Location.SourceSpan, m.Groups["to"].Value));
-            }
-            if (targets.Count == 0) return current;
-
-            var byTree = targets
-                .GroupBy(t => t.Tree)
-                .ToDictionary(g => g.Key, g => g.ToList());
-
-            bool changed = false;
-            for (int i = 0; i < current.Count; i++)
-            {
-                if (!byTree.TryGetValue(current[i], out var spans)) continue;
-                var oldRoot = current[i].GetRoot();
-                var rewriter = new ArgRewriter(spans);
-                var newRoot = rewriter.Visit(oldRoot);
-                if (rewriter.Rewrote == 0) continue;
-                current[i] = current[i].WithRootAndOptions(newRoot, current[i].Options);
-                changed = true;
-            }
-            if (!changed) return current;
+            if (d.Severity != DiagnosticSeverity.Error) continue;
+            if (d.Id != "CS1503") continue;
+            var m = _byRefMessage.Match(d.GetMessage());
+            if (!m.Success) continue;
+            if (d.Location.SourceTree == null) continue;
+            targets.Add((d.Location.SourceTree, d.Location.SourceSpan, m.Groups["to"].Value));
         }
-        return current;
+        if (targets.Count == 0) return null;
+
+        var byTree = targets
+            .GroupBy(t => t.Tree)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var current = trees.ToList();
+        bool changed = false;
+        for (int i = 0; i < current.Count; i++)
+        {
+            if (!byTree.TryGetValue(current[i], out var spans)) continue;
+            var oldRoot = current[i].GetRoot();
+            var rewriter = new ArgRewriter(spans);
+            var newRoot = rewriter.Visit(oldRoot);
+            if (rewriter.Rewrote == 0) continue;
+            current[i] = current[i].WithRootAndOptions(newRoot, current[i].Options);
+            changed = true;
+        }
+        return changed ? current : null;
     }
 
     private sealed class ArgRewriter : CSharpSyntaxRewriter

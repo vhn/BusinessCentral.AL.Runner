@@ -52,6 +52,7 @@ public static class AlXmlPortMetadataRegistry
     public static int Count => _xmlById.Count;
 
     public static void Clear() => _xmlById.Clear();
+    public static void Remove(int xmlPortId) => _xmlById.TryRemove(xmlPortId, out _);
 
     /// <summary>Snapshot of the xmlport ids currently registered (diagnostics + dep sidecars).</summary>
     public static int[] Ids => _xmlById.Keys.ToArray();

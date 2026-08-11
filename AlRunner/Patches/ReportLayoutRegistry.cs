@@ -115,6 +115,7 @@ public static class AlReportLayoutRegistry
     public static int Count => _byReportId.Values.Sum(l => { lock (l) return l.Count; });
 
     public static void Clear() => _byReportId.Clear();
+    public static void Remove(int reportId) => _byReportId.TryRemove(reportId, out _);
 
     /// <summary>All registered layouts, flattened (diagnostics + sidecar writers).</summary>
     public static AlReportLayoutInfo[] Snapshot()

@@ -48,7 +48,7 @@ public static partial class RecordPatches
     // are loose .json files, not .app zips.
     private static readonly List<string> _bcQuerySymbolJsonPaths = new();
     // Extension index built flag. Data lands directly in _parsedExtensionFields/_extensionIdsByBaseTable.
-    private static bool _bcSymbolExtensionIndexBuilt;
+    private static volatile bool _bcSymbolExtensionIndexBuilt;
     private static readonly object _bcTableIndexLock = new();
 
     // Negative cache: tableIds we've already tried and not found.
@@ -475,7 +475,6 @@ public static partial class RecordPatches
     private static void EnsureBcSymbolExtensionIndex()
     {
         if (_bcSymbolExtensionIndexBuilt) return;
-        _bcSymbolExtensionIndexBuilt = true;
 
         int merged = 0;
         foreach (var appPath in _bcAppPaths)
@@ -522,5 +521,6 @@ public static partial class RecordPatches
 
         if (merged > 0)
             Console.Error.WriteLine($"[RecordPatches] BcAppFallback: merged {merged} precompiled tableextension(s) into _parsedExtensionFields across {_bcAppPaths.Count} BC .app file(s)");
+        _bcSymbolExtensionIndexBuilt = true;
     }
 }

@@ -86,7 +86,10 @@ public sealed class TestExecutor
     /// bundle (see #1641). Null (the CLI's default) is a no-op; behaviour and the
     /// returned list are otherwise unchanged either way.
     /// </summary>
-    public IReadOnlyList<TestResult> Run(Assembly assembly, Action<TestResult>? onTestComplete = null)
+    public IReadOnlyList<TestResult> Run(
+        Assembly assembly,
+        Action<TestResult>? onTestComplete = null,
+        IReadOnlyList<Assembly>? appGenerations = null)
     {
         var totalSw = System.Diagnostics.Stopwatch.StartNew();
         var results = new List<TestResult>();
@@ -129,19 +132,26 @@ public sealed class TestExecutor
         // re-applied after every store reset (see below) because the runner's
         // reset wipes the store instead of rolling back to the committed
         // install-seeded baseline real BC restores.
-        var seedSw = System.Diagnostics.Stopwatch.StartNew();
-        // A TestExecutor instance is reused across bundles. Discard the preceding bundle's
-        // final test mutations before creating this bundle's committed installation baseline.
-        AlRunner.Patches.RecordPatches.ResetPerTestState();
-        CompanyInitializer.ResetForNewBundle();
-        InstallTriggerRunner.SetTestAssembly(assembly);
-        InstallTriggerRunner.RunAll();
-        // Install triggers do not create a company's baseline rows — company CREATION does,
-        // via codeunit 2 "Company-Initialize". Run it before the baseline snapshot so its rows
-        // (Company Information, Source Code Setup, …) are part of what every test is restored to.
-        CompanyInitializer.EnsureCompanyInitialized();
-        AlRunner.Patches.RecordPatches.CaptureInstallBaseline();
-        PerfTrace.Log($"TestExecutor.InitialInstallSeed {seedSw.ElapsedMilliseconds}ms");
+        // Program calls Run once per generation, oldest first. Seed the whole generation
+        // chain exactly once: reseeding before each overlay would reset Disabled-isolation
+        // state between the baseline's tests and the overlay's tests.
+        if (appGenerations == null || appGenerations.Count == 0
+            || ReferenceEquals(assembly, appGenerations[0]))
+        {
+            var seedSw = System.Diagnostics.Stopwatch.StartNew();
+            // A TestExecutor instance is reused across bundles. Discard the preceding bundle's
+            // final test mutations before creating this bundle's committed installation baseline.
+            AlRunner.Patches.RecordPatches.ResetPerTestState();
+            CompanyInitializer.ResetForNewBundle();
+            InstallTriggerRunner.SetTestAssemblies(appGenerations ?? new[] { assembly });
+            InstallTriggerRunner.RunAll();
+            // Install triggers do not create a company's baseline rows — company CREATION does,
+            // via codeunit 2 "Company-Initialize". Run it before the baseline snapshot so its rows
+            // (Company Information, Source Code Setup, …) are part of what every test is restored to.
+            CompanyInitializer.EnsureCompanyInitialized();
+            AlRunner.Patches.RecordPatches.CaptureInstallBaseline();
+            PerfTrace.Log($"TestExecutor.InitialInstallSeed {seedSw.ElapsedMilliseconds}ms");
+        }
 
         long scanMs = 0, instMs = 0, dispMs = 0, methodsMs = 0, disposeMs = 0, methodLoopMs = 0;   // PERF attribution accumulators
         var stageSw = new System.Diagnostics.Stopwatch();
@@ -151,6 +161,11 @@ public sealed class TestExecutor
             var isTestCu = IsTestCodeunit(t);
             scanMs += stageSw.ElapsedMilliseconds;
             if (!isTestCu) continue;
+            // A test codeunit replaced by a newer generation of the same app (a --watch
+            // delta overlay) is still loaded and would otherwise run TWICE — once from the
+            // superseded generation, running the code the developer just edited away.
+            // See AlObjectResolution.
+            if (AlRunner.Rad.AlObjectResolution.IsSuperseded(t)) continue;
             if (filter != null && !CodeunitMatchesFilter(t, filter)) continue;
 
             // W-8b A-prime: this assembly may contain AL [EventSubscriber] codeunits whose

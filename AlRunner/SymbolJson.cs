@@ -32,9 +32,7 @@ public static class SymbolJsonWriter
         if (Environment.GetEnvironmentVariable("ALRUNNER_DUMP_SYMBOLS") == "1")
             Console.Error.WriteLine($"  DEBUG WriteSymbolJson: comp has {declaredObjects.Length} declared application object symbol(s)");
 
-        var module = TryConvertCompilation(comp)
-            ?? TryConvertCompilationByScan(comp)
-            ?? throw new InvalidOperationException("Unable to build ModuleDefinition from Compilation.");
+        var module = BuildModuleDefinition(comp);
 
         if (Environment.GetEnvironmentVariable("ALRUNNER_DUMP_SYMBOLS") == "1")
         {
@@ -48,6 +46,22 @@ public static class SymbolJsonWriter
         }
 
         SymbolReferenceJsonWriter.WriteModule(output, module);
+    }
+
+    /// <summary>
+    /// The compilation's symbol picture as a <see cref="ModuleDefinition"/>. The RAD
+    /// path needs it as an object graph to compare a changed codeunit's exported surface
+    /// with the full-compile baseline, so the conversion is exposed here instead of
+    /// staying buried inside <see cref="WriteSymbolJson"/>.
+    /// </summary>
+    public static ModuleDefinition BuildModuleDefinition(Compilation comp)
+    {
+        if (comp is null) throw new ArgumentNullException(nameof(comp));
+        // Force binding: without it the converter returns a skeleton with empty arrays.
+        _ = comp.GetDeclarationDiagnostics();
+        return TryConvertCompilation(comp)
+            ?? TryConvertCompilationByScan(comp)
+            ?? throw new InvalidOperationException("Unable to build ModuleDefinition from Compilation.");
     }
 
     private static ModuleDefinition? TryConvertCompilation(Compilation comp)

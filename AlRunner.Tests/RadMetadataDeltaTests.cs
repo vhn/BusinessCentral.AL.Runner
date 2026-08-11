@@ -1,0 +1,289 @@
+// RadMetadataDeltaTests — the second half of a reload, and the half with no type system
+// to keep it honest.
+//
+// A page, report, xmlport or enum is not just its generated CLR type. BC resolves it
+// through runtime metadata that the AL emitter writes into process-wide registries
+// (AlPageMetadataRegistry, AlReportMetadataRegistry, AlXmlPortMetadataRegistry,
+// AlEnumMetadataRegistry) as a side effect of Compilation.Emit. So a RAD cycle has to keep
+// two things proportional, not one:
+//
+//   1. refresh the metadata of the objects it re-emitted — and only those. Refreshing all
+//      twenty entries to replace one is the "rebuild the world" cost RAD exists to avoid,
+//      and it is invisible in the emitted-object count.
+//   2. drop the metadata of objects it removed. A deleted page whose metadata survives is
+//      the metadata-level twin of a missing tombstone: BC still finds the object.
+//
+// And one thing atomic: those writes happen at AL-emit time, BEFORE Roslyn compiles the
+// generated C# and before the assembly loads. A candidate the backend rejects must
+// therefore leave no trace — otherwise the live runtime describes objects whose code never
+// loaded, and the next cycle's tests run against that mixture.
+
+using Xunit;
+
+namespace AlRunner.Tests;
+
+[Collection(BcEngineCollection.Name)]
+public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
+{
+    private const string ScenarioDir = "al-runner-rad-metadata-delta";
+
+    /// <summary>
+    /// Metadata-visible edits: each changes what BC would read back for that object, so
+    /// each must move exactly one registry entry.
+    /// </summary>
+    public static IEnumerable<object[]> MetadataEdits()
+    {
+        yield return
+        [
+            "page control added",
+            "RadPerfLineList.Page.al",
+            "field(HeaderNo; Rec.\"Header No.\") { ApplicationArea = All; }",
+            """
+            field(HeaderNo; Rec."Header No.") { ApplicationArea = All; }
+                            field(HeaderNoAgain; Rec."Header No.") { ApplicationArea = All; }
+            """,
+            "Page:71001",
+            "HeaderNoAgain",
+        ];
+
+        yield return
+        [
+            "report column added",
+            "RadPerfHeaderReport.Report.al",
+            "column(Description; Description) { }",
+            """
+            column(Description; Description) { }
+                        column(DescriptionAgain; Description) { }
+            """,
+            "Report:71000",
+            "DescriptionAgain",
+        ];
+
+        yield return
+        [
+            "xmlport element added",
+            "RadPerfHeaderXml.XmlPort.al",
+            "fieldelement(Description; Header.Description) { }",
+            """
+            fieldelement(Description; Header.Description) { }
+                            fieldelement(DescriptionAgain; Header.Description) { }
+            """,
+            "XmlPort:71000",
+            "DescriptionAgain",
+        ];
+
+        // Enumextension values are registered against the BASE enum's id, so this proves
+        // an extension edit refreshes its target's merged entry — the metadata equivalent
+        // of the tableextension case, where the extension alone re-emits.
+        yield return
+        [
+            "enumextension value added",
+            "RadPerfStatusExt.EnumExt.al",
+            "value(71000; Archived) { Caption = 'Archived'; }",
+            """
+            value(71000; Archived) { Caption = 'Archived'; }
+                value(71001; Retired) { Caption = 'Retired'; }
+            """,
+            "Enum:71000",
+            "71001=Retired",
+        ];
+    }
+
+    [Theory]
+    [MemberData(nameof(MetadataEdits))]
+    public void EditingOneObject_RefreshesOnlyItsMetadata(
+        string scenario,
+        string fileName,
+        string before,
+        string after,
+        string expectedMovedEntry,
+        string expectedMarker)
+    {
+        if (!engine.Ready)
+        {
+            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
+            return;
+        }
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            var baseline = RadFixture.Seed(tempRoot);
+            Assert.DoesNotContain(
+                expectedMarker,
+                Rendered(expectedMovedEntry, baseline.Metadata));
+
+            RadFixture.ReplaceExactlyOnce(
+                RadFixture.SourceFile(tempRoot, fileName), before, after);
+
+            var delta = baseline.Cycle(tempRoot);
+            Assert.False(delta.FullRebuild);
+            Assert.True(delta.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, delta.Emit.Diagnostics));
+            Assert.Single(delta.Emit.Sources);
+
+            delta.Commit(
+                baseline.Workspace,
+                RadFixture.AssembleAndLoad(baseline.Workspace, delta.Emit.Sources));
+
+            var after_ = MetadataSnapshot.Take();
+            Assert.Equal([expectedMovedEntry], MetadataSnapshot.Diff(baseline.Metadata, after_));
+            Assert.Contains(expectedMarker, Rendered(expectedMovedEntry, after_));
+            baseline.AssertSettled(tempRoot);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// A deleted object's metadata must go with it. Nothing recompiles, so the removal is
+    /// the ONLY thing the cycle does — if the entry survives, BC can still resolve an
+    /// object that no longer exists in the source tree.
+    /// </summary>
+    public static IEnumerable<object[]> MetadataDeletions()
+    {
+        yield return ["page", new[] { "RadPerfLineList.Page.al" }, "Page:71001"];
+        yield return ["report", new[] { "RadPerfHeaderReport.Report.al" }, "Report:71000"];
+        yield return ["xmlport", new[] { "RadPerfHeaderXml.XmlPort.al" }, "XmlPort:71000"];
+        // The base enum survives, so its merged entry must simply lose the extension's
+        // values rather than disappear.
+        yield return ["enumextension", new[] { "RadPerfStatusExt.EnumExt.al" }, "Enum:71000"];
+        yield return
+        [
+            "enum family",
+            new[] { "RadPerfStatus.Enum.al", "RadPerfStatusExt.EnumExt.al" },
+            "Enum:71000",
+        ];
+    }
+
+    [Theory]
+    [MemberData(nameof(MetadataDeletions))]
+    public void DeletingOneObject_DropsOnlyItsMetadata(
+        string scenario,
+        string[] deletedFiles,
+        string expectedMovedEntry)
+    {
+        if (!engine.Ready)
+        {
+            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
+            return;
+        }
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            var baseline = RadFixture.Seed(tempRoot);
+            Assert.NotEqual(string.Empty, Rendered(expectedMovedEntry, baseline.Metadata));
+
+            foreach (var file in deletedFiles)
+                File.Delete(RadFixture.SourceFile(tempRoot, file));
+
+            var delta = baseline.Cycle(tempRoot);
+            Assert.Empty(delta.Emit.Sources);
+            Assert.True(delta.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, delta.Emit.Diagnostics));
+
+            // Before the commit the metadata is still live, for the same reason the CLR
+            // types are: a candidate that fails later must leave the runtime intact.
+            Assert.Empty(MetadataSnapshot.Diff(baseline.Metadata, MetadataSnapshot.Take()));
+
+            delta.Commit(baseline.Workspace, assembly: null);
+
+            var after = MetadataSnapshot.Take();
+            Assert.Equal([expectedMovedEntry], MetadataSnapshot.Diff(baseline.Metadata, after));
+            if (scenario == "enumextension")
+                Assert.DoesNotContain("71000=Archived", Rendered(expectedMovedEntry, after));
+            else
+                Assert.Equal(string.Empty, Rendered(expectedMovedEntry, after));
+            baseline.AssertSettled(tempRoot);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// One cycle, four metadata-visible edits and one object whose generated C# Roslyn
+    /// rejects. The cycle is a unit: nothing loads, so nothing may have been registered.
+    ///
+    /// This is the transactional gap the emit-time registry writes create — the AL emitter
+    /// has already mutated the live runtime by the time the backend fails.
+    /// </summary>
+    [Fact]
+    public void RejectedCandidate_LeaksNoMetadata()
+    {
+        if (!engine.Ready)
+        {
+            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
+            return;
+        }
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            var baseline = RadFixture.Seed(tempRoot);
+
+            foreach (var row in MetadataEdits())
+                RadFixture.ReplaceExactlyOnce(
+                    RadFixture.SourceFile(tempRoot, (string)row[1]), (string)row[2], (string)row[3]);
+
+            // AL-valid, generated C# Roslyn rejects — the same seam RadDeltaWatchTests uses.
+            File.WriteAllText(
+                RadFixture.SourceFile(tempRoot, "RadPerfUnrelatedD.Codeunit.al"),
+                """
+                namespace AlRunner.Tests.RadTwentyObject;
+
+                codeunit 71005 "RAD Perf Unrelated D"
+                {
+                    procedure Value(): Integer
+                    var
+                        FileName: Text;
+                    begin
+                        Database.ExportData(false, FileName);
+                        exit(105);
+                    end;
+                }
+                """);
+
+            var candidate = baseline.Cycle(tempRoot);
+            Assert.False(candidate.FullRebuild);
+            Assert.True(candidate.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, candidate.Emit.Diagnostics));
+            Assert.Equal(5, candidate.Emit.Sources.Count);
+
+            var compiled = RadFixture.TryAssemble(baseline.Workspace, candidate.Emit.Sources);
+            Assert.False(compiled.Success,
+                "the fixture edit no longer produces C# Roslyn rejects; pick another");
+
+            Assert.Equal([], MetadataSnapshot.Diff(baseline.Metadata, MetadataSnapshot.Take()));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    private static string Rendered(string entry, MetadataSnapshot snapshot)
+    {
+        var parts = entry.Split(':');
+        var id = int.Parse(parts[1]);
+        var table = parts[0] switch
+        {
+            "Page" => snapshot.Pages,
+            "Report" => snapshot.Reports,
+            "XmlPort" => snapshot.XmlPorts,
+            "Enum" => snapshot.Enums,
+            _ => throw new ArgumentOutOfRangeException(nameof(entry), entry, "unknown metadata kind"),
+        };
+        return table.TryGetValue(id, out var value) ? value : string.Empty;
+    }
+}

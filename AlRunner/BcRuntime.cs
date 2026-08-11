@@ -437,7 +437,18 @@ public static partial class BcRuntime
     /// metadataCacheEntries, which also holds dependency BC-table metadata. See
     /// docs/server-mode.md for the reload contract and this known limitation.
     /// </summary>
-    public static void ResetForNewBundleReload()
+    /// <param name="preserveEmitCaptures">
+    /// Keep the id-keyed registries that <c>BcCompiler.CaptureOutputter</c> fills as a
+    /// side effect of emitting each object (enum values, report metadata XML, report
+    /// layouts).
+    ///
+    /// The RAD delta path needs this for its supported body-only codeunit edits: a delta
+    /// re-emits no enum or report objects, so clearing these would leave every unchanged
+    /// object without its metadata. <c>RadWorkspaceStore.PrepareBundleReload</c> permits
+    /// preservation only for that shape; other edits clear the registries and invalidate
+    /// every app in the bundle so a full emit repopulates them.
+    /// </param>
+    public static void ResetForNewBundleReload(bool preserveEmitCaptures = false)
     {
         _currentTestAssembly = null;
         // AL-output type caches that live on this partial class (CodeunitPatches,
@@ -449,11 +460,15 @@ public static partial class BcRuntime
         _queryTypeCache.Clear();
         _xmlPortTypeCache.Clear();
         _metaReportFallbackCache.Clear();
-        // Enum option metadata (this partial class) + the emit-time enum registry.
+        // Enum option metadata (this partial class) is DERIVED from the registry below and
+        // always goes; the registry itself is emit-captured and can survive a delta reload.
         _alEnumCache.Clear();
-        AlEnumMetadataRegistry.Clear();
-        AlReportMetadataRegistry.Clear();
-        AlReportLayoutRegistry.Clear();
+        if (!preserveEmitCaptures)
+        {
+            AlEnumMetadataRegistry.Clear();
+            AlReportMetadataRegistry.Clear();
+            AlReportLayoutRegistry.Clear();
+        }
         NavReportSync.ResetMetadataCache();
         // Sibling patch classes with their own bundle-derived state.
         AlRunner.Patches.RecordPatches.ResetForReload();

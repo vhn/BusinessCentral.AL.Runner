@@ -38,6 +38,7 @@ public static class AlReportMetadataRegistry
     public static int Count => _xmlById.Count;
 
     public static void Clear() => _xmlById.Clear();
+    public static void Remove(int reportId) => _xmlById.TryRemove(reportId, out _);
 
     /// <summary>Serialize the registry to a sidecar file. Returns entry count.</summary>
     public static int SaveSidecar(string path)

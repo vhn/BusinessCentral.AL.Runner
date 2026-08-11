@@ -210,14 +210,10 @@ string? testFilter = null;
 // hardcoded 60s with no CLI override — see #1648). Takes precedence over the
 // AL_RUNNER_TEST_TIMEOUT_SEC env var. Null = env var / 60s default.
 int? testTimeoutSeconds = null;
-// --watch: stay resident with warm dependencies and re-run IN-PROCESS on every .al
-// change. Each cycle resets the per-bundle caches (BcRuntime.ResetForNewBundleReload),
-// re-emits warm (~1.6s — BcCompiler loader-signature reuse keeps the ~40s dep symbol
-// load out of the loop) and runs in the same process. This replaced the original
-// child-process model (which re-paid ~14s of runtime dep-loading per save); the
-// same-bundle in-process reload is now safe because the type finders prefer the current
-// test assembly. Net: ~seconds per save instead of a cold re-run.
+// --watch: stay resident with warm dependencies and re-run IN-PROCESS when AL source
+// or app.json changes. --rad opts that loop into object-granular delta compilation.
 bool watchMode = false;
+bool radMode = false;
 // --dump-csharp DIR: write the emitted C# (BC Compilation.Emit output, post-BcAssembler
 // polyfill injection) to disk for every bundle compile. Useful for debugging codegen.
 string? dumpCsharpDir = null;
@@ -253,6 +249,7 @@ for (int i = 0; i < args.Length; i++)
     if (args[i] == "--cache" && i + 1 < args.Length) { alCacheDir = args[++i]; continue; }
     if (args[i] == "--no-cache") { alCacheDir = null; continue; }
     if (args[i] == "--watch") { watchMode = true; continue; }
+    if (args[i] == "--rad") { radMode = true; continue; }
     if (args[i] == "--server") { continue; }  // handled above (serverMode); consume so it isn't "unknown"
     if (args[i] == "--verbose") { AlRunner.Log.Verbose = true; continue; }
     if (args[i] == "--show-pass") { showPass = true; continue; }   // no-op (default in v2); kept for v1 back-compat
@@ -321,6 +318,11 @@ for (int i = 0; i < args.Length; i++)
 if (serverMode && watchMode)
 {
     Console.Error.WriteLine("--server and --watch are mutually exclusive (both stay warm in-process; pick one).");
+    return 2;
+}
+if (radMode && !watchMode)
+{
+    Console.Error.WriteLine("--rad requires --watch.");
     return 2;
 }
 // ── Positional bundle roots must exist (#1713) ────────────────────────────────
@@ -640,6 +642,9 @@ if (!provisionSubcommand && (packageCacheDirs.Count > 0 || bundleAlpackagesDirs.
 // (Microsoft.Dynamics.Nav.Core, .AL.Common, .Apps, .TableProxyBuilder, etc. — 19
 // of the 24 BC DLLs Ncl.dll references aren't project-referenced).
 DependencyLoader.EnsureResolverInstalled_Public();
+// RAD needs a resident workspace holding Microsoft's symbol baseline, and is explicit:
+// plain --watch retains its existing full-reload behaviour.
+AlRunner.Rad.RadWorkspaceStore.Enabled = watchMode && radMode;
 if (extraPreprocessorSymbols.Count > 0)
     BcCompiler.SetExtraPreprocessorSymbols(extraPreprocessorSymbols.Distinct().ToList());
 if (Environment.GetEnvironmentVariable("AL_RUNNER_DIAG_FCE") is "1" or "2")
@@ -808,8 +813,22 @@ void PaintWatchRunning()
 
 if (watchUi) PaintWatchRunning();
 
+// Arm the file watchers ONCE, before the first cycle, and keep them armed for the life
+// of the process. They used to be armed only when a cycle went idle, which drops any
+// save landing between "cycle finished" and "watchers armed" — and a dropped save in a
+// watch loop is invisible: the developer sees the previous run's results and no sign
+// that their edit was ignored. The signal is reset at the top of each cycle instead, so
+// a save DURING a compile queues another cycle rather than being lost. A redundant event
+// does not recompile unchanged apps, though the selected tests still run.
+var sourceWatch = watchMode ? ArmSourceWatch(bundles) : null;
+
 while (true)
 {
+sourceWatch?.Signal.Reset();
+var cycleChangedPaths = new List<string>();
+if (sourceWatch != null)
+    while (sourceWatch.Value.ChangedPaths.TryDequeue(out var changedPath))
+        cycleChangedPaths.Add(changedPath);
 results.Clear();
 // Clean loading (#5): the interactive dashboard owns the whole screen, but the
 // run-cycle body emits diagnostic Console.WriteLine noise ("[bundle] resolved N
@@ -848,7 +867,10 @@ foreach (var bundle in bundles)
     // on the first iteration (caches already empty). Normal one-shot mode never
     // calls this, so its behaviour is unchanged.
     if (watchMode)
-        BcRuntime.ResetForNewBundleReload();
+        BcRuntime.ResetForNewBundleReload(
+            preserveEmitCaptures: AlRunner.Rad.RadWorkspaceStore.Enabled
+                && AlRunner.Rad.RadWorkspaceStore.PrepareBundleReload(
+                    bundleAbs, cycleChangedPaths, singleBundle: bundles.Count == 1));
 
     // Forget the previous bundle's install-trigger registrations so a bundle
     // without deps doesn't inherit a sibling bundle's Install codeunits.
@@ -1068,7 +1090,19 @@ foreach (var bundle in bundles)
         // topological order (a dep-of-a-dep is written before the app that needs it), and
         // chain them into the compiler. Only sibling-dependency TARGETS are compiled here —
         // this is an extra compile per app, and most bundles (the corpus: one app) have none.
-        EmitSiblingSymbols(appGroups, bundleAbs, bundleResolvedDeps);
+        //
+        // Under RAD the pre-pass is skipped: it would compile the depended-on app a SECOND
+        // time (once for symbols, once for code), and on a watch cycle it would run BEFORE
+        // that app's delta, so the dependent would bind against the PREVIOUS cycle's
+        // symbols. Instead each app's symbols are written from its current full-compile
+        // baseline inside the loop below, in the same topological order — one compile
+        // instead of two, and never a cycle behind.
+        var siblingTargets = SiblingSymbolTargets(appGroups);
+        string? siblingDir = null;
+        if (!AlRunner.Rad.RadWorkspaceStore.Enabled)
+            EmitSiblingSymbols(appGroups, bundleAbs, bundleResolvedDeps);
+        else if (siblingTargets.Count > 0)
+            siblingDir = PrepareSiblingSymbolsDir(bundleAbs);
 
         var loadedAssemblies = new List<Assembly>();
         // SetTestAssembly re-runs its full body (incl. NavAppResourcePatches.RegisterTestAssembly)
@@ -1080,6 +1114,7 @@ foreach (var bundle in bundles)
         // sites (load loop, run loop) can set the right one immediately before calling
         // SetTestAssembly.
         var suiteDirByAssembly = new Dictionary<Assembly, string>();
+        var generationsByAssembly = new Dictionary<Assembly, IReadOnlyList<Assembly>>();
 
         // Ordered dep ids feed every app's cache key but depend only on the bucket root
         // and the package caches — both loop-invariant. Resolving them inside the loop
@@ -1088,6 +1123,7 @@ foreach (var bundle in bundles)
 
         foreach (var appGroup in appGroups)
         {
+        int appErrorsBefore = bundleErrors.Count;
         var allPaths = appGroup.Paths;
         var moduleName = appGroup.ModuleName;
 
@@ -1096,7 +1132,6 @@ foreach (var bundle in bundles)
         // NavApp.GetCurrentModuleInfo, NavApp.GetResource and install-trigger
         // seeding resolve per app instead of per bundle.
         BcCompiler.SetCurrentAppIdentity(appGroup.AppId, appGroup.Publisher, appGroup.Version);
-
         // ── cross-bundle module identity dedup (issue #1683) ────────────────
         // If this app's identity (AppId) was already compiled and loaded earlier in
         // THIS process — either as an earlier bundle's own AppGroup (this same code
@@ -1143,9 +1178,20 @@ foreach (var bundle in bundles)
         // emit produces. Serving a HIT without it leaves NCLMetaQuery null and every
         // query Find NREs inside BC's NavQuery.ValidateTablesNotVirtual.
         bool bundleDeclaresQuery = BcCompiler.BundleDeclaresQuery(allPaths);
-        if (needCompile && alCacheDir != null)
+
+        // ── RAD delta workspace (--watch) ──────────────────────────────────
+        // Held across cycles per app identity: per-file content hashes, the compiler's
+        // symbol baseline, and loaded overlay generations. With it warm, a save
+        // recompiles only the objects that changed — see BcCompiler.EmitIncremental.
+        AlRunner.Rad.RadWorkspace? radWs = needCompile && AlRunner.Rad.RadWorkspaceStore.Enabled
+            ? AlRunner.Rad.RadWorkspaceStore.For(moduleName, appGroup.AppId, appGroup.SuiteDir)
+            : null;
+        // A cached whole-module DLL has no compiler symbol baseline. RAD therefore starts
+        // with one real full emit; every later cycle can then use the resident workspace.
+
+        if (needCompile && alCacheDir != null && radWs == null)
         {
-            cacheKey = ComputeAlCacheKey(allPaths, moduleName, ordered: GetOrderedDepIds(bucketRoot, packageCacheDirs, bundleAbs));
+            cacheKey = ComputeAlCacheKey(allPaths, moduleName, ordered: orderedDepIds);
             cachePath = Path.Combine(alCacheDir, cacheKey + ".dll");
             sidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.EnumRegistrySuffix);
             querySidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.QuerySymbolsSuffix);
@@ -1168,6 +1214,14 @@ foreach (var bundle in bundles)
         }
 
         byte[]? assemblyBytes = null;
+        // Set by the RAD path when the source tree did not move: no compile at all, and
+        // the assembly already loaded for this app is reused as-is.
+        bool radNoChange = false;
+        // The prepared RAD result is committed only after its generated assembly loads.
+        // A deletion-only delta has a result but intentionally no assembly.
+        RadEmitResult? radResult = null;
+        // True for every delta, including a zero-source removal.
+        bool radOverlay = false;
         if (needCompile && cachedBytes != null)
         {
             // Replay the enum-registry sidecar BEFORE Assembly.Load. Test
@@ -1198,12 +1252,14 @@ foreach (var bundle in bundles)
         }
         if (needCompile && assemblyBytes == null)
         {
-            if (alCacheDir != null) Console.Error.WriteLine($"  [cache] MISS key={cacheKey} — running Emit+Compile");
+            if (alCacheDir != null && radWs == null) Console.Error.WriteLine($"  [cache] MISS key={cacheKey} — running Emit+Compile");
             var et = System.Diagnostics.Stopwatch.StartNew();
             IReadOnlyList<EmittedSource> sources = Array.Empty<EmittedSource>();
             IReadOnlyList<string> alDiagnostics = Array.Empty<string>();
             // Emit-phase timeout: default 120 s, override via AL_RUNNER_EMIT_TIMEOUT_SEC.
-            // Note: Task.Run thread continues in background after timeout — acceptable for a CLI tool.
+            // A RAD emit mutates its resident workspace, so it must finish before the
+            // cycle can continue; abandoning its task would let a late RecordCompile race
+            // the next edit. Cold npcore also legitimately takes longer than 120 seconds.
             int emitTimeoutSec = int.TryParse(
                 Environment.GetEnvironmentVariable("AL_RUNNER_EMIT_TIMEOUT_SEC"), out var ts) ? ts : 120;
             // Containment: keep a symbol-less .app in ONE suite's .alpackages from failing
@@ -1221,10 +1277,13 @@ foreach (var bundle in bundles)
             // .deps-bin path, neither of which this scope touches. Same filter EmitDepSymbols
             // already applies — see BcCompiler.ScopeSymbolBearingDepsOnly.
             using var bundleDepScope = BcCompiler.ScopeSymbolBearingDepsOnly();
-            var emitTask = Task.Run(() => emitter.Emit(allPaths, moduleName));
+            var emitTask = Task.Run(() => RunEmit(emitter, allPaths, moduleName, radWs));
             try
             {
-                if (!emitTask.Wait(TimeSpan.FromSeconds(emitTimeoutSec)))
+                var emitWait = radWs == null
+                    ? TimeSpan.FromSeconds(emitTimeoutSec)
+                    : System.Threading.Timeout.InfiniteTimeSpan;
+                if (!emitTask.Wait(emitWait))
                 {
                     Console.Error.WriteLine(
                         $"<bundled>: EMIT-TIMEOUT after {emitTimeoutSec}s on {allPaths.Count} AL paths");
@@ -1234,7 +1293,10 @@ foreach (var bundle in bundles)
                 }
                 else
                 {
-                    var emitOutput = emitTask.Result;
+                    var (emitOutput, result) = emitTask.Result;
+                    radResult = result;
+                    radNoChange = result?.NoChange == true;
+                    radOverlay = result is { FullRebuild: false, NoChange: false };
                     sources = emitOutput.Sources;
                     alDiagnostics = emitOutput.Diagnostics;
 
@@ -1305,7 +1367,12 @@ foreach (var bundle in bundles)
             // not yet understood — see the tracked runner-gap issue. Per
             // .claude/rules/loud-failures.md this must fail loudly, not vanish a whole
             // suite's tests with no trace.
-            if (sources.Count > 0 && alDiagnostics.Count == 0)
+            // Skipped for a delta overlay: it emits ONLY the changed objects by design, so
+            // "fewer sources than the tree declares" is the expected shape, not a silent
+            // drop. The delta path has its own equivalent guard — it compares the emitted
+            // count against the CHANGED count and falls back to a full compile on a
+            // mismatch (see BcCompiler.DeltaCompile).
+            if (sources.Count > 0 && alDiagnostics.Count == 0 && !radOverlay)
             {
                 var declaredObjects = allPaths
                     .Where(File.Exists)
@@ -1341,10 +1408,23 @@ foreach (var bundle in bundles)
                     Console.Error.WriteLine($"  {d}");
                 bundleErrors.Add($"<bundled>: EMIT-ZERO ({alDiagnostics.Count} AL error(s))");
             }
-            if (sources.Count > 0)
+            if (radNoChange && radWs is { Generations.Count: > 0 })
+            {
+                // Nothing in this app's source tree moved. The assembly compiled for it
+                // earlier in this process is what a recompile would produce, and reusing
+                // the SAME Assembly instance also avoids a second live module for one AL
+                // identity — which is what makes event-subscriber dispatch resolve against
+                // the wrong Type (see the module-identity dedup comment above).
+                reusedAsm = radWs.Generations[^1];
+                Console.Error.WriteLine($"  [rad] {moduleName}: unchanged — reusing the loaded module");
+            }
+            else if (sources.Count > 0)
             {
                 var ct = System.Diagnostics.Stopwatch.StartNew();
-                var compile = assembler.Compile(moduleName, sources);
+                // An overlay compiles under its own assembly name: two live assemblies may
+                // not share one identity.
+                var asmName = radWs?.NextAssemblyName() ?? moduleName;
+                var compile = assembler.Compile(asmName, sources);
                 ct.Stop(); bundleComp += ct.Elapsed;
                 if (!compile.Success)
                 {
@@ -1362,7 +1442,13 @@ foreach (var bundle in bundles)
                 else
                 {
                     assemblyBytes = compile.AssemblyBytes;
-                    if (cachePath != null && assemblyBytes != null)
+                    if (radOverlay)
+                        Console.Error.WriteLine(
+                            $"  [rad] {moduleName}: overlay {asmName} — {sources.Count} object(s), " +
+                            $"{assemblyBytes!.Length / 1024}KB ({ct.ElapsedMilliseconds}ms)");
+                    // An overlay is NOT the module: caching it under the whole-module key
+                    // would serve a fragment to the next cold process.
+                    if (cachePath != null && assemblyBytes != null && !radOverlay)
                     {
                         try
                         {
@@ -1388,34 +1474,32 @@ foreach (var bundle in bundles)
             }
         }
 
-        // In watch mode the parent ONLY emits to the cache (above); the actual test run
-        // happens in a fresh child process spawned after the loop, which cache-HITS this
-        // emit. The parent never loads a bundle assembly, so there is no .NET
-        // assembly-coexistence problem across re-emits.
-        // Run in-process for BOTH normal and watch mode. The same-bundle reload
-        // reset above + the test-assembly-preferring type finders make an
-        // in-process re-run of an edited same-id bundle safe (the gap that
-        // originally forced watch to spawn a child process is now closed), so
-        // watch keeps the deps warm and re-runs in ~seconds instead of re-paying
-        // a child process's startup + runtime dep load on every save.
+        // Run in-process for both normal and watch mode. Explicit generation ownership
+        // keeps same-id reloads safe while preserving warm runtime and dependency state.
         // Load and register each module as it is built, but do NOT run yet: the
         // test run happens once, after every app in the bundle is loaded, so that
         // an app can call into a sibling it depends on.
-        if (reusedAsm != null || assemblyBytes != null)
+        // Which assemblies make up this app THIS cycle. Normally one. Under a RAD delta
+        // overlay it is the baseline plus every overlay compiled since — .NET cannot
+        // unload, so an object lives in whichever generation last compiled it, and
+        // AlObjectResolution is what decides between them.
+        var appAssemblies = new List<Assembly>();
+        if (reusedAsm != null)
         {
-            Assembly asm;
-            if (reusedAsm != null)
-            {
-                // See the "cross-bundle module identity dedup" comment above: this app's
-                // AppId was already loaded earlier in this process, so run with that exact
-                // Assembly instead of Assembly.Load-ing a second, distinct module for the
-                // same AL identity.
-                asm = reusedAsm;
-            }
+            // See the "cross-bundle module identity dedup" comment above, and the
+            // RAD unchanged-app path: run with the exact Assembly (or generation chain)
+            // already loaded rather than a second live module for one AL identity.
+            if (radNoChange && radWs is { Generations.Count: > 0 })
+                appAssemblies.AddRange(radWs.Generations);
             else
+                appAssemblies.Add(reusedAsm);
+        }
+        else if (assemblyBytes != null)
+        {
+            try
             {
                 var loadSw = System.Diagnostics.Stopwatch.StartNew();
-                asm = Assembly.Load(assemblyBytes!);
+                var loaded = Assembly.Load(assemblyBytes);
                 loadSw.Stop();
                 AlRunner.PerfTrace.Log($"test assembly load {rel}/{moduleName} {loadSw.ElapsedMilliseconds}ms");
                 // Register this freshly-loaded module by AppId so a LATER bundle that
@@ -1426,8 +1510,47 @@ foreach (var bundle in bundles)
                 // never overwrite iteration 1's stale entry, and any sibling bundle that
                 // later resolves this AppId as a real dependency would get the stale copy.
                 if (!watchMode && appGroup.AppId is { } newlyLoadedId)
-                    DependencyLoader.RegisterLoaded(newlyLoadedId, asm);
+                    DependencyLoader.RegisterLoaded(newlyLoadedId, loaded);
+
+                if (radWs != null)
+                {
+                    if (radResult?.CanCommit != true)
+                        throw new InvalidOperationException(
+                            "the successful RAD assembly has no prepared workspace update");
+                    radResult.Commit(radWs, loaded);
+                    appAssemblies.AddRange(radWs.Generations);
+                }
+                else appAssemblies.Add(loaded);
             }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"<bundled>: RAD-LOAD-FAIL — {ex.Message}");
+                bundleErrors.Add($"<bundled>: RAD-LOAD-FAIL for {moduleName}: {ex.Message}");
+            }
+        }
+        else if (radWs != null
+            && radResult is { FullRebuild: false, NoChange: false, CanCommit: true }
+            && radResult.Emit.Sources.Count == 0
+            && radResult.Emit.Diagnostics.Count == 0
+            && bundleErrors.Count == appErrorsBefore)
+        {
+            try
+            {
+                // A pure removal produces no C# or assembly. Its commit still advances
+                // hashes/symbols and tombstones the removed runtime objects; all surviving
+                // generations remain active for this test cycle.
+                radResult.Commit(radWs, assembly: null);
+                appAssemblies.AddRange(radWs.Generations);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"<bundled>: RAD-LOAD-FAIL — {ex.Message}");
+                bundleErrors.Add($"<bundled>: RAD-LOAD-FAIL for {moduleName}: {ex.Message}");
+            }
+        }
+
+        foreach (var asm in appAssemblies)
+        {
             var registerSw = System.Diagnostics.Stopwatch.StartNew();
             // wireFieldTriggers:false — WireFieldTriggerHandlersAll walks EVERY table
             // registered so far, not just this assembly's. Calling it here, per app,
@@ -1461,8 +1584,24 @@ foreach (var bundle in bundles)
             registerSw.Stop();
             AlRunner.PerfTrace.Log($"RegisterTestAssemblyInfo {rel}/{moduleName} {registerSw.ElapsedMilliseconds}ms");
             suiteDirByAssembly[asm] = appGroup.SuiteDir;
+            generationsByAssembly[asm] = appAssemblies;
             loadedAssemblies.Add(asm);
         }
+
+        if (bundleErrors.Count > appErrorsBefore && radWs != null)
+        {
+            if (!radWs.HasBaseline)
+                AlRunner.Rad.RadWorkspaceStore.InvalidatePeers(
+                    radWs, "another app in the bundle failed after advancing compiler state");
+            break; // never compile dependents against an app this cycle could not load
+        }
+
+        // Publish this app's symbols to the apps that depend on it, from the stable
+        // baseline the compile above established — no second compile. BuildAppGroups
+        // ordered dependents after their dependencies, so writing here is early enough.
+        if (siblingDir != null && appGroup.AppId is { } symId && siblingTargets.Contains(symId))
+            PublishSiblingSymbols(
+                siblingDir, appGroup, appGroups, radWs, bundleAbs, bundleResolvedDeps);
         } // ── end per-app emit/compile/load loop ────────────────────────────────
 
         // Every app's assembly is now in the AppDomain, so this single walk resolves
@@ -1471,6 +1610,11 @@ foreach (var bundle in bundles)
         // (pre-registration adds every suite's src/ up front, before any app emits).
         AlRunner.Patches.RecordPatches.WireFieldTriggerHandlersAll();
 
+        // One app failing to compile invalidates the bundle as a unit: its sibling test
+        // app may still be loaded, but running it would resolve calls through the previous
+        // generation and can report a stale PASS for code Roslyn just rejected. A one-shot
+        // run has no previous generation, so its healthy siblings still run and report.
+        if (bundleErrors.Count == 0 || !AlRunner.Rad.RadWorkspaceStore.Enabled)
         foreach (var asm in loadedAssemblies)
         {
             var rt = System.Diagnostics.Stopwatch.StartNew();
@@ -1485,7 +1629,11 @@ foreach (var bundle in bundles)
                 BcRuntime.SetTestAssembly(asm, wireFieldTriggers: false);
                 BcRuntime.OosHooksActive = true;
                 var execSw = System.Diagnostics.Stopwatch.StartNew();
-                tests = executor.Run(asm);
+                tests = executor.Run(
+                    asm,
+                    appGenerations: generationsByAssembly.TryGetValue(asm, out var generations)
+                        ? generations
+                        : null);
                 execSw.Stop();
                 AlRunner.PerfTrace.Log($"TestExecutor.Run {rel} {execSw.ElapsedMilliseconds}ms");
             }
@@ -1634,8 +1782,8 @@ if (!watchMode)
     break;   // normal mode: one pass, fall through to the summary below
 
 // ── Watch mode: the bundles just ran IN-PROCESS above (deps stayed warm).
-// Show this iteration's results, then block until an .al source change and
-// loop (reset + re-emit warm + re-run, all in the same warm process). ─────────
+// Show this iteration's results, then block until AL source or app.json changes and
+// loop (reset + compile only as needed + re-run, all in the same warm process). ─────
 var cycleDur = results.Aggregate(TimeSpan.Zero,
     (acc, b) => acc + b.EmitTime + b.CompileTime + b.RunTime);
 
@@ -1650,57 +1798,46 @@ if (watchUi)
     var lines = RenderDashboardLines(WatchStatus.Idle, idleTs, cycleDur);
     watchScroll = PaintWatchViewport(lines, watchScroll);
 
-    var armed = ArmSourceWatch(bundles);
-    if (armed == null) return 0;
-    var (signal, watchers) = armed.Value;
-    bool changed = false;
+    if (sourceWatch == null) return 0;
+    var signal = sourceWatch.Value.Signal;
     // Console.KeyAvailable throws InvalidOperationException when stdin is redirected
     // (a pipe/file rather than a real terminal). We still want the dashboard + file
     // watching in that case (output is a TTY), just without scroll keys. Probe once.
     bool keyboard = !Console.IsInputRedirected;
-    try
+    while (true)
     {
-        while (true)
+        if (signal.IsSet) { System.Threading.Thread.Sleep(250); break; }
+
+        if (keyboard && SafeKeyAvailable())
         {
-            if (signal.IsSet) { System.Threading.Thread.Sleep(250); changed = true; break; }
-
-            if (keyboard && SafeKeyAvailable())
+            var key = Console.ReadKey(intercept: true);
+            int height = Math.Max(5, Console.WindowHeight);
+            int page = Math.Max(1, height - 2);
+            bool repaint = true;
+            switch (key.Key)
             {
-                var key = Console.ReadKey(intercept: true);
-                int height = Math.Max(5, Console.WindowHeight);
-                int page = Math.Max(1, height - 2);
-                bool repaint = true;
-                switch (key.Key)
-                {
-                    case ConsoleKey.UpArrow:    watchScroll--; break;
-                    case ConsoleKey.DownArrow:  watchScroll++; break;
-                    case ConsoleKey.PageUp:     watchScroll -= page; break;
-                    case ConsoleKey.PageDown:   watchScroll += page; break;
-                    case ConsoleKey.Home:       watchScroll = 0; break;
-                    case ConsoleKey.End:        watchScroll = int.MaxValue; break;
-                    case ConsoleKey.Q:          return 0; // quit
-                    case ConsoleKey.C when key.Modifiers.HasFlag(ConsoleModifiers.Control):
-                        return 0; // Ctrl+C (intercepted as a key) also quits
-                    default: repaint = false; break;
-                }
-                if (repaint)
-                {
-                    // Re-render (window may have changed if the terminal was resized).
-                    lines = RenderDashboardLines(WatchStatus.Idle, idleTs, cycleDur);
-                    watchScroll = PaintWatchViewport(lines, watchScroll);
-                }
-                continue; // drain remaining buffered keys promptly before sleeping
+                case ConsoleKey.UpArrow:    watchScroll--; break;
+                case ConsoleKey.DownArrow:  watchScroll++; break;
+                case ConsoleKey.PageUp:     watchScroll -= page; break;
+                case ConsoleKey.PageDown:   watchScroll += page; break;
+                case ConsoleKey.Home:       watchScroll = 0; break;
+                case ConsoleKey.End:        watchScroll = int.MaxValue; break;
+                case ConsoleKey.Q:          return 0; // quit
+                case ConsoleKey.C when key.Modifiers.HasFlag(ConsoleModifiers.Control):
+                    return 0; // Ctrl+C (intercepted as a key) also quits
+                default: repaint = false; break;
             }
-
-            System.Threading.Thread.Sleep(40); // don't busy-spin at 100% CPU
+            if (repaint)
+            {
+                // Re-render (window may have changed if the terminal was resized).
+                lines = RenderDashboardLines(WatchStatus.Idle, idleTs, cycleDur);
+                watchScroll = PaintWatchViewport(lines, watchScroll);
+            }
+            continue; // drain remaining buffered keys promptly before sleeping
         }
+
+        System.Threading.Thread.Sleep(40); // don't busy-spin at 100% CPU
     }
-    finally
-    {
-        foreach (var w in watchers) { w.EnableRaisingEvents = false; w.Dispose(); }
-        signal.Dispose();
-    }
-    if (!changed) return 0;
     PaintWatchRunning(); // flip the header to "⟳ running…" while the next cycle compiles
 }
 else
@@ -1715,7 +1852,7 @@ else
     // otherwise sit unflushed for the entire idle wait. A TTY auto-flushes, but piped
     // consumers must see each cycle as it completes.
     Console.Out.Flush();
-    if (!WaitForSourceChange(bundles))
+    if (!WaitForSourceChange(sourceWatch))
         return 0;
     Console.WriteLine("[watch] change detected — re-running…");
     Console.Out.Flush();
@@ -2342,33 +2479,27 @@ static List<string> DiffServerFiles(Dictionary<string, string>? prev, Dictionary
 
 // ── --watch helpers ───────────────────────────────────────────────────────────
 
-// Block until an .al file changes under any watched bundle's bucket root. Returns true
-// on a change (loop again), false if there is nothing to watch.
-static bool WaitForSourceChange(List<string> bundles)
+// Block until AL source or app.json changes under a watched bundle's bucket root. Returns true
+// on a change (loop again), false if there is nothing to watch. The watchers are armed
+// once for the process (see sourceWatch) so a save during a compile is not dropped.
+static bool WaitForSourceChange(
+    (System.Threading.ManualResetEventSlim Signal, List<FileSystemWatcher> Watchers,
+     System.Collections.Concurrent.ConcurrentQueue<string> ChangedPaths)? armed)
 {
-    var armed = ArmSourceWatch(bundles);
     if (armed == null) return false;
-    var (signal, watchers) = armed.Value;
-    try
-    {
-        signal.Wait();                       // block until the first .al change
-        System.Threading.Thread.Sleep(250);  // debounce: let a save storm settle
-        return true;
-    }
-    finally
-    {
-        foreach (var w in watchers) { w.EnableRaisingEvents = false; w.Dispose(); }
-        signal.Dispose();
-    }
+    armed.Value.Signal.Wait();               // block until the first source change
+    System.Threading.Thread.Sleep(250);      // debounce: let a save storm settle
+    return true;
 }
 
 /// <summary>
 /// Arm FileSystemWatchers over the bundles' source roots and return a settable
 /// signal + the watchers so the caller can interleave the file-change wait with
 /// other work (e.g. the interactive dashboard's keyboard polling). Returns null
-/// if there are no source dirs to watch. The caller owns disposal of both.
+/// if there are no source dirs to watch. They live until this process exits.
 /// </summary>
-static (System.Threading.ManualResetEventSlim Signal, List<FileSystemWatcher> Watchers)? ArmSourceWatch(List<string> bundles)
+static (System.Threading.ManualResetEventSlim Signal, List<FileSystemWatcher> Watchers,
+        System.Collections.Concurrent.ConcurrentQueue<string> ChangedPaths)? ArmSourceWatch(List<string> bundles)
 {
     var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     foreach (var b in bundles)
@@ -2384,13 +2515,27 @@ static (System.Threading.ManualResetEventSlim Signal, List<FileSystemWatcher> Wa
     }
 
     var signal = new System.Threading.ManualResetEventSlim(false);
+    var changedPaths = new System.Collections.Concurrent.ConcurrentQueue<string>();
     void OnChanged(object _, FileSystemEventArgs e)
     {
-        if (e.FullPath.EndsWith(".al", StringComparison.OrdinalIgnoreCase)) signal.Set();
+        if (!WatchedSource(e.FullPath)) return;
+        changedPaths.Enqueue(e.FullPath);
+        signal.Set();
     }
     void OnRenamed(object _, RenamedEventArgs e)
     {
-        if (e.FullPath.EndsWith(".al", StringComparison.OrdinalIgnoreCase)) signal.Set();
+        bool watched = false;
+        if (WatchedSource(e.OldFullPath))
+        {
+            changedPaths.Enqueue(e.OldFullPath);
+            watched = true;
+        }
+        if (WatchedSource(e.FullPath))
+        {
+            changedPaths.Enqueue(e.FullPath);
+            watched = true;
+        }
+        if (watched) signal.Set();
     }
 
     var watchers = new List<FileSystemWatcher>();
@@ -2399,14 +2544,18 @@ static (System.Threading.ManualResetEventSlim Signal, List<FileSystemWatcher> Wa
         var w = new FileSystemWatcher(d)
         {
             IncludeSubdirectories = true,
-            Filter = "*.al",
+            Filters = { "*.al", "app.json" },
             NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
-            EnableRaisingEvents = true,
         };
         w.Changed += OnChanged; w.Created += OnChanged; w.Deleted += OnChanged; w.Renamed += OnRenamed;
+        w.EnableRaisingEvents = true;
         watchers.Add(w);
     }
-    return (signal, watchers);
+    return (signal, watchers, changedPaths);
+
+    static bool WatchedSource(string path) =>
+        path.EndsWith(".al", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(Path.GetFileName(path), "app.json", StringComparison.OrdinalIgnoreCase);
 }
 
 static void DumpCsharpSources(string dir, string moduleName, IReadOnlyList<EmittedSource> sources)
@@ -2694,8 +2843,9 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("                          (key = hash of .al sources, resolved deps, runner mtime).");
     w.WriteLine("  --no-cache              Disable the AL-output cache for this run.");
     w.WriteLine("  --watch                 Stay resident with warm dependencies and re-run IN-PROCESS");
-    w.WriteLine("                          on every .al change (deps loaded once → ~seconds/save, not");
-    w.WriteLine("                          a cold re-run). Ctrl+C to quit.");
+    w.WriteLine("                          when .al source or app.json changes. Ctrl+C to quit.");
+    w.WriteLine("  --rad                   With --watch, compile and load only the changed AL objects,");
+    w.WriteLine("                          including additions and removals.");
     w.WriteLine("  --server                Long-running JSON-RPC daemon over stdin/stdout (warm");
     w.WriteLine("                          deps + BC patches loaded once; ~19s->~4s per run). One");
     w.WriteLine("                          JSON request/response per line. stdout carries ONLY the");
@@ -3737,51 +3887,52 @@ static string? SelectVersionDirOrNull(string root, string versionPrefix)
     }
 }
 
-// Walks up from <bundlePath> until it finds a dir containing app.json.
-// Returns null if none found before /tests/ or filesystem root.
 /// <summary>
-/// Write a <c>*.symbols.json</c> (plus its dependency sidecar) for every app in this bundle
-/// that another app in the SAME bundle depends on, and register the directory holding them
-/// with the compiler so those later apps can reference them.
+/// One app's AL → C# step, incremental when a RAD workspace is available.
 ///
-/// <paramref name="appGroups"/> must already be in topological order — the symbols for a
-/// dep-of-a-dep have to exist before the app that needs them is compiled. Only genuine
-/// sibling-dependency targets are emitted: each one costs an extra compile, and a bundle
-/// with no in-bundle dependencies (the corpus, every single-app bundle) does no work at all.
-///
-/// Failures are loud but non-fatal: without the symbols the dependent app fails to compile
-/// with AL0185, which is exactly the state this fixes, and the emit-retry already reports
-/// the dropped objects.
-///
-/// <paramref name="bundleResolvedDeps"/> is this bundle's resolved Microsoft-platform
-/// dependency closure (the same set every suite under a parent-of-many-apps bundle
-/// implicitly gets — Base Application, System Application, …). It is recorded in each
-/// sibling's *.symbols.deps.json sidecar so BC's ReferenceManager can see that the
-/// sibling itself depends on (e.g.) Base Application. Without it a sibling whose only
-/// AL is a `tableextension ... extends <PlatformTable>` gets an EMPTY sidecar — its
-/// declaring module has no recorded path to the module owning the base table, so the
-/// extension never attaches: the base table's own fields resolve fine (they come from
-/// the primary compile's own direct reference to the platform .app) but the extension
-/// field does not, surfacing as AL0132 "'Record X' does not contain a definition for
-/// '<field>'" in the app that consumes it. A sibling that only extends another sibling's
-/// OWN table (the common case in this bundle) never depended on this fix — its base
-/// table lives in the SAME symbols.json as the extension, so no cross-module link was
-/// needed. See #1686.
+/// A surface-stable edit to existing codeunits returns just its changed C# for an
+/// overlay. Structural edits take the normal full-compile path.
 /// </summary>
-static void EmitSiblingSymbols(
-    List<AlRunner.AppGroup> appGroups, string bundleAbs,
-    IReadOnlyList<(AlRunner.AppManifest Manifest, string AppPath)> bundleResolvedDeps)
+static (BcEmitOutput Output, RadEmitResult? Rad) RunEmit(
+    BcCompiler emitter, List<string> allPaths, string moduleName, AlRunner.Rad.RadWorkspace? ws)
+{
+    if (ws == null) return (emitter.Emit(allPaths, moduleName), null);
+
+    // Keep the number of live generations bounded. A full compile replaces every old
+    // object at once; Program clears the generation list when that assembly loads.
+    const int maxOverlayChain = 12;
+    if (ws.Generations.Count >= maxOverlayChain)
+        ws.Invalidate($"the overlay chain reached {maxOverlayChain - 1} delta(s)");
+
+    var result = emitter.EmitIncremental(allPaths, moduleName, ws);
+    // "Nothing changed" is only actionable while there is a loaded module to reuse. If a
+    // previous cycle compiled but failed to load, reporting no-change would drop the app
+    // from the run entirely — silently, since nothing failed this cycle.
+    if (result.NoChange && ws.Generations.Count > 0) return (result.Emit, result);
+    if (result.NoChange)
+    {
+        ws.Invalidate("no module is loaded for this app, so there is nothing to reuse");
+        var rebuild = emitter.EmitIncremental(allPaths, moduleName, ws);
+        return (rebuild.Emit, rebuild);
+    }
+    return (result.Emit, result);
+}
+
+/// <summary>App ids that another app in the same bundle declares a dependency on.</summary>
+static HashSet<Guid> SiblingSymbolTargets(List<AlRunner.AppGroup> appGroups)
+{
+    var present = appGroups.Where(g => g.AppId != null).Select(g => g.AppId!.Value).ToHashSet();
+    return appGroups.SelectMany(g => g.DependsOn).Where(present.Contains).ToHashSet();
+}
+
+/// <summary>
+/// Create (and clear) the directory in-bundle sibling symbols are published to, and point
+/// the compiler's reference chain at it. Splits the directory setup out of
+/// <see cref="EmitSiblingSymbols"/> so the RAD path can publish incrementally.
+/// </summary>
+static string? PrepareSiblingSymbolsDir(string bundleAbs)
 {
     BcCompiler.SetSiblingSymbolsDir(null);
-    // Not a dictionary: two suites in the same tree can (and in tests/runner-extras do)
-    // carry the same app id, which would throw on insert. Only membership matters here.
-    var presentIds = appGroups.Where(g => g.AppId != null).Select(g => g.AppId!.Value).ToHashSet();
-    var targets = appGroups
-        .SelectMany(g => g.DependsOn)
-        .Where(presentIds.Contains)
-        .ToHashSet();
-    if (targets.Count == 0) return;
-
     var dir = Path.Combine(Path.GetTempPath(),
         "al-runner-sibling-symbols", Path.GetFileName(bundleAbs.TrimEnd(Path.DirectorySeparatorChar)));
     try
@@ -3792,61 +3943,95 @@ static void EmitSiblingSymbols(
     catch (Exception ex)
     {
         Console.Error.WriteLine($"  [sibling-symbols] cannot prepare {dir}: {ex.Message}");
-        return;
+        return null;
     }
-
     BcCompiler.SetSiblingSymbolsDir(dir);
-    // A sibling's symbol compile inherits the BUNDLE-WIDE dep spec list, which in a
-    // parent-of-many-apps bundle includes packages only ONE suite declares — among them
-    // synthetic source-only .apps that the compiler's .app scanner cannot read at all.
-    // Unlike the primary emit, this compile checks declaration diagnostics, so an unrelated
-    // suite's fixture package would fail every sibling here. See ScopeSymbolBearingDepsOnly.
-    using var depScope = BcCompiler.ScopeSymbolBearingDepsOnly();
-    foreach (var group in appGroups)
+    return dir;
+}
+
+/// <summary>
+/// Publish one app's symbols for the siblings that depend on it, taken from the RAD
+/// workspace's stable full-compile baseline (body-only overlays do not change it). Falls back to
+/// a dedicated symbol-only compile when no baseline exists — a cache HIT, or a compile
+/// that failed in a way that made the baseline untrustworthy.
+/// </summary>
+static void PublishSiblingSymbols(
+    string dir, AlRunner.AppGroup group, List<AlRunner.AppGroup> appGroups,
+    AlRunner.Rad.RadWorkspace? ws,
+    string bundleAbs, IReadOnlyList<(AlRunner.AppManifest Manifest, string AppPath)> bundleResolvedDeps)
+{
+    var appId = group.AppId!.Value;
+    var symbolsPath = Path.Combine(dir, $"{appId:N}.symbols.json");
+    try
     {
-        if (group.AppId == null || !targets.Contains(group.AppId.Value)) continue;
-        var symbolsPath = Path.Combine(dir, $"{group.AppId:N}.symbols.json");
-        try
+        if (ws?.Baseline != null)
+            BcCompiler.WriteWorkspaceSymbols(ws, symbolsPath);
+        else
         {
+            using var depScope = BcCompiler.ScopeSymbolBearingDepsOnly();
             using (BcCompiler.ScopeCurrentAppIdentity(
-                       group.AppId.Value, group.Publisher ?? "AlRunner",
-                       group.Version ?? new Version(1, 0, 0, 0)))
+                       appId, group.Publisher ?? "AlRunner", group.Version ?? new Version(1, 0, 0, 0)))
                 new BcCompiler().EmitDepSymbols(
-                    group.Paths, group.ModuleName, group.AppId.Value,
+                    group.Paths, group.ModuleName, appId,
                     group.Publisher ?? "AlRunner", group.Version ?? new Version(1, 0, 0, 0),
                     symbolsPath);
-            // The dependency closure this app compiled against, so BC's ReferenceManager can
-            // link types from it that appear in the sibling's public surface — same reason as
-            // the source-dep sidecar (#1546); without it those types are __MissingTypeSymbol__.
-            //
-            // Include the BUNDLE-WIDE Microsoft-platform closure (bundleResolvedDeps) — every
-            // suite under a parent-of-many-apps bundle implicitly compiles against it, this
-            // sibling included. Without it, a sibling whose only AL is a `tableextension ...
-            // extends <PlatformTable>` records an empty dependency closure: its declaring
-            // module has no path to the module owning the base table, so the extension never
-            // attaches downstream (AL0132 in the consuming app) even though the sibling's own
-            // symbols.json genuinely contains the TableExtension entry. See #1686.
-            DepsSidecarWriter.Write(
-                Path.Combine(dir, $"{group.AppId:N}.symbols.deps.json"),
-                group.Publisher ?? "AlRunner", group.ModuleName,
-                group.Version ?? new Version(1, 0, 0, 0), group.AppId.Value,
-                DepsSidecarWriter.BuildClosure(
-                    bundleResolvedDeps.Select(d => new DepsSidecarWriter.DepEntry(
-                        d.Manifest.Publisher, d.Manifest.Name, d.Manifest.Version, d.Manifest.AppId)),
-                    ScanVendoredPlatformApps(
-                        Directory.EnumerateDirectories(bundleAbs, ".alpackages", SearchOption.AllDirectories)),
-                    group.AppId.Value));
-            // Re-index in place so the NEXT app in this loop — and every app group compiled
-            // below — sees it, without rebuilding the expensive shared reference loader.
-            BcCompiler.RefreshSiblingSymbols();
         }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine(
-                $"  [sibling-symbols] {group.ModuleName}: {ex.GetType().Name}: {ex.Message} — " +
-                "apps depending on it will fail to compile against it");
-        }
+        // Same dependency closure the pre-pass writes — see EmitSiblingSymbols for why the
+        // BUNDLE-WIDE Microsoft platform set has to be in it (#1546, #1686).
+        DepsSidecarWriter.Write(
+            Path.Combine(dir, $"{appId:N}.symbols.deps.json"),
+            group.Publisher ?? "AlRunner", group.ModuleName,
+            group.Version ?? new Version(1, 0, 0, 0), appId,
+            DepsSidecarWriter.BuildClosure(
+                bundleResolvedDeps.Select(d => new DepsSidecarWriter.DepEntry(
+                    d.Manifest.Publisher, d.Manifest.Name, d.Manifest.Version, d.Manifest.AppId))
+                    .Concat(SiblingDependencies(group, appGroups)),
+                ScanVendoredPlatformApps(
+                    Directory.EnumerateDirectories(bundleAbs, ".alpackages", SearchOption.AllDirectories)),
+                appId));
+        BcCompiler.RefreshSiblingSymbols();
     }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine(
+            $"  [sibling-symbols] {group.ModuleName}: {ex.GetType().Name}: {ex.Message} — " +
+            "apps depending on it will fail to compile against it");
+    }
+}
+
+static void EmitSiblingSymbols(
+    List<AlRunner.AppGroup> appGroups, string bundleAbs,
+    IReadOnlyList<(AlRunner.AppManifest Manifest, string AppPath)> bundleResolvedDeps)
+{
+    var targets = SiblingSymbolTargets(appGroups);
+    if (targets.Count == 0)
+    {
+        BcCompiler.SetSiblingSymbolsDir(null);
+        return;
+    }
+    var dir = PrepareSiblingSymbolsDir(bundleAbs);
+    if (dir == null) return;
+    foreach (var group in appGroups)
+        if (group.AppId is { } id && targets.Contains(id))
+            PublishSiblingSymbols(dir, group, appGroups, ws: null, bundleAbs, bundleResolvedDeps);
+}
+
+/// <summary>
+/// Direct source-app dependencies for a sibling symbol sidecar. They are deliberately
+/// absent from the resolved package list (those apps are built in this bundle),
+/// but BC still needs the edge to link A's types through an A ← B ← C chain.
+/// </summary>
+static IEnumerable<DepsSidecarWriter.DepEntry> SiblingDependencies(
+    AlRunner.AppGroup group, IEnumerable<AlRunner.AppGroup> appGroups)
+{
+    var direct = group.DependsOn.ToHashSet();
+    return appGroups
+        .Where(candidate => candidate.AppId is { } id && direct.Contains(id))
+        .Select(candidate => new DepsSidecarWriter.DepEntry(
+            candidate.Publisher ?? "AlRunner",
+            candidate.ModuleName,
+            candidate.Version ?? new Version(1, 0, 0, 0),
+            candidate.AppId!.Value));
 }
 
 /// <summary>
@@ -3930,6 +4115,7 @@ static List<DependencyRef> ReadBundleDependencyRoots(IReadOnlyList<string> manif
     return byKey.Values.ToList();
 }
 
+// Walk up until a directory containing app.json is found, or the filesystem root.
 static string? FindBucketRoot(string bundlePath)
 {
     var cur = Directory.Exists(bundlePath) ? bundlePath : Path.GetDirectoryName(bundlePath);
@@ -4736,6 +4922,16 @@ static IEnumerable<string> EnumerateSuitesBelow(string dir)
 // .al files, no sub-structure, the shape every tests/runner-extras suite uses —
 // enumerate individually instead of collapsing into one bundle (#1623, #1638).
 static bool LooksLikeSuite(string dir)
-    => File.Exists(Path.Combine(dir, "app.json"))
-    || Directory.Exists(Path.Combine(dir, "test"))
-    || Directory.Exists(Path.Combine(dir, "src"));
+{
+    // Its own manifest settles it: this directory IS one app.
+    if (File.Exists(Path.Combine(dir, "app.json"))) return true;
+    // A src//test/ split says "one synthetic app" only when the matching child is a
+    // source folder, not an app with its own manifest. On case-insensitive macOS,
+    // `dir/test` also matches a sibling `Test/` app; treating that as a source folder
+    // silently collapses the Application + Test apps into one module.
+    return IsSourceFolder(Path.Combine(dir, "test"))
+        || IsSourceFolder(Path.Combine(dir, "src"));
+
+    static bool IsSourceFolder(string path) =>
+        Directory.Exists(path) && !File.Exists(Path.Combine(path, "app.json"));
+}

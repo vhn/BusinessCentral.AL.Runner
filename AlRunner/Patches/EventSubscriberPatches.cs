@@ -275,7 +275,8 @@ public static class EventSubscriberPatches
                 || n.StartsWith("Microsoft.CodeAnalysis")) continue;
             // Skip a previous bundle assembly still loaded after a server reload.
             if (BcRuntime.IsStaleBundleAssembly(asm)) continue;
-            try { var t = asm.GetType("Microsoft.Dynamics.Nav.BusinessApplication." + name); if (t != null) { found = t; break; } }
+            try { var t = asm.GetType("Microsoft.Dynamics.Nav.BusinessApplication." + name);
+                  if (t != null && !AlRunner.Rad.AlObjectResolution.IsSuperseded(t)) { found = t; break; } }
             catch { }
         }
         _codeunitTypeCache[codeunitId] = found;
@@ -573,6 +574,12 @@ public static class EventSubscriberPatches
                 foreach (var t in types)
                 {
                     if (t == null) continue;
+                    // A codeunit replaced by a newer generation of the same app is still
+                    // loaded (.NET cannot unload it). Registering its [EventSubscriber]
+                    // methods alongside the new ones makes every subscribed event fire
+                    // TWICE — which does not crash, it silently changes what the test
+                    // observes. See AlObjectResolution.
+                    if (AlRunner.Rad.AlObjectResolution.IsSuperseded(t)) continue;
                     // Only AL codeunits can host [NavEventSubscriberAttribute] methods. The emitted
                     // test assembly contains thousands of generated types (Record<N>, Table<N>,
                     // Page<N>, Enum<N>, ...) that are guaranteed to have no subscribers — walking

@@ -95,10 +95,29 @@ public static class AlEnumMetadataRegistry
         if (implementations.Length != options.Length)
             implementations = Array.Empty<int[]>();
         var entry = new Entry(targetId, name ?? string.Empty, options, indexes, implementations);
-        _extByTargetId.AddOrUpdate(
-            targetId,
-            ImmutableList.Create(entry),
-            (_, list) => list.Add(entry));
+        lock (_extByTargetId)
+        {
+            _extByTargetId.TryGetValue(targetId, out var current);
+            _extByTargetId[targetId] = (current ?? ImmutableList<Entry>.Empty)
+                .Where(item => !string.Equals(item.Name, entry.Name, StringComparison.Ordinal))
+                .ToImmutableList()
+                .Add(entry);
+        }
+    }
+
+    public static void Remove(int id) => _byId.TryRemove(id, out _);
+
+    public static void RemoveExtension(int targetId, string name)
+    {
+        lock (_extByTargetId)
+        {
+            if (!_extByTargetId.TryGetValue(targetId, out var current)) return;
+            var remaining = current
+                .Where(item => !string.Equals(item.Name, name, StringComparison.Ordinal))
+                .ToImmutableList();
+            if (remaining.IsEmpty) _extByTargetId.TryRemove(targetId, out _);
+            else _extByTargetId[targetId] = remaining;
+        }
     }
 
     /// <summary>

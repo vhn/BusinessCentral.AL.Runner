@@ -38,7 +38,7 @@ public static class InstallTriggerRunner
     // Dependency-app assemblies in dependency order (a dep's Install fires
     // before its dependent's), then the bundle's own test assembly last.
     private static readonly List<Assembly> _depAssemblies = new();
-    private static Assembly? _testAssembly;
+    private static readonly List<Assembly> _testAssemblies = new();
 
     // Scan cache — an assembly's set of Install codeunits never changes.
     private static readonly Dictionary<Assembly, IReadOnlyList<InstallCodeunit>> _scanCache = new();
@@ -50,7 +50,7 @@ public static class InstallTriggerRunner
         lock (_depAssemblies)
         {
             _depAssemblies.Clear();
-            _testAssembly = null;
+            _testAssemblies.Clear();
         }
     }
 
@@ -68,9 +68,17 @@ public static class InstallTriggerRunner
     /// <summary>Register the bundle's own (test) assembly — its Install codeunits
     /// fire after all dependency apps', matching install order.</summary>
     public static void SetTestAssembly(Assembly assembly)
+        => SetTestAssemblies(new[] { assembly });
+
+    /// <summary>Register every live generation of one app. An overlay contains only
+    /// changed codeunits, so unchanged Install codeunits still live in the baseline.</summary>
+    public static void SetTestAssemblies(IEnumerable<Assembly> assemblies)
     {
         lock (_depAssemblies)
-            _testAssembly = assembly;
+        {
+            _testAssemblies.Clear();
+            _testAssemblies.AddRange(assemblies);
+        }
     }
 
     /// <summary>Fire every registered app's Install triggers once, dep order,
@@ -82,12 +90,13 @@ public static class InstallTriggerRunner
         lock (_depAssemblies)
         {
             ordered = new List<Assembly>(_depAssemblies);
-            if (_testAssembly != null && !ordered.Contains(_testAssembly))
-                ordered.Add(_testAssembly);
+            foreach (var asm in _testAssemblies)
+                if (!ordered.Contains(asm)) ordered.Add(asm);
         }
         foreach (var asm in ordered)
             foreach (var cu in Scan(asm))
             {
+                if (AlRunner.Rad.AlObjectResolution.IsSuperseded(cu.Type)) continue;
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 var instance = cu.Ctor.Invoke(new object[] { BcRuntime.RootTreeStub! });
                 try

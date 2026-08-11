@@ -425,6 +425,7 @@ public static partial class RecordPatches
             catch { continue; } // dynamic/reflection-only assemblies — nothing to learn here
             foreach (var t in types)
             {
+                if (AlRunner.Rad.AlObjectResolution.IsSuperseded(t)) continue;
                 if (!t.Name.StartsWith("Report", StringComparison.Ordinal)) continue;
                 if (!int.TryParse(t.Name.AsSpan(6), out var id) || id <= 0) continue;
                 yield return id;

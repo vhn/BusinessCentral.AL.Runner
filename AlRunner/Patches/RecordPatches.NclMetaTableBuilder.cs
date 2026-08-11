@@ -28,6 +28,12 @@ public static partial class RecordPatches
     {
         if (_recordTypeCache.TryGetValue(id, out var cached)) return cached;
         var name = $"Record{id}";
+        // Explicit ownership first — the preference below only covers the app currently
+        // executing, which is not enough once a bundle holds several apps. See
+        // AlObjectResolution.
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, typeof(NavRecord)) is { } owned)
+        { _recordTypeCache[id] = owned; return owned; }
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         // Prefer the current test assembly: on a server reload of the same bundle
         // a same-named Record<id> from the previous assembly is still loaded (.NET
         // cannot unload it) and would otherwise win the scan, serving stale trigger
@@ -62,6 +68,10 @@ public static partial class RecordPatches
 
     private static NCLMetaTable? BuildNCLMetaTable(int tableId)
     {
+        if (!_bcSymbolExtensionIndexBuilt)
+            lock (_bcTableIndexLock)
+                EnsureBcSymbolExtensionIndex();
+
         if (!_parsedTables.TryGetValue(tableId, out var parsed))
         {
             // Fallback: try to parse the table source from a registered BC dependency
@@ -848,6 +858,9 @@ public static partial class RecordPatches
                 if (name.Length < 7 || !name.StartsWith("Record", StringComparison.Ordinal)) continue;
                 if (!int.TryParse(name.AsSpan(6), out var id)) continue;
                 if (!typeof(NavRecord).IsAssignableFrom(t)) continue;
+                // TryAdd is first-wins, so a superseded generation reached first would
+                // pin the stale type for the rest of the cycle.
+                if (AlRunner.Rad.AlObjectResolution.IsSuperseded(t)) continue;
                 _recordTypeCache.TryAdd(id, t);
             }
         }

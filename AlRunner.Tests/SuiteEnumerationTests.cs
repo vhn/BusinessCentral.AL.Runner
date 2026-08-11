@@ -160,7 +160,8 @@ public sealed class SuiteEnumerationTests : IDisposable
         if (!ArtifactsPresent()) { Console.Error.WriteLine("[skip] BC artifacts not present"); return; }
 
         WriteFlatSuite(Path.Combine(_root, "alpha"), "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", 62200, "Alpha");
-        WriteFlatSuite(Path.Combine(_root, "beta"), "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb", 62210, "Beta");
+        // Literal `test` reproduces the Application/Test collapse on case-sensitive CI too.
+        WriteFlatSuite(Path.Combine(_root, "test"), "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb", 62210, "Beta");
         WriteFlatSuite(Path.Combine(_root, "gamma"), "cccccccc-3333-4333-8333-cccccccccccc", 62220, "Gamma");
 
         var (output, _) = RunRunner(_root);
@@ -205,5 +206,35 @@ public sealed class SuiteEnumerationTests : IDisposable
         Assert.Equal(1, SuiteCount(output));
         Assert.Equal(1, TestCount(output));
         Assert.Contains("SuiteRanSolo", output);
+    }
+
+    [Fact]
+    public void LooseSrcBesideNestedAppFolder_IsNotDropped()
+    {
+        if (!ArtifactsPresent()) { Console.Error.WriteLine("[skip] BC artifacts not present"); return; }
+
+        var src = Path.Combine(_root, "src");
+        Directory.CreateDirectory(src);
+        File.WriteAllText(Path.Combine(src, "Loose.Codeunit.al"), """
+        codeunit 62240 "Loose Source Test"
+        {
+            Subtype = Test;
+
+            [Test]
+            procedure LooseSourceRan()
+            begin
+            end;
+        }
+        """);
+        WriteFlatSuite(
+            Path.Combine(_root, "appFixture"),
+            "eeeeeeee-5555-4555-8555-eeeeeeeeeeee", 62250, "Nested");
+
+        var (output, _) = RunRunner(_root);
+
+        Assert.Equal(1, SuiteCount(output));
+        Assert.Equal(2, TestCount(output));
+        Assert.Contains("LooseSourceRan", output);
+        Assert.Contains("SuiteRanNested", output);
     }
 }

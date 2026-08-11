@@ -44,6 +44,7 @@ public class WatchTests
         foreach (var f in Directory.GetFiles(FixtureSrc))
             File.Copy(f, Path.Combine(bundle, Path.GetFileName(f)));
         var tablePath = Path.Combine(bundle, "XRecProbe.Table.al");
+        var manifestPath = Path.Combine(bundle, "app.json");
         var cacheDir = Path.Combine(bundle, ".cache");
 
         var lines = new List<string>();
@@ -51,7 +52,7 @@ public class WatchTests
         {
             FileName = "dotnet",
             Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
-                + $" \"{bundle}\" --watch --cache \"{cacheDir}\"",
+                + $" \"{bundle}\" --watch --rad --cache \"{cacheDir}\"",
             RedirectStandardOutput = true, RedirectStandardError = true,
             UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
         };
@@ -114,6 +115,9 @@ public class WatchTests
             var cycle2 = Segment(m1 + 1, m2);
             Assert.Contains("FAIL", cycle2);
             Assert.Contains("Insert_OnInsertReadsXRec_BuildsConcreteBeforeImage", cycle2);
+            Assert.Contains("[rad] Runner Tests Fixture - Record Trigger xRec: delta +0 ~1 -0", cycle2);
+            Assert.Contains("→ 1 object(s) re-emitted", cycle2);
+            Assert.DoesNotContain("[rad] Runner Tests Fixture - Record Trigger xRec: baseline built", cycle2);
             // The dependency loader stayed warm in-process across the edit: the
             // re-emit's symbol load is near-instant, not a cold ~40s reload.
             //
@@ -134,6 +138,19 @@ public class WatchTests
             Assert.True(elapsedMs < 5_000,
                 $"warm in-process symbol load took {elapsedMs}ms — a warm re-emit must not pay " +
                 "the cold ~40s dependency reload. The loader did not stay warm across the edit.");
+
+            // A manifest-only change invalidates the RAD baseline but does not change the
+            // AL-source cache key. Once a generation is loaded, the workspace must force a
+            // real baseline rebuild rather than resurrecting the pre-manifest cached DLL.
+            var manifest = await File.ReadAllTextAsync(manifestPath);
+            var versioned = manifest.Replace("\"version\": \"1.0.0.0\"", "\"version\": \"1.0.0.1\"");
+            Assert.NotEqual(manifest, versioned);
+            await File.WriteAllTextAsync(manifestPath, versioned);
+
+            int m3 = await WaitForMarkerAfter(m2 + 1, TimeSpan.FromSeconds(240));
+            var cycle3 = Segment(m2 + 1, m3);
+            Assert.Contains("[rad] Runner Tests Fixture - Record Trigger xRec: baseline built", cycle3);
+            Assert.DoesNotContain("[cache] HIT", cycle3);
         }
         finally
         {

@@ -55,7 +55,7 @@ public sealed record BcEmitOutput(
     IReadOnlyList<string> Diagnostics,
     IReadOnlyList<string> ExcludedObjects);
 
-public sealed class BcCompiler
+public sealed partial class BcCompiler
 {
     /// <summary>
     /// Compile every .al file under <paramref name="alFolders"/> into a single
@@ -232,6 +232,21 @@ public sealed class BcCompiler
     }
 
     /// <summary>
+    /// The <c>internalsVisibleTo</c> grants of the app being compiled. Source paths are
+    /// either the app root or its immediate <c>src</c>/<c>app*</c>/<c>test</c> children,
+    /// so the owning manifest is discoverable without mutable process-wide state.
+    /// </summary>
+    private static IEnumerable<NavCA.SymbolReferenceSpecification>? CurrentInternalsVisibleTo(
+        IEnumerable<string> dirs)
+    {
+        var dirList = dirs.ToList();
+        var manifest = dirList.Select(d => Path.Combine(d, "app.json")).FirstOrDefault(File.Exists)
+                       ?? dirList.Select(d => Path.Combine(d, "..", "app.json"))
+                                 .FirstOrDefault(File.Exists);
+        return ReadInternalsVisibleToRefs(manifest);
+    }
+
+    /// <summary>
     /// Temporarily overrides the "current app being compiled" identity for the
     /// duration of a single sub-compile (e.g. DependencyLoader compiling a dep from
     /// source). The override is scoped: the caller MUST dispose the returned
@@ -272,7 +287,12 @@ public sealed class BcCompiler
 
         public void Dispose()
         {
-            lock (_refSync) { _currentAppId = _savedId; _currentPublisher = _savedPublisher; _currentVersion = _savedVersion; }
+            lock (_refSync)
+            {
+                _currentAppId = _savedId;
+                _currentPublisher = _savedPublisher;
+                _currentVersion = _savedVersion;
+            }
         }
     }
 
@@ -991,6 +1011,15 @@ public sealed class BcCompiler
         catch { /* best-effort warm — never block compilation */ }
     }
 
+    /// <summary>Compilation options shared by full and RAD emits.</summary>
+    private static NavCA.CompilationOptions EmitCompilationOptions() =>
+        new(
+            continueBuildOnError: true,
+            target: NavCA.CompilationTarget.OnPrem,
+            generateOptions:
+                NavCA.CompilationGenerationOptions.Code |
+                NavCA.CompilationGenerationOptions.Navigation);
+
     public BcEmitOutput Emit(IEnumerable<string> alFolders, string moduleName)
     {
         var dirs = alFolders.Where(Directory.Exists).Distinct().ToList();
@@ -1027,13 +1056,7 @@ public sealed class BcCompiler
         });
         _mark($"parse {alFiles.Count} files");
 
-        // CompilationOptions: identical to v1 (Program.cs:1548-1555).
-        var compOpts = new NavCA.CompilationOptions(
-            continueBuildOnError: true,
-            target: NavCA.CompilationTarget.OnPrem,
-            generateOptions:
-                NavCA.CompilationGenerationOptions.Code |
-                NavCA.CompilationGenerationOptions.Navigation);
+        var compOpts = EmitCompilationOptions();
 
         // Identity: use the bundle's REAL app.json identity when set, else a synthetic
         // one. The real identity matters when a dependency grants this app access via
@@ -1041,11 +1064,17 @@ public sealed class BcCompiler
         // appId/publisher, so a synthetic "AlRunner"/deterministic-guid identity would
         // fail to match and produce AL0161 on the dep's Access=Internal members.
         var appId = _currentAppId ?? DeterministicGuid(moduleName);
+        // internalsVisibleTo: what THIS app grants other apps. Never used by its own
+        // binding, but it is the only channel through which the module it produces can
+        // tell a dependent that its Access=Internal members are visible — see
+        // CurrentInternalsVisibleTo.
+        var ivt = CurrentInternalsVisibleTo(dirs);
         var compilation = NavCA.Compilation.Create(
             moduleName: moduleName,
             publisher: _currentPublisher ?? "AlRunner",
             version: _currentVersion ?? new Version(1, 0, 0, 0),
             appId: appId,
+            internalsVisibleTo: ivt,
             syntaxTrees: trees,
             options: compOpts);
 
@@ -1227,6 +1256,7 @@ public sealed class BcCompiler
                     publisher: _currentPublisher ?? "AlRunner",
                     version: _currentVersion ?? new Version(1, 0, 0, 0),
                     appId: appId,
+                    internalsVisibleTo: ivt,
                     syntaxTrees: retryTrees,
                     options: compOpts);
                 if (refLoader != null)
@@ -1411,8 +1441,20 @@ public sealed class BcCompiler
             }
         }
 
+        // The RAD delta path needs the compilation this emit actually used (the retry loop
+        // may have replaced it) to snapshot the module's symbol picture and the per-file
+        // object map. Exposed as state rather than a return value so BcEmitOutput — a
+        // public contract with several other callers — stays as it is.
+        LastCompilation = compilation;
+
         return new BcEmitOutput(outputter.Captured, alDiags, excludedObjects);
     }
+
+    /// <summary>
+    /// The <see cref="NavCA.Compilation"/> the most recent <see cref="Emit"/> finished with.
+    /// Only meaningful to the RAD delta path, which reads it immediately after the call.
+    /// </summary>
+    internal NavCA.Compilation? LastCompilation { get; private set; }
 
     // Cheap text probe: does any source file declare an AL `query` object? Avoids
     // building the (non-trivial) ModuleDefinition for the 99% of bundles with none.
@@ -1558,8 +1600,7 @@ public sealed class BcCompiler
         // this dedicated Create parameter — not from the manifest — so without it a
         // dependent app hits AL0161 on the dep's Access=Internal members even when the
         // grant exists. (main:Program.cs BuildInternalsVisibleToRefs.)
-        var ivtRefs = ReadInternalsVisibleToRefs(
-            dirs.Select(d => Path.Combine(d, "app.json")).FirstOrDefault(File.Exists));
+        var ivtRefs = CurrentInternalsVisibleTo(dirs);
 
         var compilation = NavCA.Compilation.Create(
             moduleName: moduleName, publisher: publisher, version: version,
@@ -1716,12 +1757,13 @@ public sealed class BcCompiler
     private sealed class CaptureOutputter : NavEmit.CodeModuleOutputter
     {
         public List<EmittedSource> Captured { get; } = new();
+        public NavCA.IModuleSymbol? Module { get; private set; }
         public string? LastAddedName { get; private set; }
         public int AddCalls { get; private set; }
 
         public CaptureOutputter() : base(NavCA.EmitOptions.Default) { }
 
-        public override void InitializeModule(NavCA.IModuleSymbol moduleSymbol) { }
+        public override void InitializeModule(NavCA.IModuleSymbol moduleSymbol) => Module = moduleSymbol;
 
         public override void AddApplicationObject(
             NavCA.IApplicationObjectTypeSymbol symbol,

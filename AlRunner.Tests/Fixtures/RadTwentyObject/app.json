@@ -1,0 +1,16 @@
+{
+  "id": "e23cd601-abba-46f2-8d5e-d1ca75615f9e",
+  "name": "RAD Twenty Object Fixture",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [
+    {
+      "from": 71000,
+      "to": 71199
+    }
+  ],
+  "dependencies": []
+}

@@ -240,6 +240,9 @@ public static partial class RecordPatches
     {
         if (_tableExtensionTypeCache.TryGetValue(extId, out var cached)) return cached;
         var name = $"TableExtension{extId}";
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, typeof(NavRecordExtension)) is { } owned)
+        { _tableExtensionTypeCache[extId] = owned; return owned; }
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         var preferred = BcRuntime.CurrentTestAssembly;
         if (preferred != null)
         {

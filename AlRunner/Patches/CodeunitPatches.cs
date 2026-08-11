@@ -870,6 +870,8 @@ public static partial class BcRuntime
             .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Ncl");
         Type? queryBase = navNcl?.GetType("Microsoft.Dynamics.Nav.Runtime.NavQuery");
         var name = $"Query{id}";
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, queryBase) is { } owned) return owned;
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         if (_currentTestAssembly != null)
         {
             try
@@ -900,6 +902,8 @@ public static partial class BcRuntime
             .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Ncl");
         Type? reportBase = navNcl?.GetType("Microsoft.Dynamics.Nav.Runtime.NavReport");
         var name = $"Report{id}";
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, reportBase) is { } owned) return owned;
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         if (_currentTestAssembly != null)
         {
             try
@@ -933,6 +937,8 @@ public static partial class BcRuntime
             .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Ncl");
         Type? formBase = navNcl?.GetType("Microsoft.Dynamics.Nav.Runtime.NavForm");
         var name = $"Page{id}";
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, formBase) is { } owned) return owned;
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         if (_currentTestAssembly != null)
         {
             try
@@ -967,6 +973,8 @@ public static partial class BcRuntime
             .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Ncl");
         Type? testPageBase = navNcl?.GetType("Microsoft.Dynamics.Nav.Runtime.NavForm");
         var name = $"Page{id}";
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, testPageBase) is { } owned) return owned;
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         if (_currentTestAssembly != null)
         {
             try
@@ -1040,6 +1048,10 @@ public static partial class BcRuntime
     {
         var baseCu = typeof(Microsoft.Dynamics.Nav.Runtime.NavCodeunit);
         var name = $"Codeunit{id}";
+        // Explicit ownership first — see AlObjectResolution for why the scan below is not
+        // enough once more than one generation of an app is loaded.
+        if (AlRunner.Rad.AlObjectResolution.FindOwned(name, baseCu) is { } owned) return owned;
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         // Search the current test assembly first (avoids cross-bucket ID collisions).
         if (_currentTestAssembly != null)
         {

@@ -113,6 +113,7 @@ public static partial class RecordPatches
     {
         _metaTableCache.Clear();
         _recordTypeCache.Clear();
+        _tableExtensionTypeCache.Clear();
         _parsedTables.Clear();
         _parsedExtensionFields.Clear();
         _extensionIdsByBaseTable.Clear();
@@ -1359,6 +1360,9 @@ public static partial class RecordPatches
 
     private static Type? FindClrTypeByName(string name)
     {
+        var owned = AlRunner.Rad.AlObjectResolution.FindOwned(name, requiredBase: null);
+        if (owned != null) return owned;
+        if (AlRunner.Rad.AlObjectResolution.IsTombstoned(name)) return null;
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             try
