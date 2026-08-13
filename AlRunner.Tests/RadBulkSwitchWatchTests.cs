@@ -148,7 +148,7 @@ public class RadBulkSwitchWatchTests
             Assert.Contains("BulkValuesMatchTheCheckedOutVersion", burst);
 
             // Proportional: eight recompiled, two added, two gone — not the whole app.
-            Assert.Contains("[rad] RAD Bulk Switch Fixture: delta +2 ~8 -2", burst);
+            Assert.Contains("[watch] RAD Bulk Switch Fixture: delta +2 ~8 -2", burst);
             Assert.DoesNotContain("baseline built", burst);
 
             // Claim 1: the burst was ONE change, so it costs ONE cycle.

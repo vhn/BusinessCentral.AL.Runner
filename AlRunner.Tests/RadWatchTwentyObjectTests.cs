@@ -10,7 +10,7 @@
 //
 // So every cycle here asserts two things together:
 //
-//   * the [rad] log line for each app — `delta +0 ~1 -0` / `overlay … 1 object(s)` for the
+//   * the [watch] log line for each app — `delta +0 ~1 -0` / `overlay … 1 object(s)` for the
 //     edited app, `unchanged` for the one that was not touched, and never `baseline built`
 //     after the cold cycle. That is the performance contract, in the runner's own words.
 //   * the AL test outcome — which test flipped, and what value it reported. An edit whose
@@ -90,10 +90,10 @@ public class RadWatchTwentyObjectTests
         // the watcher but must not compile: change detection is on content, not timestamps.
         session.Touch("App/src/RadPerfService.Codeunit.al");
         var touched = await session.NextCycleAsync();
-        Assert.Contains($"[rad] {App}: unchanged — reusing the loaded module", touched);
-        Assert.Contains($"[rad] {TestApp}: unchanged — reusing the loaded module", touched);
-        Assert.DoesNotContain($"[rad] {App}: delta", touched);
-        Assert.DoesNotContain($"[rad] {App}: overlay", touched);
+        Assert.Contains($"[watch] {App}: unchanged — reusing the loaded module", touched);
+        Assert.Contains($"[watch] {TestApp}: unchanged — reusing the loaded module", touched);
+        Assert.DoesNotContain($"[watch] {App}: delta", touched);
+        Assert.DoesNotContain($"[watch] {App}: overlay", touched);
         AssertOutcomes(touched, failures: 0);
     }
 
@@ -206,18 +206,18 @@ public class RadWatchTwentyObjectTests
         //    surviving tests still run.
         session.Delete("App/src/RadPerfUnrelatedD.Codeunit.al");
         var deletion = await session.NextCycleAsync();
-        Assert.Contains($"[rad] {App}: delta +0 ~0 -1 over 0 changed file(s) → 0 object(s) re-emitted", deletion);
-        Assert.DoesNotContain($"[rad] {App}: overlay", deletion);
-        Assert.DoesNotContain($"[rad] {App}: baseline built", deletion);
-        Assert.Contains($"[rad] {TestApp}: unchanged", deletion);
+        Assert.Contains($"[watch] {App}: delta +0 ~0 -1 over 0 changed file(s) → 0 object(s) re-emitted", deletion);
+        Assert.DoesNotContain($"[watch] {App}: overlay", deletion);
+        Assert.DoesNotContain($"[watch] {App}: baseline built", deletion);
+        Assert.Contains($"[watch] {TestApp}: unchanged", deletion);
         AssertOutcomes(deletion, failures: 0);
     }
 
     /// <summary>Cycle 1 compiles both apps in full and records their RAD baselines.</summary>
     private static void AssertColdBaseline(string cycle)
     {
-        Assert.Contains($"[rad] {App}: baseline built — 20 object(s)", cycle);
-        Assert.Contains($"[rad] {TestApp}: baseline built — 2 object(s)", cycle);
+        Assert.Contains($"[watch] {App}: baseline built — 20 object(s)", cycle);
+        Assert.Contains($"[watch] {TestApp}: baseline built — 2 object(s)", cycle);
         AssertOutcomes(cycle, failures: 0);
     }
 
@@ -227,17 +227,21 @@ public class RadWatchTwentyObjectTests
     /// </summary>
     private static void AssertOneObjectDelta(string cycle, string edited, string unchanged)
     {
-        Assert.Contains($"[rad] {edited}: delta +0 ~1 -0 over 1 changed file(s) → 1 object(s) re-emitted", cycle);
+        Assert.Contains($"[watch] {edited}: delta +0 ~1 -0 over 1 changed file(s) → 1 object(s) re-emitted", cycle);
         // Read the object count off the edited app's OWN overlay line: a generic
         // "1 object(s)" match anywhere in the cycle would also accept the other app's.
         var overlay = Assert.Single(cycle.Split(Environment.NewLine)
-            .Where(line => line.Contains($"[rad] {edited}: overlay", StringComparison.Ordinal)));
+            .Where(line => line.Contains($"[watch] {edited}: overlay", StringComparison.Ordinal)));
         Assert.Contains("— 1 object(s)", overlay);
-        Assert.Contains($"[rad] {unchanged}: unchanged — reusing the loaded module", cycle);
+        Assert.Contains($"[watch] {unchanged}: unchanged — reusing the loaded module", cycle);
         // Any of these would mean the delta bailed out and the whole module was rebuilt.
-        Assert.DoesNotContain($"[rad] {edited}: baseline built", cycle);
-        Assert.DoesNotContain($"[rad] {unchanged}: baseline built", cycle);
+        Assert.DoesNotContain($"[watch] {edited}: baseline built", cycle);
+        Assert.DoesNotContain($"[watch] {unchanged}: baseline built", cycle);
+        // Both spellings: the workspace says "full rebuild — <facet moved>" when the reference
+        // surface invalidates it, and the delta path says "full compile — <reason>" when it
+        // declines a cycle. Matching only one of them lets the other class of fallback through.
         Assert.DoesNotContain("full rebuild —", cycle);
+        Assert.DoesNotContain("full compile —", cycle);
     }
 
     /// <summary>

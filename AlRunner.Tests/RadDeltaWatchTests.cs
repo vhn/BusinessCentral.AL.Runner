@@ -16,7 +16,7 @@ namespace AlRunner.Tests;
 ///    scanning loaded assemblies in unspecified order, and the PREVIOUS cycle's still-loaded
 ///    types won as often as not — so this exact edit left the test GREEN against code the
 ///    developer had just changed.
-/// 2. <b>Only the changed object is recompiled.</b> The `[rad] … delta +0 ~1 -0` line is the
+/// 2. <b>Only the changed object is recompiled.</b> The `[watch] … delta +0 ~1 -0` line is the
 ///    difference between a proportional inner loop and re-emitting the whole module.
 /// 3. <b>The untouched app is not recompiled at all.</b>
 /// 4. <b>A rejected C# generation never advances or executes the workspace.</b>
@@ -125,9 +125,9 @@ public class RadDeltaWatchTests
             var cycle1 = Segment(0, m1);
             Assert.Contains("PASS  Codeunit60941.AnswerIsFortyTwo", cycle1);
             Assert.DoesNotContain("FAIL  Codeunit", cycle1);
-            Assert.Contains("[rad] Delta Lib: baseline built", cycle1);
-            Assert.Contains("[rad] Delta Bridge: baseline built", cycle1);
-            Assert.Contains("[rad] Delta Lib Tests: baseline built", cycle1);
+            Assert.Contains("[watch] Delta Lib: baseline built", cycle1);
+            Assert.Contains("[watch] Delta Bridge: baseline built", cycle1);
+            Assert.Contains("[watch] Delta Lib Tests: baseline built", cycle1);
 
             // First edit the test codeunit itself. Its unchanged Install codeunit remains
             // in the baseline generation, but must still seed data before the overlay's
@@ -136,8 +136,8 @@ public class RadDeltaWatchTests
             int m2 = await WaitForMarkerAfter(m1 + 1, TimeSpan.FromSeconds(240));
             var cycle2 = Segment(m1 + 1, m2);
             Assert.Contains("PASS  Codeunit60941.AnswerIsFortyTwo", cycle2);
-            Assert.Contains("[rad] Delta Lib Tests: delta +0 ~1 -0", cycle2);
-            Assert.Contains("[rad] Delta Lib Tests: overlay", cycle2);
+            Assert.Contains("[watch] Delta Lib Tests: delta +0 ~1 -0", cycle2);
+            Assert.Contains("[watch] Delta Lib Tests: overlay", cycle2);
 
             // Edit ONLY the library app. The test app is now untouched and still asserts 42.
             var lib = await File.ReadAllTextAsync(libSource);
@@ -155,14 +155,14 @@ public class RadDeltaWatchTests
             Assert.Contains("Delta Lib Answer returned 43, expected 42", cycle3);
 
             // Exactly one object recompiled in the edited app…
-            Assert.Contains("[rad] Delta Lib: delta +0 ~1 -0", cycle3);
-            Assert.Contains("[rad] Delta Lib: overlay", cycle3);
+            Assert.Contains("[watch] Delta Lib: delta +0 ~1 -0", cycle3);
+            Assert.Contains("[watch] Delta Lib: overlay", cycle3);
             // …and nothing at all in the app that did not change.
-            Assert.Contains("[rad] Delta Bridge: unchanged", cycle3);
-            Assert.Contains("[rad] Delta Lib Tests: unchanged", cycle3);
+            Assert.Contains("[watch] Delta Bridge: unchanged", cycle3);
+            Assert.Contains("[watch] Delta Lib Tests: unchanged", cycle3);
             // The full path is what the delta path replaces here; seeing it means the
             // delta bailed out and the speed claim is not being met.
-            Assert.DoesNotContain("[rad] Delta Lib: baseline built", cycle3);
+            Assert.DoesNotContain("[watch] Delta Lib: baseline built", cycle3);
 
             // Edit the same codeunit again while its first overlay is already loaded.
             // The next overlay must bind against the generation chain without duplicate
@@ -174,9 +174,9 @@ public class RadDeltaWatchTests
             var cycle4 = Segment(m3 + 1, m4);
             Assert.Contains("FAIL  Codeunit60941.AnswerIsFortyTwo", cycle4);
             Assert.Contains("Delta Lib Answer returned 44, expected 42", cycle4);
-            Assert.Contains("[rad] Delta Lib: delta +0 ~1 -0", cycle4);
-            Assert.Contains("[rad] Delta Lib: overlay", cycle4);
-            Assert.DoesNotContain("[rad] Delta Lib: baseline built", cycle4);
+            Assert.Contains("[watch] Delta Lib: delta +0 ~1 -0", cycle4);
+            Assert.Contains("[watch] Delta Lib: overlay", cycle4);
+            Assert.DoesNotContain("[watch] Delta Lib: baseline built", cycle4);
 
             // A callable-surface change is still an object delta. This app has no
             // same-module callers, so only the changed codeunit is replaced.
@@ -199,9 +199,9 @@ public class RadDeltaWatchTests
             await File.WriteAllTextAsync(libSource, surfaceChanged);
             int m5 = await WaitForMarkerAfter(m4 + 1, TimeSpan.FromSeconds(240));
             var cycle5 = Segment(m4 + 1, m5);
-            Assert.Contains("[rad] Delta Lib: delta +0 ~1 -0", cycle5);
-            Assert.Contains("[rad] Delta Lib: overlay", cycle5);
-            Assert.DoesNotContain("[rad] Delta Lib: baseline built", cycle5);
+            Assert.Contains("[watch] Delta Lib: delta +0 ~1 -0", cycle5);
+            Assert.Contains("[watch] Delta Lib: overlay", cycle5);
+            Assert.DoesNotContain("[watch] Delta Lib: baseline built", cycle5);
             Assert.Contains("Delta Lib Answer returned 45, expected 42", cycle5);
 
             // Change the callable surface and introduce an AL-valid call whose generated
@@ -234,9 +234,9 @@ public class RadDeltaWatchTests
             await File.WriteAllTextAsync(libSource, broken);
             int m6 = await WaitForMarkerAfter(m5 + 1, TimeSpan.FromSeconds(240));
             var cycle6 = Segment(m5 + 1, m6);
-            Assert.Contains("[rad] Delta Lib: delta +0 ~1 -0", cycle6);
+            Assert.Contains("[watch] Delta Lib: delta +0 ~1 -0", cycle6);
             Assert.Contains("COMPILE-FAIL", cycle6);
-            Assert.DoesNotContain("[rad] Delta Lib: overlay", cycle6);
+            Assert.DoesNotContain("[watch] Delta Lib: overlay", cycle6);
             Assert.DoesNotContain("PASS  Codeunit60941.", cycle6);
             Assert.DoesNotContain("FAIL  Codeunit60941.", cycle6);
 
@@ -246,7 +246,7 @@ public class RadDeltaWatchTests
             int m7 = await WaitForMarkerAfter(m6 + 1, TimeSpan.FromSeconds(240));
             var cycle7 = Segment(m6 + 1, m7);
             Assert.Contains("COMPILE-FAIL", cycle7);
-            Assert.DoesNotContain("[rad] Delta Lib: unchanged", cycle7);
+            Assert.DoesNotContain("[watch] Delta Lib: unchanged", cycle7);
             Assert.DoesNotContain("PASS  Codeunit60941.", cycle7);
             Assert.DoesNotContain("FAIL  Codeunit60941.", cycle7);
 
@@ -254,10 +254,10 @@ public class RadDeltaWatchTests
             await File.WriteAllTextAsync(libSource, editedAgain);
             int m8 = await WaitForMarkerAfter(m7 + 1, TimeSpan.FromSeconds(240));
             var cycle8 = Segment(m7 + 1, m8);
-            Assert.Contains("[rad] Delta Lib: delta +0 ~1 -0", cycle8);
-            Assert.Contains("[rad] Delta Lib: overlay", cycle8);
-            Assert.Contains("[rad] Delta Bridge: unchanged", cycle8);
-            Assert.Contains("[rad] Delta Lib Tests: unchanged", cycle8);
+            Assert.Contains("[watch] Delta Lib: delta +0 ~1 -0", cycle8);
+            Assert.Contains("[watch] Delta Lib: overlay", cycle8);
+            Assert.Contains("[watch] Delta Bridge: unchanged", cycle8);
+            Assert.Contains("[watch] Delta Lib Tests: unchanged", cycle8);
             Assert.Contains("FAIL  Codeunit60941.AnswerIsFortyTwo", cycle8);
             Assert.Contains("Delta Lib Answer returned 44, expected 42", cycle8);
         }
@@ -346,7 +346,7 @@ public class RadDeltaWatchTests
             var cycle1 = Segment(0, m1);
             Assert.True(CountOccurrences(cycle1, "PASS  Codeunit63411.") == 4, cycle1);
             Assert.DoesNotContain("extension field 61881", cycle1);
-            Assert.Contains("[rad] DTB Platform Base Main: baseline built", cycle1);
+            Assert.Contains("[watch] DTB Platform Base Main: baseline built", cycle1);
             Assert.Contains("precompiled tableextension(s) into _parsedExtensionFields", cycle1);
 
             // Change one real codeunit file. It recompiles as a one-object overlay, while
@@ -360,7 +360,7 @@ public class RadDeltaWatchTests
             Assert.True(CountOccurrences(cycle2, "PASS  Codeunit63411.") == 4, cycle2);
             Assert.DoesNotContain("extension field 61881", cycle2);
             Assert.DoesNotContain("EXEC-FAIL", cycle2);
-            Assert.Contains("[rad] DTB Platform Base Main: delta +0 ~1 -0", cycle2);
+            Assert.Contains("[watch] DTB Platform Base Main: delta +0 ~1 -0", cycle2);
 
             // Pin the cache invariant: reload must re-merge extension metadata without
             // throwing away and rebuilding the already-warm base-table symbol index.

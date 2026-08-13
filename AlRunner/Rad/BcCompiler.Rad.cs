@@ -173,10 +173,21 @@ public sealed partial class BcCompiler
         // if the resident dependency loader is ever rebuilt, and a warm watch cycle that
         // quietly pays the ~40s reload looks exactly like a slow compile from outside.
         Mark($"GetSharedReferences ({specs.Length} specs)");
-        bool canDelta = ws.ArmFor(ReferenceSignature(moduleName, specs, dirs));
+        var signature = ReferenceSignature(moduleName, specs, dirs);
+        bool canDelta = ws.ArmFor(signature, previous => DescribeSignatureChange(previous, signature));
 
         if (!canDelta)
+        {
+            // A reason an EARLIER cycle knew about. Failing to record a baseline makes every
+            // later cycle a full compile, and the cycle that discovers the failure is not the
+            // cycle the developer watches rebuilding — so that reason is parked on the workspace
+            // and consumed here, by the compile that actually pays for it. Nothing is parked for
+            // the invalidation paths (a reference-surface change, the overlay-chain reset, a
+            // missing loaded module): those call Invalidate, which reports in the same cycle.
+            if (ws.TakePendingFullCompileReason() is { } parked)
+                FullCompileBecause(moduleName, parked);
             return FullCompile(alFolders, moduleName, ws, hashes);
+        }
 
         var (changedFiles, removedFiles) = ws.DiffFiles(hashes);
         if (changedFiles.Count == 0 && removedFiles.Count == 0)
@@ -191,12 +202,28 @@ public sealed partial class BcCompiler
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine(
-                $"  [rad] {moduleName}: delta compile threw {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+            FullCompileBecause(
+                moduleName,
+                $"the delta compile threw {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
         }
         // A fallback is still only a candidate until its generated C# loads. Keep the
         // committed hashes/baseline intact so a backend failure retries the same edit.
         return FullCompile(alFolders, moduleName, ws, hashes);
+    }
+
+    /// <summary>
+    /// Log and record one decision to compile a whole module instead of deltaing it.
+    ///
+    /// <para>Both, always. The stderr line is what a redirected/CI run and the RAD watch tests
+    /// read; the recorded note is what the interactive dashboard shows, because the bundle loop
+    /// silences stderr while it runs (see <see cref="AlRunner.Rad.RadCycleNotes"/>). A fallback
+    /// that reaches only one of the two is invisible in the other, which is how "why did that
+    /// cycle take four minutes" became unanswerable.</para>
+    /// </summary>
+    private static void FullCompileBecause(string moduleName, string reason)
+    {
+        Console.Error.WriteLine($"  [watch] {moduleName}: full compile — {reason}");
+        AlRunner.Rad.RadCycleNotes.FullCompile(moduleName, reason);
     }
 
     private RadEmitResult FullCompile(
@@ -210,16 +237,18 @@ public sealed partial class BcCompiler
         {
             try
             {
+                var objectsByFile = MapObjectsToFiles(comp);
                 var update = new AlRunner.Rad.RadWorkspaceUpdate(
                     hashes,
-                    MapObjectsToFiles(comp),
+                    objectsByFile,
+                    MapFileDeclarations(comp.SyntaxTrees, objectsByFile),
                     MapObjectReferences(comp),
                     MapExtensionTargets(comp),
                     Array.Empty<AlRunner.Rad.RadObjectKey>(),
                     SymbolJsonWriter.BuildModuleDefinition(comp),
                     Full: true);
                 Console.Error.WriteLine(
-                    $"  [rad] {moduleName}: baseline built — {output.Sources.Count} object(s) " +
+                    $"  [watch] {moduleName}: baseline built — {output.Sources.Count} object(s) " +
                     $"({sw.ElapsedMilliseconds}ms)");
                 return new RadEmitResult(output, FullRebuild: true, NoChange: false)
                 {
@@ -229,19 +258,24 @@ public sealed partial class BcCompiler
             catch (Exception ex)
             {
                 // Losing the baseline costs speed, never correctness: the next cycle just
-                // compiles in full again. Say so rather than looking mysteriously slow.
-                Console.Error.WriteLine(
-                    $"  [rad] {moduleName}: baseline snapshot failed " +
-                    $"({ex.GetType().Name}: {ex.Message.Split('\n')[0]})");
+                // compiles in full again. Say so rather than looking mysteriously slow —
+                // this is the one that makes EVERY later cycle slow, not just this one.
+                var reason =
+                    $"the baseline snapshot failed ({ex.GetType().Name}: " +
+                    $"{ex.Message.Split('\n')[0]}), so the next cycle is a full compile too";
+                FullCompileBecause(moduleName, reason);
+                ws.PendingFullCompileReason = reason;
             }
         }
         else if (output.Sources.Count > 0)
         {
             // An emit-retry exclusion means the module is missing objects — never make that
             // the baseline for future deltas.
-            Console.Error.WriteLine(
-                $"  [rad] {moduleName}: the full compile excluded objects; " +
-                "its result cannot become a RAD baseline");
+            const string reason =
+                "an earlier full compile excluded objects, so its result could not become a " +
+                "delta baseline and this cycle is a full compile too";
+            FullCompileBecause(moduleName, reason);
+            ws.PendingFullCompileReason = reason;
         }
         return new RadEmitResult(output, FullRebuild: true, NoChange: false);
     }
@@ -308,24 +342,75 @@ public sealed partial class BcCompiler
         var declaredSymbols = probe.GetDeclaredApplicationObjectSymbols().ToList();
         // The id-less kinds the symbol API omits, read off the syntax of the changed files.
         var idlessNow = IdlessDeclarations(trees).ToList();
-        var keyedFiles = declaredSymbols
-            .Where(IsKeyable)
-            .Select(FileOf).OfType<string>()
-            .Concat(idlessNow.Select(item => item.File))
-            .ToHashSet(StringComparer.Ordinal);
-        if (declaredSymbols.Any(sym => !IsKeyable(sym))
-            || removedFiles.Any(f => ws.ObjectsIn(f).Count == 0)
-            || changedFiles.Any(f => ws.ObjectsIn(f).Count == 0 && !keyedFiles.Contains(f)))
+        // …and what BC's parser says those files declare, which is the only source that can
+        // answer "nothing at all" positively. A file with no ObjectSyntax node contributes
+        // nothing to the module, so the delta carries it as a hash change and no more.
+        var declarationsNow = trees
+            .Where(tree => FilePathOf(tree) != null)
+            .ToDictionary(
+                tree => FilePathOf(tree)!,
+                tree => ObjectDeclarations(tree).Select(item => item.Node).ToList(),
+                StringComparer.Ordinal);
+
+        // Four ways a changed file cannot be accounted for. Each names itself and the file:
+        // the whole point of the fallback is that a delta here would be WRONG, and a developer
+        // who cannot see which file caused it has no way to tell that from the delta path
+        // being broken.
+        var touched = changedFiles.Concat(removedFiles).ToList();
+        var unaccounted =
+            declaredSymbols.Where(sym => !IsKeyable(sym))
+                .Select(sym =>
+                    $"{sym.Kind} '{sym.Name}' in {Path.GetFileName(FileOf(sym) ?? "an unknown file")} " +
+                    "has no id and no supported name key")
+            .Concat(declarationsNow
+                .SelectMany(pair => pair.Value.Select(node => (pair.Key, Node: node)))
+                .Where(item => !IsRecognisedDeclaration(item.Node))
+                .Select(item =>
+                    $"{Path.GetFileName(item.Key)} declares {item.Node.Kind}, which this delta " +
+                    "does not know how to identify"))
+            // A `dotnet` package is recognised and still gets the whole module: the types it
+            // publishes are what every object in the app binds against, and a RAD object
+            // compilation carries no package declaration trees at all. Both directions —
+            // declaring one now, and having declared one before it was edited away or deleted.
+            .Concat(touched
+                .Where(f => ws.DeclarationsIn(f).DotNetPackage
+                    || declarationsNow.TryGetValue(f, out var nodes)
+                        && nodes.Any(node => node is NavSyntax.DotNetPackageSyntax))
+                .Select(f =>
+                    $"{Path.GetFileName(f)} declares a dotnet package, which every object in " +
+                    "the module binds against"))
+            .Concat(touched
+                .Where(f => ws.DeclarationsIn(f).Unrecorded)
+                .Select(f =>
+                    $"{Path.GetFileName(f)} declared something the last full compile could not " +
+                    "identify, so what it used to contribute is not known"))
+            // Distinct because a file can earn the same reason twice — a changed file that
+            // declares a dotnet package now is usually one that declared one before, too.
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (unaccounted.Count > 0)
         {
-            // Id-less application objects (notably controladdin) cannot be represented
-            // by RadObjectKey. Treat their files conservatively: otherwise deleting one
-            // looks like a comment-only edit and the old object survives in the baseline.
-            Console.Error.WriteLine(
-                $"  [rad] {moduleName}: an id-less or untracked object file changed — " +
-                "falling back to a full compile");
+            // Why not just proceed: a file whose declarations the delta cannot identify is
+            // indistinguishable from one that declared something and no longer does, so
+            // deleting an object there would pass for a comment-only edit while its symbol
+            // survived in the baseline.
+            FullCompileBecause(
+                moduleName,
+                string.Join("; ", unaccounted.Take(3))
+                    + (unaccounted.Count > 3 ? $" (+{unaccounted.Count - 3} more)" : string.Empty));
             return null;
         }
 
+        // Keyed, so two declarations of one key in the changed files collapse to one and the
+        // ownership guard below cannot see it — there is no untouched owner to compare against
+        // when both files are new. That is deliberate, and no guard is added for it: a key
+        // collision within a kind IS an AL duplicate (nothing legal produces two objects with
+        // one RadObjectKey), and `CreateForRad` is handed the syntax trees of every changed
+        // file rather than the change model's object list — so both declarations reach the
+        // compiler, its declaration pass reports the duplicate with the same AL id a cold build
+        // reports, and this cycle returns diagnostics and commits nothing. Pinned by
+        // RadIdlessObjectTests.TwoFilesAddedInOneCycleDeclaringOneKey_DoNotCollapseIntoOne
+        // over a codeunit, an interface and an entitlement — one per discovery route.
         var declaredNow = new Dictionary<AlRunner.Rad.RadObjectKey, AlRunner.Rad.RadObjectRef>();
         foreach (var sym in declaredSymbols)
         {
@@ -341,10 +426,69 @@ public sealed partial class BcCompiler
             if (objectsByFile.TryGetValue(file, out var list)) list.Add(objRef);
         }
 
+        // An `entitlement` is the one AL kind BC refuses to bind against the packaged baseline.
+        // `ObjectEntitlements` may only name permission sets declared in the SAME module, and
+        // a permission set resolved from the previously committed module definition does not
+        // satisfy that: the delta fails with AL0683 ("belongs to a different module and cannot
+        // be used when defining entitlements") on a tree that compiles clean cold. Measured:
+        // with the permission set's own file in the same delta it binds without a diagnostic.
+        // So an entitlement is compiled together with the app's permission sets. All of them,
+        // because which ones it names is only recoverable by parsing the property — and an app
+        // has a handful of permission sets against approximately never editing an entitlement.
+        if (declaredNow.Values.Any(item => string.Equals(item.Key.Kind, "Entitlement", StringComparison.Ordinal)))
+        {
+            var permissionSetFiles = ws.FilesDeclaring("PermissionSet")
+                .Where(File.Exists)
+                .Where(path => !changedFiles.Contains(path, StringComparer.Ordinal))
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            if (permissionSetFiles.Count > 0)
+            {
+                Console.Error.WriteLine(
+                    $"  [watch] {moduleName}: an entitlement changed — also binding " +
+                    $"{permissionSetFiles.Count} permission-set file(s) it may name");
+                return DeltaCompile(
+                    moduleName,
+                    dirs,
+                    ws,
+                    hashes,
+                    changedFiles.Concat(permissionSetFiles).Order(StringComparer.Ordinal).ToList(),
+                    removedFiles,
+                    refLoader,
+                    specs);
+            }
+        }
+
+        // Which FILE owns a key answers both questions this loop has to answer, from one lookup
+        // that replaces the `ws.Declares` scan this used to do:
+        //
+        //  * owned already → a modification, not an addition;
+        //  * owned by a file this cycle did not touch → a DUPLICATE declaration, and only the
+        //    compiler can say what that means. `ws.Declares` answered "does the module declare
+        //    this key", which is true either way, so a new object reusing an existing id or
+        //    name passed as a modification of the other file's object — that file's copy was
+        //    then stripped from the packaged baseline and the cycle reported either success or
+        //    an unrelated dangling-reference error. Measured against a cold compile of the same
+        //    tree: a duplicated `interface` name is four AL0197s cold and NO diagnostic at all
+        //    through the delta; a duplicated codeunit id is four AL0264s cold and one AL0185
+        //    through the delta. Hand the whole module over instead.
+        var touchedFiles = changedFiles.Concat(removedFiles).ToHashSet(StringComparer.Ordinal);
         var added = new List<AlRunner.Rad.RadObjectRef>();
         var modified = new List<AlRunner.Rad.RadObjectRef>();
         foreach (var objRef in declaredNow.Values)
-            (ws.Declares(objRef.Key) ? modified : added).Add(objRef);
+        {
+            var owner = ws.FileOf(objRef.Key);
+            if (owner != null && !touchedFiles.Contains(owner))
+            {
+                FullCompileBecause(
+                    moduleName,
+                    $"{objRef.Key.Kind} '{objRef.Name}' is also declared by " +
+                    $"{Path.GetFileName(owner)}, which this cycle did not touch — only the " +
+                    "compiler can say which of the two is the duplicate");
+                return null;
+            }
+            (owner != null ? modified : added).Add(objRef);
+        }
 
         // Removed = objects the touched files used to declare and nothing declares now.
         // An object cannot escape to an untouched file: moving it edits its new home.
@@ -354,6 +498,35 @@ public sealed partial class BcCompiler
             foreach (var prev in ws.ObjectsIn(f))
                 if (!declaredNow.ContainsKey(prev.Key) && seenRemoved.Add(prev.Key))
                     removed.Add(prev);
+
+        var fileDeclarations = MapFileDeclarations(trees, objectsByFile);
+
+        // Files moved, no OBJECT did — creating an empty file, editing a comment-only one,
+        // deleting it again. There is nothing for a compiler to do, so none runs: the cycle
+        // records the new hashes and the module keeps every loaded type it already had.
+        // Reaching CreateForRad with an empty change model would at best emit nothing at
+        // greater cost, and this is also the case where the RAD emitter has no object to
+        // initialize its module from, which the baseline merge below requires.
+        if (added.Count == 0 && modified.Count == 0 && removed.Count == 0)
+        {
+            Console.Error.WriteLine(
+                $"  [watch] {moduleName}: {changedFiles.Count + removedFiles.Count} file(s) changed, " +
+                $"no AL object did — nothing to compile ({sw.ElapsedMilliseconds}ms)");
+            return new RadEmitResult(
+                new BcEmitOutput(Array.Empty<EmittedSource>(), Array.Empty<string>(), Array.Empty<string>()),
+                FullRebuild: false, NoChange: false)
+            {
+                WorkspaceUpdate = new AlRunner.Rad.RadWorkspaceUpdate(
+                    hashes,
+                    objectsByFile,
+                    fileDeclarations,
+                    new Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadObjectKey>>(),
+                    new Dictionary<AlRunner.Rad.RadObjectKey, AlRunner.Rad.RadObjectKey>(),
+                    Array.Empty<AlRunner.Rad.RadObjectKey>(),
+                    WorkspaceBaseline(ws),
+                    Full: false),
+            };
+        }
 
         // Microsoft's RAD model is object-kind generic. Modified and removed objects
         // must be absent from the packaged baseline so their stale definitions cannot
@@ -430,9 +603,10 @@ public sealed partial class BcCompiler
 
         if (caught != null)
         {
-            Console.Error.WriteLine(
-                $"  [rad] {moduleName}: delta emit crashed ({caught.GetType().Name}: " +
-                $"{caught.Message.Split('\n', 2)[0]}) — falling back to a full compile");
+            FullCompileBecause(
+                moduleName,
+                $"the delta emit crashed ({caught.GetType().Name}: " +
+                $"{caught.Message.Split('\n', 2)[0]})");
             return null;
         }
 
@@ -445,10 +619,10 @@ public sealed partial class BcCompiler
                 return new RadEmitResult(
                     new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                     FullRebuild: false, NoChange: false);
-            Console.Error.WriteLine(
-                $"  [rad] {moduleName}: delta emitted {outputter.Captured.Count} object(s) but " +
-                $"{expectedEmits} were added/modified, with no diagnostics — " +
-                "falling back to a full compile");
+            FullCompileBecause(
+                moduleName,
+                $"the delta emitted {outputter.Captured.Count} object(s) but {expectedEmits} " +
+                "were added/modified, with no diagnostics to explain the difference");
             return null;
         }
 
@@ -480,9 +654,10 @@ public sealed partial class BcCompiler
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine(
-                $"  [rad] {moduleName}: could not merge the delta symbol baseline " +
-                $"({ex.GetType().Name}: {ex.Message.Split('\n')[0]}) — falling back to a full compile");
+            FullCompileBecause(
+                moduleName,
+                "the delta symbol baseline could not be merged " +
+                $"({ex.GetType().Name}: {ex.Message.Split('\n')[0]})");
             return null;
         }
 
@@ -514,9 +689,32 @@ public sealed partial class BcCompiler
             .Select(item => item.Key)
             .Concat(removed.Select(item => item.Key))
             .ToArray();
+        // …plus every entitlement, when a permission set's NAME moved. An entitlement has no
+        // compiler symbol, so no semantic model ever reports the edge from one to the
+        // permission sets its `ObjectEntitlements` names — which meant renaming or removing a
+        // permission set left each of them naming something that no longer exists, with the
+        // delta reporting success where a cold compile reports AL0185.
+        //
+        // `ObjectEntitlements` names permission sets by NAME, so the name is the whole trigger:
+        // a removal, or a modification that renamed one. Not `changedSurfaces`, which is keyed
+        // — a permission set has a real object id, so renaming one keeps its key and arrives
+        // here as a modification, not as a removal plus an addition. And not every permission
+        // set edit either: changing `Assignable` or a permission line cannot break a reference
+        // by name, and pulling every entitlement (and with it, via the rule above, every
+        // permission set) into an ordinary permission-set edit would be a real cost for none.
+        var permissionSetNameMoved =
+            removed.Any(item => string.Equals(item.Key.Kind, "PermissionSet", StringComparison.Ordinal))
+            || modified.Any(item =>
+                string.Equals(item.Key.Kind, "PermissionSet", StringComparison.Ordinal)
+                && ws.Object(item.Key) is { } previous
+                && !string.Equals(previous.Name, item.Name, StringComparison.OrdinalIgnoreCase));
+        var entitlementFiles = permissionSetNameMoved
+            ? ws.FilesDeclaring("Entitlement")
+            : Array.Empty<string>();
         var callerFiles = ws.DirectUsersOf(changedSurfaces)
             .Select(ws.FileOf)
             .OfType<string>()
+            .Concat(entitlementFiles)
             .Where(File.Exists)
             .Where(path => !changedFiles.Contains(path, StringComparer.Ordinal))
             .Distinct(StringComparer.Ordinal)
@@ -524,7 +722,7 @@ public sealed partial class BcCompiler
         if (callerFiles.Count > 0)
         {
             Console.Error.WriteLine(
-                $"  [rad] {moduleName}: rebinding {callerFiles.Count} direct caller file(s)");
+                $"  [watch] {moduleName}: rebinding {callerFiles.Count} direct caller file(s)");
             return DeltaCompile(
                 moduleName,
                 dirs,
@@ -539,6 +737,7 @@ public sealed partial class BcCompiler
         var update = new AlRunner.Rad.RadWorkspaceUpdate(
             hashes,
             objectsByFile,
+            fileDeclarations,
             MapObjectReferences(rad),
             MapExtensionTargets(rad),
             removed.Select(item => item.Key).ToArray(),
@@ -546,7 +745,7 @@ public sealed partial class BcCompiler
             Full: false);
 
         Console.Error.WriteLine(
-            $"  [rad] {moduleName}: delta +{added.Count} ~{modified.Count} -{removed.Count} " +
+            $"  [watch] {moduleName}: delta +{added.Count} ~{modified.Count} -{removed.Count} " +
             $"over {changedFiles.Count} changed file(s) → " +
             $"{outputter.Captured.Count} object(s) re-emitted ({sw.ElapsedMilliseconds}ms)");
 
@@ -586,6 +785,12 @@ public sealed partial class BcCompiler
     /// Everything a delta may not silently change. Two compiles with the same signature
     /// resolve identical external symbols, so an object compiled under one is
     /// interchangeable with the same object compiled under the other.
+    ///
+    /// <para>Every line is <c>&lt;facet&gt;|&lt;value&gt;</c> so that
+    /// <see cref="DescribeSignatureChange"/> can say WHICH facet moved. A watch cycle that
+    /// rebuilds the whole module has to explain itself: switching a git branch usually also
+    /// switches <c>app.json</c>, and "full rebuild" with no reason looks like the delta path
+    /// simply failing.</para>
     /// </summary>
     private static string ReferenceSignature(
         string moduleName, NavCA.SymbolReferenceSpecification[] specs, IReadOnlyList<string> dirs)
@@ -598,12 +803,61 @@ public sealed partial class BcCompiler
         return string.Join("\n",
             new[]
             {
-                moduleName,
-                _currentAppId?.ToString() ?? "-",
-                _currentPublisher ?? "-",
-                _currentVersion?.ToString() ?? "-",
-                string.Join(",", _extraPreprocessorSymbols ?? Array.Empty<string>()),
+                $"name|{moduleName}",
+                $"id|{_currentAppId?.ToString() ?? "-"}",
+                $"publisher|{_currentPublisher ?? "-"}",
+                $"version|{_currentVersion?.ToString() ?? "-"}",
+                $"define|{string.Join(",", _extraPreprocessorSymbols ?? Array.Empty<string>())}",
             }.Concat(parts));
+    }
+
+    /// <summary>
+    /// Which facet of the reference signature moved, in the words the developer who moved it
+    /// would use. Four of the six come straight out of <c>app.json</c>, so the message names
+    /// the file — a branch switch that carries a different <c>app.json</c> is by far the most
+    /// common way a warm watch loses its baseline, and the developer needs to recognise the
+    /// cause rather than read it as the delta path giving up.
+    /// </summary>
+    private static string DescribeSignatureChange(string previous, string current)
+    {
+        var was = previous.Split('\n');
+        var now = current.Split('\n');
+
+        string? Single(string facet)
+        {
+            var a = was.FirstOrDefault(line => line.StartsWith(facet + "|", StringComparison.Ordinal));
+            var b = now.FirstOrDefault(line => line.StartsWith(facet + "|", StringComparison.Ordinal));
+            return string.Equals(a, b, StringComparison.Ordinal)
+                ? null
+                : $"{a?[(facet.Length + 1)..] ?? "none"} → {b?[(facet.Length + 1)..] ?? "none"}";
+        }
+
+        int Count(string[] lines, string facet) =>
+            lines.Count(line => line.StartsWith(facet + "|", StringComparison.Ordinal));
+
+        string? Set(string facet, string label) =>
+            Count(was, facet) == Count(now, facet)
+                && was.Where(l => l.StartsWith(facet + "|", StringComparison.Ordinal))
+                    .SequenceEqual(now.Where(l => l.StartsWith(facet + "|", StringComparison.Ordinal)), StringComparer.Ordinal)
+                ? null
+                : $"{label} ({Count(was, facet)} → {Count(now, facet)})";
+
+        var reasons = new List<string>();
+        if (Single("name") is { } name) reasons.Add($"app.json changed the app name: {name}");
+        if (Single("id") is { } id) reasons.Add($"app.json changed the app id: {id}");
+        if (Single("publisher") is { } publisher) reasons.Add($"app.json changed the publisher: {publisher}");
+        if (Single("version") is { } version) reasons.Add($"app.json changed the app version: {version}");
+        if (Single("define") is { } define) reasons.Add($"the --define preprocessor symbols changed: {define}");
+        // A resolved reference can move because app.json's `dependencies` changed OR because a
+        // different .app landed in .alpackages. Both are true causes; name both rather than
+        // guess, because a branch switch routinely does both at once.
+        if (Set("ref", "the resolved dependency set changed") is { } refs)
+            reasons.Add($"{refs} — app.json dependencies, or the .app files in .alpackages");
+        if (Set("ivt", "the internalsVisibleTo grants changed") is { } ivt) reasons.Add(ivt);
+
+        return reasons.Count > 0
+            ? string.Join("; ", reasons)
+            : "the compilation's reference surface changed";
     }
 
     private NavCA.ParseOptions ParseOptionsForCompile() => new(
@@ -621,12 +875,12 @@ public sealed partial class BcCompiler
     /// <c>Profile:0</c>. Measured on NP Retail, that collision threw out of the baseline
     /// snapshot and left the app without one — every cycle a full compile, no delta ever.
     ///
-    /// The id-less kinds are listed explicitly rather than inferred from "reports no id",
-    /// because being name-keyed is only half of being supported: the module definition has to
-    /// carry the object so a delta can strip its pre-edit copy, and that has to be verified
-    /// per kind. <c>pagecustomization</c> and <c>entitlement</c> report a name too and are
-    /// deliberately NOT on the list — they keep taking the full-compile path until something
-    /// declares one and proves the round trip.
+    /// The id-less kinds are listed explicitly in <see cref="AlRunner.Rad.RadObjectKey"/> rather
+    /// than inferred from "reports no id", because being name-keyed is only half of being
+    /// supported: for a MODIFIED object the module definition has to carry it so a delta can
+    /// strip the pre-edit copy, and that has to be verified per kind. All six kinds AL gives no
+    /// id are on that list now; <c>entitlement</c> is the one with no serialized form at all,
+    /// which is safe for the opposite reason — there is no copy to shadow an edit.
     /// </summary>
     private static bool IsKeyable(NavCA.ISymbol symbol) =>
         symbol is NavCA.ISymbolWithId { Id: > 0 }
@@ -644,36 +898,108 @@ public sealed partial class BcCompiler
     /// rebuild. Their declarations are read off the syntax tree instead, which is all that
     /// is needed: a kind, a name and a file is the entire identity an id-less object has.</para>
     ///
-    /// <para>Other id-less kinds (<c>pagecustomization</c>, <c>entitlement</c>) are
-    /// deliberately not listed. They stay invisible and their files keep taking the
-    /// full-compile path — the behaviour that was there before. Adding one is a line in
-    /// <see cref="IdlessKindOf"/> plus a fixture that declares it.</para>
+    /// <para>An <c>entitlement</c> is the third, and the one with no serialized form at all —
+    /// <c>ModuleDefinition</c> has no <c>Entitlements</c> array. Reading it off the syntax is
+    /// therefore the ONLY way the workspace can know its file declares anything; without it,
+    /// deleting an entitlement looked exactly like a comment-only edit.</para>
+    ///
+    /// <para><c>pagecustomization</c> and <c>profileextension</c> are deliberately absent:
+    /// the symbol API DOES return them (as application objects reporting id 0), so they are
+    /// keyed from symbols like every other object and listing them here would register each
+    /// one twice.</para>
     /// </summary>
     private static IEnumerable<(string File, AlRunner.Rad.RadObjectRef Object)> IdlessDeclarations(
         IEnumerable<NavSyntax.SyntaxTree> trees)
     {
         foreach (var tree in trees)
         {
-            string? file;
-            NavCA.SyntaxNode root;
-            try
-            {
-                file = tree.FilePath;
-                if (string.IsNullOrEmpty(file)) continue;
-                if (tree.GetRoot() is not NavSyntax.CompilationUnitSyntax unit) continue;
-                root = unit;
-            }
-            catch { continue; }
-
-            foreach (var (node, ns) in TopLevelDeclarations(root, string.Empty))
+            if (FilePathOf(tree) is not string file) continue;
+            foreach (var (node, ns) in ObjectDeclarations(tree))
             {
                 if (IdlessKindOf(node) is not string kind) continue;
                 var name = UnquoteAlName(SyntaxName(node));
                 if (string.IsNullOrEmpty(name)) continue;
-                yield return (file!, new AlRunner.Rad.RadObjectRef(
+                yield return (file, new AlRunner.Rad.RadObjectRef(
                     AlRunner.Rad.RadObjectKey.For(kind, 0, name), name, ns));
             }
         }
+    }
+
+    private static string? FilePathOf(NavSyntax.SyntaxTree tree)
+    {
+        try { return tree.FilePath is { Length: > 0 } path ? path : null; }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Every top-level AL declaration in a parsed file, with its enclosing namespace.
+    ///
+    /// <para><c>ObjectSyntax</c> is the base type of ALL of them — the id-bearing kinds through
+    /// <c>ApplicationObjectSyntax</c>, and <c>profile</c>, <c>interface</c>, <c>controladdin</c>,
+    /// <c>entitlement</c> and <c>dotnet</c> directly. Verified by reflecting on BC 28.1's syntax
+    /// hierarchy rather than inferred, because the two hierarchies disagree: a <c>profile</c> is
+    /// reported as an application object SYMBOL and is not an <c>ApplicationObjectSyntax</c>.</para>
+    ///
+    /// <para>That makes "this tree has no <c>ObjectSyntax</c> node" BC's own parser stating that
+    /// the file declares nothing — which is what a delta needs before it may skip such a file.
+    /// The absence of a SYMBOL says something weaker: an unidentifiable declaration looks the
+    /// same from there.</para>
+    /// </summary>
+    private static IEnumerable<(NavSyntax.ObjectSyntax Node, string Namespace)> ObjectDeclarations(
+        NavSyntax.SyntaxTree tree)
+    {
+        NavSyntax.CompilationUnitSyntax? unit;
+        try { unit = tree.GetRoot() as NavSyntax.CompilationUnitSyntax; }
+        catch { return []; }
+        if (unit == null) return [];
+        return TopLevelDeclarations(unit, string.Empty)
+            .Where(item => item.Node is NavSyntax.ObjectSyntax)
+            .Select(item => ((NavSyntax.ObjectSyntax)item.Node, item.Namespace));
+    }
+
+    /// <summary>
+    /// Whether the delta path knows how to identify a declaration of this shape — i.e. whether
+    /// one of its two discovery routes (a compiler symbol, or <see cref="IdlessDeclarations"/>)
+    /// is expected to return it.
+    ///
+    /// <para>The list is complete for BC 28.1 and is a guard, not a lookup: an AL kind a future
+    /// compiler adds arrives here as an unrecognised <c>ObjectSyntax</c> node and takes the
+    /// full-compile path, instead of being silently skipped as a file that declares nothing.</para>
+    /// </summary>
+    private static bool IsRecognisedDeclaration(NavSyntax.ObjectSyntax node) =>
+        node is NavSyntax.ApplicationObjectSyntax    // every id-bearing kind, pagecustomization, profileextension
+             or NavSyntax.ProfileSyntax              // a symbol reporting id 0 — but not an ApplicationObjectSyntax
+             or NavSyntax.InterfaceSyntax
+             or NavSyntax.ControlAddInSyntax
+             or NavSyntax.EntitlementSyntax
+             or NavSyntax.DotNetPackageSyntax;       // recognised, and always a full compile — see RadFileDeclarations
+
+    /// <summary>
+    /// The per-file record a later delta consults for the files this compile is about to
+    /// commit: which declared a <c>dotnet</c> package, and which declared more than the
+    /// object map could record. Only such files get an entry — on a real app that is almost
+    /// none of them.
+    /// </summary>
+    private static Dictionary<string, AlRunner.Rad.RadFileDeclarations> MapFileDeclarations(
+        IEnumerable<NavSyntax.SyntaxTree> trees,
+        IReadOnlyDictionary<string, List<AlRunner.Rad.RadObjectRef>> objectsByFile)
+    {
+        var map = new Dictionary<string, AlRunner.Rad.RadFileDeclarations>(StringComparer.Ordinal);
+        foreach (var tree in trees)
+        {
+            if (FilePathOf(tree) is not string file) continue;
+            var declarations = ObjectDeclarations(tree).Select(item => item.Node).ToList();
+            var packages = declarations.Count(node => node is NavSyntax.DotNetPackageSyntax);
+            // Counting is what catches a key CLAIMED BY TWO FILES: neither node classification
+            // nor the symbol API reports that, but the object map drops one of the two, so the
+            // file's recorded objects come up short of what it declares.
+            var recorded = objectsByFile.TryGetValue(file, out var objects) ? objects.Count : 0;
+            var record = new AlRunner.Rad.RadFileDeclarations(
+                DotNetPackage: packages > 0,
+                Unrecorded: declarations.Count - packages != recorded);
+            if (record != default) map[file] = record;
+        }
+        return map;
     }
 
     /// <summary>
@@ -702,6 +1028,7 @@ public sealed partial class BcCompiler
     {
         NavSyntax.InterfaceSyntax => "Interface",
         NavSyntax.ControlAddInSyntax => "ControlAddIn",
+        NavSyntax.EntitlementSyntax => "Entitlement",
         _ => null,
     };
 

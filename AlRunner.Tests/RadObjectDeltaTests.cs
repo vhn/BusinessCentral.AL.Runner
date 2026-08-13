@@ -361,18 +361,26 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     }
 
     /// <summary>
-    /// The other direction, and the reason the fallback still exists: a kind the workspace
-    /// cannot identify at all must NOT be deltaed. `pagecustomization` is id-less like a
-    /// controladdin, but nothing reports it — so its file looks untracked, and a delta there
-    /// would let a deletion pass for a comment-only edit while the old object survived in the
-    /// baseline. Falling back is correct; silently continuing is not.
+    /// A file that declares no AL object — a new empty one, a comment-only one — costs NO
+    /// compiler work over its whole life: created, edited, deleted, all three are deltas that
+    /// emit nothing and reload nothing.
     ///
-    /// If `pagecustomization` ever becomes trackable, this test is the one that says so — and
-    /// the levers in RadMetadataDeltaTests, which use it to reach the full-compile path, move
-    /// with it.
+    /// <para>Each of those used to be a whole-module rebuild, on the grounds that "the
+    /// workspace has no objects for this path" is also what an unidentifiable declaration
+    /// looks like. It is not the same thing, and the difference is now recorded rather than
+    /// inferred: BC's parser answers "declares nothing" positively (no `ObjectSyntax` node in
+    /// the tree), and the workspace carries a per-file note for the files whose declarations a
+    /// compile could NOT fully record — see
+    /// <see cref="AFileTheWorkspaceCouldNotFullyRecord_StillForcesAFullCompile"/> and
+    /// <see cref="AFileDeclaringADotNetPackage_StillForcesAFullCompile"/>, which are the two
+    /// cases that must stay on the full-compile path.</para>
+    ///
+    /// <para>The claim is exact: zero emitted sources, an empty change set, every one of the
+    /// twenty baseline types still the identical <see cref="Type"/> instance, and not one
+    /// full-recompile note recorded for the developer to read.</para>
     /// </summary>
     [Fact]
-    public void AddingAnUntrackedObjectKind_FallsBackToAFullCompile()
+    public void AFileThatDeclaresNoObject_CostsNoCompilerWork_WhenAddedEditedOrDeleted()
     {
         if (!engine.Ready)
         {
@@ -386,35 +394,178 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             using var identity = BcCompiler.ScopeCurrentAppIdentity(
                 RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
             var baseline = RadFixture.Seed(tempRoot);
+            AlRunner.Rad.RadCycleNotes.Drain();   // whatever the seed cycle left behind
 
-            File.WriteAllText(
-                RadFixture.SourceFile(tempRoot, "RadPerfCust.PageCust.al"),
-                """
-                namespace AlRunner.Tests.RadTwentyObject;
+            var file = RadFixture.WriteDeclarationlessFile(tempRoot, "created");
+            AssertNoCompilerWork(baseline, tempRoot, "adding");
 
-                pagecustomization "RAD Perf Header Cust" customizes "RAD Perf Header Card"
-                {
-                    layout
-                    {
-                        modify(Description) { Visible = false; }
-                    }
-                }
-                """);
+            RadFixture.WriteDeclarationlessFile(tempRoot, "edited");
+            AssertNoCompilerWork(baseline, tempRoot, "editing");
 
-            var fallback = baseline.Cycle(tempRoot);
-            Assert.True(fallback.FullRebuild,
-                "an untracked object kind must force a full compile, not a partial delta");
-            Assert.False(fallback.NoChange);
-            Assert.True(fallback.Emit.Diagnostics.Count == 0,
-                string.Join(Environment.NewLine, fallback.Emit.Diagnostics));
-            // "Full" means the untouched objects came back too, not just the new file.
-            Assert.True(fallback.Emit.Sources.Count >= RadFixture.ObjectCount,
-                $"a full compile emitted only {fallback.Emit.Sources.Count} object(s)");
-            Assert.Contains("RAD Perf Service", RadFixture.EmittedNames(fallback));
+            File.Delete(file);
+            AssertNoCompilerWork(baseline, tempRoot, "deleting");
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
 
-            fallback.Commit(
+    /// <summary>
+    /// One cycle over a file that declares nothing: a delta that compiles nothing, replaces
+    /// nothing, explains nothing to the developer — and leaves the tree settled, so the file
+    /// is not re-detected as changed on the cycle after.
+    /// </summary>
+    private static void AssertNoCompilerWork(SeededBaseline baseline, string tempRoot, string operation)
+    {
+        var cycle = baseline.Cycle(tempRoot);
+        Assert.False(cycle.FullRebuild, $"{operation} a file that declares no object rebuilt the module");
+        Assert.False(cycle.NoChange, $"{operation} a file must be seen as a change at all");
+        Assert.True(cycle.Emit.Diagnostics.Count == 0,
+            string.Join(Environment.NewLine, cycle.Emit.Diagnostics));
+        Assert.Empty(cycle.Emit.Sources);
+        Assert.Empty(cycle.Changes.Added);
+        Assert.Empty(cycle.Changes.Modified);
+        Assert.Empty(cycle.Changes.Removed);
+        // Nothing to tell the developer: the yellow "full recompile" panel must stay absent.
+        Assert.Empty(AlRunner.Rad.RadCycleNotes.Drain());
+
+        cycle.Commit(baseline.Workspace, assembly: null);
+        Assert.Single(baseline.Workspace.Generations);
+        baseline.AssertOwnership(owner: null, moved: []);
+        baseline.AssertSettled(tempRoot);
+    }
+
+    /// <summary>
+    /// The one file shape that declares no AL object and still gets the whole module. A
+    /// `dotnet` package publishes the types every object in the app binds against, and a RAD
+    /// object compilation carries no package declaration trees at all — `MergeRadBaseline`
+    /// restores the previously committed `DotNetPackages` wholesale, so a delta over an edited
+    /// one would compile against the packages as they were.
+    ///
+    /// Asserted in both directions, because they reach the rule differently: declaring one is
+    /// read off the changed file's syntax, while DELETING one can only come from the per-file
+    /// record the previous compile left behind — there is no file left to parse.
+    /// </summary>
+    [Fact]
+    public void AFileDeclaringADotNetPackage_StillForcesAFullCompile()
+    {
+        if (!engine.Ready)
+        {
+            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
+            return;
+        }
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            var baseline = RadFixture.Seed(tempRoot);
+            AlRunner.Rad.RadCycleNotes.Drain();
+
+            var packages = RadFixture.WriteDotNetPackageFile(tempRoot, "RadPerfBuilder");
+            var added = baseline.Cycle(tempRoot);
+            Assert.True(added.FullRebuild, "declaring a dotnet package must rebuild the module");
+            // And it says so, naming the file — an unexplained whole-module rebuild is
+            // indistinguishable from the delta path being broken.
+            Assert.Contains(
+                $"{Path.GetFileName(packages)} declares a dotnet package",
+                string.Join(" | ", AlRunner.Rad.RadCycleNotes.Drain()));
+            Assert.True(added.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, added.Emit.Diagnostics));
+            Assert.True(added.Emit.Sources.Count >= RadFixture.ObjectCount,
+                $"a full compile emitted only {added.Emit.Sources.Count} object(s)");
+            added.Commit(
                 baseline.Workspace,
-                RadFixture.AssembleAndLoad(baseline.Workspace, fallback.Emit.Sources));
+                RadFixture.AssembleAndLoad(baseline.Workspace, added.Emit.Sources));
+            baseline.AssertSettled(tempRoot);
+
+            // Now delete it. Nothing is left to parse, so this can only be answered from what
+            // the full compile recorded about the file.
+            File.Delete(packages);
+            var deleted = baseline.Cycle(tempRoot);
+            Assert.True(deleted.FullRebuild, "deleting a dotnet package declaration must rebuild the module");
+            Assert.Contains(
+                $"{Path.GetFileName(packages)} declares a dotnet package",
+                string.Join(" | ", AlRunner.Rad.RadCycleNotes.Drain()));
+            Assert.True(deleted.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, deleted.Emit.Diagnostics));
+            deleted.Commit(
+                baseline.Workspace,
+                RadFixture.AssembleAndLoad(baseline.Workspace, deleted.Emit.Sources));
+            baseline.AssertSettled(tempRoot);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The guard that makes the delta above safe. A file the workspace could not fully record
+    /// — a declaration with no usable key, or one whose key a second file also claimed, both of
+    /// which `MapObjectsToFiles` drops rather than guess at — must NOT be read as a file that
+    /// declares nothing. Emptying such a file would otherwise pass for a comment-only edit
+    /// while the object's symbol survived in the baseline.
+    ///
+    /// <para>The state is driven in through the workspace rather than through AL source,
+    /// because no valid AL produces it: a duplicate id or name is a compile error, so a full
+    /// compile clean enough to become a baseline cannot contain one. That is the reason this
+    /// is a guard rather than a live path — and the reason it needs a test, since nothing else
+    /// would notice it being dropped.</para>
+    /// </summary>
+    [Fact]
+    public void AFileTheWorkspaceCouldNotFullyRecord_StillForcesAFullCompile()
+    {
+        if (!engine.Ready)
+        {
+            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
+            return;
+        }
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            var baseline = RadFixture.Seed(tempRoot);
+            AlRunner.Rad.RadCycleNotes.Drain();
+
+            // The workspace now believes it never learned what this file declares.
+            var opaque = RadFixture.SourceFile(tempRoot, "RadPerfUnrelatedA.Codeunit.al");
+            baseline.Workspace.Commit(new RadWorkspaceUpdate(
+                RadWorkspace.HashSourceTree(
+                    Directory.EnumerateFiles(tempRoot, "*.al", SearchOption.AllDirectories).ToList()),
+                new Dictionary<string, List<RadObjectRef>>
+                {
+                    [opaque] = baseline.Workspace.ObjectsIn(opaque).ToList(),
+                },
+                new Dictionary<string, RadFileDeclarations>
+                {
+                    [opaque] = new(DotNetPackage: false, Unrecorded: true),
+                },
+                new Dictionary<RadObjectKey, HashSet<RadObjectKey>>(),
+                new Dictionary<RadObjectKey, RadObjectKey>(),
+                Array.Empty<RadObjectKey>(),
+                baseline.Workspace.Baseline!,
+                Full: false));
+
+            File.AppendAllText(opaque, "// touched\n");
+            var cycle = baseline.Cycle(tempRoot);
+            Assert.True(cycle.FullRebuild,
+                "a file whose declarations were never recorded must not be deltaed");
+            Assert.Contains(
+                $"{Path.GetFileName(opaque)} declared something the last full compile could not identify",
+                string.Join(" | ", AlRunner.Rad.RadCycleNotes.Drain()));
+            Assert.True(cycle.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, cycle.Emit.Diagnostics));
+
+            cycle.Commit(
+                baseline.Workspace,
+                RadFixture.AssembleAndLoad(baseline.Workspace, cycle.Emit.Sources));
+            // …and the full compile clears the note: the next edit to that file deltas again.
+            Assert.Equal(default, baseline.Workspace.DeclarationsIn(opaque));
             baseline.AssertSettled(tempRoot);
         }
         finally
@@ -429,9 +580,17 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// dependencies, or its preprocessor symbols — and every cached object was bound against
     /// a picture that no longer holds, so the workspace must invalidate rather than emit an
     /// overlay that silently disagrees with the module its dependents compiled against.
+    ///
+    /// It also has to SAY which facet moved, naming `app.json`. Switching a git branch usually
+    /// switches `app.json` with it, and that is the common way a warm watch loses its baseline —
+    /// a cycle that silently costs minutes instead of a second reads as the delta path being
+    /// broken rather than as the developer's own branch switch. The reason is asserted through
+    /// `RadCycleNotes` rather than through the log line because the interactive dashboard
+    /// redirects stderr to `TextWriter.Null` while the bundle loop runs, so the note is the
+    /// only form of it the developer ever sees.
     /// </summary>
     [Fact]
-    public void ChangingTheReferenceSurface_InvalidatesTheBaseline()
+    public void ChangingTheReferenceSurface_InvalidatesTheBaseline_AndSaysWhichFacetMoved()
     {
         if (!engine.Ready)
         {
@@ -455,9 +614,13 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             using (BcCompiler.ScopeCurrentAppIdentity(
                 RadFixture.AppId, RadFixture.Publisher, new Version(1, 0, 0, 1)))
             {
+                AlRunner.Rad.RadCycleNotes.Drain();   // whatever the seed cycle left behind
                 var rebuilt = baseline.Cycle(tempRoot);
                 Assert.True(rebuilt.FullRebuild,
                     "a version change left the delta path armed against a stale baseline");
+                Assert.Contains(
+                    "app.json changed the app version: 1.0.0.0 → 1.0.0.1",
+                    string.Join(" | ", AlRunner.Rad.RadCycleNotes.Drain()));
                 Assert.True(rebuilt.Emit.Diagnostics.Count == 0,
                     string.Join(Environment.NewLine, rebuilt.Emit.Diagnostics));
                 Assert.Equal(RadFixture.ObjectCount, rebuilt.Emit.Sources.Count);

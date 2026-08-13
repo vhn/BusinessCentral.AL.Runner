@@ -717,6 +717,11 @@ var assembler = new BcAssembler();
 var executor = new TestExecutor { Isolation = isolation, TestFilter = testFilter, TimeoutSeconds = testTimeoutSeconds, Expectations = expectations };
 var depLoader = new DependencyLoader(emitter, assembler);
 var results = new List<BucketResult>();
+// Why an app rebuilt in full rather than deltaing, for the cycle currently on screen. Held
+// alongside `results` because the dashboard is repainted on every scroll keypress, not only at
+// the end of a cycle — draining the collector at paint time would show the notes once and then
+// blank them. Populated after the bundle loop restores the console streams.
+var fullCompileNotes = new List<string>();
 
 // ── Layered source build pre-pass ─────────────────────────────────────────
 // When multiple bundles are passed and one depends on another (by AppId or
@@ -794,7 +799,7 @@ List<string> RenderDashboardLines(WatchStatus status, DateTime ts, TimeSpan dur)
         Out = new Spectre.Console.AnsiConsoleOutput(sw),
     });
     rec.Profile.Width = width;
-    rec.Write(WatchDashboard.Build(results, watchBundleName, status, ts, dur));
+    rec.Write(WatchDashboard.Build(results, watchBundleName, status, ts, dur, fullCompileNotes));
     return sw.ToString().Replace("\r\n", "\n").TrimEnd('\n').Split('\n').ToList();
 }
 
@@ -862,6 +867,8 @@ var drainedPaths = sourceWatch?.DrainChangedPaths();
 var cycleChangedPaths = drainedPaths ?? new List<string>();
 bool changedPathsComplete = sourceWatch == null || drainedPaths != null;
 results.Clear();
+fullCompileNotes.Clear();
+AlRunner.Rad.RadCycleNotes.Drain();   // discard anything left over from the previous cycle
 // Clean loading (#5): the interactive dashboard owns the whole screen, but the
 // run-cycle body emits diagnostic Console.WriteLine noise ("[bundle] resolved N
 // dep(s)", "loaded N assembl(ies)", "[i/N] … suites", …) that would scroll over
@@ -1486,7 +1493,7 @@ foreach (var bundle in bundles)
                 // identity — which is what makes event-subscriber dispatch resolve against
                 // the wrong Type (see the module-identity dedup comment above).
                 reusedAsm = radWs.Generations[^1];
-                Console.Error.WriteLine($"  [rad] {moduleName}: unchanged — reusing the loaded module");
+                Console.Error.WriteLine($"  [watch] {moduleName}: unchanged — reusing the loaded module");
             }
             else if (sources.Count > 0)
             {
@@ -1514,7 +1521,7 @@ foreach (var bundle in bundles)
                     assemblyBytes = compile.AssemblyBytes;
                     if (radOverlay)
                         Console.Error.WriteLine(
-                            $"  [rad] {moduleName}: overlay {asmName} — {sources.Count} object(s), " +
+                            $"  [watch] {moduleName}: overlay {asmName} — {sources.Count} object(s), " +
                             $"{assemblyBytes!.Length / 1024}KB ({ct.ElapsedMilliseconds}ms)");
                     // An overlay is NOT the module: caching it under the whole-module key
                     // would serve a fragment to the next cold process.
@@ -1864,6 +1871,10 @@ if (stdoutSilenced)
     Console.SetError(savedErr);
     stdoutSilenced = false;
 }
+
+// Collected here rather than logged: the `[watch]` lines carrying these reasons were written to
+// the stderr just restored above, i.e. to TextWriter.Null. See RadCycleNotes.
+fullCompileNotes.AddRange(AlRunner.Rad.RadCycleNotes.Drain());
 
 if (!watchMode)
     break;   // normal mode: one pass, fall through to the summary below

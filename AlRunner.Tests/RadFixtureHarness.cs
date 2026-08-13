@@ -144,6 +144,52 @@ internal static class RadFixture
 
     internal static string SourceFile(string tempRoot, string fileName) =>
         Path.Combine(tempRoot, "src", fileName);
+
+    /// <summary>
+    /// An `.al` file declaring no AL object. Adding, editing or deleting one is the cheapest
+    /// change a watch cycle can see: no object moved, so no compiler runs at all.
+    /// </summary>
+    internal static string WriteDeclarationlessFile(string tempRoot, string comment)
+    {
+        var path = SourceFile(tempRoot, "RadPerfNoDeclaration.al");
+        File.WriteAllText(path, $"// {comment}\n");
+        return path;
+    }
+
+    /// <summary>
+    /// A `dotnet` package declaration — the one file shape that declares no AL object and
+    /// still has to rebuild the module, because the types it publishes are what every object
+    /// in the app binds against and a RAD object compilation carries no package declaration
+    /// trees at all.
+    /// </summary>
+    internal static string WriteDotNetPackageFile(string tempRoot, string typeAlias)
+    {
+        var path = SourceFile(tempRoot, "RadPerfPackages.al");
+        File.WriteAllText(
+            path,
+            "dotnet\n{\n    assembly(System.Runtime)\n    {\n" +
+            $"        type(System.Text.StringBuilder; {typeAlias}) {{ }}\n" +
+            "    }\n}\n");
+        return path;
+    }
+
+    /// <summary>
+    /// Force the next cycle down the full-compile path, for the suites whose claim is about
+    /// what a full compile DOES rather than about what triggers one. The lever is the `dotnet`
+    /// package file: it used to be a file declaring no object, back when that still fell back.
+    ///
+    /// <para>It has to be an AL edit that reaches <c>FullCompileBecause</c>, NOT
+    /// <c>RadWorkspace.Invalidate</c>, even though the latter reads as the more direct way to
+    /// say "compile in full". Invalidating also clears the object map, and a full compile
+    /// reached that way can no longer drop the metadata of an object the developer DELETED —
+    /// which is the very thing those suites assert. Measured: both of them go green against an
+    /// empty diff, i.e. they stop testing anything.</para>
+    ///
+    /// <para>Pinned by RadObjectDeltaTests.AFileDeclaringADotNetPackage_StillForcesAFullCompile.
+    /// If that ever becomes a delta, every caller of this helper moves with it.</para>
+    /// </summary>
+    internal static string ForceFullCompile(string tempRoot) =>
+        WriteDotNetPackageFile(tempRoot, "RadPerfFullCompileLever");
 }
 
 /// <summary>The committed first-cycle state a warm RAD edit starts from.</summary>

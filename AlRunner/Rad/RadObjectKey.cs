@@ -26,6 +26,17 @@ public readonly record struct RadObjectKey(string Kind, int Id, string Name = ""
     /// enumextension, …). What such an object contributes — fields, controls, values —
     /// is only visible on its TARGET, which makes it the one kind the delta cannot strip
     /// from the packaged baseline. See BcCompiler.DeltaCompile.
+    ///
+    /// <para>This is a test on the KIND NAME, and <c>pagecustomization</c> is deliberately on
+    /// the other side of it even though the compiler reports one as an
+    /// <c>IApplicationObjectExtensionTypeSymbol</c> targeting a page. The exemption exists for
+    /// objects that declare something they then reference through the target — the AL0132s a
+    /// stripped tableextension produced against fields declared in its own file. A
+    /// pagecustomization declares nothing bindable: a <c>modify()</c> names a control the
+    /// target page already has, and the target page's symbol resolves from the baseline
+    /// whether or not the customization is stripped alongside it. Measured both ways by
+    /// RadIdlessObjectTests.ModifyingAnIdLessObject_LeavesOneBaselineCopy_CarryingTheNewShape,
+    /// which fails if stripping breaks the bind AND if not stripping shadows the edit.</para>
     /// </summary>
     public bool IsExtension => Kind.EndsWith("Extension", StringComparison.Ordinal);
 
@@ -37,12 +48,16 @@ public readonly record struct RadObjectKey(string Kind, int Id, string Name = ""
     /// <summary>
     /// Whether compiling this object produces a generated C# source.
     ///
-    /// <para>The id-less kinds do not: an <c>interface</c> is a binding-time contract, a
-    /// <c>controladdin</c> and a <c>profile</c> are metadata. They contribute symbols to the
-    /// module and nothing to the assembly, which is why a delta consisting only of id-less
-    /// objects legitimately compiles no C# at all. The delta path compares the emitted count
-    /// against this, so a kind misclassified here costs a fallback to a full compile — never
-    /// a wrong module.</para>
+    /// <para>The id-less kinds do not: an <c>interface</c> is a binding-time contract, and a
+    /// <c>controladdin</c>, <c>profile</c>, <c>pagecustomization</c>, <c>profileextension</c>
+    /// or <c>entitlement</c> is metadata. They contribute symbols to the module and nothing to
+    /// the assembly, which is why a delta consisting only of id-less objects legitimately
+    /// compiles no C# at all. The delta path compares the emitted count against this, so a
+    /// kind misclassified here costs a fallback to a full compile — never a wrong module.</para>
+    ///
+    /// <para>A <c>permissionset</c> is the counter-example worth remembering: it looks like
+    /// metadata and it DOES generate C#. It has a real object id, so it lands on the right
+    /// side of this test by id rather than by anyone remembering to special-case it.</para>
     /// </summary>
     public bool EmitsCode => !IsIdless;
 
@@ -58,15 +73,31 @@ public readonly record struct RadObjectKey(string Kind, int Id, string Name = ""
     /// fails to strip its own baseline copy — which surfaces as the pre-edit shape shadowing
     /// the edit (AL0582 against a member the source no longer declares).</para>
     ///
-    /// <para><c>pagecustomization</c> and <c>entitlement</c> have no id either and are
-    /// deliberately absent. Being name-keyed is only half of being supported: the module
-    /// definition must also carry the object so a delta can strip its pre-edit copy, and
-    /// <c>ModuleDefinition</c> has no array for either of them. They keep taking the
-    /// full-compile path until something declares one and proves the round trip — see
-    /// RadObjectDeltaTests.AddingAnUntrackedObjectKind_FallsBackToAFullCompile.</para>
+    /// <para>Being name-keyed is only half of being supported: for a MODIFIED object the
+    /// module definition must also carry it, so a delta can strip the pre-edit copy that
+    /// would otherwise shadow the supplied syntax. Five of these six kinds have an array in
+    /// <c>ModuleDefinition</c> (<c>Interfaces</c>, <c>ControlAddIns</c>, <c>Profiles</c>,
+    /// <c>PageCustomizations</c>, <c>ProfileExtensions</c>) and are stripped like any
+    /// id-bearing object.</para>
+    ///
+    /// <para><c>Entitlement</c> is the exception, and it is safe for the opposite reason:
+    /// there is no <c>Entitlements</c> array and no <c>EntitlementDefinition</c> type at all,
+    /// so an entitlement has no serialized copy that could shadow anything, and nothing
+    /// downstream can resolve one. It has no observable surface either, which is why
+    /// <c>RadIdlessObjectTests</c> proves it against a cold compile of the same tree rather
+    /// than against the baseline.</para>
+    ///
+    /// <para>What is NOT here: <c>dotnet</c> package declarations. They are not AL objects,
+    /// they change what every object in the module can bind to, and a RAD object compilation
+    /// carries no package declaration trees — the merge deliberately restores the previously
+    /// committed <c>DotNetPackages</c>. Such a file still gets the whole module, but by a rule
+    /// of its own rather than by declaring no object: a file that declares no object is now a
+    /// delta costing no compiler work at all. See <see cref="RadFileDeclarations"/> and
+    /// RadObjectDeltaTests.AFileDeclaringADotNetPackage_StillForcesAFullCompile.</para>
     /// </summary>
     public static bool IsIdlessKind(string kind) =>
-        kind is "Interface" or "ControlAddIn" or "Profile";
+        kind is "Interface" or "ControlAddIn" or "Profile"
+             or "PageCustomization" or "ProfileExtension" or "Entitlement";
 
     /// <summary>
     /// Build a key from what a compiler symbol, a syntax declaration or a serialized module

@@ -14,12 +14,12 @@ namespace AlRunner.Tests;
 public class WatchDashboardTests
 {
     private static string Render(IReadOnlyList<BucketResult> results, WatchStatus status,
-        DateTime ts, TimeSpan dur)
+        DateTime ts, TimeSpan dur, IReadOnlyList<string>? fullCompileNotes = null)
     {
         var console = new TestConsole();
         // Wide enough that the table columns aren't truncated away in the test.
         console.Profile.Width = 120;
-        console.Write(WatchDashboard.Build(results, "my-bundle", status, ts, dur));
+        console.Write(WatchDashboard.Build(results, "my-bundle", status, ts, dur, fullCompileNotes));
         return console.Output;
     }
 
@@ -175,5 +175,50 @@ public class WatchDashboardTests
         Assert.Contains("2P", output);
         Assert.Contains("0F", output);
         Assert.Contains("0E", output);
+    }
+
+    /// <summary>
+    /// Why a cycle rebuilt whole modules has to be ON this screen. The bundle loop redirects
+    /// both console streams to <c>TextWriter.Null</c> while it runs, so the `[watch]` lines
+    /// carrying the reason are discarded in exactly the mode a developer watches — a cycle that
+    /// cost four minutes looked identical to one that cost a second, with nothing to attribute
+    /// it to. The reason is the whole payload, so it is asserted verbatim rather than by the
+    /// panel's presence.
+    /// </summary>
+    [Fact]
+    public void Render_FullCompileNotes_ShowTheReasonAndTheApp()
+    {
+        var results = new List<BucketResult>
+        {
+            Bucket(new TestResult("A", "One", TestOutcome.Pass, null, null, TimeSpan.FromMilliseconds(5)))
+        };
+
+        var output = Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2),
+            ["NP Retail: app.json changed the app version: 1.0.0.0 → 1.0.1.0"]);
+
+        Assert.Contains("full recompile", output);
+        Assert.Contains("NP Retail", output);
+        Assert.Contains("app.json changed the app version", output);
+        // The results are still trustworthy — a full compile is slow, not wrong.
+        Assert.Contains("1P", output);
+    }
+
+    /// <summary>
+    /// And it is absent on an ordinary delta cycle. A panel that is always there stops carrying
+    /// information: the developer has to be able to read "no full recompile happened" off the
+    /// screen without parsing anything.
+    /// </summary>
+    [Fact]
+    public void Render_NoFullCompileNotes_OmitsThePanelEntirely()
+    {
+        var results = new List<BucketResult>
+        {
+            Bucket(new TestResult("A", "One", TestOutcome.Pass, null, null, TimeSpan.FromMilliseconds(5)))
+        };
+
+        Assert.DoesNotContain("full recompile",
+            Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2)));
+        Assert.DoesNotContain("full recompile",
+            Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2), []));
     }
 }

@@ -31,25 +31,54 @@ public static class WatchDashboard
 {
     /// <summary>
     /// Builds the full dashboard renderable: header (bundle · status · last-run
-    /// timestamp+duration), a per-codeunit tree of test procedures, and a footer with
-    /// P/F/E counts. Pure — no console side effects — so it is repaintable and testable.
+    /// timestamp+duration), the full-recompile notes for this cycle when there are any, a
+    /// per-codeunit tree of test procedures, and a footer with P/F/E counts. Pure — no console
+    /// side effects — so it is repaintable and testable.
     /// </summary>
+    /// <param name="fullCompileNotes">
+    /// Why an app rebuilt in full this cycle rather than deltaing — see
+    /// <see cref="Rad.RadCycleNotes"/>. Rendered because the bundle loop redirects stderr while
+    /// it runs, so the <c>[watch]</c> log lines that carry these reasons never reach this screen:
+    /// a cycle that suddenly cost minutes looked identical to one that cost a second.
+    /// </param>
     public static IRenderable Build(
         IReadOnlyList<BucketResult> results,
         string bundleName,
         WatchStatus status,
         DateTime lastRun,
-        TimeSpan lastDuration)
+        TimeSpan lastDuration,
+        IReadOnlyList<string>? fullCompileNotes = null)
     {
         var rows = new List<IRenderable>
         {
             Header(bundleName, status, lastRun, lastDuration),
             new Text(string.Empty),
-            BuildTree(results),
-            new Text(string.Empty),
-            Footer(results),
         };
+        if (fullCompileNotes is { Count: > 0 })
+        {
+            rows.Add(FullCompileNotes(fullCompileNotes));
+            rows.Add(new Text(string.Empty));
+        }
+        rows.Add(BuildTree(results));
+        rows.Add(new Text(string.Empty));
+        rows.Add(Footer(results));
         return new Rows(rows);
+    }
+
+    /// <summary>
+    /// The "this cycle was not a delta, and here is why" panel. Yellow rather than red: a full
+    /// compile is correct behaviour and the results below it are trustworthy — it is only slow.
+    /// </summary>
+    private static IRenderable FullCompileNotes(IReadOnlyList<string> notes)
+    {
+        var body = string.Join(
+            Environment.NewLine,
+            notes.Select(note => $"[yellow]·[/] [grey]{Markup.Escape(note)}[/]"));
+        return new Panel(new Markup(body))
+            .Header("[yellow]full recompile[/]")
+            .Border(BoxBorder.Rounded)
+            .BorderColor(Color.Yellow)
+            .Expand();
     }
 
     private static IRenderable Header(string bundleName, WatchStatus status,

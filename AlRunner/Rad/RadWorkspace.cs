@@ -8,6 +8,26 @@ namespace AlRunner.Rad;
 public sealed record RadObjectRef(RadObjectKey Key, string Name, string Namespace);
 
 /// <summary>
+/// What a file declared that the workspace's object map cannot express. Everything a compile
+/// fully recorded leaves this at its default, so the map holds an entry only for the rare file
+/// a delta may NOT assume it can skip.
+/// </summary>
+/// <param name="DotNetPackage">
+/// The file declares a <c>dotnet</c> package. Not an AL object, but it moves what every object
+/// in the module binds against, and a RAD object compilation carries no package declaration
+/// trees — <c>MergeRadBaseline</c> restores the previously committed <c>DotNetPackages</c>
+/// wholesale. So editing one, and equally DELETING one, has to rebuild the module; the deleted
+/// case is the reason this is remembered rather than read off the file each cycle.
+/// </param>
+/// <param name="Unrecorded">
+/// The file declared more than the compile could record for it — a declaration with no usable
+/// key, or one whose key another file also claimed. Without this flag such a file is
+/// indistinguishable from one that declares nothing, so emptying it would look like a
+/// comment-only edit while the object's symbol survived in the baseline.
+/// </param>
+public readonly record struct RadFileDeclarations(bool DotNetPackage, bool Unrecorded);
+
+/// <summary>
 /// Compiler state prepared by an AL emit but not made current until its generated C# has
 /// compiled and loaded successfully. Keeping this token separate prevents a rejected
 /// backend generation from advancing the next watch cycle's hashes or symbol baseline.
@@ -15,6 +35,7 @@ public sealed record RadObjectRef(RadObjectKey Key, string Name, string Namespac
 internal sealed record RadWorkspaceUpdate(
     Dictionary<string, string> FileHashes,
     IReadOnlyDictionary<string, List<RadObjectRef>> ObjectsByFile,
+    IReadOnlyDictionary<string, RadFileDeclarations> DeclarationsByFile,
     IReadOnlyDictionary<RadObjectKey, HashSet<RadObjectKey>> ReferencesByObject,
     IReadOnlyDictionary<RadObjectKey, RadObjectKey> ExtensionTargets,
     IReadOnlyCollection<RadObjectKey> RemovedObjects,
@@ -71,8 +92,28 @@ public sealed class RadWorkspace
 
     public bool HasBaseline => Baseline != null;
 
+    /// <summary>
+    /// A reason this workspace will have to compile in full that is known BEFORE the cycle that
+    /// pays for it. Failing to record a baseline makes every later cycle a full compile, and the
+    /// cycle that discovers the failure is not the cycle the developer watches rebuilding — so
+    /// the reason is parked here and consumed by the compile that acts on it.
+    ///
+    /// <para>Deliberately NOT used by the invalidation paths (a reference-surface change, the
+    /// overlay-chain reset, a missing loaded module): those call <see cref="Invalidate"/>, which
+    /// reports in the same cycle, and parking as well would say it twice.</para>
+    /// </summary>
+    internal string? PendingFullCompileReason { get; set; }
+
+    internal string? TakePendingFullCompileReason()
+    {
+        var reason = PendingFullCompileReason;
+        PendingFullCompileReason = null;
+        return reason;
+    }
+
     private readonly Dictionary<string, string> _fileHashes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<RadObjectRef>> _objectsByFile = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, RadFileDeclarations> _declarationsByFile = new(StringComparer.Ordinal);
     private readonly Dictionary<RadObjectKey, HashSet<RadObjectKey>> _referencesByObject = new();
     private readonly Dictionary<RadObjectKey, RadObjectKey> _extensionTargets = new();
 
@@ -83,10 +124,15 @@ public sealed class RadWorkspace
     public void Invalidate(string reason)
     {
         if (HasBaseline)
-            Console.Error.WriteLine($"  [rad] {ModuleName}: full rebuild — {reason}");
+        {
+            Console.Error.WriteLine($"  [watch] {ModuleName}: full rebuild — {reason}");
+            // …and where the watch dashboard can show it: the bundle loop silences stderr.
+            RadCycleNotes.FullCompile(ModuleName, reason);
+        }
         Baseline = null;
         _fileHashes.Clear();
         _objectsByFile.Clear();
+        _declarationsByFile.Clear();
         _referencesByObject.Clear();
         _extensionTargets.Clear();
         // Generations are deliberately kept: the assemblies are already loaded into the
@@ -98,10 +144,17 @@ public sealed class RadWorkspace
     /// Re-arm the workspace against <paramref name="signature"/>, invalidating if it moved.
     /// Returns true when the workspace can serve a delta.
     /// </summary>
-    public bool ArmFor(string signature)
+    /// <param name="describeChange">
+    /// Given the previous signature, the reason to report. Only the caller that builds the
+    /// signature knows how to read one, and a whole-module rebuild has to say which facet
+    /// moved — "app.json changed the app version" is recognisable; "the reference surface
+    /// changed" reads like the delta path failing.
+    /// </param>
+    public bool ArmFor(string signature, Func<string, string>? describeChange = null)
     {
         if (ReferenceSignature != null && !string.Equals(ReferenceSignature, signature, StringComparison.Ordinal))
-            Invalidate("the compilation's reference surface changed (dependencies, identity or preprocessor symbols)");
+            Invalidate(describeChange?.Invoke(ReferenceSignature)
+                ?? "the compilation's reference surface changed (dependencies, identity or preprocessor symbols)");
         ReferenceSignature = signature;
         return HasBaseline;
     }
@@ -153,6 +206,16 @@ public sealed class RadWorkspace
     public IReadOnlyList<RadObjectRef> ObjectsIn(string file) =>
         _objectsByFile.TryGetValue(file, out var list) ? list : Array.Empty<RadObjectRef>();
 
+    /// <summary>
+    /// What the previous compile saw in <paramref name="file"/> beyond the objects it could
+    /// record there. The default answer covers both a fully recorded file and one this
+    /// workspace has never seen — for a file that did not exist, "it declared nothing" is
+    /// the truth rather than an assumption, which is what lets a delta accept a NEW file
+    /// that declares no object instead of rebuilding the module for it.
+    /// </summary>
+    internal RadFileDeclarations DeclarationsIn(string file) =>
+        _declarationsByFile.TryGetValue(file, out var declarations) ? declarations : default;
+
     public bool Declares(RadObjectKey key) =>
         _objectsByFile.Values.Any(list => list.Any(o => o.Key == key));
 
@@ -165,6 +228,17 @@ public sealed class RadWorkspace
 
     internal string? FileOf(RadObjectKey key) =>
         _objectsByFile.FirstOrDefault(pair => pair.Value.Any(item => item.Key == key)).Key;
+
+    /// <summary>
+    /// Every file declaring an object of <paramref name="kind"/>. Used for the two AL kinds
+    /// whose relationship the dependency graph cannot express — see
+    /// BcCompiler.DeltaCompile's entitlement handling — where the population is small enough
+    /// by construction that "all of them" is cheaper than recording which named what.
+    /// </summary>
+    internal IReadOnlyList<string> FilesDeclaring(string kind) => _objectsByFile
+        .Where(pair => pair.Value.Any(item => string.Equals(item.Key.Kind, kind, StringComparison.Ordinal)))
+        .Select(pair => pair.Key)
+        .ToArray();
 
     internal IReadOnlyList<RadObjectKey> DirectUsersOf(IEnumerable<RadObjectKey> targets)
     {
@@ -187,6 +261,7 @@ public sealed class RadWorkspace
         if (update.Full)
         {
             _objectsByFile.Clear();
+            _declarationsByFile.Clear();
             _referencesByObject.Clear();
             _extensionTargets.Clear();
         }
@@ -197,9 +272,18 @@ public sealed class RadWorkspace
             if (objs.Count == 0) _objectsByFile.Remove(path);
             else _objectsByFile[path] = objs;
         }
-        // Files that vanished from the tree take their object mapping with them.
+        // A delta re-reads exactly the files it touched, so within that scope its answer is
+        // the whole answer: clear first, then record only what it found. Recording without
+        // clearing would keep a stale flag alive for a file that no longer earns one.
+        if (!update.Full)
+            foreach (var path in update.ObjectsByFile.Keys) _declarationsByFile.Remove(path);
+        foreach (var (path, declarations) in update.DeclarationsByFile)
+            _declarationsByFile[path] = declarations;
+        // Files that vanished from the tree take their per-file record with them.
         foreach (var gone in _objectsByFile.Keys.Where(p => !update.FileHashes.ContainsKey(p)).ToList())
             _objectsByFile.Remove(gone);
+        foreach (var gone in _declarationsByFile.Keys.Where(p => !update.FileHashes.ContainsKey(p)).ToList())
+            _declarationsByFile.Remove(gone);
 
         var refreshed = update.ObjectsByFile.Values.SelectMany(items => items)
             .Select(item => item.Key)
@@ -216,6 +300,9 @@ public sealed class RadWorkspace
             _extensionTargets[extension] = target;
 
         Baseline = update.Baseline;
+        // A recorded baseline retires any parked "you have no baseline" reason, so it cannot be
+        // reported against some unrelated future full compile.
+        PendingFullCompileReason = null;
     }
 }
 
@@ -253,19 +340,47 @@ public static class RadWorkspaceStore
     {
         var root = Path.GetFullPath(bundleRoot).TrimEnd(Path.DirectorySeparatorChar);
         var workspaces = _byKey.Values.Where(ws => IsWithin(ws.SourceRoot, root)).ToList();
-        bool preserve = singleBundle
-            && workspaces.Count > 0
-            && workspaces.All(ws => ws.HasBaseline)
-            && changedPaths.Where(path => IsWithin(path, root)).All(path =>
-            {
-                var owner = workspaces.FirstOrDefault(ws => IsWithin(path, ws.SourceRoot));
-                return owner != null
-                    && string.Equals(Path.GetExtension(path), ".al", StringComparison.OrdinalIgnoreCase);
-            });
-        if (!preserve)
+
+        // Say which of the four conditions blocked the warm reload, and for the common one say
+        // which file. A branch switch that carries a different app.json lands here as well as
+        // in ArmFor, and "clean metadata refresh" told the developer nothing about why the run
+        // they were watching suddenly cost minutes.
+        var blockers = new List<string>();
+        if (!singleBundle)
+            blockers.Add("this run has more than one bundle, so metadata cannot be kept warm");
+        if (workspaces.Count == 0)
+            blockers.Add("no delta workspace is warm for this bundle yet");
+        else if (workspaces.Any(ws => !ws.HasBaseline))
+            blockers.Add(
+                $"{workspaces.Count(ws => !ws.HasBaseline)} app(s) in the bundle have no baseline");
+        // Two different blockers, kept apart because they read as different problems and the
+        // first one is almost always `app.json`.
+        var inBundle = changedPaths.Where(path => IsWithin(path, root)).ToList();
+        var notAlSource = Names(inBundle.Where(path =>
+            !string.Equals(Path.GetExtension(path), ".al", StringComparison.OrdinalIgnoreCase)));
+        var unownedAl = Names(inBundle.Where(path =>
+            string.Equals(Path.GetExtension(path), ".al", StringComparison.OrdinalIgnoreCase)
+            && !workspaces.Any(ws => IsWithin(path, ws.SourceRoot))));
+        if (notAlSource.Count > 0)
+            blockers.Add($"{List(notAlSource)} changed — not AL source, so warm metadata cannot be kept");
+        if (unownedAl.Count > 0)
+            blockers.Add($"{List(unownedAl)} changed — AL source that no warm app in this bundle owns");
+
+        if (blockers.Count > 0)
             foreach (var ws in workspaces)
-                ws.Invalidate("the bundle needs a clean metadata refresh");
-        return preserve;
+                ws.Invalidate(string.Join("; ", blockers));
+        return blockers.Count == 0;
+
+        static List<string> Names(IEnumerable<string> paths) => paths
+            .Select(Path.GetFileName)
+            .OfType<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        // Named files, capped: the point is recognition, and a branch switch can touch hundreds.
+        static string List(List<string> names) =>
+            string.Join(", ", names.Take(3))
+            + (names.Count > 3 ? $" (+{names.Count - 3} more)" : string.Empty);
     }
 
     private static bool IsWithin(string path, string root)

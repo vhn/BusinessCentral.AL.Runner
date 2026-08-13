@@ -26,7 +26,6 @@ public static class ModuleDefinitionOps
             ["EnumExtensionTypes"] = "EnumExtension",
             ["PermissionSets"] = "PermissionSet",
             ["PermissionSetExtensions"] = "PermissionSetExtension",
-            ["Entitlements"] = "Entitlement",
             // The id-less kinds. They are in the module definition like any other object —
             // which is what lets a changed codeunit still resolve an interface it implements
             // from the packaged baseline — so a MODIFIED one has to be stripped from it just
@@ -36,6 +35,13 @@ public static class ModuleDefinitionOps
             ["Interfaces"] = "Interface",
             ["ControlAddIns"] = "ControlAddIn",
             ["Profiles"] = "Profile",
+            ["PageCustomizations"] = "PageCustomization",
+            ["ProfileExtensions"] = "ProfileExtension",
+            // No "Entitlements". Not an omission: `ModuleDefinition` has no such property and
+            // the compiler has no `EntitlementDefinition` type, so an entitlement has no
+            // serialized copy to strip, to fingerprint, or to shadow an edit with. This map
+            // previously claimed one, which cost nothing only because `GetProperty` returned
+            // null and the loop skipped it silently.
         };
 
     private static readonly ConcurrentDictionary<Type, PropertyInfo?> _nameProperties = new();
@@ -139,27 +145,45 @@ public static class ModuleDefinitionOps
         NavSymRef.ModuleDefinition module,
         RadObjectKey key)
     {
-        var property = _kindByArrayProperty.FirstOrDefault(pair => pair.Value == key.Kind).Key;
-        if (property == null) return null;
-        var element = FindElement(module, property, key);
+        var element = FindElements(module, key).FirstOrDefault();
         return element == null
             ? null
             : System.Text.Json.JsonSerializer.Serialize(element, element.GetType());
     }
 
-    private static object? FindElement(object container, string arrayProperty, RadObjectKey key)
+    /// <summary>
+    /// How many serialized elements in <paramref name="module"/> answer to
+    /// <paramref name="key"/>.
+    ///
+    /// <para>A merged baseline must hold at most one per key. Two mean a delta failed to
+    /// strip its own pre-edit definition, and which of them a later compile resolves is then
+    /// decided by array order rather than by the edit — so the cycle can go green on the
+    /// stale shape. <see cref="ObjectSurfaceFingerprint"/> cannot see that: it answers with
+    /// the first match, which is as likely to be the new copy as the old one. The RAD suites
+    /// assert this count directly for exactly that reason.</para>
+    /// </summary>
+    public static int CountObjects(NavSymRef.ModuleDefinition module, RadObjectKey key) =>
+        FindElements(module, key).Count();
+
+    private static IEnumerable<object> FindElements(object container, RadObjectKey key)
+    {
+        var arrayProperty = _kindByArrayProperty.FirstOrDefault(pair => pair.Value == key.Kind).Key;
+        return arrayProperty == null
+            ? Enumerable.Empty<object>()
+            : Elements(container, arrayProperty, key);
+    }
+
+    private static IEnumerable<object> Elements(object container, string arrayProperty, RadObjectKey key)
     {
         var type = container.GetType();
         if (type.GetProperty(arrayProperty)?.GetValue(container) is Array items)
             foreach (var item in items)
-                if (item != null && KeyOf(item, key.Kind) == key) return item;
+                if (item != null && KeyOf(item, key.Kind) == key) yield return item;
         if (type.GetProperty("Namespaces")?.GetValue(container) is Array namespaces)
             foreach (var child in namespaces)
             {
                 if (child == null) continue;
-                var hit = FindElement(child, arrayProperty, key);
-                if (hit != null) return hit;
+                foreach (var hit in Elements(child, arrayProperty, key)) yield return hit;
             }
-        return null;
     }
 }

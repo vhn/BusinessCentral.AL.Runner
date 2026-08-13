@@ -226,9 +226,9 @@ public class WatchTests
             var cycle2 = Segment(m1 + 1, m2);
             Assert.Contains("FAIL", cycle2);
             Assert.Contains("Insert_OnInsertReadsXRec_BuildsConcreteBeforeImage", cycle2);
-            Assert.Contains("[rad] Runner Tests Fixture - Record Trigger xRec: delta +0 ~1 -0", cycle2);
+            Assert.Contains("[watch] Runner Tests Fixture - Record Trigger xRec: delta +0 ~1 -0", cycle2);
             Assert.Contains("→ 1 object(s) re-emitted", cycle2);
-            Assert.DoesNotContain("[rad] Runner Tests Fixture - Record Trigger xRec: baseline built", cycle2);
+            Assert.DoesNotContain("[watch] Runner Tests Fixture - Record Trigger xRec: baseline built", cycle2);
             // The dependency loader stayed warm in-process across the edit: the
             // re-emit's symbol load is near-instant, not a cold ~40s reload.
             //
@@ -260,7 +260,7 @@ public class WatchTests
 
             int m3 = await WaitForMarkerAfter(m2 + 1, TimeSpan.FromSeconds(240));
             var cycle3 = Segment(m2 + 1, m3);
-            Assert.Contains("[rad] Runner Tests Fixture - Record Trigger xRec: baseline built", cycle3);
+            Assert.Contains("[watch] Runner Tests Fixture - Record Trigger xRec: baseline built", cycle3);
             Assert.DoesNotContain("[cache] HIT", cycle3);
         }
         finally

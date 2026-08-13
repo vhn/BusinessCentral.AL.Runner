@@ -232,26 +232,10 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
             Assert.NotEqual(string.Empty, Rendered("Page:71001", baseline.Metadata));
 
             File.Delete(RadFixture.SourceFile(tempRoot, "RadPerfLineList.Page.al"));
-            // A `pagecustomization` is the lever that still reaches the full-compile path:
-            // nothing reports it, so its file is untracked and the cycle cannot delta. See
-            // RadObjectDeltaTests.AddingAnUntrackedObjectKind_FallsBackToAFullCompile — if
-            // that kind ever becomes trackable, this lever moves with it.
-            File.WriteAllText(
-                RadFixture.SourceFile(tempRoot, "RadPerfCust.PageCust.al"),
-                """
-                namespace AlRunner.Tests.RadTwentyObject;
-
-                pagecustomization "RAD Perf Header Cust" customizes "RAD Perf Header Card"
-                {
-                    layout
-                    {
-                        modify(Description) { Visible = false; }
-                    }
-                }
-                """);
+            RadFixture.ForceFullCompile(tempRoot);
 
             var fallback = baseline.Cycle(tempRoot);
-            Assert.True(fallback.FullRebuild, "the untracked object kind must force a full compile");
+            Assert.True(fallback.FullRebuild, "the lever must force a full compile");
             Assert.True(fallback.Emit.Diagnostics.Count == 0,
                 string.Join(Environment.NewLine, fallback.Emit.Diagnostics));
             Assert.DoesNotContain("RAD Perf Line List", RadFixture.EmittedNames(fallback));
@@ -320,20 +304,7 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
                 extensionFile,
                 "value(71000; Archived) { Caption = 'Archived'; }",
                 "value(71000; Retired) { Caption = 'Retired'; }");
-            if (forceFullCompile)
-                File.WriteAllText(
-                    RadFixture.SourceFile(tempRoot, "RadPerfCust.PageCust.al"),
-                    """
-                    namespace AlRunner.Tests.RadTwentyObject;
-
-                    pagecustomization "RAD Perf Header Cust" customizes "RAD Perf Header Card"
-                    {
-                        layout
-                        {
-                            modify(Description) { Visible = false; }
-                        }
-                    }
-                    """);
+            if (forceFullCompile) RadFixture.ForceFullCompile(tempRoot);
 
             var cycle = baseline.Cycle(tempRoot);
             Assert.Equal(forceFullCompile, cycle.FullRebuild);

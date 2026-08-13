@@ -109,12 +109,15 @@ Stays resident with dependencies + BC patches loaded once, and re-runs the bundl
 With a cold output cache, the first cycle performs a normal full compile and records a
 baseline. After a cache-hit first cycle, the first edit performs one full-bundle compile
 to establish every app's baseline. Later cycles hash the complete `.al` source tree and
-recompile only the AL objects that actually changed — of any kind, including ones the save
-added or deleted — via BC's `Compilation.CreateForRad` plus a small C# overlay loaded
-beside the warm module. Only a change the delta path cannot classify (a new dependency, a
-changed app identity or preprocessor set, an id-less object such as a `controladdin`)
-falls back to a full compile. Point it at a directory holding an app and its test app and
-it watches both:
+recompile only the AL objects that actually changed — of any kind, including id-less ones
+such as a `controladdin`, and ones the save added or deleted — via BC's
+`Compilation.CreateForRad` plus a small C# overlay loaded beside the warm module. A save
+that changes no AL object at all (a new empty file, a comment-only one) compiles nothing
+whatsoever. Only a change the delta path cannot classify falls back to a full compile: a
+new dependency, a changed app identity or preprocessor set, a `dotnet` package
+declaration, or a duplicate object id/name. Every one of those says which file and which
+change caused it, in the dashboard as well as the log. Point it at a directory holding an
+app and its test app and it watches both:
 
 ```bash
 al-runner --watch --package-cache <deps-dir> path/to/repo   # repo/Application + repo/Test
