@@ -50,6 +50,36 @@ back to a normal full compile. An AL or generated-C# error never advances the la
 baseline: the emit prepares a commit token that is applied only after the overlay assembly
 loads.
 
+## Bulk changes: one switch is one cycle
+
+The change a developer makes most violently is not a save — it is a branch switch, a rebase,
+a bulk rename or a formatter run. One command rewrites, adds and deletes dozens to thousands
+of `.al` files, and it takes seconds, so the tree spends that whole window in a mixed state.
+
+`--watch` waits for the burst to finish before compiling any of it. The wake-up is the first
+file event; the cycle starts only once no further event has arrived for 300 ms
+(`AL_RUNNER_WATCH_QUIET_MS`, capped at 10 s of total waiting so a tree that is being written
+continuously still gets a cycle). Everything the burst touched is then one delta.
+
+Waking on the first event and compiling a fixed interval later — what this used to do — is
+not merely slower, it is wrong. Measured on `AlRunner.Tests/Fixtures/RadBulkSwitch`, a
+12-file version switch delivered over 1.4 s produced **two** cycles, the first of which
+compiled 4 of the 12 files and reported a **failing test** from source that passes in both
+versions. A spurious red on branch switch is worse than a slow one.
+
+Two supporting properties matter for volume:
+
+- The notification buffer is 64 KB rather than the 8 KB default, because a large checkout
+  overruns the default routinely.
+- An overflow is handled rather than ignored. Dropped events cannot corrupt the delta — which
+  files changed is decided by re-hashing the tree, not from the event stream — but they can
+  leave the runner asleep on a changed tree, so an overflow says so and forces a cycle.
+
+The residual limit: quiescence is measured on the event stream, and event delivery lags the
+writes it reports (FSEvents coalescing, the inotify queue). A writer that pauses for longer
+than the quiet window mid-burst is indistinguishable from one that has finished. Raising
+`AL_RUNNER_WATCH_QUIET_MS` is the lever if a tree ever needs it.
+
 ## What the baseline contains
 
 `AlRunner/Rad/RadWorkspace.cs` keeps, per app for the lifetime of the watch process:
@@ -99,7 +129,8 @@ full compile replaces the whole generation chain and establishes a fresh baselin
 
 Measured on NP Retail (7,053 AL files / 6,949 objects) and its test app (286 files / 286
 objects), watched together as ONE bundle on BC 28.1, 6-core / 12 GB, one test codeunit
-selected. Cold first cycle: **1,206 s**, of which 538 s is the Application's AL emit.
+selected. Cold first cycle: **~1,100 s**, of which 649 s is the Application's AL emit. The
+cold cycle is not what `--watch` optimises and is unchanged by any of this.
 
 A successful warm cycle reports the changed-object delta and overlay explicitly:
 
@@ -138,22 +169,43 @@ obvious next step; until then, editing one on an app this size is a cold compile
 
 ### Where a warm cycle's time actually goes
 
-The delta is no longer the cost. A 44 s warm cycle over both apps breaks down as
-(`BCCOMPILER_TIMING=1`):
+The delta is not the cost. A warm cycle over both apps is **~30 s**, of which the AL delta
+emit is 2.4 s. `BCCOMPILER_TIMING=1` now instruments the bundle-level phases as well as the
+per-app ones — before that, a measured cycle only accounted for about half of itself, and
+the unattributed remainder was guessed at. Steady state (cycles 2–3 after the baseline; a
+one-procedure edit to one codeunit, which moves five objects because four files call it):
 
 | Phase | Time |
 |---|---:|
-| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | ~26 s |
-| Post-registration field-trigger wiring and record prewarm | ~12 s |
-| Per-app setup, symbol publish, dependency resolve | ~3.5 s |
-| **AL delta emit + C# overlay + load** | **~1.6 s** |
-| Whole-tree hashing (7,053 files) | 0.29 s |
-| `GetSharedReferences` (warm) | 0.27 s |
-| Running the selected tests | ~1.5 s |
+| Running the selected test codeunit (30 tests) | 11.0 s |
+| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | 7.9 s |
+| **AL delta emit (`CreateForRad`)** | **2.4 s** |
+| `NP Retail Tests` establishing it has nothing to do | 2.9 s |
+| Register + publish symbols | 2.5 s |
+| Roslyn compile + assembly load of the overlay | ~1.4 s |
+| `GetSharedReferences` (warm) | 1.0 s |
+| Resolve + load dependencies | 1.0 s |
+| Whole-tree hashing (7,053 files) | 0.14 s |
+| Field-trigger wiring and record prewarm | 0.20 s |
+| C# overlay compile | 0.15 s |
 
-So delta compilation is ~4% of the cycle. The next two things worth attacking are the
-per-cycle AL source re-parse and the record prewarm — neither of which is compilation, and
-both of which are proportional to the whole tree rather than to the edit.
+`AddSourceDir` was ~26–30 s of that cycle until it stopped parsing each file eight times —
+one syntax tree was built per extractor rather than per file, so npcore's 7,339 files cost
+~59,000 AL parses per cycle instead of 7,339. A direct probe of the same phase on the same
+corpus measured **29.7 s before, 7.0–7.9 s after**; `RecordPatchesParseCostTests` pins the
+one-parse-per-file count so it cannot silently return.
+
+It is still the largest overhead in the cycle, and it is O(whole tree) by construction: the
+reload clears every parsed dictionary, so all of it is rebuilt to service an edit to one
+file. Making it O(changed files) needs file→parsed-entry provenance, which does not exist
+in `RecordPatches` today — the tableextension dictionaries are keyed by base-table name and
+accumulate, so one file's contribution cannot currently be retracted.
+
+Two corrections to what this section used to claim, both from the new instrumentation:
+post-registration field-trigger wiring and record prewarm are **0.2 s**, not ~12 s; and
+`GetSharedReferences` is cheap only when the bundle is configured as two source apps —
+leave a precompiled `NP Retail.app` in `Test/.alpackages` and it re-reads 136 MB of
+packages per call, 8–15 s per app per cycle.
 
 ### The developer loop it is meant to serve
 
@@ -186,6 +238,9 @@ different numbers:
 | `RadWatchTwentyObjectTests` | The same claims against the real `--watch` process, via its own `[rad]` log lines, with the AL test outcome proving the new code actually ran |
 | `RadIdlessObjectTests` | An app declaring two `profile`s — which both key as `Profile:0` — still gets a baseline, still deltas its ordinary objects, and takes the full-compile path when a profile itself is touched |
 | `WatchTests` | Cycle 1 of a watch is served from the AL-output cache; the first edit builds the baseline instead of being served a second time |
+| `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
+| `RadBulkSwitchWatchTests` | The same switch delivered to the real `--watch` process as a 1.4 s burst is ONE cycle, against the settled tree, with no spurious compile or test failure |
+| `RecordPatchesParseCostTests` | Registering a source directory builds exactly one AL syntax tree per `.al` file — the invariant behind the warm cycle's largest single cost |
 
 ## Reloaded dependency tableextensions
 

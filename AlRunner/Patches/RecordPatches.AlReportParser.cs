@@ -13,6 +13,7 @@
 //   * Balanced-brace body extraction to keep a nested column's Caption from masquerading as
 //     the report's. That brace counting was NOT string-literal aware, so a caption containing
 //     a literal `{` desynchronised the depth counter for everything after it in the file.
+using NavCA = Microsoft.Dynamics.Nav.CodeAnalysis;
 using NavSyntax = Microsoft.Dynamics.Nav.CodeAnalysis.Syntax;
 
 namespace AlRunner.Patches;
@@ -30,9 +31,12 @@ public static partial class RecordPatches
     }
 
 
-    private static void TryParseReportFile(string text)
+    private static void TryParseReportFile(string text) => TryParseReportObjects(ParseAlObjects(text));
+
+    /// <inheritdoc cref="TryParseReportFile"/>
+    private static void TryParseReportObjects(IReadOnlyList<NavCA.SyntaxNode> objects)
     {
-        foreach (var obj in ParseAlObjects(text))
+        foreach (var obj in objects)
         {
             switch (obj)
             {

@@ -120,6 +120,10 @@ it watches both:
 al-runner --watch --package-cache <deps-dir> path/to/repo   # repo/Application + repo/Test
 ```
 
+A bulk change is one change: switching branches rewrites, adds and deletes files over
+several seconds, and the runner waits for that to finish before compiling any of it, then
+recompiles exactly what differs. It does not fire mid-checkout against a half-applied tree.
+
 How it decides what to recompile, which changes are delta-able, and what forces a full
 rebuild: [docs/delta-compile.md](docs/delta-compile.md).
 

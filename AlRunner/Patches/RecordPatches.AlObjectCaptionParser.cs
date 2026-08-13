@@ -32,6 +32,7 @@
 // object — the trap that made the report parser fabricate a report 1306 named "against".
 // Caption comes off the object's own property list, so a caption on a nested field / control /
 // column cannot masquerade as the object's.
+using NavCA = Microsoft.Dynamics.Nav.CodeAnalysis;
 using NavSyntax = Microsoft.Dynamics.Nav.CodeAnalysis.Syntax;
 
 namespace AlRunner.Patches;
@@ -70,9 +71,12 @@ public static partial class RecordPatches
                 TryParseObjectCaptionFile(File.ReadAllText(file));
     }
 
-    private static void TryParseObjectCaptionFile(string text)
+    private static void TryParseObjectCaptionFile(string text) => TryParseObjectCaptionObjects(ParseAlObjects(text));
+
+    /// <inheritdoc cref="TryParseObjectCaptionFile"/>
+    private static void TryParseObjectCaptionObjects(IReadOnlyList<NavCA.SyntaxNode> objects)
     {
-        foreach (var obj in ParseAlObjects(text))
+        foreach (var obj in objects)
         {
             if (AlObjectKindName(obj) is not string kind) continue;
             // Reports are AlReportParser's (#1714) — see the header. Skipping the kind here

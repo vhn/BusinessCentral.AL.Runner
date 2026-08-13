@@ -14,6 +14,7 @@
 // slice, where SourceTable / InsertAllowed / field(...) could all match against it. Object
 // extent is now structural.
 using Microsoft.Dynamics.Nav.CodeAnalysis;
+using NavCA = Microsoft.Dynamics.Nav.CodeAnalysis;
 using NavSyntax = Microsoft.Dynamics.Nav.CodeAnalysis.Syntax;
 
 namespace AlRunner.Patches;
@@ -30,10 +31,11 @@ public static partial class RecordPatches
         }
     }
 
-    private static void TryParsePageFile(string text)
-    {
-        var objects = ParseAlObjects(text);
+    private static void TryParsePageFile(string text) => TryParsePageObjects(ParseAlObjects(text));
 
+    /// <inheritdoc cref="TryParsePageFile"/>
+    private static void TryParsePageObjects(IReadOnlyList<NavCA.SyntaxNode> objects)
+    {
         // Pages and pageextensions go into SEPARATE dictionaries, mirroring
         // _parsedReports / _parsedReportExtensions. AL gives `page` and `pageextension`
         // separate id namespaces, so a page 50100 and a pageextension 50100 may both exist —

@@ -1,0 +1,16 @@
+{
+  "id": "b41f9c22-6d3e-4a70-9c81-5f2a7e6d3b04",
+  "name": "RAD Bulk Switch Fixture",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [
+    {
+      "from": 71200,
+      "to": 71299
+    }
+  ],
+  "dependencies": []
+}

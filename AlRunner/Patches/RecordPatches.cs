@@ -163,15 +163,21 @@ public static partial class RecordPatches
         {
             foreach (var file in Directory.GetFiles(dir, "*.al", SearchOption.AllDirectories))
             {
-                var text = File.ReadAllText(file);
-                TryParseTableFile(text);
-                TryParseTableExtensionFile(text);
-                TryParsePageFile(text);
-                TryParseReportFile(text);
-                TryParseQueryFile(text);
-                TryParseXmlPortFile(text);
-                TryParseObjectDeclFile(text);
-                TryParseObjectCaptionFile(text);
+                // ONE syntax tree per file, shared by all eight extractors. Each of them is a
+                // filter over the same top-level object nodes, so handing them the text
+                // instead made every file pay eight full AL parses — the dominant cost of a
+                // warm --watch cycle, ~26s of a 44s cycle on a 7,000-file app. The parse
+                // itself is unchanged; only the number of times it runs is.
+                // RecordPatchesParseCostTests pins the one-per-file count.
+                var objects = ParseAlObjects(File.ReadAllText(file));
+                TryParseTableObjects(objects);
+                TryParseTableExtensionObjects(objects);
+                TryParsePageObjects(objects);
+                TryParseReportObjects(objects);
+                TryParseQueryObjects(objects);
+                TryParseXmlPortObjects(objects);
+                TryParseObjectDeclObjects(objects);
+                TryParseObjectCaptionObjects(objects);
             }
             PopulateNclMetadataCache();
         }

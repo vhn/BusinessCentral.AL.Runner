@@ -19,6 +19,7 @@
 //   declaration or a `Codeunit.Run(...)` call site could not be mistaken for an
 //   object declaration; an object declaration is now a node, so that whole class of
 //   confusion — along with declarations inside comments — cannot arise.
+using NavCA = Microsoft.Dynamics.Nav.CodeAnalysis;
 using NavSyntax = Microsoft.Dynamics.Nav.CodeAnalysis.Syntax;
 
 namespace AlRunner.Patches;
@@ -50,9 +51,12 @@ public static partial class RecordPatches
         }
     }
 
-    private static void TryParseObjectDeclFile(string text)
+    private static void TryParseObjectDeclFile(string text) => TryParseObjectDeclObjects(ParseAlObjects(text));
+
+    /// <inheritdoc cref="TryParseObjectDeclFile"/>
+    private static void TryParseObjectDeclObjects(IReadOnlyList<NavCA.SyntaxNode> objects)
     {
-        foreach (var obj in ParseAlObjects(text))
+        foreach (var obj in objects)
         {
             // Kind comes from the node type, so the old worry about `enum` matching the
             // prefix of `enumextension` is structurally gone: they are distinct node types.
