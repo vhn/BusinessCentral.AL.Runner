@@ -232,22 +232,26 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
             Assert.NotEqual(string.Empty, Rendered("Page:71001", baseline.Metadata));
 
             File.Delete(RadFixture.SourceFile(tempRoot, "RadPerfLineList.Page.al"));
-            // controladdin 71000 from the AL ID Manager for app e23cd601 — id-less, so
-            // RadObjectKey cannot represent it and the cycle must compile in full.
+            // A `pagecustomization` is the lever that still reaches the full-compile path:
+            // nothing reports it, so its file is untracked and the cycle cannot delta. See
+            // RadObjectDeltaTests.AddingAnUntrackedObjectKind_FallsBackToAFullCompile — if
+            // that kind ever becomes trackable, this lever moves with it.
             File.WriteAllText(
-                RadFixture.SourceFile(tempRoot, "RadPerfAddIn.ControlAddIn.al"),
+                RadFixture.SourceFile(tempRoot, "RadPerfCust.PageCust.al"),
                 """
                 namespace AlRunner.Tests.RadTwentyObject;
 
-                controladdin "RAD Perf Add In"
+                pagecustomization "RAD Perf Header Cust" customizes "RAD Perf Header Card"
                 {
-                    RequestedHeight = 100;
-                    RequestedWidth = 100;
+                    layout
+                    {
+                        modify(Description) { Visible = false; }
+                    }
                 }
                 """);
 
             var fallback = baseline.Cycle(tempRoot);
-            Assert.True(fallback.FullRebuild, "the id-less object must force a full compile");
+            Assert.True(fallback.FullRebuild, "the untracked object kind must force a full compile");
             Assert.True(fallback.Emit.Diagnostics.Count == 0,
                 string.Join(Environment.NewLine, fallback.Emit.Diagnostics));
             Assert.DoesNotContain("RAD Perf Line List", RadFixture.EmittedNames(fallback));
@@ -318,14 +322,16 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
                 "value(71000; Retired) { Caption = 'Retired'; }");
             if (forceFullCompile)
                 File.WriteAllText(
-                    RadFixture.SourceFile(tempRoot, "RadPerfAddIn.ControlAddIn.al"),
+                    RadFixture.SourceFile(tempRoot, "RadPerfCust.PageCust.al"),
                     """
                     namespace AlRunner.Tests.RadTwentyObject;
 
-                    controladdin "RAD Perf Add In"
+                    pagecustomization "RAD Perf Header Cust" customizes "RAD Perf Header Card"
                     {
-                        RequestedHeight = 100;
-                        RequestedWidth = 100;
+                        layout
+                        {
+                            modify(Description) { Visible = false; }
+                        }
                     }
                     """);
 

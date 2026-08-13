@@ -1,7 +1,23 @@
 namespace AlRunner.Rad;
 
-/// <summary>Compiler-independent AL object identity within one app.</summary>
-public readonly record struct RadObjectKey(string Kind, int Id)
+/// <summary>
+/// Compiler-independent AL object identity within one app.
+///
+/// <para>Most AL object kinds are identified by <c>(Kind, Id)</c> — ids are unique within a
+/// kind, and that is what BC's own metadata, AllObj and the generated CLR type names are
+/// keyed on. Some kinds have no id at all; for those <see cref="Name"/> is the identity, and
+/// it is the discriminator EXACTLY when there is no id — an id-bearing object leaves
+/// <see cref="Name"/> empty so its key, and therefore its equality, is unchanged.
+/// <see cref="IsIdlessKind"/> is the list, and it is deliberately shorter than "every kind
+/// AL gives no id to".</para>
+///
+/// <para>Getting this wrong was not a theoretical problem. A <c>profile</c> satisfies BC's
+/// <c>ISymbolWithId</c> and then reports id 0, so before <see cref="Name"/> existed every
+/// profile in an app keyed as <c>Profile:0</c>. An app with two of them produced two objects
+/// with one key, which threw out of the RAD baseline snapshot and left the app with no
+/// baseline — silently, because that throw is caught and logged.</para>
+/// </summary>
+public readonly record struct RadObjectKey(string Kind, int Id, string Name = "")
 {
     public bool IsCodeunit => string.Equals(Kind, "Codeunit", StringComparison.Ordinal);
 
@@ -12,6 +28,65 @@ public readonly record struct RadObjectKey(string Kind, int Id)
     /// from the packaged baseline. See BcCompiler.DeltaCompile.
     /// </summary>
     public bool IsExtension => Kind.EndsWith("Extension", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Whether the object has no AL object id, and is therefore identified by name.
+    /// </summary>
+    public bool IsIdless => Id <= 0;
+
+    /// <summary>
+    /// Whether compiling this object produces a generated C# source.
+    ///
+    /// <para>The id-less kinds do not: an <c>interface</c> is a binding-time contract, a
+    /// <c>controladdin</c> and a <c>profile</c> are metadata. They contribute symbols to the
+    /// module and nothing to the assembly, which is why a delta consisting only of id-less
+    /// objects legitimately compiles no C# at all. The delta path compares the emitted count
+    /// against this, so a kind misclassified here costs a fallback to a full compile — never
+    /// a wrong module.</para>
+    /// </summary>
+    public bool EmitsCode => !IsIdless;
+
+    /// <summary>
+    /// The AL kinds that have no object id, so their name is their identity.
+    ///
+    /// <para>This is decided by KIND, not by whether a given representation happens to carry
+    /// an id — because they disagree. A <c>profile</c> symbol implements
+    /// <c>ISymbolWithId</c> and reports 0; a serialized <c>InterfaceDefinition</c> in a
+    /// module definition reports a synthesized id (552062417 for one measured here) that no
+    /// compiler symbol ever produces. Keying off "does it have an id?" therefore gives the
+    /// same object two different keys depending on which side is asked, and the delta then
+    /// fails to strip its own baseline copy — which surfaces as the pre-edit shape shadowing
+    /// the edit (AL0582 against a member the source no longer declares).</para>
+    ///
+    /// <para><c>pagecustomization</c> and <c>entitlement</c> have no id either and are
+    /// deliberately absent. Being name-keyed is only half of being supported: the module
+    /// definition must also carry the object so a delta can strip its pre-edit copy, and
+    /// <c>ModuleDefinition</c> has no array for either of them. They keep taking the
+    /// full-compile path until something declares one and proves the round trip — see
+    /// RadObjectDeltaTests.AddingAnUntrackedObjectKind_FallsBackToAFullCompile.</para>
+    /// </summary>
+    public static bool IsIdlessKind(string kind) =>
+        kind is "Interface" or "ControlAddIn" or "Profile";
+
+    /// <summary>
+    /// Build a key from what a compiler symbol, a syntax declaration or a serialized module
+    /// element reports, applying the identity rule in one place so all three agree.
+    ///
+    /// <para>The name is upper-cased because AL identifiers are case-insensitive: renaming
+    /// an interface from <c>Contract</c> to <c>CONTRACT</c> is not a new object, and keying
+    /// on the exact spelling classified it as one addition plus one removal instead of a
+    /// modification. The display spelling is preserved on <c>RadObjectRef.Name</c>, which is
+    /// what Microsoft's change model and every log line are given.</para>
+    ///
+    /// <para><c>id &lt;= 0</c> is a safety net rather than part of the rule: an id-bearing
+    /// kind that unexpectedly reports no id gets a name to be told apart by, instead of
+    /// colliding with every other such object on <c>(Kind, 0)</c> — the exact failure that
+    /// cost apps with two profiles their baseline.</para>
+    /// </summary>
+    public static RadObjectKey For(string kind, int id, string? name) =>
+        IsIdlessKind(kind) || id <= 0
+            ? new(kind, 0, (name ?? string.Empty).ToUpperInvariant())
+            : new(kind, id);
 
     /// <summary>The generated top-level CLR type owned by this AL object, when it has one.</summary>
     public string? ClrTypeName => Kind switch

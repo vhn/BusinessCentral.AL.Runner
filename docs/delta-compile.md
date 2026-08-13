@@ -29,7 +29,7 @@ classifies the cycle:
 | No content changed | Reuse the loaded module; do not compile |
 | An object of any kind was edited, added or removed | Re-emit exactly those objects with `Compilation.CreateForRad` and compile a C# overlay; a removal-only cycle produces no C# at all |
 | A modified codeunit's callable surface moved, or an object was removed | Also re-emit the objects that directly reference it — one hop, not the transitive closure |
-| A changed file declares an id-less object (`controladdin`, `profile`, `pagecustomization`, …) | Normal full compile — `RadObjectKey` cannot identify it |
+| A changed file declares an object of a kind the workspace cannot identify (`pagecustomization`, `entitlement`) | Normal full compile |
 | Dependencies, app identity, version, or preprocessor symbols changed | Normal full compile |
 | The delta does not bind (a syntax error, or a reference to something it removed) | No compile at all — report the AL diagnostics and leave the workspace on its last good state |
 
@@ -160,12 +160,32 @@ One edit costs one object, for every object kind and every file operation:
 | Touched, identical bytes | no compile at all | — | — | 41 s |
 | Two files in one app | `+0 ~2 -0` → 2 | 1.1 s | 0.25 s | 43 s |
 | One file in each app | 1 + 1 | 1.2 + 0.9 s | 0.19 + 0.13 s | 42 s |
-| **Id-less object (`interface`, `controladdin`)** | **full compile** | — | — | **761–862 s** |
+| Id-less object (`interface`, `controladdin`, `profile`) | `+0 ~1 -0` → 0 | — | — | see below |
 
-An id-less object is the one shape that still costs a whole-module rebuild: `RadObjectKey`
-is `(Kind, Id)`, and `interface`, `profile`, `controladdin` and `pagecustomization` have no
-id — BC reports 0 for all of them, so they cannot be told apart. Keying them by name is the
-obvious next step; until then, editing one on an app this size is a cold compile.
+The id-less row used to read **full compile, 761–862 s**. `RadObjectKey` was `(Kind, Id)`,
+and `interface`, `controladdin` and `profile` have no id, so they could not be told apart —
+on NP Retail that was 84 of 7,339 files (60 interface, 16 controladdin, 8 profile), each a
+guaranteed whole-module rebuild on any edit including a comment. They are now keyed by name
+and delta like anything else. That row's timing has NOT been re-measured on NP Retail; the
+behaviour is pinned by `RadIdlessObjectTests` against a fixture instead, and a delta that
+compiles nothing has no plausible way to cost minutes.
+
+An id-less object is a binding contract as much as a codeunit is, so its users are rebound
+when its surface moves: the reverse dependency graph records edges onto it even though it is
+not an application object and `ContainingApplicationObject` never returns one. Without that
+edge, widening an interface without touching its implementer reported success, emitted
+nothing, and left the implementer bound to the previous contract. Two more places where the
+name has to be the identity end to end: a removed one is stripped from the previous module
+by name before Microsoft's symbol writer merges (the writer matches the change element, and
+a serialized id-less element carries a synthesized id that source cannot reproduce), and key
+names are decoded and case-folded, because AL escapes a quote by doubling it and its
+identifiers are case-insensitive.
+
+`pagecustomization` and `entitlement` still take the full-compile path. They are id-less
+too, but `ModuleDefinition` has no array for either, so a delta could not strip a modified
+one's baseline copy — being name-keyed is only half of being supported. The rule is that a
+kind counts as supported when a test declares one and proves the round trip; adding one is a
+line in `RadObjectKey.IsIdlessKind` and `IdlessKindOf` plus a fixture.
 
 ### Where a warm cycle's time actually goes
 
@@ -232,11 +252,11 @@ different numbers:
 
 | Suite | Claim |
 |---|---|
-| `RadObjectDeltaTests` | One edit → exactly which objects re-emit and which CLR types change owner, for ten object kinds plus schema additions, a rename, a callable-surface change, an id-less fallback, and a rejected or abandoned candidate |
+| `RadObjectDeltaTests` | One edit → exactly which objects re-emit and which CLR types change owner, for ten object kinds plus schema additions, a rename, a callable-surface change, and a rejected or abandoned candidate |
 | `RadDeletionDeltaTests` | One deletion → zero objects re-emitted, exactly those object identities removed, exactly those CLR names tombstoned, every survivor still the identical baseline `Type` |
 | `RadMetadataDeltaTests` | One edit → exactly one page/report/xmlport/enum metadata entry moves; a deletion drops its entry, on the delta path and on the full-compile fallback; a renamed enumextension leaves one registration; a rejected candidate leaves none behind |
 | `RadWatchTwentyObjectTests` | The same claims against the real `--watch` process, via its own `[rad]` log lines, with the AL test outcome proving the new code actually ran |
-| `RadIdlessObjectTests` | An app declaring two `profile`s — which both key as `Profile:0` — still gets a baseline, still deltas its ordinary objects, and takes the full-compile path when a profile itself is touched |
+| `RadIdlessObjectTests` | The kinds with no object id: two `profile`s are two objects rather than one colliding key; an `interface` and a `controladdin` are tracked to their file even though the symbol API never reports them; editing or deleting one is a delta that compiles no C#; narrowing an interface binds against the new contract rather than the baseline's copy; widening one WITHOUT touching its implementer still rebinds it; a deletion leaves the merged baseline, not just the change list; and identity survives an embedded quote and a case-only rename |
 | `WatchTests` | Cycle 1 of a watch is served from the AL-output cache; the first edit builds the baseline instead of being served a second time |
 | `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
 | `RadBulkSwitchWatchTests` | The same switch delivered to the real `--watch` process as a 1.4 s burst is ONE cycle, against the settled tree, with no spurious compile or test failure |

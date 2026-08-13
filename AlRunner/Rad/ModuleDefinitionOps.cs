@@ -27,7 +27,18 @@ public static class ModuleDefinitionOps
             ["PermissionSets"] = "PermissionSet",
             ["PermissionSetExtensions"] = "PermissionSetExtension",
             ["Entitlements"] = "Entitlement",
+            // The id-less kinds. They are in the module definition like any other object —
+            // which is what lets a changed codeunit still resolve an interface it implements
+            // from the packaged baseline — so a MODIFIED one has to be stripped from it just
+            // the same, or its pre-edit shape shadows the supplied syntax. Renaming an
+            // interface method without this fails the delta with AL0582 against the old
+            // member name; see RadIdlessObjectTests.
+            ["Interfaces"] = "Interface",
+            ["ControlAddIns"] = "ControlAddIn",
+            ["Profiles"] = "Profile",
         };
+
+    private static readonly ConcurrentDictionary<Type, PropertyInfo?> _nameProperties = new();
 
     private static int? IdOf(object element)
     {
@@ -41,6 +52,24 @@ public static class ModuleDefinitionOps
         });
         return property?.GetValue(element) is int id ? id : null;
     }
+
+    private static string? NameOf(object element)
+    {
+        var property = _nameProperties.GetOrAdd(element.GetType(), static type =>
+        {
+            var candidate = type.GetProperty("Name");
+            return candidate?.PropertyType == typeof(string) ? candidate : null;
+        });
+        return property?.GetValue(element) as string;
+    }
+
+    /// <summary>
+    /// The key a serialized module element answers to, applying the same "name only when
+    /// there is no id" rule <see cref="RadObjectKey.For"/> applies to compiler symbols. The
+    /// two must agree: one side builds the keys a delta strips, the other matches them.
+    /// </summary>
+    private static RadObjectKey KeyOf(object element, string kind) =>
+        RadObjectKey.For(kind, IdOf(element) ?? 0, NameOf(element));
 
     /// <summary>
     /// Copy <paramref name="source"/> without the exact changed/removed objects.
@@ -68,7 +97,7 @@ public static class ModuleDefinitionOps
             var property = type.GetProperty(propertyName);
             if (property?.GetValue(source) is not Array items || items.Length == 0) continue;
             var kept = items.Cast<object>()
-                .Where(item => !objects.Contains(new RadObjectKey(kind, IdOf(item) ?? -1)))
+                .Where(item => !objects.Contains(KeyOf(item, kind)))
                 .ToList();
             if (kept.Count != items.Length)
                 property.SetValue(copy, ToTypedArray(property.PropertyType.GetElementType()!, kept));
@@ -112,23 +141,23 @@ public static class ModuleDefinitionOps
     {
         var property = _kindByArrayProperty.FirstOrDefault(pair => pair.Value == key.Kind).Key;
         if (property == null) return null;
-        var element = FindElement(module, property, key.Id);
+        var element = FindElement(module, property, key);
         return element == null
             ? null
             : System.Text.Json.JsonSerializer.Serialize(element, element.GetType());
     }
 
-    private static object? FindElement(object container, string arrayProperty, int id)
+    private static object? FindElement(object container, string arrayProperty, RadObjectKey key)
     {
         var type = container.GetType();
         if (type.GetProperty(arrayProperty)?.GetValue(container) is Array items)
             foreach (var item in items)
-                if (item != null && IdOf(item) == id) return item;
+                if (item != null && KeyOf(item, key.Kind) == key) return item;
         if (type.GetProperty("Namespaces")?.GetValue(container) is Array namespaces)
             foreach (var child in namespaces)
             {
                 if (child == null) continue;
-                var hit = FindElement(child, arrayProperty, id);
+                var hit = FindElement(child, arrayProperty, key);
                 if (hit != null) return hit;
             }
         return null;

@@ -304,13 +304,13 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     }
 
     /// <summary>
-    /// An id-less application object cannot be identified by <see cref="RadObjectKey"/>,
-    /// so RAD must not attempt a delta for the file that declares one — a controladdin
-    /// deletion would otherwise look like a comment-only edit and the old object would
-    /// survive in the baseline. Falling back is correct; silently continuing is not.
+    /// An id-less object — one keyed by name because AL gives it no id — is a delta like any
+    /// other, and on a 20-object app that is the whole point: adding a `controladdin` used to
+    /// rebuild all twenty. It generates no C#, so a correct delta compiles nothing at all and
+    /// every existing runtime object stays exactly where it was.
     /// </summary>
     [Fact]
-    public void EditingAnIdLessObject_FallsBackToAFullCompile()
+    public void AddingAnIdLessObject_IsADelta_AndCompilesNothing()
     {
         if (!engine.Ready)
         {
@@ -325,7 +325,6 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
                 RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
             var baseline = RadFixture.Seed(tempRoot);
 
-            // controladdin 71000 from the AL ID Manager for app e23cd601.
             File.WriteAllText(
                 RadFixture.SourceFile(tempRoot, "RadPerfAddIn.ControlAddIn.al"),
                 """
@@ -338,9 +337,73 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
                 }
                 """);
 
+            var delta = baseline.Cycle(tempRoot);
+            Assert.False(delta.FullRebuild,
+                "adding an id-less object rebuilt the whole module");
+            Assert.False(delta.NoChange);
+            Assert.True(delta.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, delta.Emit.Diagnostics));
+            Assert.Equal(["RAD Perf Add In"], delta.Changes.Added.Select(item => item.Name).ToArray());
+            Assert.Empty(delta.Changes.Modified);
+            Assert.Empty(delta.Changes.Removed);
+            Assert.Empty(delta.Emit.Sources);
+
+            delta.Commit(baseline.Workspace, null);
+            // Nothing moved: every one of the twenty baseline types is still the identical
+            // Type instance the seed produced.
+            baseline.AssertOwnership(owner: null, moved: []);
+            baseline.AssertSettled(tempRoot);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The other direction, and the reason the fallback still exists: a kind the workspace
+    /// cannot identify at all must NOT be deltaed. `pagecustomization` is id-less like a
+    /// controladdin, but nothing reports it — so its file looks untracked, and a delta there
+    /// would let a deletion pass for a comment-only edit while the old object survived in the
+    /// baseline. Falling back is correct; silently continuing is not.
+    ///
+    /// If `pagecustomization` ever becomes trackable, this test is the one that says so — and
+    /// the levers in RadMetadataDeltaTests, which use it to reach the full-compile path, move
+    /// with it.
+    /// </summary>
+    [Fact]
+    public void AddingAnUntrackedObjectKind_FallsBackToAFullCompile()
+    {
+        if (!engine.Ready)
+        {
+            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
+            return;
+        }
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            var baseline = RadFixture.Seed(tempRoot);
+
+            File.WriteAllText(
+                RadFixture.SourceFile(tempRoot, "RadPerfCust.PageCust.al"),
+                """
+                namespace AlRunner.Tests.RadTwentyObject;
+
+                pagecustomization "RAD Perf Header Cust" customizes "RAD Perf Header Card"
+                {
+                    layout
+                    {
+                        modify(Description) { Visible = false; }
+                    }
+                }
+                """);
+
             var fallback = baseline.Cycle(tempRoot);
             Assert.True(fallback.FullRebuild,
-                "an id-less object must force a full compile, not a partial delta");
+                "an untracked object kind must force a full compile, not a partial delta");
             Assert.False(fallback.NoChange);
             Assert.True(fallback.Emit.Diagnostics.Count == 0,
                 string.Join(Environment.NewLine, fallback.Emit.Diagnostics));

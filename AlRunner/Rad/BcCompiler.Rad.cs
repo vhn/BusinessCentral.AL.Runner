@@ -306,9 +306,13 @@ public sealed partial class BcCompiler
         foreach (var f in removedFiles) objectsByFile[f] = new List<AlRunner.Rad.RadObjectRef>();
 
         var declaredSymbols = probe.GetDeclaredApplicationObjectSymbols().ToList();
+        // The id-less kinds the symbol API omits, read off the syntax of the changed files.
+        var idlessNow = IdlessDeclarations(trees).ToList();
         var keyedFiles = declaredSymbols
             .Where(IsKeyable)
-            .Select(FileOf).OfType<string>().ToHashSet(StringComparer.Ordinal);
+            .Select(FileOf).OfType<string>()
+            .Concat(idlessNow.Select(item => item.File))
+            .ToHashSet(StringComparer.Ordinal);
         if (declaredSymbols.Any(sym => !IsKeyable(sym))
             || removedFiles.Any(f => ws.ObjectsIn(f).Count == 0)
             || changedFiles.Any(f => ws.ObjectsIn(f).Count == 0 && !keyedFiles.Contains(f)))
@@ -325,13 +329,16 @@ public sealed partial class BcCompiler
         var declaredNow = new Dictionary<AlRunner.Rad.RadObjectKey, AlRunner.Rad.RadObjectRef>();
         foreach (var sym in declaredSymbols)
         {
-            var withId = (NavCA.ISymbolWithId)sym;
-            var key = new AlRunner.Rad.RadObjectKey(sym.Kind.ToString(), withId.Id);
             var objRef = new AlRunner.Rad.RadObjectRef(
-                key, sym.Name ?? string.Empty, NamespaceOf(sym));
-            declaredNow[key] = objRef;
+                ObjectKey(sym), sym.Name ?? string.Empty, NamespaceOf(sym));
+            declaredNow[objRef.Key] = objRef;
             var file = FileOf(sym);
             if (file != null && objectsByFile.TryGetValue(file, out var list)) list.Add(objRef);
+        }
+        foreach (var (file, objRef) in idlessNow)
+        {
+            if (!declaredNow.TryAdd(objRef.Key, objRef)) continue;
+            if (objectsByFile.TryGetValue(file, out var list)) list.Add(objRef);
         }
 
         var added = new List<AlRunner.Rad.RadObjectRef>();
@@ -429,7 +436,9 @@ public sealed partial class BcCompiler
             return null;
         }
 
-        int expectedEmits = added.Count + modified.Count;
+        // An id-less object generates no C#, so counting it here would make every delta that
+        // touches one look like it silently dropped an object and fall back to a full compile.
+        int expectedEmits = added.Concat(modified).Count(item => item.Key.EmitsCode);
         if (outputter.Captured.Count != expectedEmits)
         {
             if (diags.Count > 0)
@@ -455,7 +464,17 @@ public sealed partial class BcCompiler
                 throw new InvalidOperationException("the RAD emitter did not initialize its module");
             mergedBaseline = MergeRadBaseline(
                 outputter.Module,
-                WorkspaceBaseline(ws),
+                // Microsoft's writer drops a removed object from the previous module by
+                // matching the change element it is given, and a serialized id-less element
+                // carries a synthesized id that the element built from a compiler symbol
+                // cannot reproduce — so a deleted interface or control add-in survived the
+                // merge and the next delta still resolved it. Strip those by name first;
+                // the writer then has nothing to carry forward.
+                AlRunner.Rad.ModuleDefinitionOps.WithoutObjects(
+                    WorkspaceBaseline(ws),
+                    removed.Select(item => item.Key)
+                        .Where(key => AlRunner.Rad.RadObjectKey.IsIdlessKind(key.Kind))
+                        .ToArray()),
                 replacedOrRemoved,
                 rad.RuntimeVersion!);
         }
@@ -473,7 +492,11 @@ public sealed partial class BcCompiler
         // callers. Object removal likewise rebinds direct users so a dangling reference
         // becomes an AL diagnostic instead of silently executing an old loaded type.
         var changedSurfaces = modified
-            .Where(item => item.Key.IsCodeunit)
+            // Codeunits because generated calls bake Microsoft's member id; id-less objects
+            // because they are binding contracts (an interface's method set, a control
+            // add-in's surface) that their users were compiled against.
+            .Where(item => item.Key.IsCodeunit
+                || AlRunner.Rad.RadObjectKey.IsIdlessKind(item.Key.Kind))
             .Where(item =>
             {
                 var previous = ws.Object(item.Key);
@@ -592,14 +615,128 @@ public sealed partial class BcCompiler
     /// <summary>
     /// Whether <see cref="AlRunner.Rad.RadObjectKey"/> can identify this object at all.
     ///
-    /// AL's id-less kinds do not all fail the <c>ISymbolWithId</c> test: a
-    /// <c>profile</c> implements it and reports id 0, so an app with seven profiles
-    /// produces seven objects that all key as <c>Profile:0</c>. Measured on NP Retail,
-    /// where that collision threw out of the baseline snapshot and left the app without
-    /// one — every cycle a full compile, no delta ever. Real AL object ids start at 1.
+    /// An id identifies it when there is one; otherwise the name does. A <c>profile</c> is
+    /// why this is not simply the <c>ISymbolWithId</c> test: it implements that interface and
+    /// then reports id 0, so keying on the id alone made every profile in an app key as
+    /// <c>Profile:0</c>. Measured on NP Retail, that collision threw out of the baseline
+    /// snapshot and left the app without one — every cycle a full compile, no delta ever.
+    ///
+    /// The id-less kinds are listed explicitly rather than inferred from "reports no id",
+    /// because being name-keyed is only half of being supported: the module definition has to
+    /// carry the object so a delta can strip its pre-edit copy, and that has to be verified
+    /// per kind. <c>pagecustomization</c> and <c>entitlement</c> report a name too and are
+    /// deliberately NOT on the list — they keep taking the full-compile path until something
+    /// declares one and proves the round trip.
     /// </summary>
     private static bool IsKeyable(NavCA.ISymbol symbol) =>
-        symbol is NavCA.ISymbolWithId { Id: > 0 };
+        symbol is NavCA.ISymbolWithId { Id: > 0 }
+        || (AlRunner.Rad.RadObjectKey.IsIdlessKind(symbol.Kind.ToString())
+            && !string.IsNullOrEmpty(symbol.Name));
+
+    /// <summary>
+    /// The id-less objects Microsoft's symbol API does not report at all.
+    ///
+    /// <para><c>GetDeclaredApplicationObjectSymbols()</c> filters the module's declared
+    /// symbols to <c>IApplicationObjectTypeSymbol</c>, and <c>interface</c> and
+    /// <c>controladdin</c> symbols do not implement it — an app can declare them and the
+    /// workspace would never learn which file did, so that file stayed untracked for the
+    /// life of the process and every edit to it, comment included, forced a whole-module
+    /// rebuild. Their declarations are read off the syntax tree instead, which is all that
+    /// is needed: a kind, a name and a file is the entire identity an id-less object has.</para>
+    ///
+    /// <para>Other id-less kinds (<c>pagecustomization</c>, <c>entitlement</c>) are
+    /// deliberately not listed. They stay invisible and their files keep taking the
+    /// full-compile path — the behaviour that was there before. Adding one is a line in
+    /// <see cref="IdlessKindOf"/> plus a fixture that declares it.</para>
+    /// </summary>
+    private static IEnumerable<(string File, AlRunner.Rad.RadObjectRef Object)> IdlessDeclarations(
+        IEnumerable<NavSyntax.SyntaxTree> trees)
+    {
+        foreach (var tree in trees)
+        {
+            string? file;
+            NavCA.SyntaxNode root;
+            try
+            {
+                file = tree.FilePath;
+                if (string.IsNullOrEmpty(file)) continue;
+                if (tree.GetRoot() is not NavSyntax.CompilationUnitSyntax unit) continue;
+                root = unit;
+            }
+            catch { continue; }
+
+            foreach (var (node, ns) in TopLevelDeclarations(root, string.Empty))
+            {
+                if (IdlessKindOf(node) is not string kind) continue;
+                var name = UnquoteAlName(SyntaxName(node));
+                if (string.IsNullOrEmpty(name)) continue;
+                yield return (file!, new AlRunner.Rad.RadObjectRef(
+                    AlRunner.Rad.RadObjectKey.For(kind, 0, name), name, ns));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Object declarations in a compilation unit, descending through namespace declarations
+    /// and carrying the enclosing namespace down — BC nests a namespaced file's objects
+    /// under a <c>NamespaceDeclarationSyntax</c> rather than at the root.
+    /// </summary>
+    private static IEnumerable<(NavCA.SyntaxNode Node, string Namespace)> TopLevelDeclarations(
+        NavCA.SyntaxNode parent, string ns)
+    {
+        foreach (var node in parent.ChildNodes())
+        {
+            if (node is NavSyntax.NamespaceDeclarationSyntax nested)
+            {
+                var name = SyntaxName(nested) ?? ns;
+                foreach (var inner in TopLevelDeclarations(nested, name)) yield return inner;
+            }
+            else
+            {
+                yield return (node, ns);
+            }
+        }
+    }
+
+    private static string? IdlessKindOf(NavCA.SyntaxNode node) => node switch
+    {
+        NavSyntax.InterfaceSyntax => "Interface",
+        NavSyntax.ControlAddInSyntax => "ControlAddIn",
+        _ => null,
+    };
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, System.Reflection.PropertyInfo?>
+        _syntaxNameProperties = new();
+
+    /// <summary>
+    /// The declared name of a syntax node. Read by reflection because the id-less kinds do
+    /// not share a base type that exposes one — an <c>ApplicationObjectSyntax</c> has
+    /// <c>Name</c> and <c>ObjectId</c> together, and these kinds are precisely the ones that
+    /// are not application objects.
+    /// </summary>
+    private static string? SyntaxName(NavCA.SyntaxNode node)
+    {
+        var property = _syntaxNameProperties.GetOrAdd(
+            node.GetType(), static type => type.GetProperty("Name"));
+        try { return property?.GetValue(node)?.ToString(); }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Strip AL's identifier quoting. Symbols report <c>RAD Idless Contract</c>; the syntax
+    /// tree reports <c>"RAD Idless Contract"</c>. The two must agree, because the name IS
+    /// the key for these objects and it is also what Microsoft's change model is given.
+    /// </summary>
+    private static string UnquoteAlName(string? name)
+    {
+        var text = name?.Trim() ?? string.Empty;
+        if (text.Length < 2 || text[0] != '"' || text[^1] != '"') return text;
+        // AL escapes a quote inside a quoted identifier by doubling it, and the compiler
+        // reports the decoded value. Stripping only the delimiters leaves `A ""B""` where
+        // every other source says `A "B"` — two keys for one object, and the delta then
+        // fails to strip its own baseline copy.
+        return text[1..^1].Replace("\"\"", "\"", StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// The declared objects a delta can track: keyable, and uniquely keyed within the
@@ -623,15 +760,25 @@ public sealed partial class BcCompiler
     private static Dictionary<string, List<AlRunner.Rad.RadObjectRef>> MapObjectsToFiles(NavCA.Compilation compilation)
     {
         var map = new Dictionary<string, List<AlRunner.Rad.RadObjectRef>>(StringComparer.Ordinal);
-        foreach (var sym in UniquelyKeyedObjects(compilation))
+        var seen = new HashSet<AlRunner.Rad.RadObjectKey>();
+
+        void Record(string? file, AlRunner.Rad.RadObjectRef obj)
         {
-            var file = FileOf(sym);
-            if (file == null) continue;
+            if (file == null || !seen.Add(obj.Key)) return;
             if (!map.TryGetValue(file, out var list))
                 map[file] = list = new List<AlRunner.Rad.RadObjectRef>();
-            list.Add(new AlRunner.Rad.RadObjectRef(
-                ObjectKey(sym), sym.Name ?? string.Empty, NamespaceOf(sym)));
+            list.Add(obj);
         }
+
+        foreach (var sym in UniquelyKeyedObjects(compilation))
+            Record(FileOf(sym), new AlRunner.Rad.RadObjectRef(
+                ObjectKey(sym), sym.Name ?? string.Empty, NamespaceOf(sym)));
+
+        // …plus the kinds the symbol API never returns. Recorded second so a symbol always
+        // wins if both routes see the same object.
+        foreach (var (file, obj) in IdlessDeclarations(compilation.SyntaxTrees))
+            Record(file, obj);
+
         return map;
     }
 
@@ -673,10 +820,7 @@ public sealed partial class BcCompiler
 
             void AddReference(NavCA.ISymbol? symbol)
             {
-                var target = ContainingApplicationObject(symbol);
-                if (target == null || !IsKeyable(target)) return;
-                if (target.ContainingModule?.AppId != ownAppId) return;
-                var targetKey = ObjectKey(target);
+                if (ReferenceTargetKey(symbol, ownAppId) is not { } targetKey) return;
                 foreach (var source in sources)
                     if (source != targetKey) result[source].Add(targetKey);
             }
@@ -708,8 +852,40 @@ public sealed partial class BcCompiler
         return null;
     }
 
+    /// <summary>
+    /// The object a referenced symbol belongs to, as a dependency-graph key — or null when
+    /// the reference leaves this app or names nothing trackable.
+    ///
+    /// <para>The id-less walk is the half that is easy to miss. A codeunit that implements an
+    /// interface, or a page that hosts a control add-in, depends on it exactly as much as on
+    /// any codeunit it calls — but an interface is not an <c>IApplicationObjectTypeSymbol</c>,
+    /// so <see cref="ContainingApplicationObject"/> never returns one and the edge was simply
+    /// absent. With no recorded users, a delta that changed an interface's surface had nobody
+    /// to rebind: it reported success, emitted nothing, and left every implementer bound to
+    /// the previous contract. Verified against the compiler — the semantic model answers the
+    /// <c>implements</c> clause with the interface symbol.</para>
+    /// </summary>
+    private static AlRunner.Rad.RadObjectKey? ReferenceTargetKey(NavCA.ISymbol? symbol, Guid? ownAppId)
+    {
+        var target = ContainingApplicationObject(symbol);
+        if (target != null && IsKeyable(target))
+            return target.ContainingModule?.AppId == ownAppId ? ObjectKey(target) : null;
+
+        for (var current = symbol; current != null; current = current.ContainingSymbol)
+        {
+            var kind = current.Kind.ToString();
+            if (!AlRunner.Rad.RadObjectKey.IsIdlessKind(kind)) continue;
+            if (current.ContainingModule?.AppId != ownAppId) return null;
+            return AlRunner.Rad.RadObjectKey.For(kind, 0, current.Name);
+        }
+        return null;
+    }
+
     private static AlRunner.Rad.RadObjectKey ObjectKey(NavCA.IApplicationObjectTypeSymbol symbol) =>
-        new(symbol.Kind.ToString(), ((NavCA.ISymbolWithId)symbol).Id);
+        AlRunner.Rad.RadObjectKey.For(
+            symbol.Kind.ToString(),
+            symbol is NavCA.ISymbolWithId withId ? withId.Id : 0,
+            symbol.Name);
 
     private static string? FileOf(NavCA.ISymbol symbol)
     {
