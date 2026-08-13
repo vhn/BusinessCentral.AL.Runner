@@ -1827,11 +1827,17 @@ public sealed partial class BcCompiler
                 if (symbol is NavCA.IEnumExtensionTypeSymbol enumExtSym
                     && enumExtSym.Target is NavCA.ISymbolWithId targetSym)
                 {
-                    AlEnumMetadataRegistry.RegisterExtension(targetSym.Id, enumSym.Name, options, indexes, implementations);
+                    var extName = enumSym.Name;
+                    var extTargetId = targetSym.Id;
+                    Rad.RadMetadataCapture.ApplyOrDefer(() => AlEnumMetadataRegistry.RegisterExtension(
+                        extTargetId, extName, options, indexes, implementations));
                 }
                 else
                 {
-                    AlEnumMetadataRegistry.Register(enumSym.Id, enumSym.Name, options, indexes, implementations);
+                    var enumId = enumSym.Id;
+                    var enumName = enumSym.Name;
+                    Rad.RadMetadataCapture.ApplyOrDefer(() => AlEnumMetadataRegistry.Register(
+                        enumId, enumName, options, indexes, implementations));
                 }
             }
             // Capture the per-report runtime metadata XML the emit pipeline hands us
@@ -1840,13 +1846,20 @@ public sealed partial class BcCompiler
             // so BC's report execution chain runs on genuine metadata.
             if (symbol is NavCA.IReportTypeSymbol reportSym && !string.IsNullOrEmpty(metadata))
             {
-                AlReportMetadataRegistry.Register(reportSym.Id, metadata);
+                var reportId = reportSym.Id;
                 // The emitted metadata XML's <Layouts> block carries only
                 // Name/Caption/Summary — the layout's Type, MimeType and
                 // LayoutFile live on the compiler's own ReportLayoutSymbol.
                 // Capture those so the "Report Layout List" virtual table
                 // (2000000234) can be populated with real per-layout values.
-                CaptureReportLayouts(reportSym, metadata);
+                // Read off the symbol NOW: the registry write may be deferred to the
+                // end of a RAD cycle, by which time this compilation is gone.
+                var layouts = ReadReportLayouts(reportSym, metadata);
+                Rad.RadMetadataCapture.ApplyOrDefer(() =>
+                {
+                    AlReportMetadataRegistry.Register(reportId, metadata);
+                    foreach (var layout in layouts) AlReportLayoutRegistry.Register(layout);
+                });
             }
 
             // Same capture for pages. NCLMetaForm.LoadMetadata() parses this XML into a
@@ -1855,7 +1868,10 @@ public sealed partial class BcCompiler
             // bound to anything but a Rec field has nowhere to resolve to.
             // See AlPageMetadataRegistry.cs (and the cache-HIT sidecar it documents).
             if (symbol is NavCA.IPageTypeSymbol pageSym && !string.IsNullOrEmpty(metadata))
-                AlPageMetadataRegistry.Register(pageSym.Id, metadata);
+            {
+                var pageId = pageSym.Id;
+                Rad.RadMetadataCapture.ApplyOrDefer(() => AlPageMetadataRegistry.Register(pageId, metadata));
+            }
 
             // Same capture for xmlports. NCLMetaXmlPort.LoadMetadata() parses this XML into
             // a real MetaXmlPort with the port's full node schema; without it BC's own
@@ -1863,7 +1879,10 @@ public sealed partial class BcCompiler
             // NCLMetaXmlPort.CreateObjectInstance and GetMetadataFromLoader NRE.
             // See AlXmlPortMetadataRegistry.cs (and the cache-HIT sidecar it documents).
             if (symbol is NavCA.IXmlPortTypeSymbol xmlPortSym && !string.IsNullOrEmpty(metadata))
-                AlXmlPortMetadataRegistry.Register(xmlPortSym.Id, metadata);
+            {
+                var xmlPortId = xmlPortSym.Id;
+                Rad.RadMetadataCapture.ApplyOrDefer(() => AlXmlPortMetadataRegistry.Register(xmlPortId, metadata));
+            }
 
             if (Environment.GetEnvironmentVariable("BCCOMPILER_TRACE") == "1")
                 Console.Error.WriteLine($"  emit[{AddCalls}]: {symbol.Name} kind={symbol.GetType().Name} metaLen={metadata?.Length ?? -1}");
@@ -1888,14 +1907,16 @@ public sealed partial class BcCompiler
         ///
         /// <c>ReportLayoutSymbol</c> lives in the compiler's internal Symbols namespace
         /// (the public <c>IReportLayoutSymbol</c> exposes nothing), hence reflection.
-        /// Every step is defensive: a report whose layouts cannot be read registers no
+        /// Every step is defensive: a report whose layouts cannot be read yields no
         /// layouts and behaves exactly as it did before this capture existed.
         /// </summary>
-        private static void CaptureReportLayouts(NavCA.IReportTypeSymbol reportSym, string metadataXml)
+        private static IReadOnlyList<AlReportLayoutInfo> ReadReportLayouts(
+            NavCA.IReportTypeSymbol reportSym, string metadataXml)
         {
+            var layouts = new List<AlReportLayoutInfo>();
             try
             {
-                if (reportSym is not NavCA.IContainerSymbol container) return;
+                if (reportSym is not NavCA.IContainerSymbol container) return layouts;
                 var captions = ParseLayoutCaptionsFromMetadata(metadataXml);
                 var defaultLayoutName = ReadDefaultRenderingLayoutName(reportSym);
                 foreach (var member in container.GetMembers())
@@ -1913,7 +1934,7 @@ public sealed partial class BcCompiler
                     var resolved = ResolveLayoutFilePath(member, layoutFile);
 
                     captions.TryGetValue(name, out var cs);
-                    AlReportLayoutRegistry.Register(new AlReportLayoutInfo(
+                    layouts.Add(new AlReportLayoutInfo(
                         ReportId: reportSym.Id,
                         Name: name,
                         LayoutType: layoutType,
@@ -1929,6 +1950,7 @@ public sealed partial class BcCompiler
             {
                 Console.Error.WriteLine($"[BcCompiler] report-layout capture failed for report {reportSym.Id}: {ex.Message}");
             }
+            return layouts;
         }
 
         /// <summary>

@@ -1,6 +1,6 @@
 // RadFixtureHarness — the shared seam every RAD proportionality suite compiles against.
 //
-// The performance claim `--watch --rad` makes is not "it felt fast": it is that ONE edit
+// The performance claim `--watch` makes is not "it felt fast": it is that ONE edit
 // costs ONE object of compiler work and replaces ONE runtime object. That claim is only
 // falsifiable against a baseline big enough for "all of it" and "the changed one" to be
 // different numbers, so all of these suites share one real 20-object AL app
@@ -55,7 +55,7 @@ internal static class RadFixture
 
     /// <summary>
     /// One full compile of the fixture, committed as the RAD baseline — the state a
-    /// `--watch --rad` process reaches at the end of its first cycle. Every later
+    /// `--watch` process reaches at the end of its first cycle. Every later
     /// assertion is relative to this.
     /// </summary>
     internal static SeededBaseline Seed(string tempRoot)

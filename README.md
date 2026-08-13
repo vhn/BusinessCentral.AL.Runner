@@ -108,11 +108,13 @@ Stays resident with dependencies + BC patches loaded once, and re-runs the bundl
 
 With a cold output cache, the first cycle performs a normal full compile and records a
 baseline. After a cache-hit first cycle, the first edit performs one full-bundle compile
-to establish every app's baseline. Later cycles hash the complete `.al` source tree: a
-surface-stable edit to existing codeunits uses BC's `Compilation.CreateForRad` plus a
-small C# overlay, while additions, deletions, non-codeunit edits, callable-surface
-changes, and reference changes use a normal full compile. Point it at a directory
-holding an app and its test app and it watches both:
+to establish every app's baseline. Later cycles hash the complete `.al` source tree and
+recompile only the AL objects that actually changed — of any kind, including ones the save
+added or deleted — via BC's `Compilation.CreateForRad` plus a small C# overlay loaded
+beside the warm module. Only a change the delta path cannot classify (a new dependency, a
+changed app identity or preprocessor set, an id-less object such as a `controladdin`)
+falls back to a full compile. Point it at a directory holding an app and its test app and
+it watches both:
 
 ```bash
 al-runner --watch --package-cache <deps-dir> path/to/repo   # repo/Application + repo/Test
@@ -179,7 +181,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dev-loop) for provisioning them as a separ
 | `--package-cache PATH` | Extra `.app`-package cache directory. Repeatable. |
 | `--cache PATH` | Cache compiled AL output keyed on source + dep set + runner mtime. |
 | `--isolation codeunit\|test\|disabled` | Test isolation mode. Default `codeunit`. |
-| `--watch` | Stay resident with warm dependencies; on `.al` or `app.json` changes, compile only as needed and run **in-process**. |
+| `--watch` | Stay resident with warm dependencies; on `.al` or `app.json` changes, recompile only the AL objects that changed and run **in-process**. |
 | `--server` | Long-running JSON-RPC daemon over stdin/stdout (warm deps → ~19s→~4s/run). See [docs/server-mode.md](docs/server-mode.md). |
 | `--per-suite` | Legacy per-suite compile mode (diagnostic). Default is bundled-per-bucket. |
 | `--bundled` | No-op alias for backwards compatibility. |

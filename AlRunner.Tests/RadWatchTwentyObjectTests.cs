@@ -1,5 +1,5 @@
 // RadWatchTwentyObjectTests — the same proportionality claim as RadObjectDeltaTests, but
-// made against the real `--watch --rad` process instead of the compiler seam.
+// made against the real `--watch` process instead of the compiler seam.
 //
 // The compiler-level suites prove which objects re-emit and which CLR types change owner.
 // They deliberately stop below Program.cs, so they cannot see the half of a watch cycle
@@ -265,7 +265,7 @@ public class RadWatchTwentyObjectTests
     }
 
     /// <summary>
-    /// One resident `--watch --rad` runner over a private copy of the 20-object app and its
+    /// One resident `--watch` runner over a private copy of the 20-object app and its
     /// test app, with the output split into cycles at the watcher's own idle marker.
     ///
     /// Edits are real file writes, so the FileSystemWatcher drives the cycle exactly as it
@@ -300,7 +300,7 @@ public class RadWatchTwentyObjectTests
                 // so RAD would spend cycle 2 establishing one and the assertions below would
                 // be off by a cycle.
                 Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
-                    + $" \"{bundle}\" --watch --rad --no-cache",
+                    + $" \"{bundle}\" --watch --no-cache",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,

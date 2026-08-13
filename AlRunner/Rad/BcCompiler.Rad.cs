@@ -37,6 +37,12 @@ public sealed record RadEmitResult(
     public RadChangeSet Changes { get; init; } = RadChangeSet.Empty;
 
     /// <summary>
+    /// Runtime metadata this generation's AL emit produced, held back until the
+    /// generation loads. Null for a full compile, which writes through immediately.
+    /// </summary>
+    internal AlRunner.Rad.RadMetadataCapture? Metadata { get; init; }
+
+    /// <summary>
     /// Make a successful AL emit current only after its C# assembly has compiled and
     /// loaded. <paramref name="assembly"/> is null only for a deletion-only delta.
     /// </summary>
@@ -55,6 +61,34 @@ public sealed record RadEmitResult(
             AlRunner.Rad.AlObjectResolution.RegisterGeneration(workspace, assembly);
             workspace.Generations.Clear();
             workspace.Generations.Add(assembly);
+
+            // A warm watch cycle keeps the metadata registries across reloads, so a full
+            // compile is not a clean slate. Its re-emit has already overwritten every
+            // entry keyed by an id that still exists; what it cannot say anything about is
+            // an identity that is GONE. Two shapes of that, both resolved here while the
+            // workspace still remembers what the app used to declare:
+            var declared = WorkspaceUpdate.ObjectsByFile.Values
+                .SelectMany(objects => objects)
+                .ToDictionary(item => item.Key);
+            foreach (var previous in workspace.AllObjects())
+            {
+                //  1. the object was deleted — nothing re-registered it.
+                if (!declared.TryGetValue(previous.Key, out var current))
+                {
+                    AlRunner.Rad.RadMetadataCapture.Drop(workspace, previous);
+                    continue;
+                }
+                //  2. it survives, but an enumextension registers under (base enum id, its
+                //     own name) rather than under its own id — so a rename or a change of
+                //     target adds a second registration instead of replacing the first,
+                //     and the merged enum would carry values from both.
+                if (previous.Key.Kind == "EnumExtension"
+                    && workspace.TryGetExtensionTarget(previous.Key, out var wasTarget)
+                    && (!WorkspaceUpdate.ExtensionTargets.TryGetValue(previous.Key, out var target)
+                        || wasTarget != target
+                        || !string.Equals(previous.Name, current.Name, StringComparison.Ordinal)))
+                    AlRunner.Rad.RadMetadataCapture.Drop(workspace, previous);
+            }
         }
         else
         {
@@ -67,6 +101,9 @@ public sealed record RadEmitResult(
             if (assembly != null) workspace.Generations.Add(assembly);
         }
 
+        // Before workspace.Commit: dropping the previous identity of a renamed
+        // enumextension or a removed report needs the object map as it was.
+        Metadata?.Apply(workspace, Changes);
         workspace.Commit(WorkspaceUpdate);
     }
 }
@@ -99,6 +136,17 @@ public sealed partial class BcCompiler
     /// </summary>
     public RadEmitResult EmitIncremental(IEnumerable<string> alFolders, string moduleName, AlRunner.Rad.RadWorkspace ws)
     {
+        // BCCOMPILER_TIMING marks: the delta emit itself reports its own duration, but on a
+        // 7,000-file app the work AROUND it — enumerating the tree, hashing it, resolving
+        // the reference surface — is what a warm cycle actually spends its time on.
+        bool timing = Environment.GetEnvironmentVariable("BCCOMPILER_TIMING") == "1";
+        var step = System.Diagnostics.Stopwatch.StartNew();
+        void Mark(string label)
+        {
+            if (timing) Console.Error.WriteLine($"[emit-timing] {moduleName}: {label}: {step.ElapsedMilliseconds}ms");
+            step.Restart();
+        }
+
         var dirs = alFolders.Where(Directory.Exists).Distinct().ToList();
         if (dirs.Count == 0)
             throw new InvalidOperationException("BcCompiler.EmitIncremental: no source folders");
@@ -109,8 +157,10 @@ public sealed partial class BcCompiler
         if (alFiles.Count == 0)
             throw new InvalidOperationException(
                 $"BcCompiler.EmitIncremental: no .al files under {string.Join(", ", dirs)}");
+        Mark($"enumerate {alFiles.Count} files");
 
         var hashes = AlRunner.Rad.RadWorkspace.HashSourceTree(alFiles);
+        Mark("hash source tree");
 
         // The reference surface has to be established before the delta/full decision:
         // a dependency or preprocessor change invalidates every cached object.
@@ -119,6 +169,10 @@ public sealed partial class BcCompiler
             .Distinct()
             .ToList();
         var (refLoader, specs) = GetSharedReferences(bundleAlpackages);
+        // The full-compile path emits this same mark: this call is the one that goes cold
+        // if the resident dependency loader is ever rebuilt, and a warm watch cycle that
+        // quietly pays the ~40s reload looks exactly like a slow compile from outside.
+        Mark($"GetSharedReferences ({specs.Length} specs)");
         bool canDelta = ws.ArmFor(ReferenceSignature(moduleName, specs, dirs));
 
         if (!canDelta)
@@ -253,9 +307,9 @@ public sealed partial class BcCompiler
 
         var declaredSymbols = probe.GetDeclaredApplicationObjectSymbols().ToList();
         var keyedFiles = declaredSymbols
-            .Where(sym => sym is NavCA.ISymbolWithId)
+            .Where(IsKeyable)
             .Select(FileOf).OfType<string>().ToHashSet(StringComparer.Ordinal);
-        if (declaredSymbols.Any(sym => sym is not NavCA.ISymbolWithId)
+        if (declaredSymbols.Any(sym => !IsKeyable(sym))
             || removedFiles.Any(f => ws.ObjectsIn(f).Count == 0)
             || changedFiles.Any(f => ws.ObjectsIn(f).Count == 0 && !keyedFiles.Contains(f)))
         {
@@ -310,9 +364,21 @@ public sealed partial class BcCompiler
             .Concat(removed)
             .Select(ToChangeElement)
             .ToArray();
+        // …with one exception: an EXTENSION object stays. Its fields/controls/values reach
+        // the target object only through the packaged module — strip a tableextension and
+        // `Rec."<its own field>"` inside its own trigger stops binding with AL0132, because
+        // the target table's symbol is resolved from the packaged definition and now has no
+        // extension at all. Measured on NP Retail, where adding one field to
+        // GeneralPostingSetup.TableExt failed the cycle with three AL0132s against fields
+        // declared in that same file. Leaving it in does not shadow the edit: the supplied
+        // syntax tree is still the authority for the object being rebound, so a field the
+        // edit adds binds and one it removes stops binding — both pinned by
+        // RadTableExtensionSelfReferenceTests.
         var packaged = AlRunner.Rad.ModuleDefinitionOps.WithoutObjects(
             WorkspaceBaseline(ws),
-            modified.Concat(removed).Select(item => item.Key).ToArray());
+            modified.Concat(removed).Select(item => item.Key)
+                .Where(key => !key.IsExtension)
+                .ToArray());
         var rad = NavCA.Compilation.CreateForRad(
             moduleName: moduleName,
             objectChangeModelDefinition: model,
@@ -328,14 +394,29 @@ public sealed partial class BcCompiler
             options: compOpts,
             dotNetResolverFactory: GetOrCreateDotNetFactory());
 
+        // Ask for binding errors BEFORE code generation. BC's RAD emitter does not
+        // survive them: a reference to an object this delta removed makes it throw out of
+        // codegen ("Unexpected value 'None' of type NavTypeKind") rather than report the
+        // AL0185 its own declaration pass already found. Asking first turns a dangling
+        // reference into one diagnostic naming the missing object, instead of a whole-module
+        // rebuild whose emit-retry then silently drops the caller — and the caller's caller.
+        foreach (var d in rad.GetDeclarationDiagnostics().Where(d => d.Severity == NavDiag.DiagnosticSeverity.Error))
+            diags.Add($"{d.Location}: error {d.Id}: {d.GetMessage().Split('\n', 2)[0]}");
+        if (diags.Count > 0)
+            return new RadEmitResult(
+                new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
+                FullRebuild: false, NoChange: false);
+
+        // Metadata the emit registers is held here until the generation loads — see
+        // RadMetadataCapture. Without it a candidate the C# backend rejects still leaves
+        // the live runtime describing objects whose code never loaded.
+        using var capture = AlRunner.Rad.RadMetadataCapture.Begin();
         var outputter = new CaptureOutputter();
         NavCA.Emit.EmitResult? emitResult = null;
         Exception? caught = null;
         try { emitResult = rad.Emit(NavCA.EmitOptions.Default, outputter); }
         catch (Exception ex) { caught = ex; }
 
-        foreach (var d in rad.GetDeclarationDiagnostics().Where(d => d.Severity == NavDiag.DiagnosticSeverity.Error))
-            diags.Add($"{d.Location}: error {d.Id}: {d.GetMessage().Split('\n', 2)[0]}");
         if (emitResult != null && !emitResult.Success)
             foreach (var d in emitResult.Diagnostics.Where(d => d.Severity == NavDiag.DiagnosticSeverity.Error))
                 diags.Add($"{d.Location}: error {d.Id}: {d.GetMessage().Split('\n', 2)[0]}");
@@ -452,6 +533,7 @@ public sealed partial class BcCompiler
         {
             WorkspaceUpdate = update,
             Changes = new RadChangeSet(added, modified, removed),
+            Metadata = capture,
         };
     }
 
@@ -507,21 +589,48 @@ public sealed partial class BcCompiler
             .Concat(_extraPreprocessorSymbols ?? []),
         documentationMode: NavCA.DocumentationMode.None);
 
+    /// <summary>
+    /// Whether <see cref="AlRunner.Rad.RadObjectKey"/> can identify this object at all.
+    ///
+    /// AL's id-less kinds do not all fail the <c>ISymbolWithId</c> test: a
+    /// <c>profile</c> implements it and reports id 0, so an app with seven profiles
+    /// produces seven objects that all key as <c>Profile:0</c>. Measured on NP Retail,
+    /// where that collision threw out of the baseline snapshot and left the app without
+    /// one — every cycle a full compile, no delta ever. Real AL object ids start at 1.
+    /// </summary>
+    private static bool IsKeyable(NavCA.ISymbol symbol) =>
+        symbol is NavCA.ISymbolWithId { Id: > 0 };
+
+    /// <summary>
+    /// The declared objects a delta can track: keyable, and uniquely keyed within the
+    /// module. A key claimed by more than one object identifies neither, so both are left
+    /// out — their files then look untracked and changing one takes the full-compile path.
+    /// </summary>
+    private static List<NavCA.IApplicationObjectTypeSymbol> UniquelyKeyedObjects(
+        NavCA.Compilation compilation)
+    {
+        var byKey = new Dictionary<AlRunner.Rad.RadObjectKey, NavCA.IApplicationObjectTypeSymbol?>();
+        foreach (var symbol in compilation.GetDeclaredApplicationObjectSymbols())
+        {
+            if (!IsKeyable(symbol)) continue;
+            var key = ObjectKey(symbol);
+            byKey[key] = byKey.ContainsKey(key) ? null : symbol;
+        }
+        return byKey.Values.OfType<NavCA.IApplicationObjectTypeSymbol>().ToList();
+    }
+
     /// <summary>Which source file declares each application object in a bound compilation.</summary>
     private static Dictionary<string, List<AlRunner.Rad.RadObjectRef>> MapObjectsToFiles(NavCA.Compilation compilation)
     {
         var map = new Dictionary<string, List<AlRunner.Rad.RadObjectRef>>(StringComparer.Ordinal);
-        foreach (var sym in compilation.GetDeclaredApplicationObjectSymbols())
+        foreach (var sym in UniquelyKeyedObjects(compilation))
         {
-            if (sym is not NavCA.ISymbolWithId withId) continue;
             var file = FileOf(sym);
             if (file == null) continue;
             if (!map.TryGetValue(file, out var list))
                 map[file] = list = new List<AlRunner.Rad.RadObjectRef>();
             list.Add(new AlRunner.Rad.RadObjectRef(
-                new AlRunner.Rad.RadObjectKey(sym.Kind.ToString(), withId.Id),
-                sym.Name ?? string.Empty,
-                NamespaceOf(sym)));
+                ObjectKey(sym), sym.Name ?? string.Empty, NamespaceOf(sym)));
         }
         return map;
     }
@@ -535,9 +644,7 @@ public sealed partial class BcCompiler
     private static Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadObjectKey>>
         MapObjectReferences(NavCA.Compilation compilation)
     {
-        var declared = compilation.GetDeclaredApplicationObjectSymbols()
-            .Where(symbol => symbol is NavCA.ISymbolWithId)
-            .ToArray();
+        var declared = UniquelyKeyedObjects(compilation);
         var ownAppId = declared.FirstOrDefault()?.ContainingModule?.AppId;
         var result = declared.ToDictionary(
             ObjectKey,
@@ -567,7 +674,7 @@ public sealed partial class BcCompiler
             void AddReference(NavCA.ISymbol? symbol)
             {
                 var target = ContainingApplicationObject(symbol);
-                if (target is not NavCA.ISymbolWithId) return;
+                if (target == null || !IsKeyable(target)) return;
                 if (target.ContainingModule?.AppId != ownAppId) return;
                 var targetKey = ObjectKey(target);
                 foreach (var source in sources)
@@ -576,7 +683,7 @@ public sealed partial class BcCompiler
         }
 
         foreach (var extension in declared.OfType<NavCA.IApplicationObjectExtensionTypeSymbol>())
-            if (extension.Target is NavCA.ISymbolWithId)
+            if (IsKeyable(extension.Target))
                 result[ObjectKey(extension)].Add(ObjectKey(extension.Target));
 
         return result;
@@ -586,9 +693,9 @@ public sealed partial class BcCompiler
         MapExtensionTargets(NavCA.Compilation compilation)
     {
         var result = new Dictionary<AlRunner.Rad.RadObjectKey, AlRunner.Rad.RadObjectKey>();
-        foreach (var extension in compilation.GetDeclaredApplicationObjectSymbols()
+        foreach (var extension in UniquelyKeyedObjects(compilation)
             .OfType<NavCA.IApplicationObjectExtensionTypeSymbol>())
-            if (extension is NavCA.ISymbolWithId && extension.Target is NavCA.ISymbolWithId)
+            if (IsKeyable(extension.Target))
                 result[ObjectKey(extension)] = ObjectKey(extension.Target);
         return result;
     }

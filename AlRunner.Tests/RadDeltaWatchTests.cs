@@ -86,7 +86,7 @@ public class RadDeltaWatchTests
         {
             FileName = "dotnet",
             Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
-                + $" \"{bundle}\" --watch --rad --no-cache",
+                + $" \"{bundle}\" --watch --no-cache",
             RedirectStandardOutput = true, RedirectStandardError = true,
             UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
         };
@@ -307,7 +307,7 @@ public class RadDeltaWatchTests
         {
             FileName = "dotnet",
             Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
-                + $" \"{main}\" --watch --rad --no-cache --verbose"
+                + $" \"{main}\" --watch --no-cache --verbose"
                 + $" --package-cache \"{packages}\" --package-cache \"{platformApps}\"",
             RedirectStandardOutput = true, RedirectStandardError = true,
             UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,

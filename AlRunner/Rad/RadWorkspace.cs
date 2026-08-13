@@ -159,6 +159,10 @@ public sealed class RadWorkspace
     public RadObjectRef? Object(RadObjectKey key) =>
         _objectsByFile.Values.SelectMany(list => list).FirstOrDefault(o => o.Key == key);
 
+    /// <summary>Every object the last committed compile saw this app declare.</summary>
+    internal IReadOnlyList<RadObjectRef> AllObjects() =>
+        _objectsByFile.Values.SelectMany(list => list).ToArray();
+
     internal string? FileOf(RadObjectKey key) =>
         _objectsByFile.FirstOrDefault(pair => pair.Value.Any(item => item.Key == key)).Key;
 

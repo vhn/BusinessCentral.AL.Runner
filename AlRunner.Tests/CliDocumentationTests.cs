@@ -132,7 +132,7 @@ public sealed class CliDocumentationTests
         Assert.True(idx >= 0, "--help should keep a 'NOT YET IMPLEMENTED' section.");
         var notYet = help[idx..];
 
-        foreach (var implemented in new[] { "--server", "--watch", "--rad", "--define", "--auto-provision", "--output-json", "--output-junit" })
+        foreach (var implemented in new[] { "--server", "--watch", "--define", "--auto-provision", "--output-json", "--output-junit" })
             Assert.False(notYet.Contains(implemented, StringComparison.Ordinal),
                 $"{implemented} is implemented but listed under 'NOT YET IMPLEMENTED'.");
     }
@@ -185,11 +185,37 @@ public sealed class CliDocumentationTests
         Assert.Contains("--guied", stderr, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Delta compilation used to be opt-in behind `--rad`. It is now what `--watch`
+    /// does, so the help entry has to say so — otherwise the only description of the
+    /// behaviour a developer sees is "re-run in-process", which undersells it and gives
+    /// no name to search for when a cycle looks wrong.
+    /// </summary>
     [Fact]
-    public void Rad_RequiresWatch()
+    public void Help_DescribesWatchAsObjectGranular()
+    {
+        var (_, help, _) = RunCli("--help");
+
+        var idx = help.IndexOf("  --watch ", StringComparison.Ordinal);
+        Assert.True(idx >= 0, "--help must document --watch.");
+        var entry = help[idx..];
+        var next = entry.IndexOf("\n  --", StringComparison.Ordinal);
+        if (next > 0) entry = entry[..next];
+
+        Assert.Contains("only the AL objects", entry, StringComparison.Ordinal);
+        Assert.Contains("docs/delta-compile.md", entry, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Negative direction for the same change: `--rad` is gone rather than silently
+    /// accepted. A tolerated no-op flag would let a stale script keep passing it while
+    /// reading as if it still selected something.
+    /// </summary>
+    [Fact]
+    public void Rad_IsNoLongerAFlag()
     {
         var (exit, _, stderr) = RunCli("--rad");
         Assert.Equal(2, exit);
-        Assert.Contains("--rad requires --watch", stderr, StringComparison.Ordinal);
+        Assert.Contains("--rad", stderr, StringComparison.Ordinal);
     }
 }

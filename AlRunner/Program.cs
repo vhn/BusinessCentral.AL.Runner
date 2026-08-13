@@ -211,9 +211,8 @@ string? testFilter = null;
 // AL_RUNNER_TEST_TIMEOUT_SEC env var. Null = env var / 60s default.
 int? testTimeoutSeconds = null;
 // --watch: stay resident with warm dependencies and re-run IN-PROCESS when AL source
-// or app.json changes. --rad opts that loop into object-granular delta compilation.
+// or app.json changes, recompiling only the AL objects the save actually changed.
 bool watchMode = false;
-bool radMode = false;
 // --dump-csharp DIR: write the emitted C# (BC Compilation.Emit output, post-BcAssembler
 // polyfill injection) to disk for every bundle compile. Useful for debugging codegen.
 string? dumpCsharpDir = null;
@@ -255,7 +254,6 @@ for (int i = 0; i < args.Length; i++)
     if (args[i] == "--cache" && i + 1 < args.Length) { alCacheDir = args[++i]; continue; }
     if (args[i] == "--no-cache") { alCacheDir = null; continue; }
     if (args[i] == "--watch") { watchMode = true; continue; }
-    if (args[i] == "--rad") { radMode = true; continue; }
     if (args[i] == "--server") { continue; }  // handled above (serverMode); consume so it isn't "unknown"
     if (args[i] == "--verbose") { AlRunner.Log.Verbose = true; continue; }
     if (args[i] == "--show-pass") { showPass = true; continue; }   // no-op (default in v2); kept for v1 back-compat
@@ -324,11 +322,6 @@ for (int i = 0; i < args.Length; i++)
 if (serverMode && watchMode)
 {
     Console.Error.WriteLine("--server and --watch are mutually exclusive (both stay warm in-process; pick one).");
-    return 2;
-}
-if (radMode && !watchMode)
-{
-    Console.Error.WriteLine("--rad requires --watch.");
     return 2;
 }
 // ── Positional bundle roots must exist (#1713) ────────────────────────────────
@@ -678,9 +671,11 @@ if (!provisionSubcommand && (packageCacheDirs.Count > 0 || bundleAlpackagesDirs.
 // (Microsoft.Dynamics.Nav.Core, .AL.Common, .Apps, .TableProxyBuilder, etc. — 19
 // of the 24 BC DLLs Ncl.dll references aren't project-referenced).
 DependencyLoader.EnsureResolverInstalled_Public();
-// RAD needs a resident workspace holding Microsoft's symbol baseline, and is explicit:
-// plain --watch retains its existing full-reload behaviour.
-AlRunner.Rad.RadWorkspaceStore.Enabled = watchMode && radMode;
+// Delta compilation needs a resident workspace holding Microsoft's symbol baseline, so
+// it is exactly as available as --watch is. AL_RUNNER_RAD=0 forces every watch cycle
+// through a whole-module compile — the escape hatch for bisecting a suspected delta bug.
+AlRunner.Rad.RadWorkspaceStore.Enabled =
+    watchMode && Environment.GetEnvironmentVariable("AL_RUNNER_RAD") != "0";
 if (extraPreprocessorSymbols.Count > 0)
     BcCompiler.SetExtraPreprocessorSymbols(extraPreprocessorSymbols.Distinct().ToList());
 if (Environment.GetEnvironmentVariable("AL_RUNNER_DIAG_FCE") is "1" or "2")
@@ -1078,7 +1073,10 @@ foreach (var bundle in bundles)
     if (suites.Count == 0) { Console.WriteLine($"[{i2}/{bundles.Count}] {rel} ... SKIP (no suites)"); continue; }
     Console.WriteLine($"[{i2}/{bundles.Count}] {rel} — {suites.Count} suites");
 
-    // Pre-register every src dir for RecordPatches at the bundle level.
+    // Pre-register every src dir for RecordPatches at the bundle level. Once the patches
+    // are registered this re-reads and re-parses every .al file under each suite, which on
+    // a large app is the single biggest item in a warm watch cycle — hence the timing mark.
+    var sourceDirSw = System.Diagnostics.Stopwatch.StartNew();
     foreach (var suite in suites)
     {
         var s = Path.Combine(suite, "src");
@@ -1088,6 +1086,9 @@ foreach (var bundle in bundles)
             // Flat bundle: register the suite root so table parsers can find .al files.
             AlRunner.Patches.RecordPatches.AddSourceDir(suite);
     }
+    if (Environment.GetEnvironmentVariable("BCCOMPILER_TIMING") == "1")
+        Console.Error.WriteLine(
+            $"[emit-timing] RecordPatches.AddSourceDir ({suites.Count} suites): {sourceDirSw.ElapsedMilliseconds}ms");
 
     var bundleEmit = TimeSpan.Zero;
     var bundleComp = TimeSpan.Zero;
@@ -1163,6 +1164,18 @@ foreach (var bundle in bundles)
         var allPaths = appGroup.Paths;
         var moduleName = appGroup.ModuleName;
 
+        // BCCOMPILER_TIMING marks for the work AROUND the compile. On a large app a warm
+        // delta cycle spends far more time here — per-app setup before the emit, and
+        // module registration after it — than in the emit itself, and neither shows up in
+        // the per-cycle "AL emit / C# compile / test run" summary.
+        var appStep = System.Diagnostics.Stopwatch.StartNew();
+        void AppMark(string label)
+        {
+            if (Environment.GetEnvironmentVariable("BCCOMPILER_TIMING") == "1")
+                Console.Error.WriteLine($"[emit-timing] {moduleName}: {label}: {appStep.ElapsedMilliseconds}ms");
+            appStep.Restart();
+        }
+
         // Compile THIS app under its own app.json identity, overriding the
         // bundle-level identity set before the suite loop. This is what makes
         // NavApp.GetCurrentModuleInfo, NavApp.GetResource and install-trigger
@@ -1214,6 +1227,7 @@ foreach (var bundle in bundles)
         // emit produces. Serving a HIT without it leaves NCLMetaQuery null and every
         // query Find NREs inside BC's NavQuery.ValidateTablesNotVirtual.
         bool bundleDeclaresQuery = BcCompiler.BundleDeclaresQuery(allPaths);
+        AppMark("BundleDeclaresQuery");
 
         // ── RAD delta workspace (--watch) ──────────────────────────────────
         // Held across cycles per app identity: per-file content hashes, the compiler's
@@ -1222,10 +1236,13 @@ foreach (var bundle in bundles)
         AlRunner.Rad.RadWorkspace? radWs = needCompile && AlRunner.Rad.RadWorkspaceStore.Enabled
             ? AlRunner.Rad.RadWorkspaceStore.For(moduleName, appGroup.AppId, appGroup.SuiteDir)
             : null;
-        // A cached whole-module DLL has no compiler symbol baseline. RAD therefore starts
-        // with one real full emit; every later cycle can then use the resident workspace.
-
-        if (needCompile && alCacheDir != null && radWs == null)
+        // A cached whole-module DLL has no compiler symbol baseline, so it can serve the
+        // FIRST cycle and nothing after it: starting a watch on an unchanged tree should
+        // cost a load, not a whole-module compile, and the first edit then builds the
+        // baseline the deltas need. Once a generation is loaded the workspace owns the
+        // module — a later cache key that still matches (a manifest-only change does not
+        // move it) must never resurrect the pre-edit DLL over it.
+        if (needCompile && alCacheDir != null && radWs is null or { Generations.Count: 0 })
         {
             cacheKey = ComputeAlCacheKey(allPaths, moduleName, ordered: orderedDepIds);
             cachePath = Path.Combine(alCacheDir, cacheKey + ".dll");
@@ -1288,7 +1305,7 @@ foreach (var bundle in bundles)
         }
         if (needCompile && assemblyBytes == null)
         {
-            if (alCacheDir != null && radWs == null) Console.Error.WriteLine($"  [cache] MISS key={cacheKey} — running Emit+Compile");
+            if (cachePath != null) Console.Error.WriteLine($"  [cache] MISS key={cacheKey} — running Emit+Compile");
             var et = System.Diagnostics.Stopwatch.StartNew();
             IReadOnlyList<EmittedSource> sources = Array.Empty<EmittedSource>();
             IReadOnlyList<string> alDiagnostics = Array.Empty<string>();
@@ -1313,6 +1330,7 @@ foreach (var bundle in bundles)
             // .deps-bin path, neither of which this scope touches. Same filter EmitDepSymbols
             // already applies — see BcCompiler.ScopeSymbolBearingDepsOnly.
             using var bundleDepScope = BcCompiler.ScopeSymbolBearingDepsOnly();
+            AppMark("pre-emit setup");
             var emitTask = Task.Run(() => RunEmit(emitter, allPaths, moduleName, radWs));
             try
             {
@@ -1548,7 +1566,20 @@ foreach (var bundle in bundles)
                 if (!watchMode && appGroup.AppId is { } newlyLoadedId)
                     DependencyLoader.RegisterLoaded(newlyLoadedId, loaded);
 
-                if (radWs != null)
+                if (radWs != null && radResult == null)
+                {
+                    // Cache HIT: the whole module arrived precompiled, so there is no
+                    // compiler symbol baseline to delta against — the first edit builds
+                    // one. Take ownership of the loaded types anyway, so that compile can
+                    // tell an object the developer deleted from one it merely did not
+                    // re-emit, instead of leaving this generation unowned and resolvable
+                    // by assembly-scan order (see AlObjectResolution).
+                    AlRunner.Rad.AlObjectResolution.RegisterGeneration(radWs, loaded);
+                    radWs.Generations.Clear();
+                    radWs.Generations.Add(loaded);
+                    appAssemblies.Add(loaded);
+                }
+                else if (radWs != null)
                 {
                     if (radResult?.CanCommit != true)
                         throw new InvalidOperationException(
@@ -1585,6 +1616,7 @@ foreach (var bundle in bundles)
             }
         }
 
+        AppMark("emit + C# compile + load");
         foreach (var asm in appAssemblies)
         {
             var registerSw = System.Diagnostics.Stopwatch.StartNew();
@@ -1638,6 +1670,7 @@ foreach (var bundle in bundles)
         if (siblingDir != null && appGroup.AppId is { } symId && siblingTargets.Contains(symId))
             PublishSiblingSymbols(
                 siblingDir, appGroup, appGroups, radWs, bundleAbs, bundleResolvedDeps);
+        AppMark("register + publish symbols");
         } // ── end per-app emit/compile/load loop ────────────────────────────────
 
         // Every app's assembly is now in the AppDomain, so this single walk resolves
@@ -2879,9 +2912,9 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("                          (key = hash of .al sources, resolved deps, runner mtime).");
     w.WriteLine("  --no-cache              Disable the AL-output cache for this run.");
     w.WriteLine("  --watch                 Stay resident with warm dependencies and re-run IN-PROCESS");
-    w.WriteLine("                          when .al source or app.json changes. Ctrl+C to quit.");
-    w.WriteLine("  --rad                   With --watch, compile and load only the changed AL objects,");
-    w.WriteLine("                          including additions and removals.");
+    w.WriteLine("                          when .al source or app.json changes. Each save recompiles");
+    w.WriteLine("                          and reloads only the AL objects it changed, added or");
+    w.WriteLine("                          removed. Ctrl+C to quit. See docs/delta-compile.md.");
     w.WriteLine("  --server                Long-running JSON-RPC daemon over stdin/stdout (warm");
     w.WriteLine("                          deps + BC patches loaded once; ~19s->~4s per run). One");
     w.WriteLine("                          JSON request/response per line. stdout carries ONLY the");

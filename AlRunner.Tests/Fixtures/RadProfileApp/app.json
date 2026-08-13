@@ -1,0 +1,16 @@
+{
+  "id": "5a1d0f27-7c64-4b53-9f2e-3d8b6c41a907",
+  "name": "RAD Profile Fixture",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [
+    {
+      "from": 71400,
+      "to": 71449
+    }
+  ],
+  "dependencies": []
+}

@@ -120,7 +120,7 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     }
 
     /// <summary>
-    /// Schema edits, the reason `--watch --rad` is worth having on an app with tables: the
+    /// Schema edits, the reason `--watch` is worth having on an app with tables: the
     /// runner has no database, so adding a field is an object recompile and a metadata
     /// refresh, never a migration. A structural change must therefore stay exactly as
     /// proportional as a body edit — one object in, one object out.

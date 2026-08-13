@@ -22,16 +22,127 @@ public class WatchTests
     private static readonly string FixtureSrc = Path.GetFullPath(Path.Combine(
         AppContext.BaseDirectory, "..", "..", "..", "Fixtures", "RecordTriggerXRec"));
 
+    // Ask the runner where its artifacts are rather than hardcoding one of the several
+    // directories they can live in. Probing ~/.bcartifacts.cache/sandbox directly made
+    // both tests in this file skip silently on any machine provisioned into
+    // ~/.local/share/al-runner/artifacts — which is the default the runner itself uses.
     private static bool ArtifactsPresent()
     {
-        var home = Environment.GetEnvironmentVariable("HOME");
-        return !string.IsNullOrEmpty(home) && Directory.Exists(Path.Combine(home, ".bcartifacts.cache", "sandbox"));
+        try { return Directory.Exists(AlRunner.Infrastructure.BcArtifacts.ServiceTierDir); }
+        catch { return false; }
     }
 
     private static string CurrentFramework()
     {
         var v = Environment.Version;
         return $"net{v.Major}.{v.Minor}";
+    }
+
+    /// <summary>
+    /// Starting a watch on an unchanged tree must cost a load, not a whole-module compile.
+    /// Delta compilation needs a compiler symbol baseline that a cached DLL cannot supply,
+    /// so the temptation is to skip the cache entirely and compile the module up front —
+    /// which on a large app is minutes of waiting before the developer sees a single test
+    /// result. The contract instead is: serve cycle 1 from the cache, and let the FIRST
+    /// EDIT pay for the baseline.
+    ///
+    /// The edit half is the part that makes this test prove something. A cache HIT that
+    /// also served the second cycle would look identical here on timing alone and be
+    /// completely wrong — the developer's change would simply not run.
+    /// </summary>
+    [Fact]
+    public async Task Watch_FirstCycle_ServesTheCache_AndTheFirstEditBuildsTheBaseline()
+    {
+        if (!ArtifactsPresent()) { Console.Error.WriteLine("[skip] BC artifact cache not present"); return; }
+
+        var bundle = Path.Combine(Path.GetTempPath(), "al-runner-watch-cache", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(bundle);
+        foreach (var f in Directory.GetFiles(FixtureSrc))
+            File.Copy(f, Path.Combine(bundle, Path.GetFileName(f)));
+        var tablePath = Path.Combine(bundle, "XRecProbe.Table.al");
+        var cacheDir = Path.Combine(bundle, ".cache");
+
+        // Prime the cache with a one-shot run over the identical tree.
+        var prime = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                + $" \"{bundle}\" --cache \"{cacheDir}\"",
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+        using (var p0 = Process.Start(prime)!)
+        {
+            var so = p0.StandardOutput.ReadToEndAsync();
+            var se = p0.StandardError.ReadToEndAsync();
+            await p0.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(240));
+            var primed = (await so) + (await se);
+            Assert.True(p0.ExitCode == 0, primed);
+            Assert.Contains("[cache] WROTE", primed);
+        }
+
+        var lines = new List<string>();
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                + $" \"{bundle}\" --watch --cache \"{cacheDir}\"",
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+        using var p = Process.Start(psi)!;
+        void Pump(StreamReader r) => Task.Run(async () =>
+        {
+            string? l;
+            while ((l = await r.ReadLineAsync()) != null) lock (lines) lines.Add(l);
+        });
+        Pump(p.StandardOutput);
+        Pump(p.StandardError);
+
+        async Task<int> Marker(int fromIndex, TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline)
+            {
+                lock (lines)
+                    for (int i = fromIndex; i < lines.Count; i++)
+                        if (lines[i].Contains("[watch] waiting for AL source")) return i;
+                await Task.Delay(200);
+            }
+            string dump; lock (lines) dump = string.Join("\n", lines.TakeLast(40));
+            throw new TimeoutException($"watch marker not seen.\n--- last output ---\n{dump}");
+        }
+        string Segment(int from, int to)
+        {
+            lock (lines) return string.Join("\n", lines.GetRange(from, Math.Max(0, to - from)));
+        }
+
+        try
+        {
+            int m1 = await Marker(0, TimeSpan.FromSeconds(180));
+            var cycle1 = Segment(0, m1);
+            Assert.Contains("[cache] HIT", cycle1);
+            Assert.DoesNotContain("baseline built", cycle1);
+            Assert.Contains("PASS", cycle1);
+
+            // The same edit the sibling test uses: the fixture asserts '1', so a cycle that
+            // really recompiled and reloaded the table now FAILS. A second cache HIT would
+            // keep it green while silently ignoring the developer.
+            var table = await File.ReadAllTextAsync(tablePath);
+            var edited = table.Replace("xRec.\"Counter\" + 1", "xRec.\"Counter\" + 9");
+            Assert.NotEqual(table, edited);
+            await File.WriteAllTextAsync(tablePath, edited);
+
+            int m2 = await Marker(m1 + 1, TimeSpan.FromSeconds(240));
+            var cycle2 = Segment(m1 + 1, m2);
+            Assert.DoesNotContain("[cache] HIT", cycle2);
+            Assert.Contains("baseline built", cycle2);
+            Assert.Contains("FAIL", cycle2);
+        }
+        finally
+        {
+            try { p.Kill(true); } catch { }
+        }
     }
 
     [Fact]
@@ -52,7 +163,7 @@ public class WatchTests
         {
             FileName = "dotnet",
             Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
-                + $" \"{bundle}\" --watch --rad --cache \"{cacheDir}\"",
+                + $" \"{bundle}\" --watch --cache \"{cacheDir}\"",
             RedirectStandardOutput = true, RedirectStandardError = true,
             UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
         };
