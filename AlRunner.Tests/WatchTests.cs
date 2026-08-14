@@ -30,19 +30,25 @@ public class WatchTests
     }
 
     /// <summary>
-    /// Starting a watch on an unchanged tree must cost a load, not a whole-module compile.
-    /// Delta compilation needs a compiler symbol baseline that a cached DLL cannot supply,
-    /// so the temptation is to skip the cache entirely and compile the module up front —
-    /// which on a large app is minutes of waiting before the developer sees a single test
-    /// result. The contract instead is: serve cycle 1 from the cache, and let the FIRST
-    /// EDIT pay for the baseline.
+    /// Switching modes over one tree has to feel like one tool. A developer typically runs the
+    /// suite one-shot first and only then starts `--watch`, so a one-shot run leaves the delta
+    /// baseline beside its cached AL output: watch cycle 1 is then a load AND delta-ready, and
+    /// the first edit costs one object instead of the whole module.
     ///
-    /// The edit half is the part that makes this test prove something. A cache HIT that
-    /// also served the second cycle would look identical here on timing alone and be
-    /// completely wrong — the developer's change would simply not run.
+    /// <para>Two halves, and the second is what makes this prove something. A cache HIT that
+    /// also served the second cycle would look identical on timing alone and be completely
+    /// wrong — the developer's change would simply not run. So the edit flips the fixture's
+    /// assertion (it expects <c>1</c>; the edit makes it <c>9</c>), and PASS→FAIL is the proof
+    /// the edited table really executed.</para>
+    ///
+    /// <para>The case where the entry has NO baseline — an entry from before this existed, or
+    /// one whose snapshot failed — is
+    /// <see cref="Watch_OnACacheEntryWithNoDeltaBaseline_ServesTheCache_AndTheFirstEditBuildsIt"/>.
+    /// Watch-then-watch is
+    /// <see cref="Watch_RestartedOnAWatchPrimedCache_HydratesTheBaseline_AndDeltasTheFirstEdit"/>.</para>
     /// </summary>
     [SkippableFact]
-    public async Task Watch_FirstCycle_ServesTheCache_AndTheFirstEditBuildsTheBaseline()
+    public async Task Watch_AfterAOneShotRun_ServesTheCache_AndDeltasTheFirstEdit()
     {
         TestArtifacts.SkipIfMissing();
 
@@ -71,6 +77,20 @@ public class WatchTests
             Assert.True(p0.ExitCode == 0, primed);
             Assert.Contains("[cache] WROTE", primed);
         }
+
+        // The one-shot's own output, on disk: it compiled the module, so it also left the delta
+        // baseline beside the DLL. Asserted on the filesystem rather than inferred from a log
+        // line, because everything below depends on these two files existing.
+        var primedDll = Assert.Single(Directory.GetFiles(cacheDir, "*.dll"));
+        var primedKey = Path.GetFileNameWithoutExtension(primedDll);
+        Assert.True(
+            File.Exists(Path.Combine(
+                cacheDir, primedKey + AlRunner.Infrastructure.AlCacheSidecars.RadBaselineSuffix)),
+            "a one-shot run must leave a delta baseline beside its cached AL output");
+        Assert.True(
+            File.Exists(Path.Combine(
+                cacheDir, primedKey + AlRunner.Infrastructure.AlCacheSidecars.RadSymbolsSuffix)),
+            "a one-shot run must leave the persisted symbol baseline beside its cached AL output");
 
         var lines = new List<string>();
         var psi = new ProcessStartInfo
@@ -113,12 +133,13 @@ public class WatchTests
             int m1 = await Marker(0, TimeSpan.FromSeconds(180));
             var cycle1 = Segment(0, m1);
             Assert.Contains("[cache] HIT", cycle1);
+            Assert.Contains("rad baseline hydrated", cycle1);
             Assert.DoesNotContain("baseline built", cycle1);
             Assert.Contains("PASS", cycle1);
 
-            // The same edit the sibling test uses: the fixture asserts '1', so a cycle that
-            // really recompiled and reloaded the table now FAILS. A second cache HIT would
-            // keep it green while silently ignoring the developer.
+            // The fixture asserts '1', so a cycle that really recompiled and reloaded the table
+            // now FAILS. A second cache HIT would keep it green while silently ignoring the
+            // developer.
             var table = await File.ReadAllTextAsync(tablePath);
             var edited = table.Replace("xRec.\"Counter\" + 1", "xRec.\"Counter\" + 9");
             Assert.NotEqual(table, edited);
@@ -127,13 +148,258 @@ public class WatchTests
             int m2 = await Marker(m1 + 1, TimeSpan.FromSeconds(240));
             var cycle2 = Segment(m1 + 1, m2);
             Assert.DoesNotContain("[cache] HIT", cycle2);
-            Assert.Contains("baseline built", cycle2);
+            // A delta off the one-shot's baseline — NOT a whole-module compile, which is what
+            // "baseline built" would mean.
+            Assert.Contains(": delta +", cycle2);
+            Assert.DoesNotContain("baseline built", cycle2);
             Assert.Contains("FAIL", cycle2);
         }
         finally
         {
             try { p.Kill(true); } catch { }
         }
+    }
+
+    /// <summary>
+    /// The fallback, kept covered because the code path is still reachable: a cache entry written
+    /// before this existed, or one whose baseline snapshot failed, has a DLL and no baseline
+    /// beside it. Such an entry must still HIT — it serves correct results, it just cannot delta —
+    /// and the first edit then establishes the baseline the old way.
+    ///
+    /// <para>Modelled by deleting the two artifacts after priming, which is exactly the on-disk
+    /// state an older entry has. The <c>DoesNotContain("rad baseline hydrated")</c> is what
+    /// separates this from the sibling test above: without it, both would pass on either
+    /// behaviour.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Watch_OnACacheEntryWithNoDeltaBaseline_ServesTheCache_AndTheFirstEditBuildsIt()
+    {
+        TestArtifacts.SkipIfMissing();
+
+        var bundle = Path.Combine(
+            Path.GetTempPath(), "al-runner-watch-nobaseline", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(bundle);
+        foreach (var f in Directory.GetFiles(FixtureSrc))
+            File.Copy(f, Path.Combine(bundle, Path.GetFileName(f)));
+        var tablePath = Path.Combine(bundle, "XRecProbe.Table.al");
+        var cacheDir = Path.Combine(bundle, ".cache");
+
+        var prime = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                + $" \"{bundle}\" --cache \"{cacheDir}\"",
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+        using (var p0 = Process.Start(prime)!)
+        {
+            var so = p0.StandardOutput.ReadToEndAsync();
+            var se = p0.StandardError.ReadToEndAsync();
+            await p0.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(240));
+            var primed = (await so) + (await se);
+            Assert.True(p0.ExitCode == 0, primed);
+            Assert.Contains("[cache] WROTE", primed);
+        }
+
+        // Reduce the entry to what an older runner would have left: DLL plus the two sidecars a
+        // HIT genuinely requires, and no delta baseline.
+        foreach (var stale in Directory.GetFiles(cacheDir, "*.rad-*.json")) File.Delete(stale);
+        Assert.Empty(Directory.GetFiles(cacheDir, "*.rad-*.json"));
+
+        var lines = new List<string>();
+        using var p = Process.Start(new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                + $" \"{bundle}\" --watch --cache \"{cacheDir}\"",
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        })!;
+        try
+        {
+            Pump(p.StandardOutput, lines);
+            Pump(p.StandardError, lines);
+
+            var idle1 = await WaitForIdle(p, lines, 0, TimeSpan.FromSeconds(240));
+            var cycle1 = Slice(lines, 0, idle1);
+            Assert.Contains("[cache] HIT", cycle1);
+            Assert.DoesNotContain("rad baseline hydrated", cycle1);
+            Assert.Contains("PASS", cycle1);
+
+            var table = await File.ReadAllTextAsync(tablePath);
+            await File.WriteAllTextAsync(
+                tablePath, table.Replace("xRec.\"Counter\" + 1", "xRec.\"Counter\" + 9"));
+
+            var idle2 = await WaitForIdle(p, lines, idle1 + 1, TimeSpan.FromSeconds(240));
+            var cycle2 = Slice(lines, idle1 + 1, idle2);
+            Assert.Contains("baseline built", cycle2);
+            Assert.Contains("FAIL", cycle2);
+            // …and it says why it rebuilt, instead of looking like an unexplained stall.
+            Assert.Contains("carried no delta baseline", cycle2);
+        }
+        finally
+        {
+            try { p.Kill(true); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// What a resident `--watch` produces has to be reusable by the NEXT `--watch`: restarting
+    /// the runner on a tree it has already compiled should cost a load, and then be immediately
+    /// responsive — the first edit a delta, not a whole-module rebuild.
+    ///
+    /// <para>Driven through two real runner processes over one <c>--cache</c> directory, because
+    /// the claim is about what survives process exit. Three things are asserted, and each one
+    /// fails differently:</para>
+    /// <list type="number">
+    /// <item>watch #1 compiles the module, builds a baseline, and leaves BOTH cache artifacts on
+    /// disk — the DLL and the <c>rad-baseline</c>/<c>rad-symbols</c> pair. Checked on the
+    /// filesystem, so "it was written" is not inferred from a log line.</item>
+    /// <item>watch #2's cycle 1 is a HIT that hydrates that baseline and compiles nothing —
+    /// <c>baseline built</c> absent is what says it did not quietly rebuild.</item>
+    /// <item>watch #2's FIRST edit is a delta. This is the whole point, and the reason the
+    /// assertion is paired with a result flip: a cycle that reported <c>delta</c> while running
+    /// the previous generation's code would satisfy the log assertion and be the worst possible
+    /// outcome. The fixture asserts <c>1</c>, the edit makes it <c>9</c>, so PASS→FAIL is proof
+    /// the edited table really ran.</item>
+    /// </list>
+    /// </summary>
+    [SkippableFact]
+    public async Task Watch_RestartedOnAWatchPrimedCache_HydratesTheBaseline_AndDeltasTheFirstEdit()
+    {
+        TestArtifacts.SkipIfMissing();
+
+        var bundle = Path.Combine(
+            Path.GetTempPath(), "al-runner-watch-rad-cache", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(bundle);
+        foreach (var f in Directory.GetFiles(FixtureSrc))
+            File.Copy(f, Path.Combine(bundle, Path.GetFileName(f)));
+        var tablePath = Path.Combine(bundle, "XRecProbe.Table.al");
+        var cacheDir = Path.Combine(bundle, ".cache");
+
+        ProcessStartInfo Watch() => new()
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                + $" \"{bundle}\" --watch --cache \"{cacheDir}\"",
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+
+        // ── watch #1: cold cache, so it compiles the module and persists both artifacts ──
+        var first = new List<string>();
+        using (var p1 = Process.Start(Watch())!)
+        {
+            try
+            {
+                Pump(p1.StandardOutput, first);
+                Pump(p1.StandardError, first);
+                var idle = await WaitForIdle(p1, first, 0, TimeSpan.FromSeconds(240));
+                var cycle1 = Slice(first, 0, idle);
+                Assert.Contains("[cache] MISS", cycle1);
+                Assert.Contains("baseline built", cycle1);
+                Assert.Contains("[cache] WROTE", cycle1);
+                Assert.Contains("PASS", cycle1);
+            }
+            finally
+            {
+                try { p1.Kill(true); } catch { }
+            }
+        }
+
+        // The artifacts themselves, on disk: a watch cycle's compiler baseline is cached
+        // beside its AL output, not only inside the process that produced it.
+        var dll = Assert.Single(Directory.GetFiles(cacheDir, "*.dll"));
+        var key = Path.GetFileNameWithoutExtension(dll);
+        var envelope = Path.Combine(
+            cacheDir, key + AlRunner.Infrastructure.AlCacheSidecars.RadBaselineSuffix);
+        var symbols = Path.Combine(
+            cacheDir, key + AlRunner.Infrastructure.AlCacheSidecars.RadSymbolsSuffix);
+        Assert.True(File.Exists(envelope), $"no delta-baseline envelope beside {dll}");
+        Assert.True(File.Exists(symbols), $"no delta-baseline symbols beside {dll}");
+        Assert.True(new FileInfo(symbols).Length > 0, "the persisted symbol baseline is empty");
+
+        // ── watch #2: same tree, same cache — a load, then a delta on the first edit ──
+        var second = new List<string>();
+        using var p2 = Process.Start(Watch())!;
+        try
+        {
+            Pump(p2.StandardOutput, second);
+            Pump(p2.StandardError, second);
+
+            var idle1 = await WaitForIdle(p2, second, 0, TimeSpan.FromSeconds(240));
+            var restart = Slice(second, 0, idle1);
+            Assert.Contains("[cache] HIT", restart);
+            Assert.Contains("rad baseline hydrated", restart);
+            Assert.DoesNotContain("baseline built", restart);
+            Assert.Contains("PASS", restart);
+
+            var table = await File.ReadAllTextAsync(tablePath);
+            var edited = table.Replace("xRec.\"Counter\" + 1", "xRec.\"Counter\" + 9");
+            Assert.NotEqual(table, edited);
+            await File.WriteAllTextAsync(tablePath, edited);
+
+            var idle2 = await WaitForIdle(p2, second, idle1 + 1, TimeSpan.FromSeconds(240));
+            var firstEdit = Slice(second, idle1 + 1, idle2);
+            Assert.Contains(": delta +", firstEdit);
+            Assert.DoesNotContain("baseline built", firstEdit);
+            // …and the edited code is what ran, not the generation the cache served.
+            Assert.Contains("FAIL", firstEdit);
+        }
+        finally
+        {
+            try { p2.Kill(true); } catch { }
+        }
+    }
+
+    private static void Pump(StreamReader reader, List<string> sink) => Task.Run(async () =>
+    {
+        string? line;
+        while ((line = await reader.ReadLineAsync()) != null)
+            lock (sink) sink.Add(line);
+    });
+
+    private static string Slice(List<string> lines, int from, int to)
+    {
+        lock (lines) return string.Join("\n", lines.GetRange(from, Math.Max(0, to - from)));
+    }
+
+    /// <summary>
+    /// Index of the next "cycle finished, watcher idle" marker at or after
+    /// <paramref name="fromIndex"/>. Reports process liveness on timeout: a marker that never
+    /// arrives looks identical whether the watcher went deaf or the child died, and the two
+    /// need different fixes.
+    /// </summary>
+    private static async Task<int> WaitForIdle(
+        Process process, List<string> lines, int fromIndex, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            lock (lines)
+                for (int i = fromIndex; i < lines.Count; i++)
+                    if (lines[i].Contains("[watch] waiting for AL source", StringComparison.Ordinal))
+                        return i;
+            if (process.HasExited)
+            {
+                await Task.Delay(500);
+                lock (lines)
+                    for (int i = fromIndex; i < lines.Count; i++)
+                        if (lines[i].Contains("[watch] waiting for AL source", StringComparison.Ordinal))
+                            return i;
+                break;
+            }
+            await Task.Delay(200);
+        }
+
+        string tail;
+        lock (lines) tail = string.Join("\n", lines.TakeLast(40));
+        var liveness = process.HasExited
+            ? $"process alive=false exit={process.ExitCode}"
+            : "process alive=true";
+        throw new TimeoutException(
+            $"watch idle marker not seen ({liveness}).\n--- last output ---\n{tail}");
     }
 
     [SkippableFact]

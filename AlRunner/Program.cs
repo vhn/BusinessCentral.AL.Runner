@@ -1380,6 +1380,12 @@ foreach (var bundle in bundles)
         string? cachePath = null;
         string? sidecarPath = null;
         string? querySidecarPath = null;
+        // The RAD delta baseline (AlRunner.Rad.RadBaselineSidecar). Unlike the two above these
+        // are OPTIONAL for a HIT — without them a HIT still serves correct results, it just
+        // cannot delta until the first edit has built a baseline — so they are deliberately
+        // absent from AlCacheSidecars.IsCompleteEntry.
+        string? radBaselinePath = null;
+        string? radSymbolsPath = null;
         // A bundle declaring an AL query also needs its query-symbols sidecar: the
         // MetaQuery design is built from the compilation's SymbolReference, which only
         // emit produces. Serving a HIT without it leaves NCLMetaQuery null and every
@@ -1394,18 +1400,22 @@ foreach (var bundle in bundles)
         AlRunner.Rad.RadWorkspace? radWs = needCompile && AlRunner.Rad.RadWorkspaceStore.Enabled
             ? AlRunner.Rad.RadWorkspaceStore.For(moduleName, appGroup.AppId, appGroup.SuiteDir)
             : null;
-        // A cached whole-module DLL has no compiler symbol baseline, so it can serve the
-        // FIRST cycle and nothing after it: starting a watch on an unchanged tree should
-        // cost a load, not a whole-module compile, and the first edit then builds the
-        // baseline the deltas need. Once a generation is loaded the workspace owns the
-        // module — a later cache key that still matches (a manifest-only change does not
-        // move it) must never resurrect the pre-edit DLL over it.
+        // A cache entry serves the FIRST cycle and nothing after it: starting a watch on an
+        // unchanged tree should cost a load, not a whole-module compile. Whether that first
+        // cycle also arrives DELTA-READY depends on whether the entry carries a RAD baseline
+        // sidecar — a watch cycle that built one writes it, a one-shot run has none to write,
+        // and without it the first edit still pays for the baseline (see RadBaselineSidecar).
+        // Once a generation is loaded the workspace owns the module — a later cache key that
+        // still matches (a manifest-only change does not move it) must never resurrect the
+        // pre-edit DLL over it.
         if (needCompile && alCacheDir != null && radWs is null or { Generations.Count: 0 })
         {
             cacheKey = ComputeAlCacheKey(allPaths, moduleName, ordered: orderedDepIds);
             cachePath = Path.Combine(alCacheDir, cacheKey + ".dll");
             sidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.EnumRegistrySuffix);
             querySidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.QuerySymbolsSuffix);
+            radBaselinePath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.RadBaselineSuffix);
+            radSymbolsPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.RadSymbolsSuffix);
             if (AlRunner.Infrastructure.AlCacheSidecars.IsCompleteEntry(
                     File.Exists(cachePath), File.Exists(sidecarPath),
                     bundleDeclaresQuery, File.Exists(querySidecarPath)))
@@ -1803,15 +1813,23 @@ foreach (var bundle in bundles)
 
                 if (radWs != null && radResult == null)
                 {
-                    // Cache HIT: the whole module arrived precompiled, so there is no
-                    // compiler symbol baseline to delta against — the first edit builds
-                    // one. Take ownership of the loaded types anyway, so that compile can
-                    // tell an object the developer deleted from one it merely did not
-                    // re-emit, instead of leaving this generation unowned and resolvable
-                    // by assembly-scan order (see AlObjectResolution).
+                    // Cache HIT: the whole module arrived precompiled, so no compilation ran
+                    // this cycle. Take ownership of the loaded types first, so a later compile
+                    // can tell an object the developer deleted from one it merely did not
+                    // re-emit, instead of leaving this generation unowned and resolvable by
+                    // assembly-scan order (see AlObjectResolution).
                     AlRunner.Rad.AlObjectResolution.RegisterGeneration(radWs, loaded);
                     radWs.Generations.Clear();
                     radWs.Generations.Add(loaded);
+                    // …then restore the compiler state that DID exist when this DLL was built,
+                    // if the entry carries it. Without this the workspace has no symbol
+                    // baseline and the developer's first edit pays a whole-module compile just
+                    // to establish one — minutes, at exactly the moment they are blocked. A
+                    // rejected or absent sidecar leaves that behaviour untouched and parks the
+                    // reason, so the compile it costs says why (see RadBaselineSidecar).
+                    if (radBaselinePath != null && radSymbolsPath != null)
+                        AlRunner.Rad.RadBaselineSidecar.TryHydrate(
+                            radWs, allPaths, radBaselinePath, radSymbolsPath);
                     appAssemblies.Add(loaded);
                 }
                 else if (radWs != null)
@@ -1821,8 +1839,38 @@ foreach (var bundle in bundles)
                             "the successful RAD assembly has no prepared workspace update");
                     radResult.Commit(radWs, loaded);
                     appAssemblies.AddRange(radWs.Generations);
+                    // Persist the baseline this full compile just established, beside the DLL
+                    // written for the same key above, so the NEXT watch process over this tree
+                    // starts delta-ready instead of paying for a baseline again.
+                    //
+                    // After the commit, not at the DLL write site: there the baseline still
+                    // lives only on the uncommitted token, and — more importantly — a baseline
+                    // whose generated C# was rejected, or which failed to load, must never
+                    // become a cache entry. Only a full compile has a whole module to persist;
+                    // a delta overlay is a fragment, which is the same reason its assembly is
+                    // not cached either.
+                    if (radResult.FullRebuild && radBaselinePath != null && radSymbolsPath != null
+                        && radWs.HasBaseline)
+                        AlRunner.Rad.RadBaselineSidecar.TrySave(radWs, radBaselinePath, radSymbolsPath);
                 }
-                else appAssemblies.Add(loaded);
+                else
+                {
+                    appAssemblies.Add(loaded);
+                    // No RAD workspace — a one-shot run. It still wrote this bundle's AL output
+                    // to the cache above, so it also leaves the delta baseline beside it: the
+                    // ordinary way a developer reaches --watch is after running one-shot at
+                    // least once, and without this that first watch would hit the cache and
+                    // then rebuild the whole module on the first edit.
+                    //
+                    // `cachedBytes == null` is load-bearing, not a shortcut: it means THIS app
+                    // group compiled. `emitter` is one instance shared by every app group in the
+                    // bundle and `LastCompilation` is whatever it last emitted, so on a mixed
+                    // bundle — app A a MISS, app B a HIT — persisting on B's HIT would write A's
+                    // baseline under B's cache key. A later watch would then hydrate a baseline
+                    // describing a different app and delta against it.
+                    if (cachedBytes == null)
+                        PersistRadBaseline(emitter, allPaths, moduleName, radBaselinePath, radSymbolsPath);
+                }
             }
             catch (Exception ex)
             {
@@ -2955,6 +3003,18 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
             // the request, exactly like an AL-output cache hit.
             bool cached = reusedAsm != null;
             string? cacheKey = null, cachePath = null, sidecarPath = null, querySidecarPath = null;
+            // No RAD delta baseline is written here, unlike the CLI's one-shot path — and that is
+            // a consequence of naming, not an oversight. `moduleName` above is
+            // `V2_<bundle dir>`, while the CLI derives it from `app.json`, and
+            // ComputeAlCacheKey hashes `module:<name>`. So --server and the CLI compute
+            // DIFFERENT keys for the same tree and never share a cache entry in either
+            // direction: a baseline written here could only ever be found by another --server
+            // run, and --server has no delta workspace to hydrate it into. Writing one would be
+            // pure cost for something nothing can consume.
+            //
+            // Unifying the two names is the actual fix and it is not local to caching: the name
+            // feeds the emitted assembly name, module identity, the protocol's responses and the
+            // phase log. Tracked separately rather than done here.
             // See AlCacheSidecars: a query bundle without its query-symbols sidecar must MISS.
             bool bundleDeclaresQuery = BcCompiler.BundleDeclaresQuery(allPaths);
             if (reusedAsm == null && alCacheDir != null)
@@ -4646,6 +4706,57 @@ static (BcEmitOutput Output, RadEmitResult? Rad) RunEmit(
         return (rebuild.Emit, rebuild);
     }
     return (result.Emit, result);
+}
+
+/// <summary>
+/// Persist the delta-readiness of a whole-module compile that has just loaded, for a mode with
+/// no RAD workspace of its own — one-shot and <c>--server</c>.
+///
+/// <para>Both of those write the AL-output cache entry a later <c>--watch</c> will hit, and a HIT
+/// without a baseline beside it makes the developer's first edit a whole-module compile. Since
+/// switching between modes over one tree is the normal way people work — one-shot to see the
+/// suite, then watch to iterate, and back — the baseline has to be produced by whichever mode
+/// compiled, not only by watch.</para>
+///
+/// <para>Called AFTER <c>Assembly.Load</c> on purpose: a baseline whose generated C# was rejected,
+/// or which failed to load, must never become a cache entry. Best-effort throughout — a baseline
+/// that could not be built or written costs a later watch some speed and nothing else, so it
+/// reports and returns rather than failing the run.</para>
+/// </summary>
+static void PersistRadBaseline(
+    BcCompiler emitter,
+    IReadOnlyList<string> allPaths,
+    string moduleName,
+    string? envelopePath,
+    string? symbolsPath)
+{
+    if (envelopePath == null || symbolsPath == null) return;
+    if (emitter.LastCompilation is not { } compilation) return;
+    if (emitter.LastReferenceSignature is not { } signature) return;
+    // One emitter serves every app group in a bundle, so refuse outright if its last emit was
+    // some OTHER app's — persisting that under this app's cache key would hand a later watch a
+    // baseline describing a different module. The caller is expected to have compiled this app;
+    // this turns a mistake there into a loud no-op instead of a wrong answer on disk.
+    if (!string.Equals(emitter.LastEmittedModuleName, moduleName, StringComparison.Ordinal))
+    {
+        Console.Error.WriteLine(
+            $"  [cache] {moduleName}: no delta baseline persisted — the last compile was " +
+            $"'{emitter.LastEmittedModuleName ?? "<none>"}', not this app");
+        return;
+    }
+
+    var hashes = AlRunner.Rad.RadWorkspace.HashSourceTree(
+        AlRunner.Rad.RadWorkspace.EnumerateAlFiles(allPaths));
+    var state = emitter.TryBuildBaselineSnapshot(compilation, moduleName, hashes, out var failure);
+    if (state == null)
+    {
+        Console.Error.WriteLine(
+            $"  [cache] {moduleName}: no delta baseline persisted ({failure}) — a later " +
+            "--watch over this tree will build one on its first edit");
+        return;
+    }
+    AlRunner.Rad.RadBaselineSidecar.TrySave(
+        moduleName, state, signature, envelopePath, symbolsPath);
 }
 
 /// <summary>App ids that another app in the same bundle declares a dependency on.</summary>

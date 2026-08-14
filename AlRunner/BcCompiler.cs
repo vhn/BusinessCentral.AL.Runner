@@ -1381,6 +1381,13 @@ public sealed partial class BcCompiler
             .Distinct();
         var (refLoader, specs) = GetSharedReferences(bundleAlpackages);
         _mark($"GetSharedReferences ({specs.Length} specs)");
+        // Recorded because a caller with no RAD workspace still needs it to persist a delta
+        // baseline (one-shot and --server both cache their AL output for a later --watch to
+        // hydrate). It is the same string the delta path arms against, computed here from the
+        // same specs and dirs, so a baseline written by one mode and read by another cannot
+        // disagree about what it was built under.
+        LastReferenceSignature = ReferenceSignature(moduleName, specs, dirs);
+        LastEmittedModuleName = moduleName;
         if (refLoader != null)
         {
             compilation = compilation.WithReferenceLoader(refLoader);
@@ -1752,6 +1759,33 @@ public sealed partial class BcCompiler
     /// Only meaningful to the RAD delta path, which reads it immediately after the call.
     /// </summary>
     internal NavCA.Compilation? LastCompilation { get; private set; }
+
+    /// <summary>
+    /// The reference signature the most recent <see cref="Emit"/> compiled under — everything a
+    /// delta may not silently change (dependency set, app identity, preprocessor symbols,
+    /// <c>internalsVisibleTo</c> grants). Read immediately after the call, like
+    /// <see cref="LastCompilation"/>.
+    ///
+    /// <para>Exists so a mode with no RAD workspace can still persist a delta baseline: the
+    /// signature has to travel with it, because the AL-output cache key does not cover the app
+    /// version, publisher or id, and a delta bound under a moved identity against an old
+    /// baseline is exactly what the signature refuses.</para>
+    /// </summary>
+    internal string? LastReferenceSignature { get; private set; }
+
+    /// <summary>
+    /// The module <see cref="LastCompilation"/> and <see cref="LastReferenceSignature"/> belong
+    /// to.
+    ///
+    /// <para>One <see cref="BcCompiler"/> instance serves every app group in a bundle, so these
+    /// three always describe whichever app emitted MOST RECENTLY — not necessarily the app a
+    /// caller is currently handling. On a mixed bundle (one app a cache MISS, the next a HIT) a
+    /// caller that persisted a baseline for the HIT would silently write the previous app's
+    /// symbol picture under this app's cache key, and a later <c>--watch</c> would hydrate a
+    /// baseline describing a different app. Checking this name makes that a refusal rather than
+    /// a wrong answer — see <c>Program.PersistRadBaseline</c>.</para>
+    /// </summary>
+    internal string? LastEmittedModuleName { get; private set; }
 
     // Cheap text probe: does any source file declare an AL `query` object? Avoids
     // building the (non-trivial) ModuleDefinition for the 99% of bundles with none.

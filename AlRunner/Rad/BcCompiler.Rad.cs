@@ -235,18 +235,9 @@ public sealed partial class BcCompiler
         var comp = LastCompilation;
         if (output.Sources.Count > 0 && output.ExcludedObjects.Count == 0 && comp != null)
         {
-            try
+            var update = TryBuildBaselineSnapshot(comp, moduleName, hashes, out var failure);
+            if (update != null)
             {
-                var objectsByFile = MapObjectsToFiles(comp);
-                var update = new AlRunner.Rad.RadWorkspaceUpdate(
-                    hashes,
-                    objectsByFile,
-                    MapFileDeclarations(comp.SyntaxTrees, objectsByFile),
-                    MapObjectReferences(comp),
-                    MapExtensionTargets(comp),
-                    Array.Empty<AlRunner.Rad.RadObjectKey>(),
-                    SymbolJsonWriter.BuildModuleDefinition(comp),
-                    Full: true);
                 Console.Error.WriteLine(
                     $"  [watch] {moduleName}: baseline built — {output.Sources.Count} object(s) " +
                     $"({sw.ElapsedMilliseconds}ms)");
@@ -255,17 +246,13 @@ public sealed partial class BcCompiler
                     WorkspaceUpdate = update,
                 };
             }
-            catch (Exception ex)
-            {
-                // Losing the baseline costs speed, never correctness: the next cycle just
-                // compiles in full again. Say so rather than looking mysteriously slow —
-                // this is the one that makes EVERY later cycle slow, not just this one.
-                var reason =
-                    $"the baseline snapshot failed ({ex.GetType().Name}: " +
-                    $"{ex.Message.Split('\n')[0]}), so the next cycle is a full compile too";
-                FullCompileBecause(moduleName, reason);
-                ws.PendingFullCompileReason = reason;
-            }
+            // Losing the baseline costs speed, never correctness: the next cycle just
+            // compiles in full again. Say so rather than looking mysteriously slow —
+            // this is the one that makes EVERY later cycle slow, not just this one.
+            var reason =
+                $"the baseline snapshot failed ({failure}), so the next cycle is a full compile too";
+            FullCompileBecause(moduleName, reason);
+            ws.PendingFullCompileReason = reason;
         }
         else if (output.Sources.Count > 0)
         {
@@ -278,6 +265,68 @@ public sealed partial class BcCompiler
             ws.PendingFullCompileReason = reason;
         }
         return new RadEmitResult(output, FullRebuild: true, NoChange: false);
+    }
+
+    /// <summary>
+    /// Everything a completed whole-module compile can hand forward as delta-readiness: the
+    /// compiler's symbol picture plus the four maps a later delta reads off it. Returns null
+    /// with <paramref name="failure"/> set when the compilation cannot produce one.
+    ///
+    /// <para>Extracted from <see cref="FullCompile"/> because it has a second caller with no
+    /// RAD workspace at all: one-shot and <c>--server</c> runs persist this beside their cached
+    /// AL output so a later <c>--watch</c> over the same tree starts delta-ready instead of
+    /// paying for a baseline on the developer's first edit. Producing it in one place is what
+    /// keeps a baseline written by one mode identical to one written by another.</para>
+    ///
+    /// <para>Phase-instrumented under <c>BCCOMPILER_TIMING=1</c> because the five phases are not
+    /// remotely equal in cost: four read already-computed symbols, while the reference graph asks
+    /// Microsoft for a semantic model per tree and calls <c>GetSymbolInfo</c> on every node of
+    /// every file. A cost added to every one-shot and CI run has to be attributable.</para>
+    /// </summary>
+    internal AlRunner.Rad.RadWorkspaceUpdate? TryBuildBaselineSnapshot(
+        NavCA.Compilation comp,
+        string moduleName,
+        Dictionary<string, string> hashes,
+        out string? failure)
+    {
+        bool timing = Environment.GetEnvironmentVariable("BCCOMPILER_TIMING") == "1";
+        var step = System.Diagnostics.Stopwatch.StartNew();
+        void Mark(string label)
+        {
+            if (timing)
+                Console.Error.WriteLine($"[baseline-timing] {moduleName}: {label}: {step.ElapsedMilliseconds}ms");
+            step.Restart();
+        }
+
+        try
+        {
+            var objectsByFile = MapObjectsToFiles(comp);
+            Mark("object map");
+            var declarations = MapFileDeclarations(comp.SyntaxTrees, objectsByFile);
+            Mark("file declarations");
+            var references = MapObjectReferences(comp);
+            Mark("reference graph");
+            var extensionTargets = MapExtensionTargets(comp);
+            Mark("extension targets");
+            var module = SymbolJsonWriter.BuildModuleDefinition(comp);
+            Mark("module definition");
+
+            failure = null;
+            return new AlRunner.Rad.RadWorkspaceUpdate(
+                hashes,
+                objectsByFile,
+                declarations,
+                references,
+                extensionTargets,
+                Array.Empty<AlRunner.Rad.RadObjectKey>(),
+                module,
+                Full: true);
+        }
+        catch (Exception ex)
+        {
+            failure = $"{ex.GetType().Name}: {ex.Message.Split('\n')[0]}";
+            return null;
+        }
     }
 
     private RadEmitResult? DeltaCompile(

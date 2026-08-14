@@ -1,18 +1,112 @@
 # Delta compilation (`--watch`)
 
 Delta compilation is what `--watch` does. With a cold output cache, the first watch cycle
-performs a normal full compile and records a baseline for each source app. A cache-hit
-first cycle loads the cached DLL; the first later edit performs one full-bundle compile to
-establish every app's baseline. Subsequent cycles use those baselines when an edit is safe
-to load as a small overlay. Other runner modes use the normal compile path.
+performs a normal full compile and records a baseline for each source app. Subsequent cycles
+use those baselines when an edit is safe to load as a small overlay. Other runner modes use
+the normal compile path.
 
-The AL-output cache serves the FIRST cycle and nothing after it. A cached whole-module DLL
-carries no compiler symbol baseline, so it cannot be delta'd against — but starting a watch
-on an unchanged tree should still cost a load rather than minutes of compiling, so the cache
-answers cycle 1 and the first edit pays for the baseline. Once a generation is loaded the
-workspace owns the module: a later cache key that still matches (an `app.json`-only change
-does not move it, since the key hashes `.al` sources) must never resurrect the pre-edit DLL
-over the running one.
+## The AL-output cache serves the first cycle, and can serve it delta-ready
+
+The cache answers cycle 1 and nothing after it: starting a watch on an unchanged tree should
+cost a load rather than minutes of compiling. Once a generation is loaded the workspace owns
+the module — a later cache key that still matches (an `app.json`-only change does not move
+it, since the key hashes `.al` sources) must never resurrect the pre-edit DLL over the
+running one.
+
+A cached DLL on its own is not enough to delta against, so a HIT used to leave the workspace
+with no baseline and the developer's **first edit** paid one whole-module compile to
+establish one — 761–862 s on NP Retail, at exactly the moment they are blocked waiting for a
+result. So the baseline is cached too, in two artifacts beside the DLL:
+
+```text
+<key>.dll               the module
+<key>.rad-baseline.json the object map, per-file hashes, one-hop reference graph,
+                        extension targets and the reference signature
+<key>.rad-symbols.json  the compiler's ModuleDefinition, in BC's own serialized form
+```
+
+`AlRunner/Rad/RadBaselineSidecar.cs` writes them and restores them. That the symbol baseline
+survives a round trip is not an assumption: the delta path already reads every merged
+baseline back through `SymbolReferenceJsonReader` (see `MergeRadBaseline`), and
+`RadBaselineSidecarTests` asserts a restored full-compile baseline re-serializes
+**byte-identically** to the one the compile produced.
+
+What is persisted is the whole commit token (`RadWorkspace.Snapshot`), not just the module
+definition — deliberately the same type `Commit` takes, so a map added to the workspace and
+not to `RadWorkspaceUpdate` cannot be committed at all and the persisted set cannot fall
+behind the set a delta reads. Three of those maps are absent from the module definition, and
+two of the three fail *silently* if dropped: without the reference graph a moved callable
+surface rebinds nobody and its callers keep executing the previous contract, and without the
+extension targets a renamed enumextension leaves its old registration behind.
+
+**Hydration is validated and fails closed.** The pair is refused — leaving the workspace
+exactly as it was, so the cycle behaves as it did before any of this existed — when either
+file is missing, the envelope is of another schema or another module, or its per-file content
+hashes do not describe the tree now on disk. That last check is the substantive one: a
+hydrated baseline that disagreed with the source could bind a delta against symbols for code
+that is not there, which is worse than being slow. The refusal is *parked* on the workspace
+(`PendingFullCompileReason`), so the full compile it costs names the cause instead of looking
+like an unexplained stall.
+
+A fifth guard falls out of existing machinery: hydration restores the **reference signature**
+the baseline was built under, so the next cycle's `ArmFor` compares it and reports which facet
+moved. That is not belt-and-braces — the cache key hashes the module name, the preprocessor
+symbols, the resolved dependency ids and the `.al` contents, but **not** the app version,
+publisher or id, so a HIT can legitimately serve a tree whose `app.json` identity has changed.
+
+### One-shot writes it too, so switching modes stays fast
+
+Switching between one-shot and `--watch` over one tree has to feel like one tool, so the baseline
+is produced by **whichever of the two compiled** — not only by `--watch`. Both go through
+`BcCompiler.TryBuildBaselineSnapshot`, so a baseline written by one is indistinguishable from the
+other's:
+
+| Mode | Writes it |
+|---|---|
+| `--watch`, cycle that compiles in full | from the committed workspace, after the generation loads |
+| one-shot | `Program.PersistRadBaseline`, after `Assembly.Load` |
+| `--server` | **no** — see the third limit below |
+
+So the ordinary path — run the suite one-shot, then start `--watch` — arrives delta-ready, and
+the first edit costs one object. Pinned by
+`WatchTests.Watch_AfterAOneShotRun_ServesTheCache_AndDeltasTheFirstEdit`. The reverse direction
+(watch, then one-shot) was already a plain cache HIT and is unaffected.
+
+It costs almost nothing to produce. Measured on `tests/runner-extras` (25 compiled apps, BC 28.1,
+`BCCOMPILER_TIMING=1`): **105 ms total**, against 17.4 s of compiling and a 47.4 s run — 0.6% of
+compile time, 0.2% of wall clock. Nearly all of it is one phase:
+
+| Snapshot phase | 25 apps |
+|---|---:|
+| reference graph (a semantic model per tree, `GetSymbolInfo` per node) | 102 ms |
+| object map | 3 ms |
+| file declarations / extension targets / module definition | <1 ms each |
+
+Three limits, all stated because each looks like a bug from outside:
+
+- **A HIT never writes it** — nothing compiled, so there is no compilation to snapshot. In the
+  CLI that gate is `cachedBytes == null` and it is load-bearing: one `BcCompiler` serves every
+  app group in a bundle, so on a mixed bundle (app A a MISS, app B a HIT) persisting on B's HIT
+  would write A's symbol picture under B's key. `PersistRadBaseline` also refuses outright when
+  `LastEmittedModuleName` is not this app's, so that mistake is a logged no-op rather than a
+  wrong baseline on disk.
+- **Restarting a watch on an *edited* tree still misses.** The key hashes `.al` content, so a
+  tree that has moved since the entry was written has no entry — and therefore no DLL to hydrate
+  beside. Inherent to a content-keyed output cache.
+- **`--server` deliberately does not write one**, because it could not be consumed. Server mode
+  names its module `V2_<bundle dir>` (`Program.cs`) while the CLI derives it from `app.json`, and
+  `ComputeAlCacheKey` hashes `module:<name>` — so the two modes compute **different keys for the
+  same tree and never share a cache entry in either direction**. That predates the delta baseline
+  and writing one does not fix it: a server-written baseline could only be found by another
+  server run, and `--server` has no delta workspace to hydrate it into. Unifying the two names is
+  the actual fix, and it is not local to caching — the name feeds the emitted assembly name,
+  module identity, the protocol's responses and the phase log — so it belongs in its own change.
+
+Neither artifact is part of `AlCacheSidecars.IsCompleteEntry`, unlike the enum-registry and
+query-symbols sidecars. Those carry side effects a HIT cannot function without, so their
+absence must force a MISS. These carry an optimisation: gating a HIT on them would turn every
+pre-existing entry into a MISS, and would force a cache-schema bump that discards every one —
+both to withhold something that is only ever a speedup.
 
 ## Cycle behavior
 
@@ -81,6 +175,12 @@ a mid-burst cycle produces a correct delta of an incorrect tree.
 
 plus the reverse one-hop reference graph and the extension→target edges, both read off
 Microsoft's bound semantic models during a full compile.
+
+Everything on that list except the loaded assemblies is `RadWorkspaceUpdate` — the token
+`Commit` takes — and `RadWorkspace.Snapshot()` hands it back. That symmetry is what
+`RadBaselineSidecar` persists, and it is deliberate: a map added to the workspace but not to
+`RadWorkspaceUpdate` cannot be committed at all, so "what is persisted" cannot silently fall
+behind "what a delta reads".
 
 ## Runtime metadata moves with the objects
 
@@ -396,7 +496,8 @@ different numbers:
 | `RadMetadataDeltaTests` | One edit → exactly one page/report/xmlport/enum metadata entry moves; a deletion drops its entry, on the delta path and on the full-compile fallback; a renamed enumextension leaves one registration; a rejected candidate leaves none behind |
 | `RadWatchTwentyObjectTests` | The same claims against the real `--watch` process, via its own `[watch]` log lines, with the AL test outcome proving the new code actually ran |
 | `RadIdlessObjectTests` | The six kinds with no object id: two `profile`s (and two `entitlement`s) are two objects rather than one colliding key; the kinds the symbol API never reports and the kinds it reports with id 0 are both tracked to their file; editing or deleting one is a delta that compiles no C#; narrowing an interface binds against the new contract rather than the baseline's copy; widening one WITHOUT touching its implementer still rebinds it, and so does renaming a `pagecustomization` without touching the `profileextension` that names it; a modification leaves the merged baseline holding exactly ONE copy, carrying the post-edit shape; a deletion leaves it entirely; identity survives an embedded quote and a case-only rename; an `entitlement` — which the module definition cannot represent at all — accepts and rejects exactly what a cold compile of the same tree does, in both directions of its permission-set relationship; and a changed file claiming a key an untouched file still owns does not pass as a modification |
-| `WatchTests` | Cycle 1 of a watch is served from the AL-output cache; the first edit builds the baseline instead of being served a second time |
+| `WatchTests` | Cycle 1 of a watch is served from the AL-output cache, and the first edit really runs (never a second HIT): delta'd when the entry carries a baseline — after a one-shot run, and after an earlier watch — and building one when it does not |
+| `RadBaselineSidecarTests` | A persisted baseline restores the compiler's symbol picture **byte-identically**, and a workspace hydrated from it deltas the first edit, rebinds the direct caller of a moved surface, classifies a deletion as a removal, and still rebuilds for a deleted `dotnet` package — plus the five ways hydration must fail closed (tree moved, file edited in place, symbols missing, unknown schema, app identity changed) |
 | `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
 | `WatchDashboardTests` | …and, for the reason-reporting above: a recorded full-recompile reason reaches the dashboard verbatim with the app it belongs to, and the panel is absent on a delta cycle |
 

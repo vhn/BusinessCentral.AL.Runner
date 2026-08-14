@@ -24,6 +24,20 @@ public static class AlCacheSidecars
     public const string EnumRegistrySuffix = ".enum-registry.json";
     public const string QuerySymbolsSuffix = ".query-symbols.json";
 
+    // The RAD delta baseline: `--watch`'s per-app compiler symbol picture plus the object /
+    // dependency maps a delta binds against (AlRunner.Rad.RadBaselineSidecar). Written only by
+    // a watch cycle that actually built a baseline, so a one-shot run's cache entry has none.
+    //
+    // Deliberately NOT part of IsCompleteEntry, unlike the two above. Those carry side effects
+    // a HIT cannot function without — an empty enum registry or a null MetaQuery is a wrong
+    // answer, so their absence must force a MISS. These two carry an OPTIMISATION: without
+    // them a HIT still serves correct results, it just cannot delta until the first edit has
+    // built a baseline. Gating a HIT on them would turn every cache entry written by a
+    // one-shot run (all of CI's) into a MISS, and would force a schema bump that discards
+    // every existing entry — both to withhold something that is only ever a speedup.
+    public const string RadBaselineSuffix = ".rad-baseline.json";
+    public const string RadSymbolsSuffix = ".rad-symbols.json";
+
     /// <summary>
     /// True when a cache entry carries every artifact a HIT needs. A bundle declaring an
     /// AL query additionally requires its query-symbols sidecar.

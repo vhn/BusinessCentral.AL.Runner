@@ -160,6 +160,22 @@ public sealed class RadWorkspace
     }
 
     /// <summary>
+    /// Every <c>.al</c> file under <paramref name="alFolders"/>, as the compile sees them.
+    ///
+    /// <para>Shared rather than repeated because two callers must agree on the file SET or
+    /// the disagreement is silent: <see cref="BcCompiler.EmitIncremental"/> decides what
+    /// changed from it, and <see cref="RadBaselineSidecar"/> validates a persisted baseline
+    /// against it. A sidecar enumerated differently from the compile would reject on a
+    /// count mismatch — costing a full compile with no way to see why.</para>
+    /// </summary>
+    public static List<string> EnumerateAlFiles(IEnumerable<string> alFolders) => alFolders
+        .Where(Directory.Exists)
+        .Distinct()
+        .SelectMany(d => Directory.EnumerateFiles(d, "*.al", SearchOption.AllDirectories))
+        .Distinct()
+        .ToList();
+
+    /// <summary>
     /// Content hashes for every <c>.al</c> file under <paramref name="dirs"/>. Hashed in
     /// parallel: a 7,000-file / 50 MB tree costs well under a second, and content — not
     /// mtime — is what decides whether an object must be recompiled, so a touch-without-edit
@@ -303,6 +319,49 @@ public sealed class RadWorkspace
         // A recorded baseline retires any parked "you have no baseline" reason, so it cannot be
         // reported against some unrelated future full compile.
         PendingFullCompileReason = null;
+    }
+
+    /// <summary>
+    /// This workspace's committed delta-readiness as a commit token, or null when it has no
+    /// baseline to be ready with.
+    ///
+    /// <para>The mirror image of <see cref="Commit"/>, and deliberately the same type: what a
+    /// delta needs to exist is exactly what a compile produces, so persisting it
+    /// (<see cref="RadBaselineSidecar"/>) and restoring it are one shape rather than a second
+    /// definition of "the baseline" that could drift from this one. A map added to the
+    /// workspace and not to <see cref="RadWorkspaceUpdate"/> cannot be committed at all, which
+    /// is what keeps the persisted set complete by construction.</para>
+    /// </summary>
+    internal RadWorkspaceUpdate? Snapshot() => Baseline == null
+        ? null
+        : new RadWorkspaceUpdate(
+            new Dictionary<string, string>(_fileHashes, StringComparer.Ordinal),
+            _objectsByFile.ToDictionary(pair => pair.Key, pair => pair.Value.ToList(), StringComparer.Ordinal),
+            new Dictionary<string, RadFileDeclarations>(_declarationsByFile, StringComparer.Ordinal),
+            _referencesByObject.ToDictionary(pair => pair.Key, pair => new HashSet<RadObjectKey>(pair.Value)),
+            new Dictionary<RadObjectKey, RadObjectKey>(_extensionTargets),
+            Array.Empty<RadObjectKey>(),
+            Baseline,
+            Full: true);
+
+    /// <summary>
+    /// Adopt a baseline that came off disk rather than out of a compile — the AL-output cache
+    /// HIT path, where the module arrives precompiled and there is no compilation to snapshot.
+    ///
+    /// <para><paramref name="referenceSignature"/> is the signature the persisted baseline was
+    /// BUILT under, and adopting it is the load-bearing half. It cannot go through
+    /// <see cref="ArmFor"/>, which compares and invalidates; it has to be installed as the
+    /// incumbent so that the next cycle's <see cref="ArmFor"/> is the comparison. That
+    /// comparison is not optional: the AL-output cache key hashes the module name, the
+    /// preprocessor symbols, the resolved dependency ids and the <c>.al</c> contents, but NOT
+    /// the app version, publisher or id — so a HIT can legitimately serve a tree whose
+    /// <c>app.json</c> identity has moved, and a delta bound under the new identity against
+    /// the old baseline is precisely what the signature exists to refuse.</para>
+    /// </summary>
+    internal void Hydrate(RadWorkspaceUpdate update, string referenceSignature)
+    {
+        Commit(update);
+        ReferenceSignature = referenceSignature;
     }
 }
 
