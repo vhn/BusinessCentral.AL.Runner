@@ -140,15 +140,50 @@ public static class ModuleDefinitionOps
         return ObjectSurfaceFingerprint(module, new RadObjectKey("Codeunit", id));
     }
 
-    /// <summary>Serialized public symbol definition for one keyed AL object.</summary>
+    /// <summary>
+    /// Serialized public symbol definition for one keyed AL object, minus the properties
+    /// that record where the symbol came from rather than what it offers.
+    ///
+    /// <para>Today that is exactly <c>ReferenceSourceFileName</c>, and it has to go: a full
+    /// compile given an app root (#1912 — what the CLI passes on every cycle) records it,
+    /// while a RAD compilation cannot, because <c>CreateForRad</c> takes no file system and
+    /// attaching one afterwards destroys the packaged baseline. Comparing the raw serialized
+    /// symbols therefore reported "the surface moved" for EVERY re-emitted object, which
+    /// rebinds its direct callers, whose own fingerprints then differ for the same reason —
+    /// a one-line body edit cascaded from 1 object to 3 on the 20-object fixture, and would
+    /// keep going on a deeper graph. It is not part of any binding contract: two symbols
+    /// identical but for the file they were read from bind identically.</para>
+    /// </summary>
     public static string? ObjectSurfaceFingerprint(
         NavSymRef.ModuleDefinition module,
         RadObjectKey key)
     {
         var element = FindElements(module, key).FirstOrDefault();
-        return element == null
-            ? null
-            : System.Text.Json.JsonSerializer.Serialize(element, element.GetType());
+        if (element == null) return null;
+        var node = System.Text.Json.Nodes.JsonNode.Parse(
+            System.Text.Json.JsonSerializer.Serialize(element, element.GetType()));
+        if (node == null) return null;
+        StripProvenance(node);
+        return node.ToJsonString();
+    }
+
+    /// <summary>Properties that say where a symbol was read from, not what it offers.</summary>
+    private static readonly string[] _provenanceProperties = ["ReferenceSourceFileName"];
+
+    private static void StripProvenance(System.Text.Json.Nodes.JsonNode node)
+    {
+        switch (node)
+        {
+            case System.Text.Json.Nodes.JsonObject obj:
+                foreach (var name in _provenanceProperties) obj.Remove(name);
+                foreach (var child in obj.ToList())
+                    if (child.Value != null) StripProvenance(child.Value);
+                break;
+            case System.Text.Json.Nodes.JsonArray array:
+                foreach (var item in array)
+                    if (item != null) StripProvenance(item);
+                break;
+        }
     }
 
     /// <summary>

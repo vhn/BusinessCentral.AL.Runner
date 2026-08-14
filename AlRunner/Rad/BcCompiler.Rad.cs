@@ -134,7 +134,17 @@ public sealed partial class BcCompiler
     /// A delta that fails for any reason falls back to a full compile rather than
     /// shipping a half-updated module.
     /// </summary>
-    public RadEmitResult EmitIncremental(IEnumerable<string> alFolders, string moduleName, AlRunner.Rad.RadWorkspace ws)
+    /// <param name="appRootDir">
+    /// The app's own app.json directory, forwarded to every Compilation this method builds —
+    /// the delta ones as well as the full-compile fallback. Same contract, and same reason, as
+    /// <see cref="Emit"/>'s parameter of that name (#1899): without an <c>IFileSystem</c> BC
+    /// cannot resolve a ControlAddIn's resource paths, so a delta that re-emits an add-in would
+    /// raise AL0327 for files the full compile resolves — the delta path must not answer
+    /// differently from the compile it stands in for.
+    /// </param>
+    public RadEmitResult EmitIncremental(
+        IEnumerable<string> alFolders, string moduleName, AlRunner.Rad.RadWorkspace ws,
+        string? appRootDir = null)
     {
         // BCCOMPILER_TIMING marks: the delta emit itself reports its own duration, but on a
         // 7,000-file app the work AROUND it — enumerating the tree, hashing it, resolving
@@ -186,7 +196,7 @@ public sealed partial class BcCompiler
             // missing loaded module): those call Invalidate, which reports in the same cycle.
             if (ws.TakePendingFullCompileReason() is { } parked)
                 FullCompileBecause(moduleName, parked);
-            return FullCompile(alFolders, moduleName, ws, hashes);
+            return FullCompile(alFolders, moduleName, ws, hashes, appRootDir);
         }
 
         var (changedFiles, removedFiles) = ws.DiffFiles(hashes);
@@ -197,7 +207,8 @@ public sealed partial class BcCompiler
 
         try
         {
-            var delta = DeltaCompile(moduleName, dirs, ws, hashes, changedFiles, removedFiles, refLoader, specs);
+            var delta = DeltaCompile(
+                moduleName, dirs, ws, hashes, changedFiles, removedFiles, refLoader, specs, appRootDir);
             if (delta != null) return delta;
         }
         catch (Exception ex)
@@ -208,7 +219,7 @@ public sealed partial class BcCompiler
         }
         // A fallback is still only a candidate until its generated C# loads. Keep the
         // committed hashes/baseline intact so a backend failure retries the same edit.
-        return FullCompile(alFolders, moduleName, ws, hashes);
+        return FullCompile(alFolders, moduleName, ws, hashes, appRootDir);
     }
 
     /// <summary>
@@ -228,10 +239,10 @@ public sealed partial class BcCompiler
 
     private RadEmitResult FullCompile(
         IEnumerable<string> alFolders, string moduleName,
-        AlRunner.Rad.RadWorkspace ws, Dictionary<string, string> hashes)
+        AlRunner.Rad.RadWorkspace ws, Dictionary<string, string> hashes, string? appRootDir)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var output = Emit(alFolders, moduleName);
+        var output = Emit(alFolders, moduleName, appRootDir);
         var comp = LastCompilation;
         if (output.Sources.Count > 0 && output.ExcludedObjects.Count == 0 && comp != null)
         {
@@ -337,7 +348,8 @@ public sealed partial class BcCompiler
         List<string> changedFiles,
         List<string> removedFiles,
         NavCA.ISymbolReferenceLoader? refLoader,
-        NavCA.SymbolReferenceSpecification[] specs)
+        NavCA.SymbolReferenceSpecification[] specs,
+        string? appRootDir)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var parseOpts = ParseOptionsForCompile();
@@ -383,6 +395,7 @@ public sealed partial class BcCompiler
             if (specs.Length > 0) probe = probe.AddReferences(specs);
         }
         probe = probe.WithDotNetResolverFactory(GetOrCreateDotNetFactory());
+        probe = WithAppFileSystem(probe, appRootDir);
 
         var objectsByFile = new Dictionary<string, List<AlRunner.Rad.RadObjectRef>>(StringComparer.Ordinal);
         foreach (var f in changedFiles) objectsByFile[f] = new List<AlRunner.Rad.RadObjectRef>();
@@ -504,7 +517,8 @@ public sealed partial class BcCompiler
                     changedFiles.Concat(permissionSetFiles).Order(StringComparer.Ordinal).ToList(),
                     removedFiles,
                     refLoader,
-                    specs);
+                    specs,
+                    appRootDir);
             }
         }
 
@@ -629,7 +643,29 @@ public sealed partial class BcCompiler
         // AL0185 its own declaration pass already found. Asking first turns a dangling
         // reference into one diagnostic naming the missing object, instead of a whole-module
         // rebuild whose emit-retry then silently drops the caller — and the caller's caller.
-        foreach (var d in rad.GetDeclarationDiagnostics().Where(d => d.Severity == NavDiag.DiagnosticSeverity.Error))
+        var declarationErrors = rad.GetDeclarationDiagnostics()
+            .Where(d => d.Severity == NavDiag.DiagnosticSeverity.Error)
+            .ToList();
+
+        // One diagnostic the delta is not entitled to report: AL0327 "Missing file", raised
+        // for a ControlAddIn resource path (Scripts/StartupScript/StyleSheets/Images). BC
+        // resolves those through an IFileSystem attached to the compilation, and a RAD
+        // compilation cannot have one — CreateForRad takes no such parameter, and attaching
+        // one afterwards with WithFileSystem returns a compilation that has LOST its packaged
+        // module definition (measured: AL0247 for the target table of an untouched
+        // tableextension). So a delta cannot tell a resource that is present from one that is
+        // missing, while a full compile — which does get a file system, #1899/#1912 — can.
+        // Hand it the question. A genuinely absent file still raises AL0327 from there.
+        if (declarationErrors.Any(d => string.Equals(d.Id, "AL0327", StringComparison.Ordinal)))
+        {
+            FullCompileBecause(
+                moduleName,
+                "a changed object declares a file resource (AL0327), which only a whole-module "
+                + "compile can resolve");
+            return null;
+        }
+
+        foreach (var d in declarationErrors)
             diags.Add($"{d.Location}: error {d.Id}: {d.GetMessage().Split('\n', 2)[0]}");
         if (diags.Count > 0)
             return new RadEmitResult(
@@ -780,7 +816,8 @@ public sealed partial class BcCompiler
                 changedFiles.Concat(callerFiles).Order(StringComparer.Ordinal).ToList(),
                 removedFiles,
                 refLoader,
-                specs);
+                specs,
+                appRootDir);
         }
 
         var update = new AlRunner.Rad.RadWorkspaceUpdate(

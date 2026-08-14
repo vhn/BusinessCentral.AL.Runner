@@ -237,6 +237,52 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             ["Codeunit71000", "Codeunit71001"]);
     }
 
+    /// <summary>
+    /// The surface fingerprint must compare the callable surface, and nothing else the
+    /// compiler happens to record beside it.
+    ///
+    /// <para>Concretely: when the compile is given an app root (#1912, which is what the CLI
+    /// does on every cycle) BC records a <c>ReferenceSourceFileName</c> on each symbol it
+    /// writes. A RAD compilation cannot be given one — <c>CreateForRad</c> takes no file
+    /// system, and attaching one destroys the packaged baseline — so a re-emitted object comes
+    /// back with that property NULL. If the fingerprint is the raw serialized symbol, every
+    /// modified codeunit therefore reads as "its surface moved", pulls in its direct callers,
+    /// and those pull in theirs: measured on this fixture, a one-line body edit went from 1
+    /// re-emitted object to 3, with two rounds of "rebinding direct caller file(s)". On an app
+    /// the size of NP Retail that is the difference between a delta and a cascade.</para>
+    ///
+    /// <para>Both directions, because a fingerprint that ignored too much would be worse than
+    /// one that ignores too little: the body edit must stay at one object, and changing the
+    /// actual signature immediately below must still rebind the caller.</para>
+    /// </summary>
+    [Fact]
+    public void ABodyEdit_StaysOneObject_WhenTheCompileRecordsSourceFileNames()
+    {
+        RunOverlayScenario(
+            "body edit with a file system",
+            tempRoot => RadFixture.ReplaceExactlyOnce(
+                RadFixture.SourceFile(tempRoot, "RadPerfService.Codeunit.al"),
+                "exit(40);",
+                "exit(41);"),
+            ["RAD Perf Service"],
+            ["Codeunit71000"],
+            withFileSystem: true);
+    }
+
+    [Fact]
+    public void ACallableSurfaceEdit_StillRebindsItsCaller_WhenTheCompileRecordsSourceFileNames()
+    {
+        RunOverlayScenario(
+            "callable-surface edit with a file system",
+            tempRoot => RadFixture.ReplaceExactlyOnce(
+                RadFixture.SourceFile(tempRoot, "RadPerfService.Codeunit.al"),
+                "procedure Coerce(Input: Integer): Integer",
+                "procedure Coerce(Input: Decimal): Integer"),
+            ["RAD Perf Caller", "RAD Perf Service"],
+            ["Codeunit71000", "Codeunit71001"],
+            withFileSystem: true);
+    }
+
     [Fact]
     public void AddingOneCodeunit_ReloadsOnlyTheAddedObject()
     {
@@ -503,6 +549,86 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     }
 
     /// <summary>
+    /// A `controladdin` declaring a resource file (`StartupScript`, `Scripts`, `StyleSheets`,
+    /// `Images`) must compile on the delta path exactly as it does on the full-compile one.
+    ///
+    /// <para>BC resolves those paths through an <c>IFileSystem</c> the compilation is given
+    /// (#1899/#1912: <c>Emit</c> attaches one anchored at the app root). A RAD compilation
+    /// cannot be given one — <c>Compilation.CreateForRad</c> takes no file-system parameter,
+    /// and attaching one afterwards with <c>WithFileSystem</c> returns a compilation that has
+    /// LOST its packaged module definition, so every object outside the delta stops resolving
+    /// (measured: AL0247 for the target table of an untouched tableextension). So the delta
+    /// cannot adjudicate a resource path at all, and must hand the question to the compile
+    /// that can.</para>
+    ///
+    /// <para>Without that, editing one line of such an add-in failed the whole cycle with
+    /// AL0327 "Missing file" for a file that is present at the declared path — 0 tests run,
+    /// COMPILE FAIL — on a tree whose cold compile is clean.</para>
+    ///
+    /// <para>Both directions, because a fix that simply suppressed AL0327 would pass the first
+    /// half and hide every real typo: a resource path that genuinely does not exist must still
+    /// raise AL0327 naming that file.</para>
+    /// </summary>
+    [Fact]
+    public void AControlAddInResourcePath_IsAnsweredByTheFullCompile_NotSilencedAndNotFailed()
+    {
+        if (!engine.Ready)
+        {
+            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
+            return;
+        }
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+
+            // The add-in and its script are added BEFORE the baseline, so the resource path is
+            // part of the committed module and the edit below is an ordinary warm cycle.
+            Directory.CreateDirectory(Path.Combine(tempRoot, "src", "addin"));
+            File.WriteAllText(
+                Path.Combine(tempRoot, "src", "addin", "startup.js"), "function Start() { }\n");
+            var addin = RadFixture.SourceFile(tempRoot, "RadPerfAddin.ControlAddIn.al");
+            File.WriteAllText(addin,
+                "controladdin \"RAD Perf Addin\"\n{\n" +
+                "    StartupScript = 'src/addin/startup.js';\n" +
+                "    RequestedHeight = 100;\n}\n");
+
+            // Still 20 emitted sources: a controladdin generates no C# of its own.
+            var baseline = RadFixture.Seed(tempRoot, appRootDir: tempRoot);
+            AlRunner.Rad.RadCycleNotes.Drain();
+
+            RadFixture.ReplaceExactlyOnce(addin, "RequestedHeight = 100;", "RequestedHeight = 120;");
+            var edited = baseline.Cycle(tempRoot, appRootDir: tempRoot);
+
+            Assert.DoesNotContain("AL0327", string.Join(Environment.NewLine, edited.Emit.Diagnostics));
+            Assert.True(edited.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, edited.Emit.Diagnostics));
+            edited.Commit(
+                baseline.Workspace,
+                edited.Emit.Sources.Count == 0
+                    ? null
+                    : RadFixture.AssembleAndLoad(baseline.Workspace, edited.Emit.Sources));
+            baseline.AssertSettled(tempRoot);
+
+            // Negative: point it at a file that is not there. The answer must still be AL0327
+            // naming that path — the fallback exists to let the compiler decide, not to make
+            // the diagnostic go away.
+            RadFixture.ReplaceExactlyOnce(
+                addin, "StartupScript = 'src/addin/startup.js';", "StartupScript = 'src/addin/absent.js';");
+            var broken = baseline.Cycle(tempRoot, appRootDir: tempRoot);
+            var reported = string.Join(Environment.NewLine, broken.Emit.Diagnostics);
+            Assert.Contains("AL0327", reported);
+            Assert.Contains("absent.js", reported);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
     /// The guard that makes the delta above safe. A file the workspace could not fully record
     /// — a declaration with no usable key, or one whose key a second file also claimed, both of
     /// which `MapObjectsToFiles` drops rather than guess at — must NOT be read as a file that
@@ -753,7 +879,8 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
         string scenario,
         Action<string> mutate,
         string[] expectedEmittedObjects,
-        string[] expectedReloadedTypes)
+        string[] expectedReloadedTypes,
+        bool withFileSystem = false)
     {
         if (!engine.Ready)
         {
@@ -766,10 +893,14 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
         {
             using var identity = BcCompiler.ScopeCurrentAppIdentity(
                 RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
-            var baseline = RadFixture.Seed(tempRoot);
+            // withFileSystem mirrors what the CLI does (`RunEmit` passes the app root, #1912);
+            // the compiler then records a ReferenceSourceFileName on every symbol it writes,
+            // which a RAD compilation cannot do — see AObjectSurfaceFingerprint... below.
+            var appRootDir = withFileSystem ? tempRoot : null;
+            var baseline = RadFixture.Seed(tempRoot, appRootDir);
             mutate(tempRoot);
 
-            var delta = baseline.Cycle(tempRoot);
+            var delta = baseline.Cycle(tempRoot, appRootDir);
             var actualNames = RadFixture.EmittedNames(delta);
             var expectedNames = expectedEmittedObjects.Order(StringComparer.Ordinal).ToArray();
 

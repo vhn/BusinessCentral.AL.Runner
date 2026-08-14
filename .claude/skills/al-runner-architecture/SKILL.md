@@ -25,6 +25,13 @@ Test assembly (in-memory, optionally cached at --cache <dir>/<key>.dll)
 Results in milliseconds
 ```
 
+Under `--watch` one step changes: `BcCompiler.EmitIncremental` (`AlRunner/Rad/`) replaces the
+whole-module `Emit` when the app has a baseline and the edit is expressible as a delta —
+`Compilation.CreateForRad` re-emits only the changed objects into a small overlay assembly
+loaded beside the module. Everything downstream (Roslyn, `Assembly.Load`, `TestExecutor`) is
+unchanged, and anything the delta cannot classify falls back to the full compile above. See
+`docs/delta-compile.md`.
+
 There is **no type-renaming** layer. The `NavRecordHandle`, `NavSession`, `NavMethodScope` etc. the precompiled BaseApp / SystemApp DLLs reference are the same instances the AL tests touch. v1's `RoslynRewriter`, `MockX.cs` runtime, `AlRunner.Runtime` namespace, and `stubs/` AL stubs are all gone.
 
 ## The precompiled-DLL contract
@@ -68,6 +75,8 @@ When AL test code reaches a surface the runner cannot faithfully support, throw 
 | `AlRunner/Infrastructure/ExpectationManifest.cs` | Schema + loader for `tests/expectations/`. Library is loaded but **not yet wired into `Reporter`** — wiring is a separate PR. See `docs/expectations.md`. |
 | `AlRunner/Infrastructure/RunnerOutOfScopeException.cs` | Typed OOS exception (named API + reason) |
 | `AlRunner/Patches/*.cs` | Per-API JMP-hook patches (CodeunitPatches, RecordPatches, MetadataPatches, NavRecordIdPatches, etc.) |
+| `AlRunner/WatchSource.cs` | `--watch` file watchers: armed once per process, queue changed paths, quiescence debounce |
+| `AlRunner/Rad/*.cs` | Delta compilation for `--watch` — workspace/baseline, object identity, `CreateForRad` cycle, generation ownership, metadata buffering, cache sidecar. See `docs/delta-compile.md` |
 
 ## Exit codes
 
@@ -95,5 +104,6 @@ As of 2026-05-20, new runtime patches go through Cecil IL rewriting (`NclCecilRe
 - `docs/limitations.md` — hard architectural limits
 - `docs/expectations.md` — expectation-manifest schema
 - `docs/cecil-migration.md` — Cecil-rewrite contract and roadmap
+- `docs/delta-compile.md` — what `--watch` recompiles, and why a cycle ever compiles in full
 - `.claude/rules/precompiled-dll-respect.md` — the load-chain contract
 - `.claude/rules/loud-failures.md` — runtime-side OOS-throw contract

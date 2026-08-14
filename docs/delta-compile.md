@@ -5,6 +5,220 @@ performs a normal full compile and records a baseline for each source app. Subse
 use those baselines when an edit is safe to load as a small overlay. Other runner modes use
 the normal compile path.
 
+## How it fits together
+
+The runner's normal pipeline compiles a whole module per run. `--watch` keeps that pipeline
+and inserts one decision in front of the AL emit: **has this app got a usable baseline, and
+is the change since the last cycle one a delta can express?** Everything downstream of the
+emit — Roslyn, `Assembly.Load`, the test executor — is unchanged; a delta simply hands it a
+much smaller assembly.
+
+```text
+                        ┌─────────────────────── one --watch process ───────────────────────┐
+                        │                                                                   │
+  al-runner --watch ────┤ WatchSource.ArmSourceWatch — FileSystemWatchers armed ONCE,        │
+                        │   for the life of the process; every event is queued as a path     │
+                        │   (ChangedPaths) and stamped on a WatchActivity                    │
+                        │                            │                                       │
+                        │      ┌─────────────────────▼─────────── cycle ──────────────────┐  │
+                        │      │ drain ChangedPaths → RadWorkspaceStore.PrepareBundleReload│ │
+                        │      │   (may warm metadata survive this reload?)               │  │
+                        │      │                     │                                    │  │
+                        │      │  per app group:  RunEmit ──► BcCompiler.EmitIncremental   │ │
+                        │      │                     │            (see the cycle below)    │  │
+                        │      │                     ▼                                     │ │
+                        │      │  BcAssembler/Roslyn — compile the emitted C#              │  │
+                        │      │  Assembly.Load — overlay (delta) or whole module (full)   │  │
+                        │      │  RadEmitResult.Commit — only now does the workspace move  │  │
+                        │      │  TestExecutor — run the selected tests in-process         │  │
+                        │      └─────────────────────┬────────────────────────────────────┘  │
+                        │                            │ dashboard repaint / results           │
+                        │      AwaitChange: block on the signal, then wait for quiescence ───┘
+                        └───────────────────────────────────────────────────────────────────┘
+```
+
+The cycle's own decision, per app, is a funnel — each step can only send work *down* to a
+full compile, never up:
+
+```text
+   .al files on disk
+        │
+        ├─► RadWorkspace.HashSourceTree      SHA-256 per file (whole tree, ~0.14 s / 7k files)
+        │
+        ├─► ReferenceSignature + ws.ArmFor   app identity, preprocessor symbols, resolved
+        │        │                            dep ids — a move here invalidates everything
+        │        └── changed ──────────────────────────────────────────────► FULL COMPILE
+        │
+        ├─► ws.DiffFiles(hashes)             which files moved since the last commit
+        │        └── none ─────────────────────────────────────────► NO COMPILE AT ALL
+        │
+        ├─► declaration probe                a Compilation over the CHANGED FILES ONLY
+        │     (Compilation.Create)            answers "what do these files declare NOW"
+        │        ├── nothing at all ──────────────────► record hashes, no compiler runs
+        │        ├── a dotnet package ────────────────────────────────────► FULL COMPILE
+        │        └── a key an untouched file owns ────────────────────────► FULL COMPILE
+        │
+        ├─► classify → RadChangeSet          added / modified / removed RadObjectKeys
+        │        + one hop of reverse references when a callable surface moved
+        │        + every permission set when an entitlement changed
+        │
+        ├─► ModuleDefinitionOps.WithoutObjects
+        │        strip the changed objects from the packaged baseline, or their stale
+        │        symbols shadow the new source (AL0126)
+        │
+        ├─► Compilation.CreateForRad         Microsoft's own RAD factory: bind + generate
+        │        │                            C# for the changed objects only, resolving
+        │        │                            everything else from the baseline symbols
+        │        ├── GetDeclarationDiagnostics() FIRST — a dangling reference is one
+        │        │     AL0185, not a throw out of codegen
+        │        └── threw / miscounted / merge failed ────────────────────► FULL COMPILE
+        │
+        └─► RadEmitResult (a candidate, nothing committed yet)
+                 │
+                 ▼  Roslyn compiles it, the overlay assembly loads
+             Commit: register the generation, tombstone removed CLR names, apply the
+             buffered runtime metadata, merge the delta back into the module definition
+```
+
+`Commit` is the only thing that advances the workspace, and it runs *after* the assembly
+loads. An AL diagnostic, a rejected C# candidate or a failed load therefore leaves the last
+good baseline exactly where it was, and the next cycle retries the same edit.
+
+## The parts
+
+Everything delta-specific lives in `AlRunner/Rad/`. Nothing outside it changes shape when
+delta compilation is off — `AL_RUNNER_RAD=0`, or any mode other than `--watch`, simply never
+constructs a workspace.
+
+| Part | What it owns |
+|---|---|
+| `Rad/RadWorkspace.cs` | The per-app baseline, and `RadWorkspaceStore` — the process-wide map of them |
+| `Rad/RadObjectKey.cs` | AL object identity: `(Kind, Id)`, or `(Kind, Name)` for the kinds with no id |
+| `Rad/BcCompiler.Rad.cs` | The cycle itself: `EmitIncremental` → `DeltaCompile` / `FullCompile`, and the baseline snapshot + merge |
+| `Rad/ModuleDefinitionOps.cs` | Symbol-reference surgery on BC's `ModuleDefinition` (strip objects, count them) |
+| `Rad/AlObjectResolution.cs` | Which loaded generation owns each AL CLR type, and which names are tombstoned |
+| `Rad/RadMetadataCapture.cs` | Buffers the runtime metadata an AL emit registers, until the generation is committed |
+| `Rad/RadBaselineSidecar.cs` | Persists / restores a baseline beside the cached AL output |
+| `Rad/RadCycleNotes.cs` | Collects "why this cycle compiled in full", for the dashboard |
+| `WatchSource.cs` | Arms the watchers once per process; queues changed paths; quiescence debounce |
+| `Program.cs` (watch loop) | Drains the paths, decides warm-reload eligibility, wires cache HIT → hydrate |
+| `WatchDashboard.cs` | Renders the yellow full-recompile panel above the test tree |
+
+### `Rad/RadWorkspace.cs` — the baseline, and what may be committed to it
+
+One `RadWorkspace` per app, keyed in `RadWorkspaceStore` by module name + `AppId`, living for
+the whole watch process. It holds the SHA-256 of every `.al` file, the objects each file
+declares, the reverse one-hop reference graph, the extension→target edges, the compiler's
+symbol baseline, the reference signature it was armed under, and the loaded assembly
+generations.
+
+Its shape is the load-bearing part. Everything except the loaded assemblies is
+`RadWorkspaceUpdate` — the token `Commit` takes and `Snapshot()` hands back — so a map added
+to the workspace but not to the token cannot be committed at all. That is what keeps "what a
+delta reads", "what a cycle commits" and "what the sidecar persists" from drifting apart.
+
+`ArmFor(signature)` is the gate: a workspace that was armed under a different reference
+signature has its baseline dropped, with `DescribeSignatureChange` naming the facet that
+moved. `Invalidate(reason)` reports in the same cycle; `PendingFullCompileReason` parks a
+reason for a *later* cycle to report, for the case where the compile that discovered the
+problem is not the compile that pays for it.
+
+### `Rad/RadObjectKey.cs` — identity, including for the id-less kinds
+
+`(Kind, Id)` for everything BC gives an object id. For `interface`, `controladdin`,
+`profile`, `pagecustomization`, `profileextension` and `entitlement` there is no id — those
+key on `(Kind, Name)`, with the name decoded (AL escapes a quote by doubling it) and
+case-folded (AL identifiers are case-insensitive). The `Name` field is empty for every
+id-bearing kind, so adding it did not change any existing key's equality or hash.
+
+Keying an id-less object on its id alone was not a theoretical problem: a `profile` satisfies
+BC's `ISymbolWithId` and then reports id 0, so two profiles in one app produced two objects
+with one key — which threw out of the baseline snapshot and left the app with no baseline at
+all, silently, because that throw is caught and logged.
+
+### `Rad/BcCompiler.Rad.cs` — the cycle
+
+A partial class over `BcCompiler`, so a delta reuses the same reference loader, the same
+`.NET` resolver factory and the same compilation options as a full compile — an important
+property, because the two must not disagree about what the app is compiled against.
+
+- `EmitIncremental` — hash, arm, diff, then delegate. Public entry point.
+- `DeltaCompile` — the probe compilation, the change classification, the reverse-reference
+  hop, `CreateForRad`, and the merge back into the module definition. Returns `null` to mean
+  "not expressible as a delta", which the caller turns into a full compile.
+- `FullCompile` — the ordinary `Emit`, plus `TryBuildBaselineSnapshot` to record a baseline
+  from it. A compile whose emit-retry excluded objects deliberately records **no** baseline.
+- `MergeRadBaseline` — Microsoft's `WriteSymbolReference` merges the delta into the previous
+  `ModuleDefinition` and the result is read back with `SymbolReferenceJsonReader`. From the
+  first delta onward the live baseline is itself a JSON-reconstituted definition, which is
+  exactly why persisting one to disk is not a new capability.
+
+### `Rad/ModuleDefinitionOps.cs` — stripping the baseline
+
+`WithoutObjects` removes the changed objects from the packaged module definition before
+`CreateForRad` binds the new source; left in, the stale symbol shadows the edit and a changed
+object calling another changed object fails to bind. Extensions are the exception — what a
+`tableextension` contributes is only visible on its target, so stripping one produces AL0132s
+against fields declared in its own file.
+
+`CountObjects` exists for the tests: a *stale* copy of an object counts as one just as a
+fresh copy does, so a suite that only asserted "it is still there" would pass over a merged
+definition holding both.
+
+### `Rad/AlObjectResolution.cs` — which generation answers
+
+.NET cannot unload an assembly, so every cycle leaves the previous generation's
+`Codeunit60901` / `Record50000` beside the new one. The runner's type finders resolve an AL
+object by scanning `AppDomain.CurrentDomain.GetAssemblies()` and taking the first name match,
+biased towards the executing assembly — enough for one app, not enough for a bundle, where
+app B's tests are running while the call goes into app A.
+
+Measured before this existed: editing a library app's `Answer()` from 42 to 43 left the test
+asserting 42 **green**. So ownership is recorded rather than inferred, and a name a module
+used to declare and no longer does is tombstoned, so a deleted object resolves to nothing
+instead of resurrecting from the still-loaded previous generation.
+
+### `Rad/RadMetadataCapture.cs` — metadata that moves with the objects
+
+A page, report, xmlport or enum is not only its CLR type: BC resolves it through runtime
+metadata the AL emitter writes into process-wide registries as a *side effect* of the emit —
+which happens before Roslyn runs and before anything loads. On the delta path those writes
+are buffered here and applied only when the generation is committed, so a candidate the C#
+backend rejects leaks nothing into the live runtime.
+
+### `Rad/RadBaselineSidecar.cs` — a cache HIT that arrives delta-ready
+
+See [the next section](#the-al-output-cache-serves-the-first-cycle-and-can-serve-it-delta-ready)
+— it is the reason a HIT no longer costs a whole-module compile on the first edit.
+
+### `Rad/RadCycleNotes.cs` — why a cycle was slow, where it can be seen
+
+Every fallback already writes a `[watch]` line to stderr, and the interactive dashboard
+redirects both streams to `TextWriter.Null` while the bundle loop runs so its painted frame
+is not scrolled away — so in the one mode a developer actually watches, every reason was
+discarded. Notes are collected process-wide, drained by the watch loop after the streams are
+restored, and rendered as a yellow panel above the test tree.
+
+### `WatchSource.cs` and the watch loop
+
+Two things the delta path needs from the loop, beyond a "something changed" bit:
+
+- **The paths.** `PrepareBundleReload` has to know whether *every* change was `.al` source
+  under an app with a warm baseline before it keeps metadata warm across the reload. Events
+  are queued (`ChangedPaths`) and drained at the top of each cycle, because they arrive on
+  threadpool threads while the cycle thread is compiling.
+- **Arming once, not per idle wait.** Watchers are armed before the first cycle and stay
+  armed for the life of the process, with the signal reset at the top of each cycle. Arming
+  them only when a cycle goes idle drops any save landing between "cycle finished" and
+  "watchers armed" — and a dropped save is invisible: the developer sees the previous run's
+  results and no sign that their edit was ignored.
+
+The debounce is quiescence-based (`WaitForQuiescence`, from #1904): the wait re-arms on every
+further event and releases only after `AL_RUNNER_WATCH_QUIET_MS` of silence, capped at
+`AL_RUNNER_WATCH_MAX_WAIT_MS`. That matters more with delta compilation than without it,
+because a cycle is now short enough that a burst which used to be absorbed by a long compile
+would otherwise start one against a half-applied checkout.
+
 ## The AL-output cache serves the first cycle, and can serve it delta-ready
 
 The cache answers cycle 1 and nothing after it: starting a watch on an unchanged tree should
@@ -123,6 +337,7 @@ classifies the cycle:
 | No content changed | Reuse the loaded module; do not compile |
 | An object of any kind was edited, added or removed | Re-emit exactly those objects with `Compilation.CreateForRad` and compile a C# overlay; a removal-only cycle produces no C# at all |
 | A modified codeunit's callable surface moved, or an object was removed | Also re-emit the objects that directly reference it — one hop, not the transitive closure |
+| A changed object declares a file resource the compiler must read (`AL0327`) | Normal full compile — see below |
 | An `entitlement` changed | Delta of it **plus the app's permission sets** — see below |
 | A changed file declares a key an untouched file still owns (a duplicate id or name) | Normal full compile, so the compiler reports the duplicate |
 | A changed file declares no AL object at all (a new empty file, a comment-only file) | Record the new hash and stop — no compiler runs |
@@ -155,14 +370,20 @@ change model: `AlRunner.Tests/Fixtures/RadBulkSwitch` pins a whole-version switc
 2 added, 2 deleted) re-emitting exactly those twelve objects in both directions and leaving the
 workspace settled — see `RadBulkSwitchDeltaTests`.
 
-What is **not** yet handled is the arrival of such a change. One command takes seconds, so the
-tree spends that whole window in a mixed state, and the watch loop debounces on a fixed
-interval after the first file event rather than waiting for the burst to finish — so a cycle
-can start mid-checkout, against a tree that is part old version and part new. That is a
-correctness problem, not just a slow one, and it is tracked separately as
-[#1904](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1904). Nothing in the
-delta path depends on it being fixed; the change model is computed by re-hashing the tree, so
-a mid-burst cycle produces a correct delta of an incorrect tree.
+The *arrival* of such a change is handled by the watch loop rather than the delta path: one
+command takes seconds, so the tree spends that whole window in a mixed state, and a debounce
+that fires a fixed interval after the first file event starts a cycle mid-checkout — a
+correct delta of an incorrect tree. `WatchSource.WaitForQuiescence` ([#1904], on `main`)
+releases only after the tree has been quiet for `AL_RUNNER_WATCH_QUIET_MS` (default 250ms),
+capped at `AL_RUNNER_WATCH_MAX_WAIT_MS` (default 10s) from the first event.
+
+A watcher-buffer overflow (`FileSystemWatcher.Error`) is the residual case, and it is safe
+here for a structural reason: the change model is computed by **re-hashing the whole tree**,
+never from the event list. Dropped events can therefore only delay a cycle, not corrupt one.
+The queued paths are used for one narrower decision — whether warm metadata may survive the
+reload — and the app-identity half of that is re-checked independently by `ArmFor`.
+
+[#1904]: https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1904
 
 ## What the baseline contains
 
@@ -379,6 +600,33 @@ Adding a future kind is a line in `RadObjectKey.IsIdlessKind` (plus `IdlessKindO
 symbol API omits it, plus a `ModuleDefinitionOps` array entry if one exists) and a fixture
 that declares one — a kind counts as supported when a test proves the round trip, not when
 it has a key.
+
+#### A file resource is a question only the full compile can answer
+
+BC resolves a `controladdin`'s `Scripts` / `StartupScript` / `StyleSheets` / `Images` through
+an `IFileSystem` attached to the compilation, anchored at the app root (#1899/#1912). A RAD
+compilation cannot have one: `Compilation.CreateForRad` takes no file-system parameter, and
+attaching one afterwards with `WithFileSystem` returns a compilation that has **lost its
+packaged module definition** — measured, everything outside the delta stops resolving, e.g.
+`AL0247` for the target table of an untouched `tableextension`.
+
+So the delta cannot tell a resource that is present from one that is missing, and an
+`AL0327` from a RAD compilation is not evidence of anything. It is treated as "not
+expressible as a delta" and the cycle compiles the module in full, which resolves the path
+or reports a genuine typo. Both directions are pinned by
+`RadObjectDeltaTests.AControlAddInResourcePath_IsAnsweredByTheFullCompile_NotSilencedAndNotFailed`
+— a fix that merely suppressed AL0327 would hide every real one.
+
+The same asymmetry has a second consequence, in the surface fingerprint. A full compile with
+a file system records a `ReferenceSourceFileName` on every symbol it writes; a RAD-emitted
+one comes back with it null. `ObjectSurfaceFingerprint` therefore strips it before comparing
+— otherwise **every** re-emitted object reads as "its surface moved" and pulls in its direct
+callers, whose fingerprints then differ for the same reason. Measured on the 20-object
+fixture: a one-line body edit went from 1 re-emitted object to 3, over two rounds of
+rebinding. Where a symbol was read from is not part of any binding contract; what it offers
+is. Pinned in both directions by
+`ABodyEdit_StaysOneObject_WhenTheCompileRecordsSourceFileNames` and
+`ACallableSurfaceEdit_StillRebindsItsCaller_WhenTheCompileRecordsSourceFileNames`.
 
 #### Every full compile says why, where the developer is looking
 

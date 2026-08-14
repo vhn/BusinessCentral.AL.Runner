@@ -58,11 +58,11 @@ internal static class RadFixture
     /// `--watch` process reaches at the end of its first cycle. Every later
     /// assertion is relative to this.
     /// </summary>
-    internal static SeededBaseline Seed(string tempRoot)
+    internal static SeededBaseline Seed(string tempRoot, string? appRootDir = null)
     {
         var workspace = new RadWorkspace(ModuleName, tempRoot);
         var compiler = new BcCompiler();
-        var result = compiler.EmitIncremental([tempRoot], ModuleName, workspace);
+        var result = compiler.EmitIncremental([tempRoot], ModuleName, workspace, appRootDir);
         Assert.True(result.FullRebuild);
         Assert.False(result.NoChange);
         Assert.True(result.Emit.Diagnostics.Count == 0,
@@ -199,9 +199,14 @@ internal sealed record SeededBaseline(
     IReadOnlyDictionary<string, Type> Types,
     MetadataSnapshot Metadata)
 {
-    /// <summary>Run one warm cycle: re-diff the tree and emit whatever changed.</summary>
-    internal RadEmitResult Cycle(string tempRoot) =>
-        Compiler.EmitIncremental([tempRoot], RadFixture.ModuleName, Workspace);
+    /// <summary>
+    /// Run one warm cycle: re-diff the tree and emit whatever changed. <paramref
+    /// name="appRootDir"/> mirrors what the CLI passes (the app's own app.json directory) and
+    /// is only needed by scenarios involving files the compiler must read off disk — see
+    /// <c>BcCompiler.Emit</c>'s parameter of that name.
+    /// </summary>
+    internal RadEmitResult Cycle(string tempRoot, string? appRootDir = null) =>
+        Compiler.EmitIncremental([tempRoot], RadFixture.ModuleName, Workspace, appRootDir);
 
     /// <summary>
     /// Assert the tree is fully settled: a committed cycle must leave no residue that
