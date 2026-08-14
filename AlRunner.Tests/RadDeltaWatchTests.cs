@@ -36,16 +36,10 @@ public class RadDeltaWatchTests
     private static readonly string TableExtMainSrc = Path.Combine(
         RepoRoot, "tests", "runner-extras", "dep-tableext-platform-base-main");
 
-    private static bool ArtifactsPresent()
-    {
-        try { return Directory.Exists(AlRunner.Infrastructure.BcArtifacts.ServiceTierDir); }
-        catch { return false; }
-    }
-
-    [Fact]
+    [SkippableFact]
     public async Task Watch_EditingTheLibraryApp_RecompilesOnlyThatObject_AndRunsTheNewCode()
     {
-        if (!ArtifactsPresent()) { Console.Error.WriteLine("[skip] BC artifact cache not present"); return; }
+        TestArtifacts.SkipIfMissing();
 
         var bundle = Path.Combine(Path.GetTempPath(), "al-runner-rad-delta", Guid.NewGuid().ToString("N"));
         CopyTree(FixtureSrc, bundle);
@@ -268,12 +262,13 @@ public class RadDeltaWatchTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task Watch_PrecompiledTableExtensionDependency_RehydratesFieldsAfterReload()
     {
-        if (!ArtifactsPresent()) { Console.Error.WriteLine("[skip] BC artifact cache not present"); return; }
+        TestArtifacts.SkipIfMissing();
         var platformApps = CompatiblePlatformApps();
-        if (platformApps == null) { Console.Error.WriteLine("[skip] compatible platform-apps not present"); return; }
+        TestArtifacts.SkipIf(platformApps == null,
+            $"compatible platform-apps not provisioned under '{TestArtifacts.PlatformAppsDir()}'.");
 
         var root = Path.Combine(Path.GetTempPath(), "al-runner-rad-tableext", Guid.NewGuid().ToString("N"));
         var dep = Path.Combine(root, "dep");

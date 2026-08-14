@@ -41,22 +41,16 @@ public class RadWatchTwentyObjectTests
     private const string TestCodeunit = "Codeunit71202";
     private const int TestCount = 6;
 
-    private static bool ArtifactsPresent()
-    {
-        try { return Directory.Exists(AlRunner.Infrastructure.BcArtifacts.ServiceTierDir); }
-        catch { return false; }
-    }
-
     /// <summary>
     /// Body edits to two different object kinds — a codeunit and a table — each replacing
     /// exactly one object, with the AL test outcome proving the new body ran. The table row
     /// is the interesting one: the runner has no database, so a table edit is an object
     /// recompile plus a metadata refresh and has no business costing more than a codeunit.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task Watch_EditingOneObjectBody_ReplacesOnlyThatObject()
     {
-        if (!ArtifactsPresent()) { Console.Error.WriteLine("[skip] BC artifact cache not present"); return; }
+        TestArtifacts.SkipIfMissing();
 
         using var session = WatchSession.Start("al-runner-rad-watch-bodies");
         var cold = await session.NextCycleAsync();
@@ -107,10 +101,10 @@ public class RadWatchTwentyObjectTests
     /// all, and the surviving tests must still run: an empty emit once left the app out of
     /// the cycle's assembly list entirely, which reads as "no tests" rather than a failure.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public async Task Watch_AddingAndRemovingObjects_StaysProportional()
     {
-        if (!ArtifactsPresent()) { Console.Error.WriteLine("[skip] BC artifact cache not present"); return; }
+        TestArtifacts.SkipIfMissing();
 
         using var session = WatchSession.Start("al-runner-rad-watch-structural");
         AssertColdBaseline(await session.NextCycleAsync());
