@@ -294,13 +294,26 @@ public sealed partial class BcCompiler
     /// so the owning manifest is discoverable without mutable process-wide state.
     /// </summary>
     private static IEnumerable<NavCA.SymbolReferenceSpecification>? CurrentInternalsVisibleTo(
-        IEnumerable<string> dirs)
+        IEnumerable<string> dirs) => ReadInternalsVisibleToRefs(FindAppManifest(dirs));
+
+    /// <summary>
+    /// The <c>app.json</c> owning a set of source directories: the caller's explicit app root
+    /// first, then the directories themselves, then their parents. The parent hop is what
+    /// covers the ordinary <c>&lt;app&gt;/src</c> layout — a compile handed <c>Lib/src</c> would
+    /// otherwise find no manifest at all, and silently compile with no
+    /// <c>internalsVisibleTo</c> grants (AL0161 in the app that depends on it) and no
+    /// <c>contextSensitiveHelpUrl</c> (AL0543).
+    /// </summary>
+    private static string? FindAppManifest(IEnumerable<string> dirs, string? appRootDir = null)
     {
+        if (appRootDir != null)
+        {
+            var atRoot = Path.Combine(appRootDir, "app.json");
+            if (File.Exists(atRoot)) return atRoot;
+        }
         var dirList = dirs.ToList();
-        var manifest = dirList.Select(d => Path.Combine(d, "app.json")).FirstOrDefault(File.Exists)
-                       ?? dirList.Select(d => Path.Combine(d, "..", "app.json"))
-                                 .FirstOrDefault(File.Exists);
-        return ReadInternalsVisibleToRefs(manifest);
+        return dirList.Select(d => Path.Combine(d, "app.json")).FirstOrDefault(File.Exists)
+               ?? dirList.Select(d => Path.Combine(d, "..", "app.json")).FirstOrDefault(File.Exists);
     }
 
     /// <summary>
@@ -1308,6 +1321,17 @@ public sealed partial class BcCompiler
         catch { /* best-effort warm — never block compilation */ }
     }
 
+    /// <summary>
+    /// Anchor a compilation's file access at the app root so ControlAddIn resource paths
+    /// (<c>Scripts</c>, <c>StartupScript</c>, <c>StyleSheets</c>, <c>Images</c>) resolve —
+    /// see <see cref="Emit"/>'s <c>appRootDir</c> parameter and #1899. A null or missing
+    /// root leaves the compilation untouched, exactly as the inline sites below do.
+    /// </summary>
+    private static NavCA.Compilation WithAppFileSystem(NavCA.Compilation compilation, string? appRootDir) =>
+        appRootDir != null && Directory.Exists(appRootDir)
+            ? compilation.WithFileSystem(new NavCA.RelativeFileSystem(appRootDir))
+            : compilation;
+
     /// <summary>Compilation options shared by full and RAD emits.</summary>
     private static NavCA.CompilationOptions EmitCompilationOptions() =>
         new(
@@ -1317,7 +1341,19 @@ public sealed partial class BcCompiler
                 NavCA.CompilationGenerationOptions.Code |
                 NavCA.CompilationGenerationOptions.Navigation);
 
-    public BcEmitOutput Emit(IEnumerable<string> alFolders, string moduleName)
+    /// <param name="appRootDir">
+    /// The directory containing this app's own app.json — NOT <paramref name="alFolders"/>
+    /// (which is typically the src/ subdirectory). BC's compiler needs an <c>IFileSystem</c>
+    /// to resolve ControlAddIn resource paths (<c>Scripts</c>, <c>StartupScript</c>,
+    /// <c>StyleSheets</c>, <c>Images</c>) — those are declared relative to the app root, e.g.
+    /// <c>src/addin/startup.js</c>, not relative to the src/ folder itself. Without a file
+    /// system, BC cannot resolve ANY such path and raises AL0327 "Missing file" for every
+    /// declaration, even when the file is present at the declared path — see issue #1899.
+    /// Null is accepted (skips WithFileSystem entirely) for callers that don't have a known
+    /// app root, e.g. dependency compiles staging synthetic AL into a temp dir with no
+    /// resource files anyway.
+    /// </param>
+    public BcEmitOutput Emit(IEnumerable<string> alFolders, string moduleName, string? appRootDir = null)
     {
         var dirs = alFolders.Where(Directory.Exists).Distinct().ToList();
         if (dirs.Count == 0)
@@ -1374,6 +1410,15 @@ public sealed partial class BcCompiler
             internalsVisibleTo: ivt,
             syntaxTrees: trees,
             options: compOpts);
+
+        // #1899: give the compiler a file-access abstraction anchored at the APP ROOT
+        // (where app.json lives), not `dirs` (the src/ subdirectory this method receives
+        // as alFolders). Without an IFileSystem, BC's compiler cannot resolve ANY
+        // ControlAddIn resource path (Scripts/StartupScript/StyleSheets/Images) and raises
+        // AL0327 "Missing file" for every declaration, even when the file exists exactly
+        // where declared. RelativeFileSystem is a public BC API — no new dependency.
+        if (appRootDir != null && Directory.Exists(appRootDir))
+            compilation = compilation.WithFileSystem(new NavCA.RelativeFileSystem(appRootDir));
 
         // Suite-local .alpackages (rare in v2's corpus today, but cheap to honour).
         var bundleAlpackages = dirs
@@ -1563,6 +1608,11 @@ public sealed partial class BcCompiler
                     internalsVisibleTo: ivt,
                     syntaxTrees: retryTrees,
                     options: compOpts);
+                // #1899: same file system as the primary compile above — without it, a
+                // retry after excluding an unrelated broken object would still raise AL0327
+                // for a perfectly-resolvable ControlAddIn resource and could exclude it too.
+                if (appRootDir != null && Directory.Exists(appRootDir))
+                    retryCompilation = retryCompilation.WithFileSystem(new NavCA.RelativeFileSystem(appRootDir));
                 if (refLoader != null)
                 {
                     retryCompilation = retryCompilation.WithReferenceLoader(refLoader);
@@ -1898,9 +1948,17 @@ public sealed partial class BcCompiler
     /// only shipped a symbol-less synthetic .app before, hence AL0185). The
     /// Compilation is created with the dep's REAL identity so the loader indexes it.
     /// </summary>
+    /// <param name="appRootDir">
+    /// The directory containing this dep's own app.json — see the identically-named
+    /// parameter on <see cref="Emit"/> for why (#1899). When omitted, falls back to
+    /// whichever of <paramref name="alFolders"/> already carries an app.json — the same
+    /// directory <c>ivtRefs</c> below is read from — since every current caller of this
+    /// overload passes a single flat directory that already IS the app root.
+    /// </param>
     public void EmitDepSymbols(
         IEnumerable<string> alFolders, string moduleName,
-        Guid appId, string publisher, Version version, string symbolsJsonPath)
+        Guid appId, string publisher, Version version, string symbolsJsonPath,
+        string? appRootDir = null)
     {
         var dirs = alFolders.Where(Directory.Exists).Distinct().ToList();
         var alFiles = dirs
@@ -1921,21 +1979,49 @@ public sealed partial class BcCompiler
             var src = File.ReadAllText(alFiles[i]);
             trees[i] = NavSyntax.SyntaxTree.ParseObjectText(src, path: alFiles[i], encoding: null!, parseOpts, default);
         });
+        // Locate the dep's own app.json BEFORE building CompilationOptions — both
+        // internalsVisibleTo (below) and contextSensitiveHelpUrl (#1898) are read from
+        // it, and the latter has to be in hand for the CompilationOptions ctor itself.
+        var foundAppJson = FindAppManifest(dirs, appRootDir);
         var compOpts = new NavCA.CompilationOptions(
             continueBuildOnError: true,
             target: NavCA.CompilationTarget.OnPrem,
             generateOptions:
-                NavCA.CompilationGenerationOptions.Code | NavCA.CompilationGenerationOptions.Navigation);
+                NavCA.CompilationGenerationOptions.Code | NavCA.CompilationGenerationOptions.Navigation,
+            // #1898: BC's AL0543 check ("The manifest property 'contextSensitiveHelpUrl'
+            // must be set in order to use the property 'ContextSensitiveHelpPage'") reads
+            // THIS CompilationOptions field directly — there is no separate "give the
+            // compiler the manifest" API on Compilation/Compilation.Create (confirmed via
+            // reflection over Compilation's public surface: no WithManifest, and
+            // CompilationOptions' ctor takes contextSensitiveHelpUrl as a plain string
+            // param, default ""). Leaving it unset here — as EmitDepSymbols always did
+            // before this fix — makes BC treat the property as unset even when the dep's
+            // own app.json genuinely sets it, so a dependency using
+            // ContextSensitiveHelpPage always failed AL0543 regardless of its manifest.
+            // Reading the real value here restores parity with what alc.exe does (and
+            // with what the primary bundle-compile path already tolerates via its own,
+            // separate leniency — see the Emit() docs above). A dep whose manifest
+            // genuinely omits the URL still gets "" here and AL0543 still fires,
+            // preserving the diagnostic for an actually-invalid manifest.
+            contextSensitiveHelpUrl: ReadContextSensitiveHelpUrl(foundAppJson));
         // Propagate the dep's own `internalsVisibleTo` (from its app.json) into the
         // Compilation. BC populates IModuleSymbol.InternalsVisibleToModules ONLY from
         // this dedicated Create parameter — not from the manifest — so without it a
         // dependent app hits AL0161 on the dep's Access=Internal members even when the
         // grant exists. (main:Program.cs BuildInternalsVisibleToRefs.)
-        var ivtRefs = CurrentInternalsVisibleTo(dirs);
+        var ivtRefs = ReadInternalsVisibleToRefs(foundAppJson);
 
         var compilation = NavCA.Compilation.Create(
             moduleName: moduleName, publisher: publisher, version: version,
             appId: appId, internalsVisibleTo: ivtRefs, syntaxTrees: trees, options: compOpts);
+
+        // #1899: same rationale as Emit's appRootDir — without an IFileSystem, a
+        // ControlAddIn inside a source dependency raises AL0327 for every resource path.
+        // Falls back to the directory the manifest was already found in (foundAppJson)
+        // when the caller didn't pass one explicitly.
+        var effectiveAppRoot = appRootDir ?? (foundAppJson != null ? Path.GetDirectoryName(foundAppJson) : null);
+        if (effectiveAppRoot != null && Directory.Exists(effectiveAppRoot))
+            compilation = compilation.WithFileSystem(new NavCA.RelativeFileSystem(effectiveAppRoot));
 
         var bundleAlpackages = dirs
             .SelectMany(d => Directory.EnumerateDirectories(d, ".alpackages", SearchOption.AllDirectories))
@@ -2017,6 +2103,28 @@ public sealed partial class BcCompiler
             return refs.Count > 0 ? refs : null;
         }
         catch { return null; }
+    }
+
+    /// <summary>
+    /// Read <c>contextSensitiveHelpUrl</c> from an app.json, for the dedicated
+    /// <c>contextSensitiveHelpUrl</c> parameter of <see cref="NavCA.CompilationOptions"/>
+    /// (see #1898). Empty string — BC's own default for the parameter — when the
+    /// manifest is missing, unreadable, or genuinely omits the property, so an
+    /// actually-unset manifest still trips AL0543 on a page/report/etc. using
+    /// <c>ContextSensitiveHelpPage</c>, exactly as real BC does.
+    /// </summary>
+    private static string ReadContextSensitiveHelpUrl(string? appJsonPath)
+    {
+        if (appJsonPath == null || !File.Exists(appJsonPath)) return "";
+        try
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(appJsonPath));
+            if (json.RootElement.TryGetProperty("contextSensitiveHelpUrl", out var v)
+                && v.ValueKind == System.Text.Json.JsonValueKind.String)
+                return v.GetString() ?? "";
+        }
+        catch { /* fall through to the "unset" default below */ }
+        return "";
     }
 
     /// <summary>

@@ -789,13 +789,44 @@ var fullCompileNotes = new List<string>();
 // (symbols.json-only scan) instead of _packageCacheDirs. See BcCompiler
 // GetSharedReferences for the _extraSymbolDirs contract.
 var layeredWorkspaceDirs = new List<string>();
+// #1898: RunLayeredPrePass/BuildSiblingSourceDeps run BEFORE a single object of ANY
+// bundle compiles or a single test runs — a genuine dependency-compile failure inside
+// either (e.g. an impl app whose app.json really omits a manifest property its AL
+// needs, so AL0543 legitimately fires) throws InvalidOperationException, and this call
+// site sat outside every try/catch in Main. That let the exception reach the CLR's
+// default unhandled-exception handler, which prints a raw .NET stack trace and aborts
+// the process with SIGABRT (exit 134) — no al-runner-formatted diagnostic, no
+// documented exit code, and EVERY bundle in the invocation lost, not just the one
+// whose dependency is broken. Catch here and report it the same way every other
+// compile-time failure in this file does: a "<layered-deps>: COMPILE-FAIL" line on
+// stderr and the documented exit code 3 (docs/server-mode.md's "3 compilation error"
+// ladder — same code EMIT-ZERO/COMPILE-FAIL already return elsewhere in Main).
 if (bundles.Count > 1)
-    packageCacheDirs = RunLayeredPrePass(bundles, packageCacheDirs, layeredWorkspaceDirs);
+{
+    try
+    {
+        packageCacheDirs = RunLayeredPrePass(bundles, packageCacheDirs, layeredWorkspaceDirs);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"<layered-deps>: COMPILE-FAIL — {ex.Message}");
+        return 3;
+    }
+}
 // Discover + compile sibling source-only dependency apps. Some apps declare a
 // dependency that ships ONLY as AL source in a sibling directory (not a compiled
 // .app in any cache) — e.g. the corpus internalsVisibleTo fixture next to the
 // main test app. Inert when no declared dep matches a sibling source app.
-packageCacheDirs = BuildSiblingSourceDeps(bundles, packageCacheDirs, layeredWorkspaceDirs);
+// Same unhandled-exception exposure as RunLayeredPrePass above (#1898) — same fix.
+try
+{
+    packageCacheDirs = BuildSiblingSourceDeps(bundles, packageCacheDirs, layeredWorkspaceDirs);
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"<sibling-source-deps>: COMPILE-FAIL — {ex.Message}");
+    return 3;
+}
 
 // Dirs the COMPILE-time .app scanner may safely enumerate: everything except the
 // synthetic workspace dirs (whose source-only .apps would trip AL1023).
@@ -1539,7 +1570,7 @@ foreach (var bundle in bundles)
             // already applies — see BcCompiler.ScopeSymbolBearingDepsOnly.
             using var bundleDepScope = BcCompiler.ScopeSymbolBearingDepsOnly();
             AppMark("pre-emit setup");
-            var emitTask = Task.Run(() => RunEmit(emitter, allPaths, moduleName, radWs));
+            var emitTask = Task.Run(() => RunEmit(emitter, allPaths, moduleName, radWs, appGroup.SuiteDir));
             try
             {
                 var emitWait = radWs == null
@@ -2066,7 +2097,7 @@ foreach (var bundle in bundles)
             IReadOnlyList<string> suiteAlDiagnostics = Array.Empty<string>();
             try
             {
-                var emitOutput = emitter.Emit(suitePaths, $"V2_{Path.GetFileName(suite)}");
+                var emitOutput = emitter.Emit(suitePaths, $"V2_{Path.GetFileName(suite)}", suite);
                 sources = emitOutput.Sources;
                 suiteAlDiagnostics = emitOutput.Diagnostics;
             }
@@ -2205,13 +2236,17 @@ if (watchUi)
 
     if (sourceWatch == null) return 0;
     var signal = sourceWatch.Value.Signal;
+    var watchActivity = sourceWatch.Value.Activity;
     // Console.KeyAvailable throws InvalidOperationException when stdin is redirected
     // (a pipe/file rather than a real terminal). We still want the dashboard + file
     // watching in that case (output is a TTY), just without scroll keys. Probe once.
     bool keyboard = !Console.IsInputRedirected;
     while (true)
     {
-        if (signal.IsSet) { System.Threading.Thread.Sleep(250); break; }
+        // #1904: quiescence, not a fixed sleep after only the first event — a branch
+        // switch/bulk rewrite keeps this re-armed until the tree actually stops
+        // changing, instead of starting a cycle against a half-applied checkout.
+        if (signal.IsSet) { WatchSource.WaitForQuiescence(watchActivity); break; }
 
         if (keyboard && SafeKeyAvailable())
         {
@@ -2260,7 +2295,7 @@ else
     if (sourceWatch == null) return 0;
     Console.WriteLine("[watch] waiting for AL source changes… (Ctrl+C to quit)");
     Console.Out.Flush();
-    WatchSource.AwaitChange(sourceWatch.Value.Signal);
+    WatchSource.AwaitChange(sourceWatch.Value.Signal, sourceWatch.Value.Activity);
     Console.WriteLine("[watch] change detected — re-running…");
     Console.Out.Flush();
 }
@@ -3062,7 +3097,7 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
                 var et = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
-                    var emitOutput = emitter.Emit(allPaths, moduleName);
+                    var emitOutput = emitter.Emit(allPaths, moduleName, bucketRoot);
                     sources = emitOutput.Sources;
                     alDiagnostics = emitOutput.Diagnostics;
                     excludedObjects = emitOutput.ExcludedObjects;
@@ -3824,7 +3859,7 @@ static int RunPrecompile(string[] subArgs)
     BcEmitOutput emitOut;
     try
     {
-        emitOut = compiler.Emit(new[] { tempDir }, manifest.Name);
+        emitOut = compiler.Emit(new[] { tempDir }, manifest.Name, tempDir);
     }
     catch (Exception ex)
     {
@@ -4142,7 +4177,7 @@ static List<string> RunLayeredPrePass(List<string> bundles, List<string> package
                 var implDeps = implResolver.Resolve(implId.Dependencies);
                 BcCompiler.SetResolvedDeps(implDeps, implSymbolDirs);
                 using (BcCompiler.ScopeCurrentAppIdentity(implId.AppId, implId.Publisher, implId.Version))
-                    new BcCompiler().EmitDepSymbols(new[] { implPath }, implId.Name, implId.AppId, implId.Publisher, implId.Version, symbolsPath);
+                    new BcCompiler().EmitDepSymbols(new[] { implPath }, implId.Name, implId.AppId, implId.Publisher, implId.Version, symbolsPath, implPath);
                 // Declare the FULL compile closure — the resolved deps (real AppIds/versions)
                 // UNIONed with the Microsoft platform apps vendored in the impl's own
                 // .alpackages. Filtering to non-Optional declared deps drops the implicit
@@ -4405,7 +4440,7 @@ static List<string> BuildSiblingSourceDeps(List<string> bundles, List<string> pa
             try
             {
                 using (BcCompiler.ScopeCurrentAppIdentity(sid.AppId, sid.Publisher, sid.Version))
-                    new BcCompiler().EmitDepSymbols(new[] { dir }, sid.Name, sid.AppId, sid.Publisher, sid.Version, symbolsPath);
+                    new BcCompiler().EmitDepSymbols(new[] { dir }, sid.Name, sid.AppId, sid.Publisher, sid.Version, symbolsPath, dir);
                 // Full compile closure (resolved deps ∪ vendored platform apps) — see the
                 // impl-bundle site above and #1546. Filtering to non-Optional declared deps
                 // would drop the implicit platform roots whose types appear in this dep's
@@ -4684,9 +4719,10 @@ static string? SelectVersionDirOrNull(string root, string versionPrefix)
 /// overlay. Structural edits take the normal full-compile path.
 /// </summary>
 static (BcEmitOutput Output, RadEmitResult? Rad) RunEmit(
-    BcCompiler emitter, List<string> allPaths, string moduleName, AlRunner.Rad.RadWorkspace? ws)
+    BcCompiler emitter, List<string> allPaths, string moduleName, AlRunner.Rad.RadWorkspace? ws,
+    string? appRootDir)
 {
-    if (ws == null) return (emitter.Emit(allPaths, moduleName), null);
+    if (ws == null) return (emitter.Emit(allPaths, moduleName, appRootDir), null);
 
     // Keep the number of live generations bounded. A full compile replaces every old
     // object at once; Program clears the generation list when that assembly loads.
@@ -4694,7 +4730,7 @@ static (BcEmitOutput Output, RadEmitResult? Rad) RunEmit(
     if (ws.Generations.Count >= maxOverlayChain)
         ws.Invalidate($"the overlay chain reached {maxOverlayChain - 1} delta(s)");
 
-    var result = emitter.EmitIncremental(allPaths, moduleName, ws);
+    var result = emitter.EmitIncremental(allPaths, moduleName, ws, appRootDir);
     // "Nothing changed" is only actionable while there is a loaded module to reuse. If a
     // previous cycle compiled but failed to load, reporting no-change would drop the app
     // from the run entirely — silently, since nothing failed this cycle.
@@ -4702,7 +4738,7 @@ static (BcEmitOutput Output, RadEmitResult? Rad) RunEmit(
     if (result.NoChange)
     {
         ws.Invalidate("no module is loaded for this app, so there is nothing to reuse");
-        var rebuild = emitter.EmitIncremental(allPaths, moduleName, ws);
+        var rebuild = emitter.EmitIncremental(allPaths, moduleName, ws, appRootDir);
         return (rebuild.Emit, rebuild);
     }
     return (result.Emit, result);
@@ -4815,7 +4851,7 @@ static void PublishSiblingSymbols(
                 new BcCompiler().EmitDepSymbols(
                     group.Paths, group.ModuleName, appId,
                     group.Publisher ?? "AlRunner", group.Version ?? new Version(1, 0, 0, 0),
-                    symbolsPath);
+                    symbolsPath, group.SuiteDir);
         }
         // Same dependency closure the pre-pass writes — see EmitSiblingSymbols for why the
         // BUNDLE-WIDE Microsoft platform set has to be in it (#1546, #1686).

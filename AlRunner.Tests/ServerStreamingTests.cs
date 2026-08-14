@@ -16,31 +16,51 @@ namespace AlRunner.Tests;
 ///
 /// See DefineFlagIntegrationTests for why this used to be
 /// [Collection("server-serial")] and no longer is — #1809.
+///
+/// #1804: all three facts share ONE server process via SharedCliServer instead
+/// of spawning their own. None needs a different --cache/startup flag from the
+/// others and none tears the process down (conditions (a)/(b) of
+/// SharedCliServer's doc comment). Condition (c) — distinct app IDs — is
+/// enforced by giving <see cref="MakeMixedBundle"/> a <c>variant</c>: a shared
+/// server process caches a compiled module by AppId for the process's whole
+/// lifetime (<c>DependencyLoader.TryGetByAppId</c>) and reuses it for ANY later
+/// request whose bundle reports the same AppId at a different SourcePath,
+/// regardless of content — so two facts calling this bundle generator with the
+/// SAME AppId would (harmlessly, while the content happens to stay identical,
+/// but not safely in general) share one compiled module instead of each
+/// genuinely compiling its own. See ServerTestIsolationTests' class doc
+/// comment for the same point made at more length.
 /// </summary>
-public class ServerStreamingTests
+public class ServerStreamingTests : IClassFixture<SharedCliServer>
 {
+    private readonly SharedCliServer _fixture;
+
+    public ServerStreamingTests(SharedCliServer fixture) => _fixture = fixture;
 
     // One passing test, one failing test (with a recognisable Error() message) —
     // exercises both status branches of the streamed `test` event shape.
-    private static string MakeMixedBundle()
+    // `variant` gives each call site its own AppId (last hex digit) and object
+    // ID (offset by variant*10 from 60200) — see the class doc comment.
+    private static string MakeMixedBundle(int variant)
     {
         var dir = Path.Combine(Path.GetTempPath(), "al-runner-server-streaming", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, "app.json"), """
+        var baseId = 60200 + variant * 10;
+        File.WriteAllText(Path.Combine(dir, "app.json"), $$"""
         {
-          "id": "a1b2c3d4-e5f6-4708-a9ba-cbdcedfe0f11",
-          "name": "Runner Extras - Server Streaming Probe",
+          "id": "a1b2c3d4-e5f6-4708-a9ba-cbdcedfe0f1{{variant:x1}}",
+          "name": "Runner Extras - Server Streaming Probe {{variant}}",
           "publisher": "AL Runner",
           "version": "1.0.0.0",
           "dependencies": [],
           "platform": "1.0.0.0",
           "application": "1.0.0.0",
-          "idRanges": [ { "from": 60200, "to": 60209 } ],
+          "idRanges": [ { "from": {{baseId}}, "to": {{baseId + 9}} } ],
           "runtime": "14.0"
         }
         """);
-        File.WriteAllText(Path.Combine(dir, "StreamingTest.Codeunit.al"), """
-        codeunit 60200 "Server Streaming Probe SX"
+        File.WriteAllText(Path.Combine(dir, "StreamingTest.Codeunit.al"), $$"""
+        codeunit {{baseId}} "Server Streaming Probe SX {{variant}}"
         {
             Subtype = Test;
 
@@ -72,9 +92,8 @@ public class ServerStreamingTests
     {
         TestArtifacts.SkipIfMissing();
 
-        var bundle = MakeMixedBundle();
-        var cacheDir = Path.Combine(Path.GetTempPath(), "al-runner-server-streaming-cache", Guid.NewGuid().ToString("N"));
-        await using var server = await CliServer.StartAsync(new[] { "--cache", cacheDir });
+        var bundle = MakeMixedBundle(variant: 0);
+        var server = await _fixture.GetAsync();
 
         var lines = await server.SendRequestStreamingAsync(RunTestsReq(bundle));
 
@@ -102,7 +121,7 @@ public class ServerStreamingTests
         Assert.Equal("runtime", fail.GetProperty("errorKind").GetString());
         var frames = fail.GetProperty("stackFrames");
         Assert.Equal(1, frames.GetArrayLength());
-        Assert.Equal("\"Server Streaming Probe SX\"(CodeUnit 60200).FailingTest",
+        Assert.Equal("\"Server Streaming Probe SX 0\"(CodeUnit 60200).FailingTest",
                      frames[0].GetProperty("name").GetString());
         Assert.Equal(2, frames[0].GetProperty("line").GetInt32());
         Assert.Equal("normal", frames[0].GetProperty("presentationHint").GetString());
@@ -121,7 +140,7 @@ public class ServerStreamingTests
     {
         TestArtifacts.SkipIfMissing();
 
-        await using var server = await CliServer.StartAsync();
+        var server = await _fixture.GetAsync();
         var lines = await server.SendRequestStreamingAsync(
             JsonSerializer.Serialize(new { command = "runTests" }));
 
@@ -137,9 +156,8 @@ public class ServerStreamingTests
     {
         TestArtifacts.SkipIfMissing();
 
-        var bundle = MakeMixedBundle();
-        var cacheDir = Path.Combine(Path.GetTempPath(), "al-runner-server-streaming-exec-cache", Guid.NewGuid().ToString("N"));
-        await using var server = await CliServer.StartAsync(new[] { "--cache", cacheDir });
+        var bundle = MakeMixedBundle(variant: 1);
+        var server = await _fixture.GetAsync();
 
         // execute (run-mode) is unaffected by the streaming change — still one
         // v1-shaped response line, no "type" discriminator.

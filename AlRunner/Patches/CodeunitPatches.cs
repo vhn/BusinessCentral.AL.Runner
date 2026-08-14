@@ -980,6 +980,11 @@ public static partial class BcRuntime
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             if (asm == _currentTestAssembly) continue;
+            // Skip a previous-cycle generation of a SIBLING/dependency app —
+            // otherwise a cross-app call can bind to the stale generation even
+            // though CurrentTestAssembly correctly points at the fresh copy of the
+            // app actually executing right now (issue #1901).
+            if (IsStaleBundleAssembly(asm)) continue;
             try
             {
                 var t = Array.Find(asm.GetTypes(),
@@ -1012,6 +1017,11 @@ public static partial class BcRuntime
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             if (asm == _currentTestAssembly) continue;
+            // Skip a previous-cycle generation of a SIBLING/dependency app —
+            // otherwise a cross-app call can bind to the stale generation even
+            // though CurrentTestAssembly correctly points at the fresh copy of the
+            // app actually executing right now (issue #1901).
+            if (IsStaleBundleAssembly(asm)) continue;
             try
             {
                 var t = Array.Find(asm.GetTypes(),
@@ -1047,6 +1057,11 @@ public static partial class BcRuntime
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             if (asm == _currentTestAssembly) continue;
+            // Skip a previous-cycle generation of a SIBLING/dependency app —
+            // otherwise a cross-app call can bind to the stale generation even
+            // though CurrentTestAssembly correctly points at the fresh copy of the
+            // app actually executing right now (issue #1901).
+            if (IsStaleBundleAssembly(asm)) continue;
             try
             {
                 var t = Array.Find(asm.GetTypes(),
@@ -1083,6 +1098,11 @@ public static partial class BcRuntime
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             if (asm == _currentTestAssembly) continue;
+            // Skip a previous-cycle generation of a SIBLING/dependency app —
+            // otherwise a cross-app call can bind to the stale generation even
+            // though CurrentTestAssembly correctly points at the fresh copy of the
+            // app actually executing right now (issue #1901).
+            if (IsStaleBundleAssembly(asm)) continue;
             try
             {
                 var t = Array.Find(asm.GetTypes(),
@@ -1162,6 +1182,11 @@ public static partial class BcRuntime
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             if (asm == _currentTestAssembly) continue;
+            // Skip a previous-cycle generation of a SIBLING/dependency app —
+            // otherwise a cross-app call can bind to the stale generation even
+            // though CurrentTestAssembly correctly points at the fresh copy of the
+            // app actually executing right now (issue #1901).
+            if (IsStaleBundleAssembly(asm)) continue;
             try
             {
                 var t = Array.Find(asm.GetTypes(),
