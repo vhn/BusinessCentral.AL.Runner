@@ -861,11 +861,10 @@ var sourceWatch = watchMode ? ArmSourceWatch(bundles) : null;
 while (true)
 {
 sourceWatch?.Signal.Reset();
-// Null means a notification overflow dropped events, so the path list is incomplete and
-// nothing may be inferred from what is NOT in it — see SourceWatch.DrainChangedPaths.
-var drainedPaths = sourceWatch?.DrainChangedPaths();
-var cycleChangedPaths = drainedPaths ?? new List<string>();
-bool changedPathsComplete = sourceWatch == null || drainedPaths != null;
+var cycleChangedPaths = new List<string>();
+if (sourceWatch != null)
+    while (sourceWatch.Value.ChangedPaths.TryDequeue(out var changedPath))
+        cycleChangedPaths.Add(changedPath);
 results.Clear();
 fullCompileNotes.Clear();
 AlRunner.Rad.RadCycleNotes.Drain();   // discard anything left over from the previous cycle
@@ -920,10 +919,6 @@ foreach (var bundle in bundles)
     if (watchMode)
         BcRuntime.ResetForNewBundleReload(
             preserveEmitCaptures: AlRunner.Rad.RadWorkspaceStore.Enabled
-                // An incomplete path list cannot establish that the change was confined to
-                // AL sources: PrepareBundleReload's "every changed path is a .al file under
-                // a known app" is vacuously true of the empty list an overflow leaves behind.
-                && changedPathsComplete
                 && AlRunner.Rad.RadWorkspaceStore.PrepareBundleReload(
                     bundleAbs, cycleChangedPaths, singleBundle: bundles.Count == 1));
 
@@ -1897,16 +1892,14 @@ if (watchUi)
     watchScroll = PaintWatchViewport(lines, watchScroll);
 
     if (sourceWatch == null) return 0;
-    var signal = sourceWatch.Signal;
+    var signal = sourceWatch.Value.Signal;
     // Console.KeyAvailable throws InvalidOperationException when stdin is redirected
     // (a pipe/file rather than a real terminal). We still want the dashboard + file
     // watching in that case (output is a TTY), just without scroll keys. Probe once.
     bool keyboard = !Console.IsInputRedirected;
     while (true)
     {
-        // Same two-stage wait as the headless path: woken by the first event, released
-        // only once the burst behind it has finished landing. See SourceWatch.
-        if (signal.IsSet) { sourceWatch.AwaitQuiet(); break; }
+        if (signal.IsSet) { System.Threading.Thread.Sleep(250); break; }
 
         if (keyboard && SafeKeyAvailable())
         {
@@ -2582,11 +2575,13 @@ static List<string> DiffServerFiles(Dictionary<string, string>? prev, Dictionary
 // Block until AL source or app.json changes under a watched bundle's bucket root. Returns true
 // on a change (loop again), false if there is nothing to watch. The watchers are armed
 // once for the process (see sourceWatch) so a save during a compile is not dropped.
-static bool WaitForSourceChange(SourceWatch? armed)
+static bool WaitForSourceChange(
+    (System.Threading.ManualResetEventSlim Signal, List<FileSystemWatcher> Watchers,
+     System.Collections.Concurrent.ConcurrentQueue<string> ChangedPaths)? armed)
 {
     if (armed == null) return false;
-    armed.Signal.Wait();     // block until the first source change
-    armed.AwaitQuiet();      // then until the change has finished arriving
+    armed.Value.Signal.Wait();               // block until the first source change
+    System.Threading.Thread.Sleep(250);      // debounce: let a save storm settle
     return true;
 }
 
@@ -2596,7 +2591,8 @@ static bool WaitForSourceChange(SourceWatch? armed)
 /// other work (e.g. the interactive dashboard's keyboard polling). Returns null
 /// if there are no source dirs to watch. They live until this process exits.
 /// </summary>
-static SourceWatch? ArmSourceWatch(List<string> bundles)
+static (System.Threading.ManualResetEventSlim Signal, List<FileSystemWatcher> Watchers,
+        System.Collections.Concurrent.ConcurrentQueue<string> ChangedPaths)? ArmSourceWatch(List<string> bundles)
 {
     var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     foreach (var b in bundles)
@@ -2611,31 +2607,31 @@ static SourceWatch? ArmSourceWatch(List<string> bundles)
         return null;
     }
 
-    var watch = new SourceWatch();
+    var signal = new System.Threading.ManualResetEventSlim(false);
+    var changedPaths = new System.Collections.Concurrent.ConcurrentQueue<string>();
     void OnChanged(object _, FileSystemEventArgs e)
     {
         if (!WatchedSource(e.FullPath)) return;
-        watch.Record(e.FullPath);
+        changedPaths.Enqueue(e.FullPath);
+        signal.Set();
     }
     void OnRenamed(object _, RenamedEventArgs e)
     {
-        if (WatchedSource(e.OldFullPath)) watch.Record(e.OldFullPath);
-        if (WatchedSource(e.FullPath)) watch.Record(e.FullPath);
-    }
-    // A notify-buffer overflow is the one failure mode that can leave the runner asleep on
-    // a tree that HAS changed — exactly what a bulk change (branch switch, rebase, bulk
-    // find-and-replace) is most likely to provoke. The delta is computed by re-hashing the
-    // tree rather than from these paths, so the safe response is simply to wake up: a cycle
-    // that finds nothing changed costs one no-op, whereas a missed wake-up shows the
-    // developer stale results with no sign anything was dropped.
-    void OnError(object _, ErrorEventArgs e)
-    {
-        Console.Error.WriteLine(
-            $"[watch] file-notification overflow ({e.GetException().GetType().Name}) — " +
-            "some change events were dropped; re-scanning the tree.");
-        watch.Record(null);
+        bool watched = false;
+        if (WatchedSource(e.OldFullPath))
+        {
+            changedPaths.Enqueue(e.OldFullPath);
+            watched = true;
+        }
+        if (WatchedSource(e.FullPath))
+        {
+            changedPaths.Enqueue(e.FullPath);
+            watched = true;
+        }
+        if (watched) signal.Set();
     }
 
+    var watchers = new List<FileSystemWatcher>();
     foreach (var d in dirs)
     {
         var w = new FileSystemWatcher(d)
@@ -2643,16 +2639,12 @@ static SourceWatch? ArmSourceWatch(List<string> bundles)
             IncludeSubdirectories = true,
             Filters = { "*.al", "app.json" },
             NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
-            // The 8 KB default holds only a few dozen events on a deep tree; a checkout
-            // that rewrites hundreds of files overruns it routinely.
-            InternalBufferSize = 64 * 1024,
         };
         w.Changed += OnChanged; w.Created += OnChanged; w.Deleted += OnChanged; w.Renamed += OnRenamed;
-        w.Error += OnError;
         w.EnableRaisingEvents = true;
-        watch.Watchers.Add(w);
+        watchers.Add(w);
     }
-    return watch;
+    return (signal, watchers, changedPaths);
 
     static bool WatchedSource(string path) =>
         path.EndsWith(".al", StringComparison.OrdinalIgnoreCase)

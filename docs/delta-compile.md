@@ -53,35 +53,22 @@ back to a normal full compile. An AL or generated-C# error never advances the la
 baseline: the emit prepares a commit token that is applied only after the overlay assembly
 loads.
 
-## Bulk changes: one switch is one cycle
+## Bulk changes
 
-The change a developer makes most violently is not a save — it is a branch switch, a rebase,
-a bulk rename or a formatter run. One command rewrites, adds and deletes dozens to thousands
-of `.al` files, and it takes seconds, so the tree spends that whole window in a mixed state.
+A branch switch, rebase, bulk rename or formatter run rewrites, adds and deletes dozens to
+thousands of `.al` files in one command. Whatever the cycle sees as changed is deltaed as one
+change model: `AlRunner.Tests/Fixtures/RadBulkSwitch` pins a whole-version switch (8 modified,
+2 added, 2 deleted) re-emitting exactly those twelve objects in both directions and leaving the
+workspace settled — see `RadBulkSwitchDeltaTests`.
 
-`--watch` waits for the burst to finish before compiling any of it. The wake-up is the first
-file event; the cycle starts only once no further event has arrived for 300 ms
-(`AL_RUNNER_WATCH_QUIET_MS`, capped at 10 s of total waiting so a tree that is being written
-continuously still gets a cycle). Everything the burst touched is then one delta.
-
-Waking on the first event and compiling a fixed interval later — what this used to do — is
-not merely slower, it is wrong. Measured on `AlRunner.Tests/Fixtures/RadBulkSwitch`, a
-12-file version switch delivered over 1.4 s produced **two** cycles, the first of which
-compiled 4 of the 12 files and reported a **failing test** from source that passes in both
-versions. A spurious red on branch switch is worse than a slow one.
-
-Two supporting properties matter for volume:
-
-- The notification buffer is 64 KB rather than the 8 KB default, because a large checkout
-  overruns the default routinely.
-- An overflow is handled rather than ignored. Dropped events cannot corrupt the delta — which
-  files changed is decided by re-hashing the tree, not from the event stream — but they can
-  leave the runner asleep on a changed tree, so an overflow says so and forces a cycle.
-
-The residual limit: quiescence is measured on the event stream, and event delivery lags the
-writes it reports (FSEvents coalescing, the inotify queue). A writer that pauses for longer
-than the quiet window mid-burst is indistinguishable from one that has finished. Raising
-`AL_RUNNER_WATCH_QUIET_MS` is the lever if a tree ever needs it.
+What is **not** yet handled is the arrival of such a change. One command takes seconds, so the
+tree spends that whole window in a mixed state, and the watch loop debounces on a fixed
+interval after the first file event rather than waiting for the burst to finish — so a cycle
+can start mid-checkout, against a tree that is part old version and part new. That is a
+correctness problem, not just a slow one, and it is tracked separately as
+[#1904](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1904). Nothing in the
+delta path depends on it being fixed; the change model is computed by re-hashing the tree, so
+a mid-burst cycle produces a correct delta of an incorrect tree.
 
 ## What the baseline contains
 
@@ -338,16 +325,15 @@ attached to some unrelated later rebuild. The invalidation paths deliberately do
 
 ### Where a warm cycle's time actually goes
 
-The delta is not the cost. A warm cycle over both apps is **~30 s**, of which the AL delta
-emit is 2.4 s. `BCCOMPILER_TIMING=1` now instruments the bundle-level phases as well as the
-per-app ones — before that, a measured cycle only accounted for about half of itself, and
-the unattributed remainder was guessed at. Steady state (cycles 2–3 after the baseline; a
+The delta is not the cost. `BCCOMPILER_TIMING=1` instruments the bundle-level phases as well
+as the per-app ones — before that, a measured cycle only accounted for about half of itself,
+and the unattributed remainder was guessed at. Steady state (cycles 2–3 after the baseline; a
 one-procedure edit to one codeunit, which moves five objects because four files call it):
 
 | Phase | Time |
 |---|---:|
 | Running the selected test codeunit (30 tests) | 11.0 s |
-| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | 7.9 s |
+| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | 7.9 s* |
 | **AL delta emit (`CreateForRad`)** | **2.4 s** |
 | `NP Retail Tests` establishing it has nothing to do | 2.9 s |
 | Register + publish symbols | 2.5 s |
@@ -358,17 +344,21 @@ one-procedure edit to one codeunit, which moves five objects because four files 
 | Field-trigger wiring and record prewarm | 0.20 s |
 | C# overlay compile | 0.15 s |
 
-`AddSourceDir` was ~26–30 s of that cycle until it stopped parsing each file eight times —
-one syntax tree was built per extractor rather than per file, so npcore's 7,339 files cost
-~59,000 AL parses per cycle instead of 7,339. A direct probe of the same phase on the same
-corpus measured **29.7 s before, 7.0–7.9 s after**; `RecordPatchesParseCostTests` pins the
-one-parse-per-file count so it cannot silently return.
+\* **The `AddSourceDir` row, and therefore the cycle total, is measured with a change this
+branch does not carry.** That phase builds one AL syntax tree **per extractor** rather than per
+file, so npcore's 7,339 files cost ~59,000 AL parses per cycle instead of 7,339. A direct probe
+of the phase on the same corpus measured **29.7 s** at eight parses per file against
+**7.0–7.9 s** at one; the table above was taken with the latter. Deduplicating the parse is
+tracked separately as
+[#1903](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1903), so as this
+branch stands the row is ~29.7 s and the cycle is roughly 22 s longer than the rows sum to.
+That composite has not been re-measured in this configuration.
 
-It is still the largest overhead in the cycle, and it is O(whole tree) by construction: the
-reload clears every parsed dictionary, so all of it is rebuilt to service an edit to one
-file. Making it O(changed files) needs file→parsed-entry provenance, which does not exist
-in `RecordPatches` today — the tableextension dictionaries are keyed by base-table name and
-accumulate, so one file's contribution cannot currently be retracted.
+`AddSourceDir` is the largest overhead in the cycle either way, and it is O(whole tree) by
+construction: the reload clears every parsed dictionary, so all of it is rebuilt to service an
+edit to one file. Making it O(changed files) needs file→parsed-entry provenance, which does not
+exist in `RecordPatches` today — the tableextension dictionaries are keyed by base-table name
+and accumulate, so one file's contribution cannot currently be retracted.
 
 Two corrections to what this section used to claim, both from the new instrumentation:
 post-registration field-trigger wiring and record prewarm are **0.2 s**, not ~12 s; and
@@ -408,8 +398,6 @@ different numbers:
 | `RadIdlessObjectTests` | The six kinds with no object id: two `profile`s (and two `entitlement`s) are two objects rather than one colliding key; the kinds the symbol API never reports and the kinds it reports with id 0 are both tracked to their file; editing or deleting one is a delta that compiles no C#; narrowing an interface binds against the new contract rather than the baseline's copy; widening one WITHOUT touching its implementer still rebinds it, and so does renaming a `pagecustomization` without touching the `profileextension` that names it; a modification leaves the merged baseline holding exactly ONE copy, carrying the post-edit shape; a deletion leaves it entirely; identity survives an embedded quote and a case-only rename; an `entitlement` — which the module definition cannot represent at all — accepts and rejects exactly what a cold compile of the same tree does, in both directions of its permission-set relationship; and a changed file claiming a key an untouched file still owns does not pass as a modification |
 | `WatchTests` | Cycle 1 of a watch is served from the AL-output cache; the first edit builds the baseline instead of being served a second time |
 | `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
-| `RadBulkSwitchWatchTests` | The same switch delivered to the real `--watch` process as a 1.4 s burst is ONE cycle, against the settled tree, with no spurious compile or test failure |
-| `RecordPatchesParseCostTests` | Registering a source directory builds exactly one AL syntax tree per `.al` file — the invariant behind the warm cycle's largest single cost |
 | `WatchDashboardTests` | …and, for the reason-reporting above: a recorded full-recompile reason reaches the dashboard verbatim with the app it belongs to, and the panel is absent on a delta cycle |
 
 ## Reloaded dependency tableextensions

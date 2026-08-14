@@ -186,17 +186,6 @@ public static partial class RecordPatches
     }
 
     /// <summary>
-    /// How many AL syntax trees have been built by <see cref="ParseAlObjects"/> in this
-    /// process. A diagnostic counter, not runtime state: an AL parse is the single most
-    /// expensive thing a warm <c>--watch</c> cycle does per file, so the invariant "one
-    /// parse per file, no matter how many object kinds we extract from it" needs to be
-    /// assertable rather than left to wall-clock timing. See RecordPatchesParseCostTests.
-    /// </summary>
-    internal static long AlObjectParseCount => Interlocked.Read(ref _alObjectParseCount);
-
-    private static long _alObjectParseCount;
-
-    /// <summary>
     /// Parses every AL object in <paramref name="text"/> with BC's own parser and returns the
     /// object declarations. Never throws: this is fed arbitrary .al text — pages, codeunits,
     /// AL sliced out of dependency .app archives, and synthesized table text — and a parse it
@@ -207,7 +196,6 @@ public static partial class RecordPatches
     private static IReadOnlyList<NavCA.SyntaxNode> ParseAlObjects(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return [];
-        Interlocked.Increment(ref _alObjectParseCount);
         try
         {
             var tree = NavSyntax.SyntaxTree.ParseObjectText(
@@ -402,12 +390,9 @@ public static partial class RecordPatches
         return parts;
     }
 
-    private static void TryParseTableFile(string text) => TryParseTableObjects(ParseAlObjects(text));
-
-    /// <inheritdoc cref="TryParseTableFile"/>
-    private static void TryParseTableObjects(IReadOnlyList<NavCA.SyntaxNode> objects)
+    private static void TryParseTableFile(string text)
     {
-        foreach (var obj in objects)
+        foreach (var obj in ParseAlObjects(text))
         {
             if (obj is not NavSyntax.TableSyntax table) continue;
             if (table.ObjectId?.Value.Value is not int tableId) continue;
@@ -467,12 +452,9 @@ public static partial class RecordPatches
         }
     }
 
-    private static void TryParseTableExtensionFile(string text) => TryParseTableExtensionObjects(ParseAlObjects(text));
-
-    /// <inheritdoc cref="TryParseTableExtensionFile"/>
-    private static void TryParseTableExtensionObjects(IReadOnlyList<NavCA.SyntaxNode> objects)
+    private static void TryParseTableExtensionFile(string text)
     {
-        foreach (var obj in objects)
+        foreach (var obj in ParseAlObjects(text))
         {
             if (obj is not NavSyntax.TableExtensionSyntax ext) continue;
             if (ext.ObjectId?.Value.Value is not int extId) continue;

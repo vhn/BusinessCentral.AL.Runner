@@ -10,7 +10,6 @@
 // object-keyword list excludes it, and text that says `queryextension 50100 X extends Y` is a
 // parse error, not an object. The old regex matched that text anyway and stored an
 // IsExtension: true entry; nothing valid can reach that path, so the flag is now always false.
-using NavCA = Microsoft.Dynamics.Nav.CodeAnalysis;
 using NavSyntax = Microsoft.Dynamics.Nav.CodeAnalysis.Syntax;
 
 namespace AlRunner.Patches;
@@ -27,12 +26,9 @@ public static partial class RecordPatches
         }
     }
 
-    private static void TryParseQueryFile(string text) => TryParseQueryObjects(ParseAlObjects(text));
-
-    /// <inheritdoc cref="TryParseQueryFile"/>
-    private static void TryParseQueryObjects(IReadOnlyList<NavCA.SyntaxNode> objects)
+    private static void TryParseQueryFile(string text)
     {
-        foreach (var obj in objects)
+        foreach (var obj in ParseAlObjects(text))
         {
             if (obj is not NavSyntax.QuerySyntax q) continue;
             if (ObjectIdOf(q) is not int id) continue;

@@ -5,7 +5,6 @@
 // so NCLMetadata.GetMetaApplicationObjectInternal finds an entry instead of
 // throwing NavNCLApplicationObjectNotFoundException for xmlports.
 // Parsed from BC's own AL syntax tree (#1696).
-using NavCA = Microsoft.Dynamics.Nav.CodeAnalysis;
 using NavSyntax = Microsoft.Dynamics.Nav.CodeAnalysis.Syntax;
 
 namespace AlRunner.Patches;
@@ -22,12 +21,9 @@ public static partial class RecordPatches
         }
     }
 
-    private static void TryParseXmlPortFile(string text) => TryParseXmlPortObjects(ParseAlObjects(text));
-
-    /// <inheritdoc cref="TryParseXmlPortFile"/>
-    private static void TryParseXmlPortObjects(IReadOnlyList<NavCA.SyntaxNode> objects)
+    private static void TryParseXmlPortFile(string text)
     {
-        foreach (var obj in objects)
+        foreach (var obj in ParseAlObjects(text))
         {
             if (obj is not NavSyntax.XmlPortSyntax x) continue;
             if (ObjectIdOf(x) is not int id) continue;
