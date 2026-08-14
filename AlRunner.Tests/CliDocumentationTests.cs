@@ -185,10 +185,10 @@ public sealed class CliDocumentationTests
     }
 
     /// <summary>
-    /// Delta compilation used to be opt-in behind `--rad`. It is now what `--watch`
-    /// does, so the help entry has to say so — otherwise the only description of the
-    /// behaviour a developer sees is "re-run in-process", which undersells it and gives
-    /// no name to search for when a cycle looks wrong.
+    /// Delta compilation is what `--watch` does, so the help entry has to say so —
+    /// otherwise the only description of the behaviour a developer sees is "re-run
+    /// in-process", which undersells it and gives no name to search for when a cycle
+    /// looks wrong.
     /// </summary>
     [Fact]
     public void Help_DescribesWatchAsObjectGranular()
@@ -203,18 +203,5 @@ public sealed class CliDocumentationTests
 
         Assert.Contains("only the AL objects", entry, StringComparison.Ordinal);
         Assert.Contains("docs/delta-compile.md", entry, StringComparison.Ordinal);
-    }
-
-    /// <summary>
-    /// Negative direction for the same change: `--rad` is gone rather than silently
-    /// accepted. A tolerated no-op flag would let a stale script keep passing it while
-    /// reading as if it still selected something.
-    /// </summary>
-    [Fact]
-    public void Rad_IsNoLongerAFlag()
-    {
-        var (exit, _, stderr) = RunCli("--rad");
-        Assert.Equal(2, exit);
-        Assert.Contains("--rad", stderr, StringComparison.Ordinal);
     }
 }
