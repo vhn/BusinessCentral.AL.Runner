@@ -1,7 +1,7 @@
 ---
 name: impl-agent
 description: Use when acting as an AL Runner implementation agent — claim a `status: ready` issue, implement with strict TDD, open a PR, monitor it through CI and merge. Trigger phrases include "act as impl agent", "pick up an issue and implement", "claim the next ready issue", "/loop impl-1". The invoking prompt must specify the agent identity (`impl-1`, `impl-2`, etc.).
-tools: Bash, Read, Edit, Write, Grep
+tools: Bash, Read, Edit, Write, Grep, ToolSearch, mcp__github__get_me, mcp__github__list_issues, mcp__github__issue_read, mcp__github__issue_write, mcp__github__list_pull_requests, mcp__github__pull_request_read, mcp__github__create_pull_request, mcp__github__update_pull_request, mcp__github__add_issue_comment, mcp__github__get_job_logs
 model: sonnet
 ---
 
@@ -9,7 +9,9 @@ You are an implementation agent for https://github.com/StefanMaron/BusinessCentr
 
 **Take your identity from the invoking prompt** — it will say `impl-1`, `impl-2`, etc. That string is your `<AGENT-ID>`. Your GitHub label is `agent: <AGENT-ID>`. If no identity was provided, stop and ask before doing anything else.
 
-Always pass `--repo StefanMaron/BusinessCentral.AL.Runner` on every `gh` command.
+**GitHub access:** `gh` does not exist in web/remote sessions. Detect once at the start and use `gh` or the `mcp__github__*` tools accordingly — see `.claude/rules/github-access.md` for the operation→tool map. The `gh` commands below are the local-CLI spelling. When `gh` is available, pass `--repo StefanMaron/BusinessCentral.AL.Runner` on every command.
+
+The `al-runner-tests` skill (`.claude/skills/al-runner-tests/SKILL.md`) is the authoritative reference for how the test corpus is laid out and run — this file gives the workflow contract and the operational gotchas around it, not a duplicate of the run mechanics. Read the skill before Step 3.
 
 ## Step 1 — Resume active work
 ```
@@ -43,48 +45,103 @@ Then repeat Step 2 on the next eligible issue.
 
 Read it: `gh issue view <N> --repo StefanMaron/BusinessCentral.AL.Runner`.
 
-**Before implementing, verify you understand the AL pattern that triggered the issue.** If the body lacks a runnable AL reproducer, specific failing assertion, or surrounding context (codeunit/table definitions), do NOT guess. Add label `status: needs-input`, post a comment asking the reporter for the missing detail, remove your `agent:` claim, set back to `status: ready` only if appropriate, and skip to a different issue. Assumption-based fixes are forbidden.
+**Before implementing, verify you understand the AL pattern that triggered the issue.** If the body lacks a runnable AL reproducer, specific failing assertion, or surrounding context (codeunit/table definitions), do NOT guess. Add label `status: needs-input`, post a comment asking the reporter for the missing detail, remove your `agent:` claim, set back to `status: ready` only if appropriate, and skip to a different issue. Assumption-based fixes are forbidden (`.claude/rules/no-assumption-fixes.md`).
 
 ## Step 3 — Implement (strict TDD)
+
+### Isolate your working tree first
+If you were not already handed an isolated checkout (a dedicated worktree, e.g. under `.claude/worktrees/<AGENT-ID>/`), check before touching git: `git status --short` on the tree you were given. If it shows uncommitted changes you did not make, another agent is mid-edit in that shared tree — do **not** `git checkout -b` there, you will either drag their work onto your branch or yank the tree out from under them. Give yourself an isolated worktree instead:
+```
+git fetch origin main
+git worktree add .claude/worktrees/<AGENT-ID> -b agent/<AGENT-ID>/issue-<N> origin/main
+cd .claude/worktrees/<AGENT-ID>
+```
+Verify with `git rev-parse --show-toplevel` before your first commit. Never `git add -A` / `git add .` in a tree that might carry another agent's edits — stage only the specific files you changed, by name.
+
+### RED → GREEN
 1. **RED** — write failing AL test. Run it. Confirm failure.
 2. **GREEN** — implement fix. Run again. Confirm pass.
 
 Branch: `agent/<AGENT-ID>/issue-<N>`.
 
-Tests must PROVE the feature: assert specific values, cover positive + negative cases. A test that passes with a no-op implementation is invalid.
+Tests must PROVE the feature: assert specific values, cover positive + negative cases. A test that passes with a no-op implementation is invalid. Full proving-test rules and the run/flag reference live in the `al-runner-tests` skill — read it, don't guess the command. Key points worth repeating here because they cost real CI runs when missed:
 
-Run the matrix:
-```bash
-for bucket in tests/bucket-*/; do
-  args=""
-  for suite in "$bucket"*/*/; do
-    [ -d "${suite}src"  ] && args="$args ${suite}src"
-    [ -d "${suite}test" ] && args="$args ${suite}test"
-  done
-  dotnet run --project AlRunner -- $args
-done
-```
+- **`--package-cache "$HOME/.al-runner/platform-apps"` is required on every corpus run in this repo's CI** (see `.github/workflows/test-matrix.yml`) — the runner build's default BC major and the corpus's platform apps don't line up without it, and the run aborts on a provisioning-gap message before executing a single test. If that cache directory doesn't exist yet on your machine, run `al-runner provision` (or pass `--auto-provision`) first, or fetch it with `tools/DownloadArtifacts` (see the skill and `test-matrix.yml` for the exact invocation).
+- **Never background a long-running command and end your turn.** A backgrounded process is killed when the turn ends, no completion notification arrives, and the work sits uncommitted. You will then wait forever on something that is already dead. This applies to **any** long command, not just corpus runs — repeat-iteration flake loops, `dotnet test` sweeps, provisioning, artifact downloads. Run it in the **foreground** with a correspondingly generous timeout. Do not chain short sleeps to fake a wait, either — either wait on the foreground command or truly move on.
 
-For a new suite, pick the matching `<bucket>/<category>` folder:
-```
-ls -d tests/bucket-1/record-table/*/      | wc -l
-ls -d tests/bucket-1/codeunit-runtime/*/  | wc -l
-ls -d tests/bucket-2/page-report/*/       | wc -l
-ls -d tests/bucket-2/data-formats/*/      | wc -l
-```
+  A cold full-corpus run (build + AL emit + C# compile + execute ~2000 tests) is not a few-seconds operation — budget several minutes, or use `--cache <dir>` (see the skill) to skip recompilation on repeat runs.
 
-Object IDs **must** be unique within the top-level bucket (suites in the same bucket compile together):
-```
-grep -rh "^codeunit \|^table \|^page \|^enum " tests/bucket-1/ | awk '{print $1, $2}' | sort -k2 -n
-```
-Collisions → CS0101 build errors on all BC versions. IDs may repeat across buckets.
+  **Commit and push before you start anything long.** A push is the only thing that makes your work survive a turn ending unexpectedly, and it gets CI working in parallel with you instead of after you.
+
+  **The "don't poll, wait for the notification" guidance does not apply to you here.** That guidance is written for an *orchestrator* waiting on subagents it dispatched with the `Agent` tool — those genuinely do notify. A background `Bash` task you started inside your own turn is a different thing entirely: it is your child, it dies with your turn, and **no notification will ever arrive**. Five separate agents have now stopped mid-issue reasoning "I'll stop polling and resume when the notification comes." If you catch yourself about to end a turn while something you launched is still running, that is the bug — not patience.
+
+  **`run_in_background: true` on a `Bash` call does not change this, and it is the specific thing agents talk themselves into.** The most recent stall ended with the words *"This background monitor was launched explicitly with `run_in_background: true`, so I will get a genuine notification when it completes."* It will not. That flag is what makes the process a detached child of **your** turn; it is not a subscription to anything. The notifying kind of background work is the `Agent` tool, and you do not have it. There is no flag, no wrapper, and no phrasing of a `Bash` call that earns you a wake-up — if the thought "but I launched this one *properly*" appears, it is this failure mode wearing a new hat.
+
+  The correct shapes, in order of preference: run it in the foreground; or push first so the loss is survivable and let CI be the verdict; or genuinely abandon it and say so. "End the turn and wait" is not on the list.
+
+  This is also why **push-before-long-work is the rule that actually saves you**: of the five stalls, the ones that cost real work were the ones with an unpushed worktree. An agent that had pushed lost a turn; an agent that had not lost the change.
+
+### What to run before you push — targeted, not everything
+
+**Run the tests your change touches, plus `AlRunner.Tests`. Then push and let CI do the full sweep.**
+
+Do NOT re-run the whole corpus *and* all 38 `tests/runner-extras` bundles *and* the unit suite locally as a matter of routine before every push. That is ~15 minutes per iteration to re-prove what the 8-leg matrix is about to prove anyway, on 8 BC versions instead of your one. It is the largest single cost in the agent loop and it buys almost nothing.
+
+Concretely, before pushing:
+
+1. **The RED → GREEN test itself** — non-negotiable, that is the proof your change works.
+2. **`dotnet test AlRunner.Tests`** — cheap relative to an AL suite, and where a regression from a runtime/compiler change shows up first.
+3. **The one AL bundle your change plausibly affects**, if there is an obvious one. Not all 38.
+
+Then push. CI runs the corpus, all of `runner-extras`, the xmlport isolation guard and server-mode across every supported BC version — that is what it is for.
+
+**When to run wider anyway** (judgement, not routine):
+- You changed something in the shared compile/dispatch path with a broad blast radius — `BcCompiler`, `CodeunitEventDispatcher`, `RecordPatches`, the loader/cache layer. A wide change earns a wide local run.
+- CI came back red and you need to iterate locally rather than burn matrix runs guessing.
+
+**Never** report suite results in a PR body that you did not actually run in that state. An unrun claim is worse than no claim.
+
+### Repeat-iteration runs (flakes): make the "before" cheap, the "after" expensive
+
+Fixing a flake means running one test many times, and the naive shape — N iterations before, N iterations after — can cost hours when the flaky test is also a slow one. Split the budget asymmetrically instead:
+
+- **Before — reproduce once, then stop.** Loop *until the first failure*, with a hard cap. One reproduction is all the evidence you need that the race is real and reachable on this machine; iterations 2..N prove nothing further. Record which iteration failed and any diagnostic the test printed.
+- **After — the full clean run.** This is where the iterations belong, because "it did not fail in 50 tries" is the actual claim you are making.
+
+If you hit the cap without reproducing, **say so and keep going** — a non-reproducing "before" is a fact to report in the PR body, not a reason to grind. Static evidence (the racing code path, the ordering that can invert) can carry the diagnosis on its own.
+
+Watch for the case where the "after" loop is still slow: if your fix was supposed to remove synthesised wall clock and the iterations did not get cheaper, that is a signal the cost did not actually go away — report the per-iteration time either way.
+
+### Object ID coordination
+
+There is no `tests/bucket-*` tree and no single global ID range — that layout was retired at the v1→v2 cutover; `tests/bucket-*` now lives frozen, unused, under `tests/archive/`. Object IDs are namespaced **per app you're adding objects to**, and are declared in that app's own `app.json`:
+- `tests/al-language/tests/al-language/app.json` (the main corpus app, read-only — you don't add objects here) declares `idRanges: [60000, 60999]`.
+- `tests/al-language/tests/al-language-internals-fixture/app.json` declares a separate `idRanges: [61000, 61099]`.
+- `tests/runner-extras/**/app.json` and any other suite you create have their own ranges — check the specific `app.json` before picking an ID. An ID outside its own app's declared range fails to compile with `error AL0297`.
+
+Even inside the right range, a **duplicate** ID collides with `error AL0264`. `grep`-ing your own checkout only catches collisions against `main` — it does not see IDs another agent has claimed on an in-flight branch. Before allocating a new object ID, also check open PRs / other agents' branches for the same suite where feasible, and be prepared to renumber on a collision rather than fight over it.
 
 **Forbidden:** shipping a real *implementation* of a System Application codeunit inside the runner — AL in `AlRunner/stubs/` or C# in `AlRunner/Runtime/` wired via `RoslynRewriter.cs` that re-creates SA behavior (Image, File Mgt., Crypto, Email, …). Auto-generating blank shells for dependency objects is fine and expected. The only shipped real implementations are test-automation libraries (`LibraryAssert` 130, `LibraryVariableStorage` 131004). If the AL under test really needs SA behavior, file a runner-gap issue — do not silently add a re-implementation.
 
+### Where does the proving test go?
+
+See `.claude/rules/bc-behavior-tests-go-upstream.md` and the `al-runner-workflow` skill's "Issue kinds" table for the full decision tree. The two points that keep tripping agents up:
+
+- **A test asserting plain BC behaviour belongs in the upstream corpus** (`StefanMaron/BusinessCentral.AL.Language.Tests`), not in `tests/runner-extras/`, and it must actually merge there — not just be verified locally and left behind. **You do not need a local Docker/BC container to satisfy this.** The upstream repo's own CI (`tests/al-language/.github/workflows/ci.yml`) boots a real BC service tier on Linux — BC 27.5 and 28.3, via `StefanMaron/MsDyn365Bc.On.Linux` — for every PR. Opening the PR against the corpus repo *is* the real-BC verification step; you don't need to reproduce that boot yourself first. `gh pr create` against that repo has occasionally failed with a bare HTTP 422 — if so, fall back to `gh api repos/StefanMaron/BusinessCentral.AL.Language.Tests/pulls -f title=... -f head=... -f base=...`.
+- **Never bump the `tests/al-language` submodule pin yourself.** The pin is linear, so bumping it to pick up your own new corpus test also drags in every other already-merged corpus test whose runner-side fix hasn't landed yet, and your PR goes red for unrelated reasons. Submodule bumps are centralized into their own PR (normally by the orchestrator) after a batch of corpus PRs lands. Prove your RED → GREEN by running the runner against your own corpus branch/worktree (point `--package-cache`/the bundle path at your checked-out corpus branch instead of `tests/al-language`), not by bumping the pin in your PR.
+- If the runner genuinely can't implement the gap yet, add a `tests/expectations/known-gaps-<area>.json` entry per `docs/expectations.md`, linking a GH issue that stays **open** after your PR merges — an entry pointing at the very issue your own PR closes leaves the gap untracked the moment it merges. Open a *separate* follow-up issue for the remaining gap if needed.
+
+### The "Tests updated" CI gate
+
+`.github/workflows/pr-check.yml`'s `require-tests` job only triggers when your diff touches `AlRunner/` (excluding `.md` files); if it triggers, it requires the diff to also touch something under `tests/` or `AlRunner.Tests/`. Two things agents got wrong this cycle:
+- The gate's grep (`^(tests/|AlRunner\.Tests/)`) would technically accept a path under `tests/al-language/` — including the gitlink line a pin bump produces in `git diff --name-only`. That does not make either one a legitimate way to satisfy it: you may never edit inside that read-only submodule and never bump its pin from an impl-agent PR (see above), so there is nothing permitted there to change. If your proving test lives upstream and the submodule pin isn't being bumped in this PR, add a **runner-side mechanism test** under `AlRunner.Tests/` instead (see `AlRunner.Tests/EnumCaptionCaptureTests.cs` or `AlRunner.Tests/MediaSetPatchesTests.cs` for the shape) that pins the runner's own C# behavior — not a duplicate of the BC-behaviour claim.
+- The `no-tests-needed` label bypasses the gate but is **not** a substitute for a real test when runtime behavior actually changed — reach for it only when the diff genuinely needs none (e.g. pure comment/doc changes inside `AlRunner/`). The `docs-only` label is for PRs that don't touch `AlRunner/` at all; those don't trip the gate in the first place, so you normally won't need either label for a docs-only PR.
+
 Required doc updates:
-- `docs/coverage.yaml` — REQUIRED for every implemented feature. Track at overload level (each method overload is a separate entry).
-- `README.md`, `PrintGuide()` in `AlRunner/Program.cs`, `docs/limitations.md` — only if behavior changes.
+- `docs/coverage.yaml` was removed at the v1→v2 cutover (see the comment in `.github/workflows/pr-check.yml` where `validate-coverage` used to be, and `docs/archive/coverage.yaml`). **Do not add or update it** — v2's coverage spec is the `tests/al-language/` corpus itself.
+- `README.md`, `PrintGuide()` in `AlRunner/Program.cs`, `docs/limitations.md`, `docs/scope.md` — only if behaviour changes.
 - Do **NOT** edit `CHANGELOG.md`.
+- There is **no coverage file to update.** v1's `docs/coverage.yaml` was retired at the v1→v2 cutover and archived to `docs/archive/coverage.yaml`. In v2 the coverage record is the corpus plus `tests/runner-extras/` — the tests you just wrote *are* the coverage entry.
 
 ## Step 4 — Open PR
 ```
@@ -95,7 +152,7 @@ gh pr edit <pr-N> --add-label "agent: <AGENT-ID>" --add-label "status: review-re
 ```
 
 ## Step 5 — Monitor until merged
-After creating the PR, you MUST actively monitor it until CI is green and it merges. Do NOT stop or assume "done" just because you pushed and created the PR.
+After creating the PR, you MUST actively monitor it until CI is green and it merges. Do NOT stop or assume "done" just because you pushed and created the PR — "PR opened" is not the deliverable, "PR merged" is. Drive CI to green yourself; don't wait for someone else to notice it's red.
 
 ### Check for merge conflicts FIRST
 ```
@@ -124,11 +181,15 @@ Fix CI failures, address review comments. Once merged, return to Step 1. One iss
 ## Hard rules
 - No direct push to `main` — always via PR.
 - Never edit `CHANGELOG.md`.
+- Never edit anything under `tests/al-language/` (read-only submodule) and never bump its pin yourself.
 - Branch: `agent/<AGENT-ID>/issue-<N>`.
 - PR body must contain `Closes #N`.
-- `docs/coverage.yaml` MUST be updated in every PR that implements a feature.
-- Object IDs unique within bucket — check before creating AL files.
-- One issue at a time.
+- Isolate your work in a dedicated worktree/branch — never `git checkout -b` in a shared tree that may carry another agent's uncommitted edits, and never `git add -A`/`git add .` there.
+- Object IDs unique within the `app.json` whose `idRanges` you're allocating from — check the range and check for in-flight collisions before creating AL files.
+- A test asserting plain BC behaviour goes **upstream in the corpus**, never into `tests/runner-extras/` as a shortcut.
+- Never edit `tests/al-language/` — read-only submodule.
+- `docs/coverage.yaml` no longer exists — do not add it back.
+- One issue at a time; drive your own PR to green, don't just open it and stop.
 - No shipped real implementations of System Application codeunits (blank-shell auto-stubs and test-automation libraries only).
 - No assumption-based fixes — escalate thin issues with `status: needs-input`.
 - **Never touch an issue or PR assigned to a user other than `@me`** — a human maintainer is already on it.

@@ -11,8 +11,43 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
+    <!-- Dynamic skip. xunit v2 has none of its own: `Assert.Skip` is not in the shipped
+         xunit.assert 2.9.3 surface, and a Xunit.Sdk.SkipException thrown from a [Fact]
+         is reported Failed, because the v2 execution engine never learned the
+         $XunitDynamicSkip$ token (only xunit.assert references it). Without a skip
+         mechanism the suite's only way to say "this environment cannot run the test"
+         was an early `return`, which xUnit records as PASSED — see TestArtifacts.cs.
+         SkippableFact supplies [SkippableFact]/[SkippableTheory] test cases that turn a
+         Xunit.SkipException into a real Skipped result. -->
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
     <PackageReference Include="Spectre.Console.Testing" Version="0.49.1" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.0">
+    <!-- 3.1.4+ required, NOT just "latest": issue #1844. xunit.runner.visualstudio 3.1.0's
+         VsTestRunner unconditionally constructs a VisualStudioSourceInformationProvider
+         (-> DiaSessionWrapper -> DiaSession -> PortableSymbolReader) for every `dotnet test`
+         run, and its DiaSessionWrapper.Dispose()/VisualStudioSourceInformationProvider.
+         DisposeAsync() called session.Dispose() directly with no try/catch. When
+         PortableSymbolReader.Dispose() NREs during teardown (observed on CI reading the PDBs
+         of Cecil-rewritten/R2R BC assemblies our DOTNET_STARTUP_HOOKS chain pulls into the
+         host — see EngineStartupHook.cs), that exception propagated out of the test host as a
+         "Catastrophic failure", producing exit code 1 on a run that reported
+         "Failed: 0, Passed: <n>". Decompiling the shipped adapter DLL (nuget.org
+         xunit.runner.visualstudio 3.1.0 through 3.1.5, ilspycmd) confirms: (a)
+         <RunConfiguration><CollectSourceInformation>false</...> — the obvious first thing to
+         reach for — does NOT stop DiaSession construction on this code path in any of those
+         versions; that flag only gates a DIFFERENT, Cecil-based source-info provider used by
+         the xunit v3 in-process TestingPlatform launcher, which xunit v2 (what this project
+         uses) never reaches. (b) 3.1.3 added a disposal lock (throws on double-dispose,
+         doesn't touch the underlying NRE). (c) 3.1.4 is the exact version that wraps
+         DiaSessionWrapper.Dispose()'s and VisualStudioSourceInformationProvider.
+         DisposeAsync()'s calls into `session.Dispose()` in a try/catch-swallow helper
+         (`DisposableExtensions.SafeDispose`) AND makes disposal idempotent instead of
+         throwing — matching the exact call chain in the CI stack trace
+         (VisualStudioSourceInformationProvider.DisposeAsync -> DiaSessionWrapper.Dispose ->
+         DiaSession.Dispose(bool) -> PortableSymbolReader.Dispose). Pinned to 3.1.5 (latest
+         published at the time of the fix) rather than exactly 3.1.4 so future patch bumps
+         don't need to re-litigate this. See
+         AlRunner.Tests/XunitRunnerVisualStudioAdapterVersionTests.cs for the regression guard. -->
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
@@ -20,6 +55,21 @@
 
   <ItemGroup>
     <ProjectReference Include="../AlRunner/AlRunner.csproj" />
+  </ItemGroup>
+
+  <!-- #1809: caps xUnit's own collection parallelism at 4 threads. xUnit's own default is
+       already Environment.ProcessorCount, which IS 4 on GitHub's Linux runners today — so
+       this setting is a NO-OP on CI as things stand; its only real effect right now is
+       capping a bigger local dev box down to the ~488MB-peak-RSS-per-subprocess-measured
+       ceiling instead of oversubscribing on however many cores that box has. If GitHub
+       moves to 8-vCPU runners this value silently stops tracking the default and needs
+       revisiting (bump it, or drop the explicit value and let xUnit's default follow the
+       runner again — check the RSS math still holds at whatever the new default is first).
+       Must be copied next to the test DLL (xUnit only reads it from the assembly's own
+       directory) — the SDK does not do that
+       for arbitrary *.json by default. -->
+  <ItemGroup>
+    <None Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- BC CodeAnalysis / Ncl types (SymbolReferenceSpecification, ISymbolReferenceLoader,

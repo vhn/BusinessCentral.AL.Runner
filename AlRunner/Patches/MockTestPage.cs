@@ -72,7 +72,7 @@ internal class MockITestPage : ITestPage
     public int        ValidationErrorCount => 0;
     public virtual FormResult FormResult   => FormResult.OK;
     public string     Name                 => string.Empty;
-    public string     Caption              => string.Empty;
+    public virtual string Caption          => string.Empty;
     public virtual int PageId            => 0;
     public virtual Guid FormHandle         => Guid.Empty;
     public virtual bool Creatable          => false;
@@ -153,6 +153,13 @@ internal class LiveNavTestPage : MockITestPage
     // A constant true made every `CurrPage.Editable(false)` invisible to the test that was
     // written to check it.
     public override bool RuntimeEditable => _staticEditable;
+
+    // TestPage.Caption() (#1776). The base mock answered a constant empty string, which was
+    // wrong for BOTH of a page's caption sources: the static `Caption = '…'` property AND a
+    // runtime `CurrPage.Caption := '…'` assignment made from OnOpenPage. Both write the same
+    // underlying NavForm.PageCaption — reading it here is what makes a single accessor answer
+    // correctly whether or not the page ever touched CurrPage.Caption at all.
+    public override string Caption => _page?.PageCaption ?? string.Empty;
 
     /// <summary>
     /// The subpage part hosted by <paramref name="controlId"/>, driven live over its own
@@ -377,6 +384,11 @@ internal class LiveNavTestPage : MockITestPage
     {
         FlushPendingNewRow();   // starting a second row persists the first
 
+        // The rows around the insert decide the new row's AutoSplitKey number, and the row
+        // the cursor sits on is about to be wiped by NewRecord's ALInit — so the position is
+        // read NOW and the number computed from it at flush time (ProposeAutoSplitKey).
+        CaptureInsertPosition();
+
         // Ask the page to start the row, exactly as it would for a user: BC's NavForm.NewRecord
         // does ALInit, fills the linking fields in from the page's own filters, and raises
         // OnNewRecord. A filtered page is showing one parent's rows, so a row created on it
@@ -466,12 +478,17 @@ internal class LiveNavTestPage : MockITestPage
     ///   corpus CU60922.
     ///
     /// THE RUNNER'S INSERTION POINT
-    ///   <c>InsertEmptyRow</c> here appends: there is no cursor held across a New(), so the row
-    ///   goes after the last row of the page's filtered set. So <c>rangeStart</c> is that last
-    ///   row's key, read with BC's own ALFindLast over the page's own filters, and the draft count
-    ///   is 1 exactly when the set is empty. A test that positions mid-grid and inserts would
-    ///   split an interval on real BC and append here; that is the pre-existing shape of this
-    ///   class's New(), not something this method decides.
+    ///   The row the cursor sits on when New() is called, read by
+    ///   <see cref="CaptureInsertPosition"/> before NewRecord wipes it: <c>rangeStart</c> is
+    ///   that row's key (the last row of the filtered set when the page holds no cursor),
+    ///   <c>rangeEnd</c> is the next row of the same parent when the insert lands mid-grid,
+    ///   and the placeholder draft is counted where the measurements put it — BEFORE the
+    ///   insert on an empty grid (the 20000), AFTER it when the insert is at the end of a
+    ///   non-empty rowset. That last count is load-bearing and was measured, not derived: a
+    ///   grid holding one line at -10000 numbers the next row -6667 on real BC 27.5/28.3
+    ///   (corpus CU60929) — the range up to zero split in THREE, the trailing placeholder
+    ///   taking the third share. Mid-grid the placeholder sits beyond <c>rangeEnd</c> and
+    ///   does not participate, which the measured -1 for a -10000..10000 insert pins.
     /// </summary>
     private void ProposeAutoSplitKey()
     {
@@ -479,67 +496,196 @@ internal class LiveNavTestPage : MockITestPage
         _page.SetAutoKeyValue(ClientAutoKeyValue());
     }
 
+    // The insert position CaptureInsertPosition read at New() time, consumed at flush time.
+    // Null bounds are meaningful (no saved row on that side), so a separate flag records
+    // whether a capture happened at all.
+    private object? _insertRangeStart;
+    private object? _insertRangeEnd;
+    private int _insertDraftRowsBefore;
+    private int _insertDraftRowsAfter;
+    private bool _insertPositionCaptured;
+
+    /// <summary>
+    /// Read the rows around the insertion point — the client half of AutoSplitKey that must
+    /// run at New() time, because NewRecord's ALInit erases the cursor row it reads.
+    /// </summary>
+    private void CaptureInsertPosition()
+    {
+        _insertPositionCaptured = false;
+        if (_page == null || !_page.NeedsAutoSplitKey) return;
+        // The AutoSplitKey field is the LAST field of the primary key — BC picks it the same
+        // way inside SplitKey, so a page whose key shape the runner read differently would
+        // number a different field than BC validates.
+        var primaryKey = _record.MetaTable?.PrimaryKey;
+        if (primaryKey == null || primaryKey.KeyFieldCount == 0) return;
+        var keyFieldNo = primaryKey.KeyFieldsList[primaryKey.KeyFieldCount - 1].FieldNo;
+
+        _insertRangeStart = null;
+        _insertRangeEnd = null;
+        _insertDraftRowsBefore = 0;
+        _insertDraftRowsAfter = 0;
+
+        // Cloned with reset:false so it carries the page's filters (a subpage part's
+        // SubPageLink above all: without it this would walk the lines of SOME OTHER header)
+        // and cannot disturb the cursor the page is on.
+        using var probe = _record.CloneRecord(_record.Parent, reset: false, keepCompany: true);
+
+        // "The cursor sits on a saved row" is decided the way SplitKey itself decides it — a
+        // row with the cursor's ALRecordId exists. With no cursor row the client viewport's
+        // insert goes after the LAST row of the set (BC's own ALFindLast over the page's
+        // filters); with no rows at all the grid is empty.
+        var positioned = probe.ExistsAsync(probe.ALRecordId).AsTask().GetAwaiter().GetResult()
+            || probe.ALFindLastAsync(DataError.TrapError).GetAwaiter().GetResult();
+        if (positioned)
+        {
+            _insertRangeStart = Unwrap(probe.GetFieldValue(keyFieldNo));
+            _insertRangeEnd = NextRowKeyInSequence();
+            // At the end of the rowset the trailing blank placeholder row sits AFTER the
+            // insert and shares the range; mid-grid it sits beyond rangeEnd and does not.
+            // Measured, not derived: -6667 (not -5000) after a single line at -10000.
+            _insertDraftRowsAfter = _insertRangeEnd == null ? 1 : 0;
+        }
+        else
+        {
+            // Empty grid: the placeholder is the row the insert lands AFTER, so it burns the
+            // first interval — the measured 20000 for a first line (corpus CU60922).
+            _insertDraftRowsBefore = 1;
+        }
+        _insertPositionCaptured = true;
+
+        // The next row of the SAME parent, or null when the cursor row ends its sequence —
+        // the prefix-compare mirror of NavForm.IsPositionedAtEndOfSequence: iteration is
+        // unfiltered primary-key order, so "next row belongs to another parent" shows as its
+        // other key fields changing.
+        object? NextRowKeyInSequence()
+        {
+            var prefix = new object?[primaryKey.KeyFieldCount - 1];
+            for (var i = 0; i < prefix.Length; i++)
+                prefix[i] = Unwrap(probe.GetFieldValue(primaryKey.KeyFieldsList[i].FieldNo));
+            if (probe.ALNext() <= 0) return null;
+            for (var i = 0; i < prefix.Length; i++)
+                if (!Equals(Unwrap(probe.GetFieldValue(primaryKey.KeyFieldsList[i].FieldNo)), prefix[i]))
+                    return null;
+            return Unwrap(probe.GetFieldValue(keyFieldNo));
+        }
+    }
+
     private object? ClientAutoKeyValue()
     {
-        // The AutoSplitKey field is the LAST field of the primary key — BC picks it the same way
-        // inside SplitKey, so a page whose key shape the runner read differently would number a
-        // different field than BC validates.
+        if (!_insertPositionCaptured) return null;
+        _insertPositionCaptured = false;
         var primaryKey = _record.MetaTable?.PrimaryKey;
         if (primaryKey == null || primaryKey.KeyFieldCount == 0) return null;
         var keyFieldNo = primaryKey.KeyFieldsList[primaryKey.KeyFieldCount - 1].FieldNo;
 
-        // Zero of the key field's own type, straight off the freshly initialised buffer. Used as
-        // the base for an empty rowset so the proposal is typed like the field: SplitKey feeds it
-        // to NavValue.CreateNavValueFromObject, which converts per the field's NCL type, and an
-        // Int32 offered for a BigInteger or Decimal key is a different value than BC's client
-        // would have sent.
-        object? rangeStart = Unwrap(_record.GetFieldValue(keyFieldNo));
-        var draftRowsBefore = 1;
-
-        // The last row of the page's filtered set — BC's non-draft row before the insertion
-        // point. Cloned with reset:false so it carries the page's filters (a subpage part's
-        // SubPageLink above all: without it this would find the last line of SOME OTHER header)
-        // and cannot disturb the cursor the page is on. Same call SplitKey's own collision
-        // fallback makes.
-        using (var probe = _record.CloneRecord(_record.Parent, reset: false, keepCompany: true))
+        // The key field's CLR type steers the arithmetic, read off the freshly initialised
+        // buffer so the proposal is typed like the field: SplitKey feeds it to
+        // NavValue.CreateNavValueFromObject, which converts per the field's NCL type, and an
+        // Int32 offered for a BigInteger or Decimal key is a different value than BC's
+        // client would have sent.
+        var draftRowCount = _insertDraftRowsBefore + 1 + _insertDraftRowsAfter;
+        return Unwrap(_record.GetFieldValue(keyFieldNo)) switch
         {
-            if (probe.ALFindLastAsync(DataError.TrapError).GetAwaiter().GetResult())
-            {
-                rangeStart = Unwrap(probe.GetFieldValue(keyFieldNo));
-                draftRowsBefore = 0;
-            }
-        }
+            int => Box(CalculateClientAutoKey<int>(
+                (int?)_insertRangeStart, (int?)_insertRangeEnd, draftRowCount, _insertDraftRowsBefore)),
+            long => Box(CalculateClientAutoKey<long>(
+                (long?)_insertRangeStart, (long?)_insertRangeEnd, draftRowCount, _insertDraftRowsBefore)),
+            decimal => Box(CalculateClientAutoKey<decimal>(
+                (decimal?)_insertRangeStart, (decimal?)_insertRangeEnd, draftRowCount, _insertDraftRowsBefore)),
+            // GUID: BC's client and SplitKey both just mint a fresh Guid, so no proposal adds
+            // nothing. Unsupported key types: SplitKey must be the one to throw, so the AL
+            // sees BC's message.
+            _ => null,
+        };
 
-        return Advance(rangeStart, draftRowsBefore + 1);
+        static object? Box<T>(T? value) where T : struct => value.HasValue ? value.Value : null;
     }
 
     /// <summary>
-    /// <c>value + intervals * 10000</c> in the key field's own CLR type — the arithmetic half of
-    /// <c>AutoKeyGenerator.CalculateNumericKeyValue</c> for the append case.
+    /// Verbatim port of the client's <c>AutoKeyGenerator.CalculateNumericKeyValue</c>
+    /// (Microsoft.Dynamics.Nav.Client.UI.dll) — the algorithm that decides what number a new
+    /// grid row gets on a real service tier. Ported rather than invoked because constructing
+    /// the real generator needs a live client ColumnBinder; the arithmetic itself is
+    /// self-contained. Adjudicated against real BC 27.5/28.3 by corpus CU60922 and CU60929:
+    /// append, empty-grid, wide-gap cap, zero-crossing and the placeholder-in-the-divisor
+    /// cases are all pinned by measurement.
     ///
-    /// Answering null means "no proposal", which is a real answer and not a failure: SplitKey then
-    /// computes the key itself. That is the right outcome for a GUID key (BC's client and SplitKey
-    /// both just mint a fresh Guid, so proposing one would add nothing), for a key type SplitKey
-    /// refuses outright (it throws, and it must be the one to throw so the AL sees BC's message),
-    /// and on overflow — where BC's client also gives up and BC's <c>ArithmeticHelper.BoundedAdd</c>
-    /// saturates instead.
+    /// Null means "no proposal", which is a real answer and not a failure: the client raises
+    /// AutoKeyException there (key space exhausted, overflow), and SplitKey's own bound
+    /// arithmetic answers instead.
     /// </summary>
-    private static object? Advance(object? value, int intervals)
+    private static T? CalculateClientAutoKey<T>(
+        T? rangeStart, T? rangeEnd, int draftRowCount, int index)
+        where T : struct, System.Numerics.INumber<T>
     {
-        try
+        var hasStart = rangeStart.HasValue;
+        var hasEnd = rangeEnd.HasValue;
+        var isDecimal = typeof(T) == typeof(decimal);
+        checked
         {
-            checked
+            try
             {
-                return value switch
+                var inc = T.CreateChecked(AutoSplitKeyIncrement);
+                if (!hasStart && !hasEnd)
+                    return Step(T.Zero, inc, false);
+                if (hasStart && !hasEnd && rangeStart!.Value >= T.Zero)
+                    return Step(rangeStart.Value, inc, false);
+                if (hasEnd && !hasStart && rangeEnd!.Value <= T.Zero)
+                    return Step(rangeEnd.Value, -inc, false);
+
+                var slots = T.CreateChecked(draftRowCount + 1);
+                var lowerBound = hasStart ? rangeStart!.Value : T.Min(T.Zero, rangeEnd!.Value - slots);
+                var upperBound = hasEnd ? rangeEnd!.Value : T.Max(T.Zero, rangeStart!.Value + slots);
+                if (lowerBound >= upperBound) return null;
+                var crossesZero = lowerBound < T.Zero && upperBound > T.Zero;
+                if (!isDecimal && crossesZero)
                 {
-                    int i     => i + intervals * AutoSplitKeyIncrement,
-                    long l    => l + intervals * (long)AutoSplitKeyIncrement,
-                    decimal d => d + intervals * (decimal)AutoSplitKeyIncrement,
-                    _         => (object?)null,
-                };
+                    var negRoom = T.Zero - lowerBound;
+                    var posRoom = upperBound - T.Zero;
+                    if (negRoom >= slots && hasStart && !hasEnd)
+                        upperBound = T.Zero;
+                    else if (posRoom >= slots && hasEnd && !hasStart)
+                        lowerBound = T.Zero;
+                    else
+                    {
+                        var range = upperBound - lowerBound;
+                        if (range < slots + T.One)
+                        {
+                            if (!hasStart)
+                                lowerBound -= range - upperBound;
+                            else
+                            {
+                                if (hasEnd) return null;
+                                upperBound += range + lowerBound;
+                            }
+                        }
+                    }
+                }
+                var delta = T.Min(
+                    (upperBound - lowerBound - ((crossesZero && !isDecimal) ? T.One : T.Zero)) / slots,
+                    inc);
+                if (!isDecimal && delta < T.One) return null;
+                if (delta <= T.Zero) return null;
+                return Step(lowerBound, delta, crossesZero);
+            }
+            catch (OverflowException)
+            {
+                return null;
+            }
+
+            T Step(T lowerBound, T delta, bool compensateForZero)
+            {
+                var value = lowerBound + T.CreateChecked(index + 1) * delta;
+                if (compensateForZero)
+                {
+                    if (isDecimal && value == T.Zero)
+                        value -= delta / T.CreateChecked(2);
+                    else if (!isDecimal && value >= T.Zero)
+                        value += T.One;
+                }
+                return value;
             }
         }
-        catch (OverflowException) { return null; }
     }
 
     // The same client model as _pendingNewRow, for the other half of editing: a SetValue on an
@@ -645,6 +791,18 @@ internal class LiveNavTestPage : MockITestPage
 
     public override ITestField GetField(int id)
     {
+        // A control whose OWN Visible, or that of any group enclosing it, is the compile-time
+        // LITERAL false is dead-code-eliminated on real BC — it never exists on the runtime
+        // page at all. Returning null here is what makes that faithful: the caller is
+        // NavTestPageBase.GetField(int,bool) (a precompiled BC method, not ours), and when
+        // ITestPage.GetField answers null it raises BC's own NavTestFieldNotFoundException
+        // ("The field with ID = ... is not found on the page.") itself — so this control gets
+        // the EXACT exception real BC raises, not a runner-invented one. A Visible bound to a
+        // variable/expression is never eliminated this way, even while it is currently false;
+        // see RunnerPageInstance.ControlIsCompileTimeEliminated for the literal-vs-expression
+        // distinction and the ancestor walk.
+        if (_page?.ControlIsCompileTimeEliminated(id) == true) return null!;
+
         // A control bound to a Rec field resolves against the record, as before.
         if (_controlIdToFieldNo.TryGetValue(id, out var tableFieldNo))
         {
@@ -961,6 +1119,43 @@ internal static class TestPageOptionValue
             StringComparison.OrdinalIgnoreCase);
 }
 
+/// <summary>
+/// Boolean values as a TestPage sees them, on a page-variable-bound control
+/// (<c>field(Flag; ShowFlag)</c> where <c>ShowFlag: Boolean</c>).
+///
+/// <c>NavTestField.ALSetValue</c> — the real, precompiled BC method the AL compiler emits for
+/// every <c>TestPage.&lt;field&gt;.SetValue(&lt;Boolean&gt;)</c> call — never hands a NavValue
+/// straight to <see cref="ITestField"/>. For anything that is not itself already a
+/// <c>NavStringValue</c> it round-trips through <see cref="ITestField.FieldType"/> (to pick a
+/// <c>NavValueMetadata</c>) and then <see cref="ITestField.ValueToString"/> (both OUR OWN mock
+/// methods) to turn the boolean back into a string before ever reaching <see cref="ITestField.Value"/>'s
+/// setter — see the doc comment on <see cref="PageVariableTestField.FieldType"/> for why that
+/// matters here.
+///
+/// Because both ends of that round trip are code THIS runner owns (<see cref="ITestField.ValueToString"/>
+/// always answers with <c>Convert.ToString(boolValue)</c>, i.e. exactly "True" or "False"), accepting
+/// only that spelling here is not a narrowing of what <c>SetValue(&lt;Boolean&gt;)</c> can express —
+/// it is the ONLY spelling that overload ever produces. Anything else (a literal
+/// <c>SetValue('Yes')</c>, locale spellings, ...) is a genuinely separate, upstream-unvalidated
+/// question about what real BC's own text-to-Boolean evaluate accepts on this surface, so it stays
+/// out of scope here and throws loudly rather than guessing.
+/// </summary>
+internal static class TestPageBooleanValue
+{
+    internal static NavValue Resolve(string value, string context)
+    {
+        if (string.Equals(value, "True", StringComparison.OrdinalIgnoreCase)) return NavBoolean.Create(true);
+        if (string.Equals(value, "False", StringComparison.OrdinalIgnoreCase)) return NavBoolean.Create(false);
+
+        throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+            context,
+            $"testpage-boolean-value — '{value}' is neither 'True' nor 'False'. Only the exact "
+            + "round-trip spelling TestPage SetValue(Boolean) itself produces is supported here; "
+            + "arbitrary text-to-Boolean spellings ('Yes'/'No', locale forms, ...) are a separate, "
+            + "not-yet-implemented surface. See docs/scope.md");
+    }
+}
+
 internal sealed class LiveNavTestField : ITestField
 {
     private readonly NavRecord _record;
@@ -1029,7 +1224,20 @@ internal sealed class LiveNavTestField : ITestField
         => _page != null && _controlId != 0 ? _page.TryGetOptionCaptions(_controlId) : null;
 
     public string Name => Caption;
-    public string Caption => TryGetMetaFieldName() ?? $"Field {_fieldNo}";
+
+    // TestPage field Caption() (#1777). BC's own precedence, control-declared wins over the
+    // source field's Caption, which wins over the field's bare name:
+    //   1. the control's own Caption (field(Foo; Rec.Foo) { Caption = '…'; }) — page metadata
+    //      that only exists when this field is bound to a live control, not a bare NavRecord.
+    //   2. the source table field's declared Caption (field(2; Foo; Text[30]) { Caption = '…'; })
+    //      — read straight from the parse-time metadata, bypassing NCLMetaField.FieldCaption
+    //      (JmpHooked to always answer the field NAME; see TryGetParsedFieldCaption).
+    //   3. the field's technical name, BC's own fallback when neither is declared.
+    public string Caption
+        => (_page != null && _controlId != 0 ? _page.TryGetControlCaption(_controlId) : null)
+           ?? TryGetMetaFieldCaption()
+           ?? TryGetMetaFieldName()
+           ?? $"Field {_fieldNo}";
     public NavType FieldType => TryGetMetaFieldType() ?? NavType.Text;
     public int ValidationErrorCount => 0;
     public long LastUsedValidationErrorId => 0;
@@ -1072,7 +1280,26 @@ internal sealed class LiveNavTestField : ITestField
 
     public void Lookup(NavDataSet dataSet) => Lookup();
     public void AssistEdit() { }
-    public void Drilldown() { }
+
+    /// <summary>
+    /// Run the control's OnDrillDown trigger — see RunnerPageInstance.RaiseOnDrillDown for the
+    /// full contract, including the fixed error real BC raises when no trigger is declared.
+    /// Left #57's literal no-op (`public void Drilldown() { }`), which let a test call
+    /// DrillDown(), observe nothing happened, and pass anyway — the trigger's effect (or its
+    /// documented absence-error) never ran, and the test only tripped one step later on a
+    /// missing side effect that pointed at the wrong place.
+    /// </summary>
+    public void Drilldown()
+    {
+        if (_page == null)
+            throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                $"TestPage drilldown on field {_fieldNo}",
+                "testpage-drilldown — no AL page object was built for this page, so its "
+                + "OnDrillDown trigger cannot be reached. See docs/scope.md");
+
+        _page.RaiseOnDrillDown(_controlId);
+    }
+
     public void Invoke() { }
     public string ValueToString(object? value) => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
 
@@ -1087,6 +1314,14 @@ internal sealed class LiveNavTestField : ITestField
     private string? TryGetMetaFieldName()
     {
         return _record.MetaTable.TryGetFieldByNo(_fieldNo, out var field) ? field.FieldName : null;
+    }
+
+    // The source field's own declared Caption — see RecordPatches.TryGetParsedFieldCaption
+    // for why this cannot go through NCLMetaField.FieldCaption.
+    private string? TryGetMetaFieldCaption()
+    {
+        var tableId = _record.MetaTable.TableId;
+        return tableId != 0 ? RecordPatches.TryGetParsedFieldCaption(tableId, _fieldNo) : null;
     }
 
     private NavType? TryGetMetaFieldType()
@@ -1136,20 +1371,41 @@ internal sealed class PageVariableTestField : ITestField
     /// come from the binding, not from the caller — writing a NavText into an Option
     /// binding throws deep inside the page's own generated setter
     /// ("Unable to cast object of type 'NavText' to type 'NavOption'"), which says nothing
-    /// about the value that was wrong.
+    /// about the value that was wrong. A Boolean binding has the same shape of problem
+    /// (#1837): a NavText written into it throws "The input string '...' was not in a
+    /// correct format" instead of setting the field, so Boolean gets the same NavOption-style
+    /// special case — see <see cref="TestPageBooleanValue"/>.
     /// </summary>
     private NavValue ToBoundValue(string value)
-        => RunnerPageInstance.GetValue(_expression) is NavOption option
-            ? TestPageOptionValue.Resolve(option, value, _page.TryGetOptionCaptions(_controlId),
-                $"TestPage SetValue (control {_controlId})")
-            : ALCompiler.ToNavValue(value);
+        => RunnerPageInstance.GetValue(_expression) switch
+        {
+            NavOption option => TestPageOptionValue.Resolve(option, value, _page.TryGetOptionCaptions(_controlId),
+                $"TestPage SetValue (control {_controlId})"),
+            NavBoolean => TestPageBooleanValue.Resolve(value, $"TestPage SetValue (control {_controlId})"),
+            _ => ALCompiler.ToNavValue(value),
+        };
 
     public string Name => Caption;
     public string Caption => _expression.GetType()
         .GetProperty("Name", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
         ?.GetValue(_expression) as string ?? string.Empty;
 
-    public NavType FieldType => NavType.Text;
+    // The real underlying NavType, not a constant. NavTestField.ALSetValue — the precompiled BC
+    // method the AL compiler emits for every SetValue(<Boolean>) call on this control — asks
+    // THIS property to pick a NavValueMetadata before converting the incoming value to a string
+    // via ITestField.ValueToString (see TestPageBooleanValue's doc comment for the full chain).
+    // A hardcoded NavType.Text made BC's own dispatch treat every page-variable control as text,
+    // so a Boolean write got coerced through Text metadata into BC's "Yes"/"No" textual spelling
+    // (NOT the "True"/"False" ValueToString itself would have produced) before ever reaching our
+    // Value setter — which is why the var-bound and Rec-bound halves of #1837 threw two DIFFERENT
+    // exceptions for the same SetValue(true) call: they disagreed about what string this control
+    // even claimed to receive.
+    public NavType FieldType => RunnerPageInstance.GetValue(_expression) switch
+    {
+        NavOption => NavType.Option,
+        NavBoolean => NavType.Boolean,
+        _ => NavType.Text,
+    };
     public int ValidationErrorCount => 0;
     public long LastUsedValidationErrorId => 0;
     public long MaxValidationErrorId => 0;
@@ -1173,7 +1429,8 @@ internal sealed class PageVariableTestField : ITestField
     }
     public void Lookup(NavDataSet dataSet) => Lookup();
     public void AssistEdit() { }
-    public void Drilldown() { }
+    /// <summary>Run the control's OnDrillDown trigger — see LiveNavTestField.Drilldown.</summary>
+    public void Drilldown() => _page.RaiseOnDrillDown(_controlId);
     public void Invoke() { }
     public string ValueToString(object? value) => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
     public string GetOption(int index) => string.Empty;

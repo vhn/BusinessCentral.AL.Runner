@@ -108,6 +108,71 @@ public sealed class TestExecutor
     /// </summary>
     public Infrastructure.ExpectationManifest? Expectations { get; set; }
 
+    // #1867: process-lifetime cache of the dependency-assemblies' Install triggers +
+    // Company-Initialize (codeunit 2) — the invariant portion of the per-app-group
+    // "install-seed" sequence, keyed by InstallTriggerRunner.CurrentDependencySetKey()
+    // (the exact ordered set of loaded dependency assemblies, by Module Version ID).
+    // #1866 measured this pair at 62.4% + 20.1% = 82.5% of run_ms across 23 runner-extras
+    // app groups that all shared the identical 12-assembly dependency closure (issue's own
+    // "APP STAGES" table) — every one of the 23 re-executed the SAME MS System-Application
+    // Install codeunits (Email Installer, Plan Installer, ...) and re-ran codeunit 2 from
+    // scratch.
+    //
+    // WHY CACHING THE SNAPSHOT IS LOSSLESS — the structural argument, not an appeal to
+    // BC's Install-trigger contract:
+    //
+    // A HIT restores table rows only (RestoreInstallBaselineSnapshot →
+    // RecordPatches.InstallBaseline.cs), so at first glance any NON-table side effect a
+    // dependency Install trigger left in process-wide state — SingleInstance codeunit
+    // instance variables, the shared-object container, write-transaction state, MediaSet /
+    // RecordLink / IsolatedStorage entries stashed outside a table row — would not be
+    // reproduced on a HIT. That would be a real gap.
+    //
+    // It isn't one, because every codeunit boundary in this run — INCLUDING the app
+    // group's very first codeunit — calls RecordPatches.RestoreInstallBaseline() (see the
+    // TestIsolation.Codeunit / TestIsolation.Test branches further down in this file), and
+    // that call begins with ResetPerTestState() (RecordPatches.cs), which unconditionally
+    // wipes exactly those things: _dataAccessByTable per-table rows,
+    // RecordLinkPatches.ResetForTest(), TenantStoragePatches.ResetForTest(),
+    // MediaSetPatches.ResetForTest(), ALDatabasePatches.ResetWriteTransactionState(),
+    // BcRuntime.DisposeSkeletonSharedObjectContainerChildren(), and
+    // BcRuntime.ResetSingleInstanceCache(). So the set of install-seed state that can ever
+    // survive to the moment ANY test body runs is exactly
+    // {table rows, isolated storage, record links, auto-increment} — precisely the four
+    // things InstallBaselineSnapshot captures. A non-table side effect of a dependency
+    // Install trigger was already unobservable to every test BEFORE this cache existed;
+    // caching the snapshot doesn't create a new gap, it caches the only part of the
+    // dependency Install/Company-Initialize output that was ever able to reach a test in
+    // the first place.
+    //
+    // Two supporting facts, both verified rather than assumed: rows are CloneValues-copied
+    // (with NavBLOB.DeepCopy for BLOB fields) on BOTH capture (buffer.ToArray()) and
+    // restore (new ReadOnlyRecordBuffer(..., CloneValues(values))), so no live row can alias
+    // into the process-lifetime snapshot — this matters more here than for the
+    // CaptureInstallBaseline singleton this is modelled on, because one aliased row here
+    // would corrupt every subsequent app group sharing this dep key, not just one. And the
+    // virtual/system metadata tables (Field, AllObj, AllObjWithCaption, table id ≥
+    // 2,000,000,000) that grow monotonically as more test assemblies load in-process are not
+    // a staleness hazard for a HIT either: GetDataAccessForTableCore re-populates them on
+    // EVERY access as an idempotent top-up, so restoring an earlier app group's narrower
+    // subset self-corrects on the next read.
+    //
+    // NOT cached here: the bundle's OWN test assembly's Install triggers
+    // (InstallTriggerRunner.RunTestAssemblyOnly, genuinely per-app-group, always re-run) and
+    // CaptureInstallBaseline's per-app-group singleton (which layers the bundle's own
+    // install-seeded rows on top of whichever dep+company snapshot below was used, and is
+    // what RestoreInstallBaseline's per-codeunit/per-test boundary restores — unaffected by
+    // this cache either way).
+    //
+    // Kill switch: set AL_RUNNER_NO_DEP_COMPANY_CACHE=1 to force every lookup to MISS (see
+    // the cache-or-compute call site below). Exists for diagnostic blast radius — this cache
+    // is process-lifetime and shared across every app group in the process, so it is
+    // hypothesis #1 for any future "passes alone, fails in the suite" report, and without a
+    // switch the only way to test that hypothesis is a patched rebuild.
+    private static readonly Dictionary<string, AlRunner.Patches.RecordPatches.InstallBaselineSnapshot>
+        _depCompanyBaselineCache = new();
+    private static readonly object _depCompanyBaselineCacheLock = new();
+
     /// <summary>
     /// Runs every [Test] method in <paramref name="assembly"/>. When
     /// <paramref name="onTestComplete"/> is supplied it fires synchronously right
@@ -116,10 +181,23 @@ public sealed class TestExecutor
     /// <c>test</c> line per completed test instead of waiting for the whole
     /// bundle (see #1641). Null (the CLI's default) is a no-op; behaviour and the
     /// returned list are otherwise unchanged either way.
+    ///
+    /// <paramref name="cancellationToken"/> is checked cooperatively BETWEEN
+    /// tests — before instantiating the next test codeunit and before running the
+    /// next [Test] method inside an already-instantiated codeunit — never mid-test
+    /// (a test's own AL body is never interrupted). Matches v1's `cancel` command
+    /// (#1613): "stop before running the next test," not preemptive abort. The
+    /// caller (the <c>--server</c> `runtests` handler) owns the
+    /// <see cref="System.Threading.CancellationTokenSource"/> and inspects
+    /// <c>IsCancellationRequested</c> after <c>Run</c> returns to decide whether
+    /// the summary carries `cancelled:true` — this method does not report that
+    /// itself, it only obeys the token. Default is <c>default</c> (never
+    /// cancellable), so every existing CLI/non-server caller is unaffected.
     /// </summary>
     public IReadOnlyList<TestResult> Run(
         Assembly assembly,
         Action<TestResult>? onTestComplete = null,
+        System.Threading.CancellationToken cancellationToken = default,
         IReadOnlyList<Assembly>? appGenerations = null)
     {
         var totalSw = System.Diagnostics.Stopwatch.StartNew();
@@ -154,6 +232,11 @@ public sealed class TestExecutor
         }
         typeSw.Stop();
         PerfTrace.Log($"TestExecutor.GetTypes {types.Length} type(s) {typeSw.ElapsedMilliseconds}ms");
+        // #1861: reflecting over the freshly-loaded module's types is one of the issue's
+        // named candidates for the flat per-app-group tax. Marked directly (not via
+        // PhaseLog.AppStage's `using`) because the Stopwatch above already spans the
+        // try/catch and re-timing it would double the cost of GetTypes itself.
+        AlRunner.Infrastructure.PhaseLog.AddAppStage("type-discovery", typeSw.Elapsed);
 
         // Model a freshly-installed bundle: register this assembly with the
         // install-trigger runner and fire every loaded app's Subtype=Install
@@ -169,25 +252,81 @@ public sealed class TestExecutor
         if (appGenerations == null || appGenerations.Count == 0
             || ReferenceEquals(assembly, appGenerations[0]))
         {
-            var seedSw = System.Diagnostics.Stopwatch.StartNew();
-            // A TestExecutor instance is reused across bundles. Discard the preceding bundle's
-            // final test mutations before creating this bundle's committed installation baseline.
+        var seedSw = System.Diagnostics.Stopwatch.StartNew();
+        // A TestExecutor instance is reused across bundles. Discard the preceding bundle's
+        // final test mutations before creating this bundle's committed installation baseline.
+        //
+        // #1861 follow-up review: the original single "install-seed" mark wrapped all six
+        // calls below and carried 85.1% of run_ms in the PR's own measurement — an opaque
+        // span relabelled one level in, not a breakdown. Each call now gets its own
+        // AppStage mark (exclusive of the others; no parent mark is emitted alongside them,
+        // so nothing here double-counts) so a follow-up fix knows which of the six to chase
+        // instead of re-running this whole attribution exercise.
+        using (AlRunner.Infrastructure.PhaseLog.AppStage("install-seed-reset-per-test"))
             AlRunner.Patches.RecordPatches.ResetPerTestState();
+        using (AlRunner.Infrastructure.PhaseLog.AppStage("install-seed-reset-for-new-bundle"))
             CompanyInitializer.ResetForNewBundle();
+        using (AlRunner.Infrastructure.PhaseLog.AppStage("install-seed-set-test-assembly"))
             InstallTriggerRunner.SetTestAssemblies(appGenerations ?? new[] { assembly });
-            InstallTriggerRunner.RunAll();
-            // Install triggers do not create a company's baseline rows — company CREATION does,
-            // via codeunit 2 "Company-Initialize". Run it before the baseline snapshot so its rows
-            // (Company Information, Source Code Setup, …) are part of what every test is restored to.
-            CompanyInitializer.EnsureCompanyInitialized();
+        // #1867: install-seed-run-install-triggers + install-seed-ensure-company-initialized
+        // were 62.4% + 20.1% = 82.5% of run_ms (#1866's own APP STAGES measurement), and both
+        // are re-executing the SAME dependency assemblies' Install triggers / the SAME
+        // codeunit 2 body every app group even though the dependency closure had not changed.
+        // The dep+company baseline cache field doc above has the full justification; this is
+        // just the cache-or-compute call site. Install triggers do not create a company's
+        // baseline rows — company CREATION does, via codeunit 2 "Company-Initialize" — so on a
+        // miss it still runs right after the dependency triggers, before the snapshot is taken,
+        // exactly matching the order the uncached path always ran in.
+        using (AlRunner.Infrastructure.PhaseLog.AppStage("install-seed-dep-company-baseline"))
+        {
+            var depKey = InstallTriggerRunner.CurrentDependencySetKey();
+            AlRunner.Patches.RecordPatches.InstallBaselineSnapshot? cached;
+            // Permanent kill switch (see the field's doc comment above for why it exists):
+            // forces every lookup to MISS, as if the cache were never populated, so the
+            // fresh-computation path can always be re-run on demand for diagnosis or to
+            // re-verify the speedup without a patched rebuild.
+            if (Environment.GetEnvironmentVariable("AL_RUNNER_NO_DEP_COMPANY_CACHE") == "1")
+                cached = null;
+            else
+                lock (_depCompanyBaselineCacheLock)
+                    _depCompanyBaselineCache.TryGetValue(depKey, out cached);
+            if (cached != null)
+            {
+                AlRunner.Patches.RecordPatches.RestoreInstallBaselineSnapshot(cached);
+                // #1867 proving-test hook: a stable, directly-assertable signal that this app
+                // group reused a prior computation instead of re-running dependency Install
+                // triggers + Company-Initialize. See InstallSeedDepCompanyCacheTests.
+                PerfTrace.Log($"InstallBaseline.DepCompanyCache HIT {depKey[..Math.Min(8, depKey.Length)]}");
+            }
+            else
+            {
+                InstallTriggerRunner.RunDependenciesOnly();
+                CompanyInitializer.EnsureCompanyInitialized();
+                var snapshot = AlRunner.Patches.RecordPatches.CaptureInstallBaselineSnapshot();
+                lock (_depCompanyBaselineCacheLock)
+                    _depCompanyBaselineCache[depKey] = snapshot;
+                PerfTrace.Log($"InstallBaseline.DepCompanyCache MISS {depKey[..Math.Min(8, depKey.Length)]}");
+            }
+        }
+        // Genuinely per-app-group — the bundle's own Install codeunits (if any) are never
+        // shared across app groups, so this always runs fresh, cache or no cache.
+        using (AlRunner.Infrastructure.PhaseLog.AppStage("install-seed-run-own-install-triggers"))
+            InstallTriggerRunner.RunTestAssemblyOnly();
+        using (AlRunner.Infrastructure.PhaseLog.AppStage("install-seed-capture-baseline"))
             AlRunner.Patches.RecordPatches.CaptureInstallBaseline();
-            PerfTrace.Log($"TestExecutor.InitialInstallSeed {seedSw.ElapsedMilliseconds}ms");
+        seedSw.Stop();
+        PerfTrace.Log($"TestExecutor.InitialInstallSeed {seedSw.ElapsedMilliseconds}ms");
         }
 
         long scanMs = 0, instMs = 0, dispMs = 0, methodsMs = 0, disposeMs = 0, methodLoopMs = 0;   // PERF attribution accumulators
+        long injectMs = 0, resetMs = 0;   // #1861 app-stage accumulators, same shape as the above
         var stageSw = new System.Diagnostics.Stopwatch();
         foreach (var t in types)
         {
+            // Cooperative cancellation: stop before instantiating the next test
+            // codeunit. See the Run() doc comment — never mid-test.
+            if (cancellationToken.IsCancellationRequested) break;
+
             stageSw.Restart();
             var isTestCu = IsTestCodeunit(t);
             scanMs += stageSw.ElapsedMilliseconds;
@@ -206,6 +345,7 @@ public sealed class TestExecutor
             var injectSw = System.Diagnostics.Stopwatch.StartNew();
             AlRunner.Patches.EventSubscriberPatches.InjectAllUsingStoredLookup();
             injectSw.Stop();
+            injectMs += injectSw.ElapsedMilliseconds;
             PerfTrace.Log($"EventSubscriber.InjectAllUsingStoredLookup {t.Name} {injectSw.ElapsedMilliseconds}ms");
 
             // Per-codeunit reset: BC's 130450 "Test Runner - Isol. Codeunit" wraps
@@ -215,6 +355,8 @@ public sealed class TestExecutor
             {
                 var resetSw = System.Diagnostics.Stopwatch.StartNew();
                 AlRunner.Patches.RecordPatches.RestoreInstallBaseline();
+                resetSw.Stop();
+                resetMs += resetSw.ElapsedMilliseconds;
                 PerfTrace.Log($"TestExecutor.CodeunitBoundary {t.Name} restore={resetSw.ElapsedMilliseconds}ms t={totalSw.ElapsedMilliseconds}ms");
             }
 
@@ -248,8 +390,12 @@ public sealed class TestExecutor
             var loopSw = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                foreach (var m in OrderTestMethodsBySourceDeclaration(t))
                 {
+                    // Cooperative cancellation: stop before running the next test
+                    // method inside this already-instantiated codeunit.
+                    if (cancellationToken.IsCancellationRequested) break;
+
                     if (!IsTestMethod(m)) continue;
                     if (filter != null && !MethodMatchesFilter(t.Name, m.Name, filter)) continue;
                     var entry = LookupExpectation(t.Name, displayName, m.Name);
@@ -301,6 +447,21 @@ public sealed class TestExecutor
         totalSw.Stop();
         PerfTrace.Log($"TestExecutor stages scan={scanMs}ms instantiate={instMs}ms displayName={dispMs}ms runOneOuter={methodsMs}ms dispose={disposeMs}ms methodLoop={methodLoopMs}ms");
         PerfTrace.Log($"TestExecutor total {results.Count} test(s) {totalSw.ElapsedMilliseconds}ms");
+        // #1861: hand the same per-loop accumulators PerfTrace has always logged
+        // (unstructured, easy to miss under CI's noise) to the phase log too, so the
+        // per-app-group sub-stage report can attribute run_ms instead of leaving it as
+        // one opaque span. "run-test-methods" is the ONE stage here that is genuine
+        // per-test workload, not a flat tax — it is what the issue's 18.3s summed-PASS-
+        // duration figure roughly reconciles against; every other mark below is exactly
+        // the kind of cost the issue is hunting: paid once per app group, independent of
+        // how much test content the group holds.
+        AlRunner.Infrastructure.PhaseLog.AddAppStage("codeunit-scan", TimeSpan.FromMilliseconds(scanMs));
+        AlRunner.Infrastructure.PhaseLog.AddAppStage("event-subscriber-inject", TimeSpan.FromMilliseconds(injectMs));
+        AlRunner.Infrastructure.PhaseLog.AddAppStage("codeunit-reset", TimeSpan.FromMilliseconds(resetMs));
+        AlRunner.Infrastructure.PhaseLog.AddAppStage("codeunit-instantiate", TimeSpan.FromMilliseconds(instMs));
+        AlRunner.Infrastructure.PhaseLog.AddAppStage("resolve-display-name", TimeSpan.FromMilliseconds(dispMs));
+        AlRunner.Infrastructure.PhaseLog.AddAppStage("run-test-methods", TimeSpan.FromMilliseconds(methodsMs));
+        AlRunner.Infrastructure.PhaseLog.AddAppStage("codeunit-dispose", TimeSpan.FromMilliseconds(disposeMs));
         return results;
     }
 
@@ -390,6 +551,89 @@ public sealed class TestExecutor
     private static bool IsTestMethod(MethodInfo m) =>
         m.GetCustomAttributes(inherit: false)
          .Any(a => a.GetType().Name is "NavTestAttribute" or "TestAttribute");
+
+    // ── AL source declaration order ────────────────────────────────────────────
+    //
+    // BC's own AL compiler — which we must not rewrite (.claude/rules/precompiled-dll-
+    // respect.md) — does not preserve AL source order in the emitted MethodDef table: a
+    // codeunit whose AL source declares test A before test B can (and empirically does)
+    // compile to IL where B's token precedes A's, because the compiler alphabetizes
+    // members. Real BC's test framework runs [Test] procedures in AL SOURCE declaration
+    // order, not compiled-metadata order, and AL test-writing conventions assume it
+    // (Initialize() re-seeding at the top of a codeunit, an early test committing a
+    // baseline a later test relies on, etc.) — see StefanMaron/BusinessCentral.AL.Runner#1766.
+    // Running in reflection order silently reorders those dependencies and produces
+    // order-dependent divergence from real BC that has nothing to do with the (correct,
+    // already-implemented — see RecordPatches.TransactionSnapshot) asserterror rollback
+    // mechanism itself.
+    //
+    // The AL compiler still records the true declaration position even though it does not
+    // preserve it in method order: every compiled procedure gets its own nested
+    // "{MethodName}_Scope_<hash>" type carrying a SignatureSpanAttribute whose EncodedSpan
+    // holds the absolute source line the procedure's own `procedure` keyword sits on — the
+    // same metadata AlCallStackCapture already decodes for stack-trace line numbers. Sorting
+    // by that line recovers true declaration order without touching the compiler's own
+    // (unmodifiable) member ordering.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo[]> _sourceOrderCache = new();
+    private static Type? _signatureSpanAttrType;
+    private static bool _signatureSpanAttrTypeResolved;
+    private static readonly System.Text.RegularExpressions.Regex _scopeTypeSuffix =
+        new(@"_Scope_+\d+$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>
+    /// Returns <paramref name="t"/>'s public instance methods ordered by AL source
+    /// declaration line where resolvable. Falls back to reflection order for any method
+    /// whose scope type or span attribute can't be found — never worse than the previous
+    /// (pure-reflection) behaviour, only ever more faithful to real BC.
+    /// </summary>
+    private static MethodInfo[] OrderTestMethodsBySourceDeclaration(Type t) =>
+        _sourceOrderCache.GetOrAdd(t, static type =>
+        {
+            var methods = type.GetMethods(BindingFlags.Public | BindingFlags.Instance);
+            var lineByMethod = ResolveSignatureLines(type, methods);
+            if (lineByMethod.Count == 0) return methods; // nothing resolved — keep original order
+            // Stable: a method whose line we couldn't resolve keeps its relative
+            // reflection-order position, sorted after every line we DID resolve.
+            return methods
+                .Select((m, i) => (m, i, line: lineByMethod.TryGetValue(m, out var l) ? l : int.MaxValue))
+                .OrderBy(x => x.line)
+                .ThenBy(x => x.i)
+                .Select(x => x.m)
+                .ToArray();
+        });
+
+    private static Dictionary<MethodInfo, int> ResolveSignatureLines(Type codeunitType, MethodInfo[] methods)
+    {
+        var result = new Dictionary<MethodInfo, int>();
+        if (!_signatureSpanAttrTypeResolved)
+        {
+            _signatureSpanAttrTypeResolved = true;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                _signatureSpanAttrType = asm.GetType("Microsoft.Dynamics.Nav.Runtime.SignatureSpanAttribute");
+                if (_signatureSpanAttrType != null) break;
+            }
+        }
+        var tSig = _signatureSpanAttrType;
+        var piSig = tSig?.GetProperty("EncodedSpan");
+        if (tSig == null || piSig == null) return result;
+
+        var nested = codeunitType.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic);
+        foreach (var m in methods)
+        {
+            var scopeType = nested.FirstOrDefault(nt =>
+                nt.Name.StartsWith(m.Name, StringComparison.Ordinal) &&
+                _scopeTypeSuffix.IsMatch(nt.Name[m.Name.Length..]));
+            if (scopeType == null) continue;
+            var attr = scopeType.GetCustomAttribute(tSig);
+            if (attr == null) continue;
+            var encoded = (long)(piSig.GetValue(attr) ?? 0L);
+            // SignatureSpan layout matches SourceSpan (StructLayout.Explicit, little-endian):
+            // from.line occupies bits 48-63 — see AlCallStackCapture.GetRelativeLine.
+            result[m] = (ushort)((ulong)encoded >> 48);
+        }
+        return result;
+    }
 
     // Cached reflection handle for NavApplicationObjectBase.ObjectName (same pattern as
     // AlCallStackCapture._piObjectName). Resolved lazily from the instance's runtime type

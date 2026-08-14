@@ -157,11 +157,18 @@ public static class AlObjectResolution
     /// Scans that enumerate every loaded assembly (the event-subscriber registry, the
     /// record-type prewarm) must skip these or a replaced object registers twice.
     /// </summary>
-    public static bool IsSuperseded(Type type)
+    public static bool IsSuperseded(Type type) => IsSuperseded(type.Name, type.Assembly);
+
+    /// <summary>
+    /// <see cref="IsSuperseded(Type)"/> keyed on the name, for scans that hold an object id
+    /// rather than a <see cref="Type"/> — the per-assembly compiled-report-id cache reads
+    /// back <c>int</c>s, and resolving each one to a Type just to ask this question would
+    /// reintroduce the reflection that cache exists to avoid.
+    /// </summary>
+    public static bool IsSuperseded(string typeName, Assembly candidate)
     {
-        var name = type.Name;
-        if (_tombstones.ContainsKey(name)) return true;
-        return _owner.TryGetValue(name, out var owner) && !ReferenceEquals(owner, type.Assembly);
+        if (_tombstones.ContainsKey(typeName)) return true;
+        return _owner.TryGetValue(typeName, out var owner) && !ReferenceEquals(owner, candidate);
     }
 
     private static Type[] LoadTypes(Assembly assembly)

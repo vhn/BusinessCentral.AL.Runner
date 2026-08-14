@@ -4,6 +4,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using AlRunner.Infrastructure;
 
 namespace AlRunner.Patches;
 
@@ -37,8 +38,63 @@ internal static partial class BcAppSymbolCache
     // "Error Messages") would silently get a NON-temporary Rec, and its own body's
     // Rec.Copy(source, shareTable: true) would throw NavNCLArgumentException — a correctness
     // regression, not a cache miss.
-    private const int CacheVersion = 11;
+    // v12: EnumSymbol gained Captions (issue #1775 — Format(<enum value>) on a
+    // dependency's enum must return the declared Caption, not the member name). A v11
+    // payload deserialises with Captions null, which AlEnumOptionMetadata already treats
+    // as "no captions captured" (falls back to member name for every value) — silently
+    // wrong for any dependency enum whose Caption differs from its name, not a cache miss.
+    // v13: PageSymbol gained PageType/Caption/Editable/InsertAllowed/ModifyAllowed/
+    // DeleteAllowed/CardPageName and its field-control tree (Controls), feeding the "Page
+    // Metadata" (2000000138) and "Page Control Field" (2000000192) virtual tables for a
+    // page that lives in a precompiled dependency .app (issues #1769 / #1779). A v12
+    // payload deserialises with PageType null / Controls empty / CardPageName null, which
+    // the Page Metadata provider would read as "declares no PageType" (defaults to Card,
+    // right only by coincidence) and "declares no CardPageId" (CardPageID = 0, which is
+    // exactly the value Base App "Page Management".GetDefaultCardPageID uses to decide a
+    // table has no card page at all — a real behavioral divergence, not a display nit),
+    // and the Page Control Field provider would read as "no controls" — silent wrong
+    // answers, not a cache miss, hence the bump.
+    private const int CacheVersion = 13;
     private static readonly ConcurrentDictionary<string, AppSymbols> ProcessCache = new(StringComparer.OrdinalIgnoreCase);
+    // Issue #1820 — path -> content-hash memo. ComputeAppContentHash needs to read the
+    // WHOLE .app to hash it (unlike the FileInfo.Length/LastWriteTimeUtc stat it replaced,
+    // which touched no file bytes), and Get() is called once per virtual-table lookup —
+    // often a dozen or more times for the SAME dependency .app within a single run (Pages,
+    // Tables, Enums, Objects, Reports, Queries each have their own call site). Caching the
+    // hash per full path means that cost is paid once per unique .app per process, not once
+    // per Get() call. Content doesn't change mid-run (nothing in this process writes to a
+    // dependency .app), so no invalidation beyond "one entry per path" is needed.
+    private static readonly ConcurrentDictionary<string, string> AppContentHashCache = new(StringComparer.OrdinalIgnoreCase);
+
+    // Test-only instrumentation: counts genuine Parse() invocations (i.e. an on-disk cache
+    // MISS that required reparsing SymbolReference.json), PER full .app path — not a single
+    // global counter, because this project's xunit.runner.json runs test collections in
+    // parallel (parallelizeTestCollections=true) and every BcAppSymbolCache*Tests class is
+    // its own collection, all sharing this static type; a plain global counter would be
+    // incremented by unrelated concurrent tests' own Get() calls, making a "before/after"
+    // delta unreliable. Keying by path means a test using its own uniquely-named temp .app
+    // observes only ITS OWN Parse() calls, immune to what any other collection is doing.
+    // Exists so BcAppSymbolCacheContentAddressedKeyTests can assert "the second Get() call,
+    // from a simulated fresh process, was a real disk HIT" deterministically — PerfTrace/
+    // stderr capture was considered and rejected for the same parallel-collections reason
+    // (Console.Error and environment variables are process-global).
+    private static readonly ConcurrentDictionary<string, int> ParseInvocationCountByPath = new(StringComparer.OrdinalIgnoreCase);
+
+    internal static int ParseInvocationCountForTests(string appPath)
+        => ParseInvocationCountByPath.TryGetValue(Path.GetFullPath(appPath), out var count) ? count : 0;
+
+    /// <summary>
+    /// Clears the in-memory ProcessCache (and the content-hash memo) — for tests that
+    /// simulate multiple independent process runs inside one xunit process (a real CI leg
+    /// always starts with an empty ProcessCache). Never touches the on-disk cache, and never
+    /// touches <see cref="ParseInvocationCountByPath"/> — that counter is meant to persist
+    /// across a test's simulated "process restarts" so it can observe totals across them.
+    /// </summary>
+    internal static void ResetProcessCacheForTests()
+    {
+        ProcessCache.Clear();
+        AppContentHashCache.Clear();
+    }
 
     internal sealed record AppSymbols(List<ParsedTable> Tables, List<EnumSymbol> Enums, List<QuerySymbol> Queries,
         List<ObjectSymbol> Objects, List<ReportSymbol> Reports, List<PageSymbol> Pages);
@@ -53,7 +109,35 @@ internal static partial class BcAppSymbolCache
     /// BOTH sides temporary, so a page whose SourceTable is declared temporary needs its
     /// bound Rec built temporary too, not just any record of the right table.
     /// </summary>
-    internal sealed record PageSymbol(int Id, string Name, int SourceTableId, bool SourceTableTemporary);
+    internal sealed record PageSymbol(
+        int Id, string Name, int SourceTableId, bool SourceTableTemporary,
+        // Everything below feeds the "Page Metadata" (2000000138) virtual table (#1769).
+        // AL defaults: PageType = Card (MS docs), Editable/InsertAllowed/ModifyAllowed/
+        // DeleteAllowed = true, all only when the symbol file states nothing to the contrary.
+        string PageType = "Card", string? Caption = null,
+        bool Editable = true, bool InsertAllowed = true, bool ModifyAllowed = true, bool DeleteAllowed = true,
+        // Field controls with a real SourceExpression, feeding "Page Control Field"
+        // (2000000192) (#1779). Unlike the source-parsed path (Rec.-bound only, see
+        // RecordPatches.AlPageParser.cs), the symbol file states EVERY field control's
+        // SourceExpression verbatim, Rec.-bound or not — see TryParsePageSymbol.
+        List<PageControlSymbol>? Controls = null,
+        // AL's CardPageId property, stated by the symbol file as the target page's NAME
+        // (verified: Base Application 28.1's "Customer List" carries
+        // CardPageID = "Customer Card", not a numeric id) — resolved against the run's page
+        // inventory at Page Metadata row-build time, same as the source-parsed path.
+        string? CardPageName = null);
+
+    /// <summary>
+    /// One field control of a precompiled dependency page, as SymbolReference.json states
+    /// it. <c>SourceExpression</c>/<c>Visible</c>/<c>Editable</c>/<c>Enabled</c> are the raw
+    /// property text the compiler recorded — e.g. Base Application's Customer Card control
+    /// "No." carries <c>Visible = "NoFieldVisible"</c> (a global Boolean variable name, not
+    /// a literal), which is exactly what the real "Page Control Field" table's Text columns
+    /// hold for a control whose Visible is driven by code rather than a constant.
+    /// </summary>
+    internal sealed record PageControlSymbol(
+        int Id, string Name, string SourceExpression,
+        string? VisibleExpr, string? EditableExpr, string? EnabledExpr, int Sequence);
 
     /// <summary>
     /// A precompiled dependency's report, as far as SymbolReference.json states it. Feeds
@@ -117,7 +201,11 @@ internal static partial class BcAppSymbolCache
         ("PermissionSets", "PermissionSet"),
         ("PermissionSetExtensions", "PermissionSetExtension"),
     };
-    internal sealed record EnumSymbol(int Id, string Name, List<string> Options, List<int> Indexes, List<List<int>> Implementations);
+    // Captions[i] is value i's declared Caption text, or null when it declares none
+    // (issue #1775 — Format(<enum value>) must return the Caption, not the member
+    // name, for enums coming from a prebuilt dependency .app too, not just enums
+    // compiled from this bundle's own source).
+    internal sealed record EnumSymbol(int Id, string Name, List<string> Options, List<int> Indexes, List<List<int>> Implementations, List<string?>? Captions = null);
 
     // Parsed query SymbolReference.json shape. A query is a tree of dataitems; the root
     // dataitem(s) live under the query's "Elements", nested dataitems under "DataItems".
@@ -135,7 +223,12 @@ internal static partial class BcAppSymbolCache
     // SourceColumn is the field NAME on RelatedTable; Id is the BC column id; Caption optional.
     internal sealed record QueryColumnSymbol(int Id, string Name, string SourceColumn, string? Caption);
 
-    private sealed record CachePayload(long Length, long LastWriteUtcTicks,
+    // #1820: ContentHash replaces Length/LastWriteUtcTicks. The KEY (below, in Get) already
+    // switched from mtime to a content hash, so an old Length/LastWriteUtcTicks payload can
+    // never be found under a new key anyway (different key string -> different SHA-256 ->
+    // different on-disk filename, see CachePath) — no CacheVersion bump needed, this changes
+    // cache-key VALIDATION, not what Parse extracts from SymbolReference.json.
+    private sealed record CachePayload(string ContentHash,
         List<ParsedTable> Tables, List<EnumSymbol> Enums, List<QuerySymbol> Queries,
         List<ObjectSymbol>? Objects, List<ReportSymbol>? Reports, List<PageSymbol>? Pages);
 
@@ -162,14 +255,15 @@ internal static partial class BcAppSymbolCache
 
     internal static AppSymbols Get(string appPath)
     {
-        var info = new FileInfo(appPath);
-        var key = $"{Path.GetFullPath(appPath)}|{info.Length}|{info.LastWriteTimeUtc.Ticks}|v{CacheVersion}";
+        var fullPath = Path.GetFullPath(appPath);
+        var contentHash = ComputeAppContentHash(fullPath);
+        var key = $"{fullPath}|hash:{contentHash}|v{CacheVersion}";
         if (ProcessCache.TryGetValue(key, out var cachedInProcess))
             return cachedInProcess;
 
         var sw = Stopwatch.StartNew();
         var cachePath = CachePath(key);
-        var cached = TryRead(cachePath, info);
+        var cached = TryRead(cachePath, contentHash);
         if (cached != null)
         {
             PerfTrace.Log($"bc-symbols HIT {Path.GetFileName(appPath)} tables={cached.Tables.Count} enums={cached.Enums.Count} queries={cached.Queries.Count} {sw.ElapsedMilliseconds}ms");
@@ -177,22 +271,41 @@ internal static partial class BcAppSymbolCache
             return cached;
         }
 
+        ParseInvocationCountByPath.AddOrUpdate(fullPath, 1, static (_, count) => count + 1);
         var parsed = Parse(appPath);
-        TryWrite(cachePath, info, parsed);
+        TryWrite(cachePath, contentHash, parsed);
         PerfTrace.Log($"bc-symbols MISS {Path.GetFileName(appPath)} tables={parsed.Tables.Count} enums={parsed.Enums.Count} queries={parsed.Queries.Count} {sw.ElapsedMilliseconds}ms");
         ProcessCache[key] = parsed;
         return parsed;
     }
 
-    private static AppSymbols? TryRead(string cachePath, FileInfo appInfo)
+    /// <summary>
+    /// Content hash (hex SHA-256) of a .app file's bytes — the cache-key component that
+    /// replaced FileInfo.Length/LastWriteTimeUtc (#1820, same defect family as #1815: CI
+    /// re-downloads every platform/test-toolkit .app on every run, so LastWriteTimeUtc is
+    /// fresh even when the bytes are byte-for-byte identical to a prior run's, and an
+    /// mtime-keyed entry persisted across CI runs would MISS unconditionally regardless of
+    /// content). Delegates to RunnerFingerprint.ComputeContentHash — the same
+    /// content-hash-of-bytes helper #1817 introduced for the AL-output/source-dep caches —
+    /// rather than a second hashing convention; that helper already handles the
+    /// missing-file "unknown" sentinel generically.
+    ///
+    /// Memoized per full path in <see cref="AppContentHashCache"/> — see that field's
+    /// comment for why a per-Get()-call hash would be a regression, not just correct.
+    /// </summary>
+    internal static string ComputeAppContentHash(string appPath)
+    {
+        var fullPath = Path.GetFullPath(appPath);
+        return AppContentHashCache.GetOrAdd(fullPath, static p => RunnerFingerprint.ComputeContentHash(p));
+    }
+
+    private static AppSymbols? TryRead(string cachePath, string contentHash)
     {
         if (!File.Exists(cachePath)) return null;
         try
         {
             var payload = JsonSerializer.Deserialize<CachePayload>(File.ReadAllText(cachePath));
-            if (payload == null
-                || payload.Length != appInfo.Length
-                || payload.LastWriteUtcTicks != appInfo.LastWriteTimeUtc.Ticks)
+            if (payload == null || payload.ContentHash != contentHash)
                 return null;
             return new AppSymbols(payload.Tables, payload.Enums, payload.Queries ?? new List<QuerySymbol>(),
                 payload.Objects ?? new List<ObjectSymbol>(), payload.Reports ?? new List<ReportSymbol>(),
@@ -205,13 +318,29 @@ internal static partial class BcAppSymbolCache
         }
     }
 
-    private static void TryWrite(string cachePath, FileInfo appInfo, AppSymbols symbols)
+    // internal (not private): AlRunner.Tests exercises this directly to pin the
+    // atomic-publish contract at this specific call site — see
+    // BcAppSymbolCacheAtomicWriteTests.cs.
+    internal static void TryWrite(string cachePath, string contentHash, AppSymbols symbols)
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
-            var payload = new CachePayload(appInfo.Length, appInfo.LastWriteTimeUtc.Ticks, symbols.Tables, symbols.Enums, symbols.Queries, symbols.Objects, symbols.Reports, symbols.Pages);
-            File.WriteAllText(cachePath, JsonSerializer.Serialize(payload));
+            var payload = new CachePayload(contentHash, symbols.Tables, symbols.Enums, symbols.Queries, symbols.Objects, symbols.Reports, symbols.Pages);
+            // #1809 follow-up: cachePath is content-keyed (hash of the .app file),
+            // so two subprocesses parsing the same app concurrently used to race a
+            // plain File.WriteAllText into the same path. TryRead already treats any
+            // exception (including a partial-JSON parse failure from a torn read) as
+            // a cache miss, so this was never a crash — but it was a silent-ish
+            // "MISS when it should have been a HIT" that reparses on every collision,
+            // which is exactly the kind of intermittent-and-unexplained cost
+            // parallelizing AlRunner.Tests's subprocess collections (#1809) makes
+            // more likely to hit. Fix: publish atomically like every other
+            // content-keyed cache in this codebase (AlCacheWriter.AtomicPublish —
+            // temp file in the same directory + File.Move(overwrite:true)), so a
+            // concurrent reader only ever sees "file absent" or "file complete",
+            // never a torn write.
+            AlCacheWriter.AtomicPublish(cachePath, tmp => File.WriteAllText(tmp, JsonSerializer.Serialize(payload)));
         }
         catch (Exception ex)
         {
@@ -332,10 +461,69 @@ internal static partial class BcAppSymbolCache
 
         var props = SymbolProperties(page);
         int sourceTableId = props.TryGetValue("SourceTable", out var st) && int.TryParse(st, out var stId) ? stId : 0;
-        bool sourceTableTemporary = props.TryGetValue("SourceTableTemporary", out var stt)
-            && (stt == "1" || string.Equals(stt, "true", StringComparison.OrdinalIgnoreCase));
-        return new PageSymbol(pageId, name!, sourceTableId, sourceTableTemporary);
+        bool sourceTableTemporary = SymbolBool(props, "SourceTableTemporary");
+
+        props.TryGetValue("PageType", out var pageType);
+        props.TryGetValue("Caption", out var caption);
+        // SymbolProperties is case-insensitive, covering both "CardPageID" (observed on
+        // Base Application 28.1) and any "CardPageId" spelling — same tolerance Table
+        // Metadata already applies to LookupPageId/LookupPageID.
+        props.TryGetValue("CardPageId", out var cardPageName);
+        // AL defaults for these four: true, only an explicit "false"/"0" flips them — same
+        // rule ParsePageControls uses for the source-parsed path.
+        bool editable = !SymbolBoolFalse(props, "Editable");
+        bool insertAllowed = !SymbolBoolFalse(props, "InsertAllowed");
+        bool modifyAllowed = !SymbolBoolFalse(props, "ModifyAllowed");
+        bool deleteAllowed = !SymbolBoolFalse(props, "DeleteAllowed");
+
+        var controls = new List<PageControlSymbol>();
+        int seq = 0;
+        if (page.TryGetProperty("Controls", out var controlsArr) && controlsArr.ValueKind == JsonValueKind.Array)
+            foreach (var c in controlsArr.EnumerateArray())
+                CollectPageControlSymbols(c, controls, ref seq);
+
+        return new PageSymbol(pageId, name!, sourceTableId, sourceTableTemporary,
+            string.IsNullOrWhiteSpace(pageType) ? "Card" : pageType!, caption,
+            editable, insertAllowed, modifyAllowed, deleteAllowed, controls,
+            string.IsNullOrWhiteSpace(cardPageName) ? null : cardPageName);
     }
+
+    /// <summary>
+    /// Recursively collect every "Kind 8" field control (identified by having a
+    /// <c>SourceExpression</c> property, NOT a hardcoded Kind number — verified against
+    /// Base Application 28.1: every one of its 36890 <c>SourceExpression</c>-bearing
+    /// controls is Kind 8, and no other Kind ever carries one) out of a page's <c>Controls</c>
+    /// tree, which nests group/repeater/cuegroup/etc. the same way a report's data items nest.
+    /// Sequence is assigned here, depth-first in document order — the same order a real page
+    /// renders its controls.
+    /// </summary>
+    private static void CollectPageControlSymbols(JsonElement control, List<PageControlSymbol> into, ref int sequence)
+    {
+        var props = SymbolProperties(control);
+        if (props.TryGetValue("SourceExpression", out var srcExpr))
+        {
+            var name = control.TryGetProperty("Name", out var n) ? n.GetString() : null;
+            int id = control.TryGetProperty("Id", out var idProp) && idProp.TryGetInt32(out var idv) ? idv : 0;
+            if (!string.IsNullOrEmpty(name) && id != 0)
+            {
+                sequence++;
+                props.TryGetValue("Visible", out var visible);
+                props.TryGetValue("Editable", out var editable);
+                props.TryGetValue("Enabled", out var enabled);
+                into.Add(new PageControlSymbol(id, name!, srcExpr, visible, editable, enabled, sequence));
+            }
+        }
+
+        if (control.TryGetProperty("Controls", out var children) && children.ValueKind == JsonValueKind.Array)
+            foreach (var child in children.EnumerateArray())
+                CollectPageControlSymbols(child, into, ref sequence);
+    }
+
+    private static bool SymbolBool(Dictionary<string, string> props, string name)
+        => props.TryGetValue(name, out var v) && (v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase));
+
+    private static bool SymbolBoolFalse(Dictionary<string, string> props, string name)
+        => props.TryGetValue(name, out var v) && (v == "0" || string.Equals(v, "false", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Parse one entry of a SymbolReference.json <c>Reports</c> array into the subset the
@@ -617,6 +805,7 @@ internal static partial class BcAppSymbolCache
         var options = new List<string>();
         var indexes = new List<int>();
         var implementations = new List<List<int>>();
+        var captions = new List<string?>();
         var nextOrdinal = 0;
         foreach (var value in values.EnumerateArray())
         {
@@ -639,9 +828,16 @@ internal static partial class BcAppSymbolCache
                 }
             }
             implementations.Add(implementationIds);
+            // Issue #1775 — a value's declared Caption, same SymbolProperties read the
+            // report/query/field Caption capture already uses elsewhere in this file.
+            // Missing/empty means "declares none"; the consumer (AlEnumOptionMetadata.
+            // GetCaptionFromIndex) falls back to the member name for that case.
+            captions.Add(props.TryGetValue("Caption", out var captionText) && !string.IsNullOrEmpty(captionText)
+                ? captionText
+                : null);
             nextOrdinal = ordinal + 1;
         }
-        return new EnumSymbol(id, name, options, indexes, implementations);
+        return new EnumSymbol(id, name, options, indexes, implementations, captions);
     }
 
     private static Dictionary<string, string> SymbolProperties(JsonElement element)
@@ -778,9 +974,9 @@ internal static partial class BcAppSymbolCache
     private static string CachePath(string key)
     {
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
-        return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "al-runner", "bc-symbols", hash + ".json");
+        // #1821: was hardcoded to ~/.cache/al-runner/bc-symbols regardless of --cache;
+        // now follows the same isolation root al-out already honoured.
+        return Path.Combine(CacheRoots.Resolve("bc-symbols"), hash + ".json");
     }
 
 }

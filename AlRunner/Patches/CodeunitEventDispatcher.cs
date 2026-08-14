@@ -19,6 +19,67 @@ public static partial class BcRuntime
     private static int _dispatchCount;
     private static int _dispatchFiredCount;
 
+    internal const string PublisherKindCodeunit = "Codeunit";
+    internal const string PublisherKindTable = "Record";
+    // Page/Report/Query/XmlPort own-code (triggers, procedures, manually-declared events)
+    // compiles to a class literally named "<Kind><N>" — unlike Table, there is no separate
+    // metadata-only class to disambiguate from (issue #1794). Confirmed empirically by
+    // reflecting over an emitted test assembly: a manually-declared [IntegrationEvent] on
+    // each of these object kinds produces "Page90101+OnProbePageEvent_Scope",
+    // "Report90102+OnProbeReportEvent_Scope", "Query90103+OnProbeQueryEvent_Scope",
+    // "XmlPort90104+OnProbeXmlPortEvent_Scope" — each carrying the same
+    // γeventScope : NavEventScope static field a codeunit publisher's scope class does.
+    internal const string PublisherKindPage = "Page";
+    internal const string PublisherKindReport = "Report";
+    internal const string PublisherKindQuery = "Query";
+    internal const string PublisherKindXmlPort = "XmlPort";
+
+    // These six prefixes are mutually non-prefixing (none is a string-prefix of another),
+    // so iteration order here is irrelevant — this is NOT sorted longest-first. The closest
+    // near-miss is "Record" vs "Report", which merely SHARE a "Re" prefix; neither is a
+    // prefix of the other, so it still doesn't matter. If a future object kind's prefix
+    // IS a prefix of (or is prefixed by) one already in this list, order starts to matter
+    // and this array must become longest-first — check that before adding a new entry.
+    private static readonly string[] _publisherKindPrefixes =
+    {
+        PublisherKindCodeunit, PublisherKindTable,
+        PublisherKindPage, PublisherKindReport, PublisherKindQuery, PublisherKindXmlPort,
+    };
+
+    /// <summary>
+    /// Decode a publisher scope's declaring-type name into (kind, publisherId) —
+    /// e.g. <c>"Codeunit50041"</c> → <c>(PublisherKindCodeunit, 50041)</c>,
+    /// <c>"Record60976"</c> → <c>(PublisherKindTable, 60976)</c>,
+    /// <c>"Page90101"</c> → <c>(PublisherKindPage, 90101)</c>. Any other prefix returns
+    /// false — those publisher kinds are not registered by
+    /// <c>EventSubscriberPatches.EnsureRegistryFresh</c>.
+    ///
+    /// Extracted as a pure, unit-testable seam (see DispatchObserveAsyncResultTests.cs for the
+    /// established pattern of pinning dispatcher behavior at a seam that can't be reached from
+    /// first-party AL). Issue #1770 was exactly a miss in this decode: only the "Codeunit"
+    /// prefix was recognized, so a table object's OWN code — which compiles to a class named
+    /// "Record&lt;N&gt;", not "Table&lt;N&gt;" — never matched, and a manually-declared
+    /// [IntegrationEvent] raised from inside a table's trigger silently never dispatched.
+    /// Issue #1794 extends the same decode to Page/Report/Query/XmlPort publishers, which had
+    /// no branch here at all (not even a wrong one) — their manually-declared events were never
+    /// recognized as a dispatchable publisher, so a subscriber to one silently never fired.
+    /// </summary>
+    internal static bool TryDecodeEventPublisherDeclType(string declTypeName, out string publisherKind, out int publisherId)
+    {
+        foreach (var prefix in _publisherKindPrefixes)
+        {
+            if (declTypeName.StartsWith(prefix, StringComparison.Ordinal)
+                && int.TryParse(declTypeName.AsSpan(prefix.Length), out publisherId))
+            {
+                publisherKind = prefix;
+                return true;
+            }
+        }
+        publisherKind = "";
+        publisherId = 0;
+        return false;
+    }
+
     /// <summary>
     /// Entry point called from the Cecil-rewritten NavMethodScope.OnRunEventAsync.
     /// Returns default ValueTask — synchronous execution model.
@@ -58,19 +119,37 @@ public static partial class BcRuntime
         Interlocked.Increment(ref _dispatchCount);
         if (!_firstDispatchLogged) { _firstDispatchLogged = true; Console.Error.WriteLine($"[Dispatch] first call: scope={scopeType.FullName}"); }
 
-        // Decode publisher codeunit id + event method name from scope type name.
+        // Decode publisher id + event method name from scope type name.
         //   Microsoft.Dynamics.Nav.BusinessApplication.Codeunit50041+OnDoCalc_Scope
+        //   Microsoft.Dynamics.Nav.BusinessApplication.Record50140+OnAfterXyz_Scope
+        //
+        // A manually-declared [IntegrationEvent]/[BusinessEvent] compiles to this same
+        // generic <EventName>_Scope + OnRunEventAsync pattern regardless of which AL object
+        // kind declares it — BC's NavTriggerEventType ordinals (Insert/Modify/Delete/Rename/
+        // Validate) only cover the implicit table-trigger events, which fire through the
+        // separate NavTableTriggerEventHandler path and never reach here. So a table object
+        // that ALSO declares its own custom event needs the same universal dispatch as a
+        // codeunit publisher, just keyed by table id instead of codeunit id (see issue #1770).
+        // A table object's OWN code (triggers, procedures, and any manually-declared event)
+        // compiles to a class named "Record<N>", NOT "Table<N>" (that name is a separate,
+        // metadata-only class) — confirmed by reflecting over the emitted assembly.
         var declType = scopeType.DeclaringType;
         if (declType == null) return;
         var declName = declType.Name;
-        if (!declName.StartsWith("Codeunit", StringComparison.Ordinal)) return;
-        if (!int.TryParse(declName.AsSpan("Codeunit".Length), out int codeunitId)) return;
         var scopeName = scopeType.Name;
         int us = scopeName.IndexOf('_');
         if (us < 0) return;
         string eventMethodName = scopeName.Substring(0, us);
 
-        var subs = EventSubscriberPatches.GetCodeunitSubscribers(codeunitId, eventMethodName);
+        if (!TryDecodeEventPublisherDeclType(declName, out var publisherKind, out int publisherId)) return;
+        IReadOnlyList<MethodInfo>? subs = publisherKind switch
+        {
+            PublisherKindCodeunit => EventSubscriberPatches.GetCodeunitSubscribers(publisherId, eventMethodName),
+            PublisherKindTable => EventSubscriberPatches.GetTableEventSubscribers(publisherId, eventMethodName),
+            PublisherKindPage or PublisherKindReport or PublisherKindQuery or PublisherKindXmlPort
+                => EventSubscriberPatches.GetObjectEventSubscribers(publisherKind, publisherId, eventMethodName),
+            _ => null,
+        };
         if (subs == null || subs.Count == 0) return;
         Interlocked.Increment(ref _dispatchFiredCount);
         if (!_firstFireLogged) { _firstFireLogged = true; Console.Error.WriteLine($"[Dispatch] first FIRE: {declName}.{eventMethodName} → {subs.Count} subs"); }
@@ -430,13 +509,33 @@ public static partial class BcRuntime
     /// be unwrapped to its ordinal here. The mirror case (subscriber declares the param as
     /// the NavOption carrier, field is an int) is handled too. This is faithful: a NavOption
     /// is exactly its integer ordinal as far as an AL Option/Integer parameter observes.
+    ///
+    /// A precompiled application DLL additionally stores a scope field
+    /// <c>ByRef&lt;T&gt;</c>-wrapped when the publishing method captured the value slot by
+    /// reference before raising the event (issue #1816: Base App
+    /// <c>Item.CheckDocuments</c>'s <c>currentFieldNo</c>), while the subscriber's
+    /// parameter is by value. The wrapper is a getter/setter pair over the slot, so the
+    /// faithful by-value observation is the slot's current value at dispatch time —
+    /// unwrap it and re-coerce (the inner value may itself be a NavOption). When the
+    /// subscriber's parameter IS the ByRef&lt;T&gt; (AL <c>var</c>), the assignability
+    /// early-return above already passed the wrapper through untouched, keeping writeback.
+    ///
     /// All other types pass through unchanged.
     /// </summary>
-    private static object? CoerceArg(object? value, Type paramType)
+    internal static object? CoerceArg(object? value, Type paramType)
     {
         if (value == null) return null;
         var vt = value.GetType();
         if (paramType.IsAssignableFrom(vt)) return value;
+
+        if (vt.IsGenericType
+            && vt.GetGenericTypeDefinition() == typeof(Microsoft.Dynamics.Nav.Runtime.ByRef<>))
+        {
+            object? inner = vt
+                .GetProperty("Value", BindingFlags.Public | BindingFlags.Instance)!
+                .GetValue(value);
+            return CoerceArg(inner, paramType);
+        }
 
         EnsureNavOptionReflection();
 

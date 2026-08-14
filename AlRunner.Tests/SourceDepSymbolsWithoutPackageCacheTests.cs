@@ -37,28 +37,19 @@ namespace AlRunner.Tests;
 /// them and silently took the working path.
 ///
 /// Spawns the real runner; needs the BC artifact cache. Skips (no-op) when absent.
+/// See DefineFlagIntegrationTests for why this used to be
+/// [Collection("server-serial")] and no longer is — #1809.
 /// </summary>
-[Collection("server-serial")]
 public class SourceDepSymbolsWithoutPackageCacheTests
 {
     private static readonly string RepoRoot = Path.GetFullPath(
         Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
     private static readonly string ProjectPath = Path.Combine(RepoRoot, "AlRunner");
 
-    private static bool ArtifactsPresent()
-    {
-        var home = Environment.GetEnvironmentVariable("HOME")
-            ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (string.IsNullOrEmpty(home)) return false;
-        if (Directory.Exists(Path.Combine(home, ".bcartifacts.cache", "sandbox"))) return true;
-        var stdCache = Path.Combine(home, ".local", "share", "al-runner", "artifacts");
-        return Directory.Exists(stdCache) && Directory.EnumerateDirectories(stdCache).Any();
-    }
-
-    [Fact]
+    [SkippableFact]
     public void SiblingSourceDep_CompilesWithZeroPackageCacheDirs()
     {
-        if (!ArtifactsPresent()) { Console.Error.WriteLine("[skip] BC artifact cache not present"); return; }
+        TestArtifacts.SkipIfMissing();
 
         var scratchRoot = Path.Combine(
             Path.GetTempPath(), "al-runner-srcdep-nopkgcache", Guid.NewGuid().ToString("N"));

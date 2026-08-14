@@ -22,10 +22,46 @@ namespace AlRunner;
 
 public sealed class DependencyLoader
 {
-    private static readonly ConcurrentDictionary<Guid, Assembly> _cache = new();
+    // Identity carried alongside each cached module so a later lookup for the SAME
+    // AppId can tell "the same app resolved a second time" (#1683 — legitimate,
+    // reuse) apart from "two different apps that happen to share a GUID" (#1850 —
+    // must fail loudly, never silently pick one). Name/Publisher/Version are
+    // already read off app.json / the dependency manifest for every app that
+    // reaches this cache, so the comparison costs nothing extra — no content hash,
+    // no re-reading source.
+    private readonly record struct LoadedAppEntry(
+        Assembly Asm, string Name, string Publisher, string Version, string SourcePath);
+
+    private static readonly ConcurrentDictionary<Guid, LoadedAppEntry> _cache = new();
     private static readonly ConcurrentDictionary<string, Assembly> _byName =
         new(StringComparer.OrdinalIgnoreCase);
     private static int _resolverInstalled;
+
+    /// <summary>
+    /// True when <paramref name="name"/>/<paramref name="publisher"/>/<paramref name="version"/>
+    /// match the identity already cached for an AppId — i.e. this is the SAME app being
+    /// resolved a second time (own-bundle + dependency, or two sibling bundles that both
+    /// carry it), not a different app that happens to share the GUID. Ordinal for Version
+    /// (already a normalized ToString()), case-insensitive for Name/Publisher (app.json
+    /// casing is not semantically significant to BC's own identity resolution).
+    ///
+    /// The two callers read Publisher from different places and must keep agreeing on
+    /// what "absent" means, or a legitimately-same app could read as a collision (or
+    /// worse, vice versa): the app-group path (Program.cs → InProcessAppPackager.ReadIdentity)
+    /// defaults a missing `publisher` in app.json to "Unknown"; the dependency path
+    /// (AppLoader's NAVX manifest reader) defaults a missing `Publisher` attribute to "".
+    /// Checked (PR #1862 review) that this does not bite in practice: InProcessAppPackager
+    /// always writes the NAVX it packages with `Publisher=identity.Publisher`, so an
+    /// "Unknown" default round-trips as "Unknown" through both readers for any app this
+    /// runner itself packaged. The only way to actually hit the mismatch is a third-party
+    /// `.app` whose NAVX omits `Publisher` AND whose app.json (if it is also discovered as
+    /// a source suite) omits `publisher` — both paths, both fields missing at once. If you
+    /// change either default, keep the other in sync or this comparison silently drifts.
+    /// </summary>
+    private static bool IdentityMatches(LoadedAppEntry entry, string name, string publisher, string version)
+        => string.Equals(entry.Name, name, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(entry.Publisher, publisher, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(entry.Version, version, StringComparison.Ordinal);
 
     private readonly BcCompiler _compiler;
     private readonly BcAssembler _assembler;
@@ -44,9 +80,21 @@ public sealed class DependencyLoader
         var list = new List<Assembly>();
         foreach (var (m, path) in ordered)
         {
+            // One stage per dependency, not one for the whole loop. #1828 measured this
+            // loop at 180 s of a 396 s runner-extras bundle — 78% of everything the bundle
+            // spends outside its app groups — and a single number cannot say whether that
+            // is one expensive dependency or twelve mediocre ones. The `dep-load:` prefix
+            // is what groups them back together in scripts/phase-log-report.py.
+            using var depStage = AlRunner.Infrastructure.PhaseLog.Stage($"dep-load:{m.Name}");
             if (_cache.TryGetValue(m.AppId, out var existing))
             {
-                list.Add(existing);
+                var newVersion = m.Version.ToString();
+                if (!IdentityMatches(existing, m.Name, m.Publisher, newVersion))
+                    throw new AlRunner.Infrastructure.AppIdCollisionException(
+                        m.AppId,
+                        existing.Name, existing.Publisher, existing.Version, existing.SourcePath,
+                        m.Name, m.Publisher, newVersion, path);
+                list.Add(existing.Asm);
                 continue;
             }
             // A source-only Microsoft app carries compile-time symbols, not a runtime DLL.
@@ -118,7 +166,7 @@ public sealed class DependencyLoader
             }
             if (asm != null)
             {
-                _cache[m.AppId] = asm;
+                _cache[m.AppId] = new LoadedAppEntry(asm, m.Name, m.Publisher, m.Version.ToString(), path);
                 _byName[asm.GetName().Name ?? ""] = asm;
                 // Register app metadata so AlCallStackCapture can decorate frames.
                 AlCallStackCapture.RegisterAssemblyInfo(asm, m.Name, m.Publisher, m.Version.ToString());
@@ -176,7 +224,13 @@ public sealed class DependencyLoader
             try
             {
                 var bytes = File.ReadAllBytes(precompiled);
-                return Assembly.Load(bytes);
+                var asm = Assembly.Load(bytes);
+                // #1852: pre-warm the Report{id} type-name cache from the bytes we already
+                // hold, so RecordPatches.CompiledReportIds() never has to call
+                // asm.GetTypes() on this assembly (asm.Location is empty for a byte[]-loaded
+                // assembly, so it couldn't cheaply re-derive this later on its own).
+                AlRunner.Patches.RecordPatches.SeedCompiledReportIdsFromPEBytes(asm, bytes);
+                return asm;
             }
             catch (Exception ex)
             {
@@ -204,6 +258,10 @@ public sealed class DependencyLoader
                     try
                     {
                         var asm = Assembly.Load(dll);
+                        // #1852: same pre-warm as Tier 1 — these R2R chunks are exactly the
+                        // multi-thousand-type BaseApplication/SystemApplication assemblies
+                        // whose GetTypes() cost was measured at 0.7s-4.3s EACH.
+                        AlRunner.Patches.RecordPatches.SeedCompiledReportIdsFromPEBytes(asm, dll);
                         var n = asm.GetName().Name ?? "";
                         _byName[n] = asm;
                         primary ??= asm;
@@ -253,9 +311,9 @@ public sealed class DependencyLoader
         }
 
         var cacheKey = ComputeSourceDependencyCacheKey(m, appPath);
-        var cacheDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".cache", "al-runner", "compiled-deps");
+        // #1821: was hardcoded to ~/.cache/al-runner/compiled-deps regardless of --cache;
+        // now follows the same isolation root al-out already honoured.
+        var cacheDir = AlRunner.Infrastructure.CacheRoots.Resolve("compiled-deps");
         var cachedDll = Path.Combine(cacheDir, cacheKey + ".dll");
         var reportSidecar = Path.Combine(cacheDir, cacheKey + ".report-metadata.json");
         // Sibling sidecar for the dep's `rendering { layout(...) }` declarations —
@@ -388,18 +446,17 @@ public sealed class DependencyLoader
         try
         {
             Directory.CreateDirectory(cacheDir);
-            File.WriteAllBytes(cachedDll, compile.AssemblyBytes!);
-            // Persist the report metadata THIS app's emit contributed, so cache
-            // HIT replays it (mirrors the bundle enum-registry sidecar).
             var ownReportIds = AlReportMetadataRegistry.Ids
                 .Where(i => !reportIdsBeforeEmit.Contains(i)).ToArray();
-            int sidecarCount = AlReportMetadataRegistry.SaveSidecar(reportSidecar, ownReportIds);
-            AlReportLayoutRegistry.SaveSidecar(reportLayoutSidecar, ownReportIds);
-            AlPageMetadataRegistry.SaveSidecar(pageMetadataSidecar,
-                AlPageMetadataRegistry.Ids.Where(i => !pageIdsBeforeEmit.Contains(i)).ToArray());
-            AlXmlPortMetadataRegistry.SaveSidecar(xmlPortMetadataSidecar,
-                AlXmlPortMetadataRegistry.Ids.Where(i => !xmlPortIdsBeforeEmit.Contains(i)).ToArray());
-            int enumSidecarCount = AlEnumMetadataRegistry.SaveSidecar(enumRegistrySidecar,
+            var (sidecarCount, enumSidecarCount) = PublishSourceDependencyCache(
+                cachedDll, compile.AssemblyBytes!,
+                reportSidecar, ownReportIds,
+                reportLayoutSidecar,
+                pageMetadataSidecar,
+                AlPageMetadataRegistry.Ids.Where(i => !pageIdsBeforeEmit.Contains(i)).ToArray(),
+                xmlPortMetadataSidecar,
+                AlXmlPortMetadataRegistry.Ids.Where(i => !xmlPortIdsBeforeEmit.Contains(i)).ToArray(),
+                enumRegistrySidecar,
                 AlEnumMetadataRegistry.Ids.Where(i => !enumIdsBeforeEmit.Contains(i)));
             Console.Error.WriteLine(
                 $"[deps] source-cache WROTE: {m.Name} v{m.Version} key={cacheKey[..12]} ({compile.AssemblyBytes!.Length} bytes, {sidecarCount} report-metadata entries, {enumSidecarCount} enum-registry entries)");
@@ -418,6 +475,64 @@ public sealed class DependencyLoader
         }
     }
 
+    /// <summary>
+    /// Publishes the six on-disk artifacts of a compiled source-dependency cache entry
+    /// (five metadata sidecars + the DLL). Extracted out of <see cref="LoadOne"/> so
+    /// AlRunner.Tests can pin the write-ordering/atomicity contract directly —
+    /// see AlCacheWriterDependencyCacheOrderingTests.
+    ///
+    /// #1809 follow-up: two concurrent dep compiles that land on the SAME cacheKey
+    /// (same publisher/name/version/appPath — deterministic input) used to race a plain
+    /// File.WriteAllBytes/WriteAllText into these exact paths. A reader's
+    /// File.Exists(cachedDll) check (LoadOne, above) could observe a file mid-write from
+    /// another process's FileStream and hand a torn read to Assembly.Load — same defect
+    /// class as the Ncl.dll SIGBUS fix (NclCecilRewrite.AtomicReplace) and the #1810/#1812
+    /// AL-output cache fix, just with a louder failure mode here
+    /// (BadImageFormatException, not a crash) because Assembly.Load(byte[]) copies rather
+    /// than memory-maps. Parallelizing AlRunner.Tests's subprocess collections (#1809)
+    /// raised the odds of landing in that window.
+    ///
+    /// Fix: publish every artifact via AlCacheWriter.AtomicPublish (temp file in the same
+    /// directory + File.Move(overwrite:true), atomic on both Linux rename(2) and Windows
+    /// MoveFileEx — see AlCacheWriter.cs), and publish the DLL LAST. LoadOne's read side
+    /// only gates on File.Exists(cachedDll), so writing the DLL last makes "the DLL is
+    /// there" imply "every sidecar it depends on is already there too" — the exact
+    /// ordering guarantee AlCacheWriterTests.
+    /// SequencedPublish_SidecarThenDll_DllNeverVisibleBeforeSidecar pins for the
+    /// AL-output cache; this mirrors it for the dependency-compile cache's larger
+    /// 5-sidecars-then-1-DLL shape.
+    /// </summary>
+    ///
+    /// <param name="onSidecarsPublishedBeforeDll">Test-only seam: invoked after all five
+    /// sidecars are committed but before the DLL is published, so a test can assert the
+    /// DLL-not-yet-visible ordering deterministically instead of racing a polling thread
+    /// against the filesystem. Null in production and in every test that doesn't need it
+    /// — see AlCacheWriterDependencyCacheOrderingTests. Same seam shape as
+    /// Win32Stubs.PathEnvironmentForTests.</param>
+    internal static (int sidecarCount, int enumSidecarCount) PublishSourceDependencyCache(
+        string cachedDll, byte[] assemblyBytes,
+        string reportSidecar, int[] ownReportIds,
+        string reportLayoutSidecar,
+        string pageMetadataSidecar, int[] ownPageIds,
+        string xmlPortMetadataSidecar, int[] ownXmlPortIds,
+        string enumRegistrySidecar, IEnumerable<int> ownEnumIds,
+        Action? onSidecarsPublishedBeforeDll = null)
+    {
+        int sidecarCount = AlCacheWriter.AtomicPublish(reportSidecar,
+            tmp => AlReportMetadataRegistry.SaveSidecar(tmp, ownReportIds));
+        AlCacheWriter.AtomicPublish(reportLayoutSidecar,
+            tmp => AlReportLayoutRegistry.SaveSidecar(tmp, ownReportIds));
+        AlCacheWriter.AtomicPublish(pageMetadataSidecar,
+            tmp => AlPageMetadataRegistry.SaveSidecar(tmp, ownPageIds));
+        AlCacheWriter.AtomicPublish(xmlPortMetadataSidecar,
+            tmp => AlXmlPortMetadataRegistry.SaveSidecar(tmp, ownXmlPortIds));
+        int enumSidecarCount = AlCacheWriter.AtomicPublish(enumRegistrySidecar,
+            tmp => AlEnumMetadataRegistry.SaveSidecar(tmp, ownEnumIds));
+        onSidecarsPublishedBeforeDll?.Invoke();
+        AlCacheWriter.AtomicPublish(cachedDll, tmp => File.WriteAllBytes(tmp, assemblyBytes));
+        return (sidecarCount, enumSidecarCount);
+    }
+
     private static string ComputeSourceDependencyCacheKey(AppManifest manifest, string appPath)
     {
         using var sha = SHA256.Create();
@@ -428,12 +543,15 @@ public sealed class DependencyLoader
             ms.Write(bytes, 0, bytes.Length);
         }
 
-        WriteLine("schema:v1");
-        var runnerLoc = typeof(BcAssembler).Assembly.Location;
-        if (!string.IsNullOrEmpty(runnerLoc) && File.Exists(runnerLoc))
-            WriteLine($"runner:{File.GetLastWriteTimeUtc(runnerLoc).Ticks}:{new FileInfo(runnerLoc).Length}");
-        else
-            WriteLine("runner:unknown");
+        // v2 (issue #1815): runner fingerprint switched from mtime+length to a content
+        // hash (mtime moved on every CI rebuild, so a persisted cache could never hit),
+        // and an explicit bc:<version> line was added (a content hash alone is identical
+        // across every BC-version CI leg building the same commit, so without it all legs
+        // would collide on one cache entry and a leg could load a dependency DLL compiled
+        // against another BC version's symbols). v1 entries carried neither and must not
+        // be served under the new key shape.
+        WriteLine("schema:v2");
+        AlRunner.Infrastructure.RunnerFingerprint.WriteKeyLines(WriteLine);
         WriteLine($"app:{manifest.AppId}:{manifest.Publisher}:{manifest.Name}:{manifest.Version}");
         foreach (var dep in manifest.Dependencies.OrderBy(d => $"{d.Publisher}/{d.Name}/{d.Version}/{d.AppId}", StringComparer.OrdinalIgnoreCase))
             WriteLine($"dep:{dep.AppId}:{dep.Publisher}:{dep.Name}:{dep.Version}");
@@ -540,11 +658,41 @@ public sealed class DependencyLoader
     }
 
     /// <summary>
-    /// Lookup helper for callers that want to access a loaded dep by name
-    /// (e.g. when verifying that a compile-time symbol matches a runtime one).
+    /// Lookup helper for the bundle loop's own-AppGroup dedup check (Program.cs,
+    /// issue #1683 for the CLI loop, #1892 for --server's per-request bundle loop):
+    /// "was this AppId already compiled/loaded earlier in this process?" Returns
+    /// the cached Assembly when <paramref name="name"/>/<paramref name="publisher"/>/
+    /// <paramref name="version"/> match the identity already cached for
+    /// <paramref name="appId"/> — the legitimate same-app-twice case, safe to reuse.
+    /// Returns null when nothing is cached yet for this AppId.
+    /// Throws <see cref="AlRunner.Infrastructure.AppIdCollisionException"/> when an
+    /// entry IS cached but its identity does NOT match — two different apps
+    /// declaring the same app.json id (issue #1850): silently reusing the earlier
+    /// module here would drop every test in <paramref name="sourcePath"/>'s app,
+    /// exactly as it did before this check existed.
+    ///
+    /// Also returns null — deliberately NOT a reuse — when the cached entry's own
+    /// <c>SourcePath</c> equals <paramref name="sourcePath"/> (#1892 follow-up,
+    /// caught by ServerTests.RunTests_Then_EditTable_Then_RunAgain_PicksUpChange):
+    /// that is not a genuinely different sibling bundle providing this AppId, it is
+    /// THIS SAME bundle directory being asked about again — server mode's core
+    /// edit-and-rerun contract, where the SAME sourcePath is compiled repeatedly in
+    /// one warm session and each rerun must see any source edit since the last one.
+    /// The CLI loop never hits this branch (a single non-watch invocation visits
+    /// each SuiteDir at most once), so this only narrows the check for the
+    /// caller that genuinely needs it.
     /// </summary>
-    public static Assembly? TryGetByAppId(Guid appId)
-        => _cache.TryGetValue(appId, out var asm) ? asm : null;
+    public static Assembly? TryGetByAppId(Guid appId, string name, string publisher, string version, string sourcePath)
+    {
+        if (!_cache.TryGetValue(appId, out var entry)) return null;
+        if (!IdentityMatches(entry, name, publisher, version))
+            throw new AlRunner.Infrastructure.AppIdCollisionException(
+                appId, entry.Name, entry.Publisher, entry.Version, entry.SourcePath,
+                name, publisher, version, sourcePath);
+        if (string.Equals(entry.SourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
+            return null;
+        return entry.Asm;
+    }
 
     /// <summary>
     /// Record that <paramref name="asm"/> is the loaded module for AL app identity
@@ -556,9 +704,32 @@ public sealed class DependencyLoader
     /// issue #1683 (event-subscriber dispatch pairs a MethodInfo from one module's
     /// Type with a subscriberInstance from the other module's Type, throwing
     /// TargetException at ValidateInvokeTarget). First registration for a given AppId
-    /// wins; a duplicate call for an AppId already present is a no-op (the earlier
-    /// module is the one every other bundle should keep resolving to).
+    /// wins when the identity matches AND the registration is for a DIFFERENT
+    /// <paramref name="sourcePath"/> than the one already cached (the earlier module
+    /// is the one every other bundle should keep resolving to). When it does NOT
+    /// match — a genuine GUID collision between two different apps (#1850) that the
+    /// caller's own <see cref="TryGetByAppId"/> check raced past — this throws instead
+    /// of silently keeping the wrong module registered.
+    ///
+    /// When the identity matches AND <paramref name="sourcePath"/> equals the cached
+    /// entry's own SourcePath, this OVERWRITES the entry instead (#1892 follow-up):
+    /// that is not two different bundles racing to register the same AppId, it is the
+    /// SAME bundle re-registering itself after a fresh compile — server mode's
+    /// edit-and-rerun contract, where <see cref="TryGetByAppId"/> deliberately never
+    /// serves a stale reuse for a same-sourcePath lookup (see its own doc comment), so
+    /// each rerun's freshly-compiled module must become the one a LATER sibling
+    /// bundle in a subsequent request resolves to, not whatever compiled first.
     /// </summary>
-    public static void RegisterLoaded(Guid appId, Assembly asm)
-        => _cache.TryAdd(appId, asm);
+    public static void RegisterLoaded(Guid appId, Assembly asm, string name, string publisher, string version, string sourcePath)
+    {
+        var newEntry = new LoadedAppEntry(asm, name, publisher, version, sourcePath);
+        if (_cache.TryAdd(appId, newEntry)) return;
+        var existing = _cache[appId];
+        if (!IdentityMatches(existing, name, publisher, version))
+            throw new AlRunner.Infrastructure.AppIdCollisionException(
+                appId, existing.Name, existing.Publisher, existing.Version, existing.SourcePath,
+                name, publisher, version, sourcePath);
+        if (string.Equals(existing.SourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
+            _cache[appId] = newEntry;
+    }
 }

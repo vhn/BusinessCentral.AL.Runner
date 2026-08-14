@@ -71,3 +71,18 @@ tests/runner-extras/dotnet-interop/
 # #1672: prebuilt Win32 stub shims are build artifacts, produced fresh per-arch by
 # AlRunner.csproj's BuildWin32PrebuiltStubs target — never committed as binaries.
 AlRunner/Win32Stubs/*.so
+
+# #1881: BuildDeterminismTests (AlRunner.Tests) generates a throwaway probe project
+# directly under the repo root (so it inherits Directory.Build.props via MSBuild's
+# normal upward search) and deletes it in a `finally`. A hard crash/kill/timeout can
+# leave one behind — ignore it so a stray copy never shows up as untracked or gets
+# swept into a `git add -A`.
+/.build-determinism-probe-*/
+
+# The DOTNET_STARTUP_HOOKS runsettings for the in-process BC engine tests is GENERATED,
+# never authored: test-matrix.yml writes it fresh per leg (see its "Generate .runsettings"
+# step) and anyone running the suite locally writes their own. It embeds ABSOLUTE paths to
+# AlRunner.Tests' bin dir, so a committed copy would be wrong on every machine but the one
+# that produced it — and CI would silently overwrite it anyway. Same rationale as #1881
+# above: keep a stray copy from showing up as untracked or being swept into `git add -A`.
+/engine.runsettings

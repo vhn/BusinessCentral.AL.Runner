@@ -93,7 +93,57 @@ public static class InstallTriggerRunner
             foreach (var asm in _testAssemblies)
                 if (!ordered.Contains(asm)) ordered.Add(asm);
         }
-        foreach (var asm in ordered)
+        FireAll(ordered);
+    }
+
+    /// <summary>Fire ONLY the registered dependency assemblies' Install triggers — never
+    /// the bundle's own test assembly. #1867: this is the invariant portion of RunAll()
+    /// across every app group that shares the same dependency closure (see
+    /// TestExecutor.Run's dep+company baseline cache, which calls this on a cache miss and
+    /// otherwise skips it entirely). Real BC's Install-trigger contract is inherently
+    /// self-contained per installing app — each dependency's trigger only ever touches its
+    /// own app's/Base-App-visible data and cannot observe what else is installed — so
+    /// splitting dependency firing out from the bundle's own firing changes nothing about
+    /// what any individual trigger body does or sees.</summary>
+    public static void RunDependenciesOnly()
+    {
+        List<Assembly> ordered;
+        lock (_depAssemblies)
+            ordered = new List<Assembly>(_depAssemblies);
+        FireAll(ordered);
+    }
+
+    /// <summary>Fire ONLY the bundle's own registered test assembly's Install triggers, if
+    /// it declares any — never the dependency assemblies. The complement of
+    /// <see cref="RunDependenciesOnly"/>; always genuinely per-app-group, never cached.</summary>
+    public static void RunTestAssemblyOnly()
+    {
+        // Every live generation of the app, not one assembly: an overlay carries only the
+        // changed codeunits, so an unchanged Install codeunit is still in the baseline.
+        List<Assembly> ordered;
+        lock (_depAssemblies)
+            ordered = new List<Assembly>(_testAssemblies);
+        if (ordered.Count > 0)
+            FireAll(ordered);
+    }
+
+    /// <summary>A stable identity for the CURRENTLY REGISTERED dependency assembly set
+    /// (excludes the test assembly), used to key the process-lifetime dep+company baseline
+    /// cache in TestExecutor.Run. Built from each assembly's Module Version ID rather than
+    /// its declared name/version, so it changes whenever the underlying IL actually changes
+    /// — a dependency recompiled mid-process (e.g. an AL-output cache miss after a schema
+    /// edit) gets a fresh MVID and therefore a fresh key, never a stale cache hit.</summary>
+    public static string CurrentDependencySetKey()
+    {
+        List<Assembly> ordered;
+        lock (_depAssemblies)
+            ordered = new List<Assembly>(_depAssemblies);
+        return string.Join("|", ordered.Select(a => a.ManifestModule.ModuleVersionId.ToString("N")));
+    }
+
+    private static void FireAll(IEnumerable<Assembly> asms)
+    {
+        foreach (var asm in asms)
             foreach (var cu in Scan(asm))
             {
                 if (AlRunner.Rad.AlObjectResolution.IsSuperseded(cu.Type)) continue;

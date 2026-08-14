@@ -1,5 +1,5 @@
-// XmlPortPatches — replacements for NavXmlPortHandle.CreateTarget and NavXmlPort
-// instance methods (Export, Import, Run, SetTableView).
+// XmlPortPatches — replacements for NavXmlPortHandle.CreateTarget /
+// NCLMetaXmlPort.CreateObjectInstance (construction) and NavXmlPort's static Run overloads.
 //
 // NavXmlPortHandle.CreateTarget normally calls
 //   NavGlobal.NCLMetadata.GetMetaXmlPortById(id, true).CreateObjectInstance(this)
@@ -7,9 +7,13 @@
 // delegate. We bypass it by finding XmlPort{ID} in the loaded test assembly and
 // constructing directly via reflection — same pattern as NavFormHandle/NavReportHandle.
 //
-// The NavXmlPort instance methods (Export, Import, Run, SetTableView) all internally
-// call Session.BeginTransaction / ApplicationObjectRootScope which NRE on our skeleton.
-// We replace them with stubs that return the "success" value without side effects.
+// The NavXmlPort INSTANCE methods (Export, Import, Run, SetTableView,
+// BeginInitialization/EndInitialization/Add) are NOT replaced here (or anywhere) — BC's real,
+// unpatched bodies already handle well-formed AL usage correctly once construction succeeds
+// (see the #1800 investigation below and tests/runner-extras/standalone-suites/
+// xmlport-cluster-hooks-1800). Only the four STATIC Run(int[, bool[, bool[, NavRecord]]])
+// overloads are replaced, and only because they are a genuine, permanent out-of-scope
+// surface — see the block above NavXmlPort_StaticRun1..4 below.
 using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -179,40 +183,86 @@ public static partial class BcRuntime
     // ──────────────────────────────────────────────────────────────────
     // NavXmlPort static Run — XMLPORT.RUN(id), XMLPORT.RUN(id, reqPage),
     // XMLPORT.RUN(id, reqPage, import), XMLPORT.RUN(id, reqPage, import, rec)
-    // in AL compile to these static overloads. In standalone mode there is no
-    // service tier and no interactive request page, so all four overloads are
-    // safe no-ops. Without these hooks, BCruntime calls
-    // NCLMetadata.GetMetaXmlPortById(id) → ThrowMetaApplicationObjectNotFound
-    // for any XmlPort not registered in NCLMetadata (i.e. every test-assembly
-    // XmlPort).
+    // in AL compile to these static overloads.
+    //
+    // These are a genuine, permanent out-of-scope surface — §3.4 (file-storage)
+    // of docs/scope.md, same bucket as NavFile.ALUpload/ALDownload's browser
+    // round-trip overloads (see FilePatches.cs) — NOT "in scope, not yet
+    // implemented" and NOT a safe no-op. Verified by decompiling BC's real,
+    // unpatched Ncl.dll body (Microsoft.Dynamics.Nav.Runtime.NavXmlPort):
+    //
+    //   public static void Run(int xmlPortId, bool requestWindow, bool import, NavRecord record)
+    //   {
+    //       using NavXmlPort navXmlPort = NavGlobal.NCLMetadata.GetMetaXmlPortById(xmlPortId, ...)
+    //           .CreateObjectInstance(NavCurrentThread.Session);
+    //       navXmlPort.useRequestForm = requestWindow;
+    //       if (record != null) navXmlPort.SetTableView(record);
+    //       navXmlPort.ImportFile = import;
+    //       navXmlPort.RunXmlPort();   // <-- always runs, regardless of the args above
+    //   }
+    //
+    //   private void RunXmlPort()
+    //   {
+    //       ApplicationObjectRootScope.AddApplicationObjectRootScope(this, delegate {
+    //           if (!CallRequestForm()) return;               // no-op when UseRequestPage=false
+    //           if (importFile)
+    //               fileBufferedStream = NavFile.InternalUpload(displayDialog: true, ..., Guid.NewGuid());
+    //           else
+    //               NavFile.InternalDownload(displayDialog: true, ..., Destination.InternalStream, Guid.NewGuid());
+    //       });
+    //   }
+    //
+    // `record` only ever feeds SetTableView (a row filter) — it never supplies an
+    // I/O stream. There is no argument combination, including requestWindow=false,
+    // that skips NavFile.InternalUpload/InternalDownload: both are called with
+    // displayDialog:true hard-coded, and both resolve to
+    // Session.ClientCallback.UploadFileAction/DownloadFileAction — the exact
+    // "browser round-trip" surface docs/scope.md#file-storage already names for
+    // NavFile.ALUpload/ALDownload. On the runner's non-interactive skeleton session,
+    // Session.ClientCallback itself throws NavNCLCallbackNotAllowedException
+    // ("Callback functions are not allowed") — confirmed empirically against a
+    // pristine, unpatched build for every overload/argument combination tried
+    // (unresolvable id still raises BC's own NavALException first, as expected).
+    //
+    // So a "real fix" resolving via ConstructXmlPort and calling the instance's
+    // Export()/Import() directly (bypassing RunXmlPort()'s file-dialog step) would
+    // NOT be faithful to XmlPort.Run(...) — it would silently answer a different,
+    // easier question (this is already proven and covered by
+    // InstanceExportImportRoundTrip_RealBcBody_NoThrow in the sibling suite) while
+    // claiming to implement Run(), which is exactly the "pass for the wrong reason"
+    // failure loud-failures.md exists to prevent. We instead throw our own typed
+    // OOS exception uniformly, before BC's real (and, on the export path,
+    // inconsistent — see PR #1884 discussion) body runs at all, mirroring
+    // FilePatches.cs's policy for the same underlying surface.
     // ──────────────────────────────────────────────────────────────────
 
-    /// <summary>NavXmlPort.Run(int xmlPortId) — no-op; standalone mode has no request page or I/O target.</summary>
+    /// <summary>NavXmlPort.Run(int xmlPortId) — always needs a client file-browse dialog; OOS.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void NavXmlPort_StaticRun1(int xmlPortId)
     {
-        Console.Error.WriteLine($"[BcRuntime] NavXmlPort.Run({xmlPortId}) → no-op (static Run hook)");
+        RunnerScope.ThrowOutOfScope("NavXmlPort.Run", "browser-roundtrip", "file-storage");
     }
 
-    /// <summary>NavXmlPort.Run(int xmlPortId, bool requestWindow) — no-op.</summary>
+    /// <summary>NavXmlPort.Run(int xmlPortId, bool requestWindow) — always needs a client file-browse dialog; OOS.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void NavXmlPort_StaticRun2(int xmlPortId, bool requestWindow)
     {
-        Console.Error.WriteLine($"[BcRuntime] NavXmlPort.Run({xmlPortId}, {requestWindow}) → no-op (static Run hook)");
+        RunnerScope.ThrowOutOfScope("NavXmlPort.Run", "browser-roundtrip", "file-storage");
     }
 
-    /// <summary>NavXmlPort.Run(int xmlPortId, bool requestWindow, bool import) — no-op.</summary>
+    /// <summary>NavXmlPort.Run(int xmlPortId, bool requestWindow, bool import) — always needs a client file-browse dialog; OOS.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void NavXmlPort_StaticRun3(int xmlPortId, bool requestWindow, bool import)
     {
-        Console.Error.WriteLine($"[BcRuntime] NavXmlPort.Run({xmlPortId}, {requestWindow}, {import}) → no-op (static Run hook)");
+        RunnerScope.ThrowOutOfScope("NavXmlPort.Run", "browser-roundtrip", "file-storage");
     }
 
-    /// <summary>NavXmlPort.Run(int xmlPortId, bool requestWindow, bool import, NavRecord record) — no-op.</summary>
+    /// <summary>NavXmlPort.Run(int xmlPortId, bool requestWindow, bool import, NavRecord record) — record only ever
+    /// feeds SetTableView, never the I/O stream; still always needs a client file-browse dialog; OOS.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void NavXmlPort_StaticRun4(int xmlPortId, bool requestWindow, bool import, object record)
     {
-        Console.Error.WriteLine($"[BcRuntime] NavXmlPort.Run({xmlPortId}, {requestWindow}, {import}, record) → no-op (static Run hook)");
+        RunnerScope.ThrowOutOfScope("NavXmlPort.Run", "browser-roundtrip", "file-storage");
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -241,73 +291,43 @@ public static partial class BcRuntime
         return default;
     }
 
-    /// <summary>Export(DataError) — loud failure; in-memory XmlPort not yet implemented.</summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static bool NavXmlPort_Export(object self, int errorLevel)
-    {
-        RunnerScope.ThrowNotYetImplemented(
-            "NavXmlPort.Export",
-            "in-memory XmlPort serialization not yet implemented — see HANDOFF.md and SCOPE-AUDIT.md");
-        return default;
-    }
-
-    /// <summary>Import(DataError) — loud failure; in-memory XmlPort not yet implemented.</summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static bool NavXmlPort_Import(object self, int errorLevel)
-    {
-        RunnerScope.ThrowNotYetImplemented(
-            "NavXmlPort.Import",
-            "in-memory XmlPort serialization not yet implemented — see HANDOFF.md and SCOPE-AUDIT.md");
-        return default;
-    }
-
-    /// <summary>Run() — loud failure; in-memory XmlPort not yet implemented.</summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void NavXmlPort_Run(object self)
-    {
-        RunnerScope.ThrowNotYetImplemented(
-            "NavXmlPort.Run",
-            "in-memory XmlPort serialization not yet implemented — see HANDOFF.md and SCOPE-AUDIT.md");
-    }
-
-    /// <summary>RunXmlPort() (private) — loud failure; in-memory XmlPort not yet implemented.</summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void NavXmlPort_RunXmlPort(object self)
-    {
-        RunnerScope.ThrowNotYetImplemented(
-            "NavXmlPort.RunXmlPort",
-            "in-memory XmlPort serialization not yet implemented — see HANDOFF.md and SCOPE-AUDIT.md");
-    }
-
-    /// <summary>SetTableView(NavRecord) — loud failure; in-memory XmlPort not yet implemented.</summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void NavXmlPort_SetTableView(object self, object record)
-    {
-        RunnerScope.ThrowNotYetImplemented(
-            "NavXmlPort.SetTableView",
-            "in-memory XmlPort serialization not yet implemented — see HANDOFF.md and SCOPE-AUDIT.md");
-    }
-
-    /// <summary>BeginInitialization() — called from the BC-generated XmlPort{ID} ctor.
-    /// Skeleton ctor-time scaffolding — required so XmlPort{ID} construction succeeds;
-    /// no observable AL-test behavior to fake.
-    /// Dereferences Session.MetadataProvider (null on skeleton) → NRE. Stub as no-op;
-    /// fields it would populate (metadata, fieldDelimiter, …) are not needed for our
-    /// Export/Import/Run/SetTableView loud-failure hooks.</summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void NavXmlPort_BeginInitialization(object self)
-    {
-    }
-
-    /// <summary>EndInitialization() — called from the BC-generated XmlPort{ID} ctor after
-    /// the node-building code. Skeleton ctor-time scaffolding — required so XmlPort{ID}
-    /// construction succeeds; no observable AL-test behavior to fake.
-    /// Accesses metadata.UseRequestForm and requestOptionsPage
-    /// (both null on skeleton after BeginInitialization is no-op'd) → NRE. Stub as no-op.</summary>
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void NavXmlPort_EndInitialization(object self)
-    {
-    }
+    // Export(DataError) / Import(DataError) / Run() / RunXmlPort() (private) /
+    // SetTableView(NavRecord) / BeginInitialization() / EndInitialization() /
+    // Add(TableNode|FieldNode|TextNode) used to live here as JmpHook.Hook(...) targets in
+    // BcRuntime.cs — Export/Import/Run/RunXmlPort/SetTableView as loud "not-yet-implemented"
+    // throw stubs, BeginInitialization/EndInitialization/Add as no-op ctor scaffolding. ALL of
+    // them were dead: JmpHook is disabled by default, so none of these hooks ever fired and
+    // BC's real, unpatched bodies ran instead.
+    //
+    // Investigated as part of #1800 (orphaned-hook audit). An earlier revision of this fix
+    // Cecil-owned BeginInitialization to install stub metadata, on the belief that
+    // Session.MetadataProvider is null on the skeleton and NREs the ctor — that turned out to
+    // be a misdiagnosis, and an active regression: it broke 14 previously-passing al-language
+    // corpus tests (Codeunit60206/60207). Root cause: Session.MetadataProvider is NOT null on
+    // the skeleton — AlRunner/Patches/MetadataPatches.cs's InjectSkeletonSystemTenant already
+    // seeds session.tenant/systemTenant for exactly this call path (its own comment names
+    // NavXmlPort.BeginInitialization as the motivating case), so BC's real, unpatched
+    // BeginInitialization/EndInitialization/Add bodies already construct correctly — proven
+    // empirically against a pristine, unpatched build. And once construction succeeds, BC's
+    // real Export/Import/Run/SetTableView bodies already handle well-formed AL usage correctly
+    // too (nested-table export/import, text-variable triggers, auto-update/auto-replace,
+    // SetTableView row filtering — all passing against the corpus). So none of these eight
+    // methods need a runner replacement at all; their throw stubs / no-ops and the matching
+    // (already-orphaned) Hook(...) call sites were deleted outright rather than left dead —
+    // there is nothing correct to redirect them to, BC's real body already is the right
+    // answer. See tests/runner-extras/standalone-suites/xmlport-cluster-hooks-1800 for the
+    // proving tests and the #1800 PR body for the full orphan-hook inventory and the
+    // misdiagnosis-and-correction record.
+    //
+    // NavXmlPort.Run(int[, bool[, bool[, NavRecord]]]) — the 4 static overloads — are the one
+    // genuine, permanent out-of-scope surface in this cluster, NOT a case of "BC's real body
+    // is already correct" like the eight methods above: see the block above
+    // (NavXmlPort_StaticRun1..4) and the matching Cecil ownership in NclCecilRewrite.cs for the
+    // decompiled-source evidence and the docs/scope.md#file-storage classification.
+    //
+    // XmlPort{ID}.InitializeComponent() (below) and NavXmlPortTableNode..ctor (further down)
+    // are a separate mechanism — JmpHook.Apply against methods on the test assembly's own
+    // BC-generated types, not NCL — and were not part of this investigation; left unchanged.
 
     /// <summary>
     /// XmlPort{ID}.InitializeComponent() — the BC-generated override that calls
@@ -324,21 +344,6 @@ public static partial class BcRuntime
     public static void NavXmlPort_InitializeComponent(object self)
     {
     }
-
-    // Skeleton ctor-time scaffolding — required so XmlPort{ID} construction succeeds;
-    // no observable AL-test behavior to fake.
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void NavXmlPort_AddTableNode(object self, object node) { }
-
-    // Skeleton ctor-time scaffolding — required so XmlPort{ID} construction succeeds;
-    // no observable AL-test behavior to fake.
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void NavXmlPort_AddFieldNode(object self, object node) { }
-
-    // Skeleton ctor-time scaffolding — required so XmlPort{ID} construction succeeds;
-    // no observable AL-test behavior to fake.
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void NavXmlPort_AddTextNode(object self, object node) { }
 
     // Skeleton ctor-time scaffolding — required so XmlPort{ID} construction succeeds;
     // no observable AL-test behavior to fake. Initializes the attribute/element child

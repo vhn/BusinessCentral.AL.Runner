@@ -50,7 +50,9 @@
 //   helpers the AllObj provider resolves. No AL business-logic body is touched.
 
 using System.Collections.Concurrent;
+using System.IO;
 using System.Reflection;
+using System.Reflection.Metadata;
 using System.Runtime.CompilerServices;
 using AlRunner.Infrastructure;
 using Microsoft.Dynamics.Nav.Runtime;
@@ -406,6 +408,26 @@ public static partial class RecordPatches
     }
 
     /// <summary>
+    /// Per-assembly memo for <see cref="CompiledReportIds"/> — see that method's remarks
+    /// for why this exists. Keyed by reference identity (an Assembly instance never changes
+    /// once loaded), valued by the Report{id} ids that assembly's <c>GetTypes()</c> yielded.
+    /// A <c>ConcurrentDictionary</c> because <see cref="KnownReportIdSet"/> can be reached
+    /// from more than one call site (PopulateNclMetadataCache and
+    /// NclMetaFormReportBuilder) without a shared lock ordering guarantee.
+    /// </summary>
+    private static readonly ConcurrentDictionary<Assembly, int[]> _compiledReportIdsByAssembly = new();
+
+    /// <summary>
+    /// Test-only probe: true once <paramref name="asm"/> has an entry in
+    /// <see cref="_compiledReportIdsByAssembly"/>, regardless of whether that entry came from
+    /// <see cref="SeedCompiledReportIdsFromPEBytes"/> (no <c>GetTypes()</c> call) or from
+    /// <see cref="CompiledReportIds"/>'s own lazy fallback scan. #1852's proving test uses
+    /// this to assert the PE-byte seed path populates the cache without ever reaching the
+    /// slow path for that assembly.
+    /// </summary>
+    internal static bool IsCompiledReportIdsSeeded(Assembly asm) => _compiledReportIdsByAssembly.ContainsKey(asm);
+
+    /// <summary>
     /// Report ids that exist as a compiled <c>Report{id}</c> type in a loaded assembly.
     ///
     /// The other two sources both need something the runner does not always have: AL source
@@ -415,23 +437,206 @@ public static partial class RecordPatches
     /// <c>Report.SaveAs</c> on one failed with BC's "metadata object Report N was not found /
     /// the application might be incompatible with the current compiler" rather than running.
     /// The compiled type is proof the report exists, which is exactly what this set answers.
+    ///
+    /// PER-ASSEMBLY MEMOIZED (#1852): <see cref="KnownReportIdSet"/>'s own generation key
+    /// includes the loaded-assembly count, so every newly loaded assembly (test-emitted
+    /// output, a lazily-loaded BC dependency DLL, ...) busts that outer cache and this method
+    /// runs again. Before this memo, EVERY call re-scanned EVERY loaded assembly from
+    /// scratch via <c>Assembly.GetTypes()</c> — including the huge precompiled
+    /// BaseApplication/SystemApplication DLLs already scanned by a prior call. Measured on
+    /// this repo's own boot sequence: the first scan over ~189 assemblies cost ~17.7s, and an
+    /// immediate repeat over the SAME assembly set (nothing newly loaded) cost only ~207ms —
+    /// the type-loading work itself is the expensive part, and it was being redone in full on
+    /// every cache-busting call instead of once per assembly for the process's lifetime.
+    /// Caching per-assembly turns that into O(assemblies) total reflection work across the
+    /// whole process, not O(calls × assemblies).
     /// </summary>
     private static IEnumerable<int> CompiledReportIds()
     {
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
-            Type[] types;
-            try { types = asm.GetTypes(); }
-            catch { continue; } // dynamic/reflection-only assemblies — nothing to learn here
-            foreach (var t in types)
+            if (_compiledReportIdsByAssembly.TryGetValue(asm, out var cached))
             {
-                if (AlRunner.Rad.AlObjectResolution.IsSuperseded(t)) continue;
-                if (!t.Name.StartsWith("Report", StringComparison.Ordinal)) continue;
-                if (!int.TryParse(t.Name.AsSpan(6), out var id) || id <= 0) continue;
-                yield return id;
+                foreach (var id in LiveReportIds(cached, asm)) yield return id;
+                continue;
             }
+
+            Type[]? types;
+            int[]? partialIdsOnException = null;
+            try
+            {
+                types = asm.GetTypes();
+            }
+            catch (ReflectionTypeLoadException rtle)
+            {
+                // A partial load — typically an assembly scanned before all of its own
+                // dependencies are loaded yet, which #1852's own investigation established
+                // DOES happen mid-spawn (assemblies keep arriving through a spawn's life).
+                // ex.Types carries whatever DID load; use it for THIS yield, but do not cache
+                // it — see the "no cache write" note below for why a partial answer must
+                // never become the permanent one. (Can't yield from inside a catch block, so
+                // stash it and yield once we're back in the loop body below.)
+                partialIdsOnException = ExtractReportIds(rtle.Types);
+                types = null;
+            }
+            catch
+            {
+                // Anything else that makes GetTypes() unusable for this assembly (dynamic /
+                // reflection-only assemblies, etc.) — try again on a later call rather than
+                // caching a wrong answer now that the assembly might be more loadable later.
+                types = null;
+            }
+
+            if (types is null)
+            {
+                if (partialIdsOnException is not null)
+                    foreach (var id in LiveReportIds(partialIdsOnException, asm)) yield return id;
+                continue;
+            }
+
+            // NO CACHE WRITE ON EXCEPTION (#1852 review): the original code's `catch { continue; }`
+            // never cached a failed scan, so a LATER call — once the assembly's dependencies
+            // are actually loaded — retries it from scratch and can find its ids. Caching an
+            // empty/partial result on exception would instead memoize an incomplete answer for
+            // the rest of the process, and a real report id going missing from KnownReportIdSet
+            // surfaces as BC's "metadata object Report N was not found" — the exact failure
+            // this whole set exists to prevent. Only a SUCCESSFUL, complete GetTypes() call
+            // (or the PE-byte path below, which has no such partial-load failure mode at all)
+            // gets a permanent cache entry.
+            var idsArray = ExtractReportIds(types);
+            _compiledReportIdsByAssembly[asm] = idsArray;
+            foreach (var id in LiveReportIds(idsArray, asm)) yield return id;
         }
     }
+
+    /// <summary>
+    /// Drop the ids whose <c>Report{id}</c> type in <paramref name="asm"/> is not the live
+    /// generation. A warm <c>--watch</c> cycle replaces or deletes objects and .NET cannot
+    /// unload, so a superseded assembly still answers <c>GetTypes()</c> with a report that no
+    /// longer exists — and this set is what tells BC a report exists at all.
+    ///
+    /// <para>Applied at YIELD time rather than inside <see cref="ExtractReportIds"/> on
+    /// purpose: <see cref="_compiledReportIdsByAssembly"/> is written once per assembly and
+    /// kept for the life of the process, whereas which generation owns a name changes with
+    /// every delta. Filtering before the cache write would freeze one cycle's answer.</para>
+    /// </summary>
+    private static IEnumerable<int> LiveReportIds(int[] ids, Assembly asm)
+    {
+        foreach (var id in ids)
+            if (!AlRunner.Rad.AlObjectResolution.IsSuperseded("Report" + id, asm))
+                yield return id;
+    }
+
+    /// <summary>
+    /// The one gate both discovery paths apply to a TypeDef name: a <c>Report{id}</c> name
+    /// (numeric suffix, no leading-zero requirement beyond <c>int.TryParse</c>, id must be
+    /// positive) yields its id; anything else — including a name that merely starts with
+    /// "Report" but has a non-numeric suffix — yields nothing. Actually SHARED code (not just
+    /// parallel implementations of the same rule), called from both
+    /// <see cref="ExtractReportIds"/> (the <c>GetTypes()</c> path) and
+    /// <see cref="ScanReportIdsFromPeBytes"/> (the <c>MetadataReader</c> path, which only ever
+    /// has a name string, never a <c>Type</c>), so the two discovery mechanisms can only ever
+    /// agree or disagree on WHICH ids exist, never on what counts as one.
+    /// </summary>
+    private static bool TryParseReportId(ReadOnlySpan<char> typeName, out int id)
+    {
+        id = 0;
+        if (!typeName.StartsWith("Report", StringComparison.Ordinal)) return false;
+        return int.TryParse(typeName[6..], out id) && id > 0;
+    }
+
+    /// <summary>
+    /// Shared by both discovery paths (<see cref="CompiledReportIds"/>'s <c>GetTypes()</c>
+    /// scan and <see cref="ScanReportIdsFromPeBytes"/>'s <c>MetadataReader</c> scan) via
+    /// <see cref="TryParseReportId"/> — see that method's remarks for the shared gate.
+    /// </summary>
+    private static int[] ExtractReportIds(IEnumerable<Type?> types)
+    {
+        List<int>? ids = null;
+        foreach (var t in types)
+        {
+            if (t is null) continue; // ReflectionTypeLoadException.Types can contain nulls for the types that failed to load
+            if (!TryParseReportId(t.Name, out var id)) continue;
+            (ids ??= new List<int>()).Add(id);
+        }
+        return ids?.ToArray() ?? Array.Empty<int>();
+    }
+
+    /// <summary>
+    /// Test-only: exercises the exact same <c>GetTypes()</c> + name-gate logic
+    /// <see cref="CompiledReportIds"/> uses for one assembly, without touching the cache or
+    /// any other loaded assembly. #1852's equivalence test reads this directly instead of
+    /// diffing <see cref="KnownReportIdSet"/>'s process-wide union, which cannot isolate one
+    /// assembly's contribution once two assemblies share identical Report{id} names (a plain
+    /// <c>HashSet&lt;int&gt;</c> of ids carries no assembly provenance).
+    /// </summary>
+    internal static int[] ReadReportIdsViaGetTypesForTest(Assembly asm) => ExtractReportIds(asm.GetTypes());
+
+    /// <summary>
+    /// Core PE-byte scan behind <see cref="SeedCompiledReportIdsFromPEBytes"/> — reads
+    /// <c>Report{id}</c> TypeDef names directly from raw PE bytes via
+    /// <c>System.Reflection.Metadata</c>, no <c>Assembly.Load</c> or <c>GetTypes()</c>
+    /// involved. Returns <see langword="null"/> for an unreadable/malformed image (no
+    /// metadata, corrupt stream, ...) so the caller can distinguish "found nothing" from
+    /// "couldn't read this at all".
+    /// </summary>
+    private static int[]? ScanReportIdsFromPeBytes(byte[] peBytes)
+    {
+        try
+        {
+            using var peReader = new System.Reflection.PortableExecutable.PEReader(
+                new MemoryStream(peBytes, writable: false));
+            if (!peReader.HasMetadata) return null;
+            var mr = peReader.GetMetadataReader();
+            List<int>? ids = null;
+            foreach (var th in mr.TypeDefinitions)
+            {
+                var name = mr.GetString(mr.GetTypeDefinition(th).Name);
+                if (!TryParseReportId(name, out var id)) continue;
+                (ids ??= new List<int>()).Add(id);
+            }
+            return ids?.ToArray() ?? Array.Empty<int>();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Pre-warms <see cref="_compiledReportIdsByAssembly"/> for one just-loaded assembly
+    /// directly from its raw PE bytes — reading only the TypeDef table's Name strings, never
+    /// materializing a <c>RuntimeType</c> (no <c>Assembly.GetTypes()</c> call at all).
+    ///
+    /// WHY: measured on this repo's own boot, <c>Assembly.GetTypes()</c> over the R2R DLL
+    /// chunks DependencyLoader loads for BaseApplication/SystemApplication (Tier 1/2, tens of
+    /// thousands of types each) cost 0.7s–4.3s PER ASSEMBLY, ~17.7s total across one bundle's
+    /// six chunks — the dominant single cost in a cold spawn's engine boot. Those assemblies
+    /// are loaded via <c>Assembly.Load(byte[])</c>, so <c>asm.Location</c> is empty and
+    /// <see cref="CompiledReportIds"/> could not re-derive a file path to read metadata from
+    /// more cheaply after the fact. DependencyLoader already holds the raw bytes at load
+    /// time, so seeding here means <see cref="CompiledReportIds"/> never has to call
+    /// <c>GetTypes()</c> on these assemblies at all — same TypeDef table, same ids, just read
+    /// through the metadata-only reader instead of the CLR's full type-loading machinery.
+    ///
+    /// A malformed/unreadable image is not an error here: it just skips the pre-warm, and
+    /// <see cref="CompiledReportIds"/> falls back to its normal (slower but correct)
+    /// <c>GetTypes()</c> path for that one assembly on first ask.
+    /// </summary>
+    internal static void SeedCompiledReportIdsFromPEBytes(Assembly asm, byte[] peBytes)
+    {
+        if (_compiledReportIdsByAssembly.ContainsKey(asm)) return;
+        var ids = ScanReportIdsFromPeBytes(peBytes);
+        if (ids is null) return; // unreadable — leave unseeded, CompiledReportIds() falls back to GetTypes() lazily
+        _compiledReportIdsByAssembly[asm] = ids;
+    }
+
+    /// <summary>
+    /// Test-only: exercises the exact same PE-byte/<c>MetadataReader</c> scan
+    /// <see cref="SeedCompiledReportIdsFromPEBytes"/> uses, without touching the cache.
+    /// See <see cref="ReadReportIdsViaGetTypesForTest"/> for the counterpart on the other path.
+    /// </summary>
+    internal static int[] ReadReportIdsFromPeBytesForTest(byte[] peBytes) => ScanReportIdsFromPeBytes(peBytes) ?? Array.Empty<int>();
 
     private static IEnumerable<BcAppSymbolCache.ReportSymbol> EnumerateBcAppReportSymbols()
     {

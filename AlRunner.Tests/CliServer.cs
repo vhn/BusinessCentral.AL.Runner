@@ -32,6 +32,10 @@ public sealed class CliServer : IAsyncDisposable
 
     public int ExitCode => _process.ExitCode;
 
+    /// <summary>OS process id of the server subprocess. #1888: lets a caller correlate
+    /// phase-log rows (which carry "pid") with the exact process this handle wraps.</summary>
+    public int Pid => _process.Id;
+
     /// <summary>Captured stderr so far — surfaced in assertion messages when the protocol stalls.</summary>
     public string StdErr { get { lock (_stderr) return _stderr.ToString(); } }
 
@@ -42,7 +46,16 @@ public sealed class CliServer : IAsyncDisposable
     }
 
     /// <param name="extraArgs">Extra CLI args after --server (e.g. --cache, --package-cache).</param>
-    public static async Task<CliServer> StartAsync(IEnumerable<string>? extraArgs = null, TimeSpan? readyTimeout = null)
+    /// <param name="extraEnv">
+    /// Extra environment variables set on THIS child process only (via
+    /// <see cref="ProcessStartInfo.EnvironmentVariables"/>, never via
+    /// <see cref="Environment.SetEnvironmentVariable"/> on the current xUnit
+    /// worker process) — so a test-only knob like
+    /// AL_RUNNER_TEST_BARRIER_DIR (#1845) cannot leak into any OTHER test's
+    /// server subprocess started concurrently on a shared xUnit worker.
+    /// </param>
+    public static async Task<CliServer> StartAsync(IEnumerable<string>? extraArgs = null, TimeSpan? readyTimeout = null,
+        IReadOnlyDictionary<string, string>? extraEnv = null)
     {
         var argList = new StringBuilder(
             TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg + " --server");
@@ -61,6 +74,9 @@ public sealed class CliServer : IAsyncDisposable
             CreateNoWindow = true,
             WorkingDirectory = RepoRoot,
         };
+        if (extraEnv != null)
+            foreach (var kv in extraEnv)
+                psi.EnvironmentVariables[kv.Key] = kv.Value;
 
         var proc = Process.Start(psi)!;
 
@@ -150,6 +166,81 @@ public sealed class CliServer : IAsyncDisposable
             if (type != "test" && type != "progress") break; // single-line error/ack response
         }
         return lines;
+    }
+
+    /// <summary>
+    /// Send a <c>runTests</c> request and, the moment the FIRST <c>{"type":"test"}</c>
+    /// line lands on stdout, push a <c>{"command":"cancel"}</c> request back on stdin
+    /// (see #1641/v1 #1613-#1614). Keeps reading until the terminating
+    /// <c>{"type":"summary"}</c> line and returns the full transcript (test/summary/ack
+    /// lines, in the order the server emitted them — the ack can land interleaved with
+    /// still-streaming test lines, since it's answered by a side-channel thread
+    /// independent of the runtests handler) along with the ack line for the cancel.
+    ///
+    /// Exercises the mid-run cancel path end to end: it only proves anything if the
+    /// server's stdin-reader thread is willing to read and answer another request line
+    /// while `runtests` is still streaming on the main dispatch thread.
+    /// </summary>
+    /// <param name="onAckReceived">
+    /// Invoked synchronously exactly once, right after the cancel's ack line is
+    /// observed, before this method reads any further stdout lines. #1845:
+    /// ServerCancelTests uses this to release its test-only barrier (see
+    /// AlRunner.Infrastructure.TestBarrier) only once the ack is confirmed —
+    /// i.e. only once "cancel arrived while a run was active" is already proven,
+    /// not merely "cancel was sent".
+    /// </param>
+    public async Task<(List<string> Lines, string? AckLine)> SendRequestAndCancelAfterFirstTestAsync(
+        string jsonRequest, TimeSpan? timeout = null, Action? onAckReceived = null)
+    {
+        await _process.StandardInput.WriteLineAsync(jsonRequest);
+        await _process.StandardInput.FlushAsync();
+
+        var t = timeout ?? TimeSpan.FromSeconds(120);
+        var lines = new List<string>();
+        string? ackLine = null;
+        bool cancelSent = false;
+
+        while (true)
+        {
+            var readTask = _process.StandardOutput.ReadLineAsync();
+            var completed = await Task.WhenAny(readTask, Task.Delay(t));
+            if (completed != readTask)
+                throw new TimeoutException(
+                    $"No response within {t.TotalSeconds:F0}s to: {jsonRequest}\n--- stderr ---\n{StdErr}");
+            var line = await readTask
+                ?? throw new Exception($"Server closed stdout before completing: {jsonRequest}\n--- stderr ---\n{StdErr}");
+            lines.Add(line);
+
+            string? type = null;
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(line);
+                if (doc.RootElement.TryGetProperty("type", out var tEl))
+                    type = tEl.GetString();
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                // Tolerate a non-JSON line (should not happen) — it doesn't terminate
+                // the stream and doesn't carry an ack/summary signal we need to act on.
+            }
+
+            // Fire cancel the instant the FIRST test event is observed — proves cts
+            // already exists (OnTestComplete can only fire after HandleServerRunTests
+            // published it), so this cancel is never a "no active run yet" false noop.
+            if (!cancelSent && type == "test")
+            {
+                cancelSent = true;
+                await _process.StandardInput.WriteLineAsync("{\"command\":\"cancel\"}");
+                await _process.StandardInput.FlushAsync();
+            }
+            if (type == "ack" && cancelSent && ackLine == null)
+            {
+                ackLine = line;
+                onAckReceived?.Invoke();
+            }
+            if (type == "summary")
+                return (lines, ackLine);
+        }
     }
 
     public async Task<bool> WaitForExitAsync(TimeSpan timeout)
