@@ -293,6 +293,29 @@ public sealed class RadWorkspace
         _extensionTargets.TryGetValue(extension, out target);
 
     /// <summary>
+    /// Every extension object whose target is in <paramref name="targets"/>.
+    ///
+    /// <para>A tableextension's field, an enumextension's value, a pageextension's control and
+    /// a reportextension's column exist on the TARGET, not on the extension — so when a delta
+    /// strips the target and rebuilds it from syntax, the extension's contribution is not in
+    /// that syntax and does not come back. The extension has to be rebound from source in the
+    /// same cycle, and this is how it is found.</para>
+    ///
+    /// <para>Scanned rather than indexed on purpose: the map holds only extension objects, so
+    /// it is a small fraction of the app, and unlike a caller set it does not grow with the
+    /// call graph. An object has the extensions it has.</para>
+    /// </summary>
+    internal IReadOnlyList<RadObjectKey> ExtensionsTargeting(IEnumerable<RadObjectKey> targets)
+    {
+        var wanted = targets.ToHashSet();
+        if (wanted.Count == 0) return Array.Empty<RadObjectKey>();
+        return _extensionTargets
+            .Where(pair => wanted.Contains(pair.Value))
+            .Select(pair => pair.Key)
+            .ToArray();
+    }
+
+    /// <summary>
     /// Record the outcome of a compile: source hashes, object locations and symbol baseline.
     /// </summary>
     internal void Commit(RadWorkspaceUpdate update)

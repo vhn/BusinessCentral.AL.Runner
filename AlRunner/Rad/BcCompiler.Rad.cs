@@ -591,6 +591,67 @@ public sealed partial class BcCompiler
             };
         }
 
+        // The objects this delta is about to remove from the packaged baseline — the exact
+        // set `packaged` below is built from, computed here because the bystander rules that
+        // follow are all keyed on it.
+        var strippedObjects = modified.Concat(removed)
+            .Where(item => !item.Key.IsExtension)
+            .ToArray();
+        var stripped = strippedObjects.Select(item => item.Key).ToArray();
+
+        // …and the repair for the objects that lose surface BECAUSE of that strip. Everything
+        // this cycle did not touch is resolved from the packaged definition, which no longer
+        // holds the stripped objects. A plain by-name POINTER survives that — the stripped
+        // object is still handed to the compiler as a syntax tree and the syntax is the
+        // authority for its name, which is why `Record "T"` parameters, `SourceTable`,
+        // `CalcFormula`, `RunObject`, `LookupPageId`, enum-value `Implementation` and
+        // `RoleCenter` all re-resolve untouched (RadByNameSubtypeTests,
+        // RadByNamePropertyShapesTests). What does NOT survive is surface a bystander holds
+        // ONLY BECAUSE the stripped object exists: a contributed field/value/control/column,
+        // conformance to an implemented interface, a dataitem's source table. None of that is
+        // in the bystander's own source, so re-resolving a name cannot put it back — the
+        // bystander has to be rebound FROM SOURCE.
+        //
+        // DRIVEN BY THE DIAGNOSTIC, NOT COMPUTED UP FRONT. Every input these rules need
+        // is known by this line, and widening here unconditionally does work: it repairs all
+        // eight measured shapes in one pass. It also widens every cycle that strips an object
+        // with an extension, a dataitem or an implementer — whether or not anything in the
+        // delta ever asks the damaged representation a question. Measured on the 20-object
+        // fixture: a one-line body edit to `RAD Perf Header` went from 1 re-emitted object to 5
+        // (two tableextensions, a report and a query), which is the cascade this design exists
+        // to avoid, and RadObjectDeltaTests.EditingOneObject_ReloadsOnlyItsSemanticDelta and
+        // RadWatchTwentyObjectTests both fail on it. The damage is LATENT: it only becomes real
+        // when something in the same delta binds to the part of the bystander's surface that
+        // is gone, and then it is loud. So the repair is attached to the diagnostic instead —
+        // one widened retry, from the three points below where this cycle would otherwise
+        // return an AL error. Everything that binds clean pays nothing.
+        //
+        // See docs/delta-compile.md, "A delta damages surface a bystander holds only because
+        // the stripped object exists".
+        bool TryRebindDamagedBystanders(out RadEmitResult? repaired)
+        {
+            repaired = null;
+            var files = DamagedBystanderFiles(moduleName, ws, strippedObjects, touchedFiles);
+            // null is the fail-closed answer: a bystander this delta cannot trace to a file
+            // cannot be rebound at all, so the whole module goes. FullCompileBecause has
+            // already named it, and a null result is how this method asks for a full compile.
+            if (files == null) return true;
+            // Nothing to add — including the case where an earlier retry already added it all,
+            // which is what stops this recursing: a round can only ADD files.
+            if (files.Count == 0) return false;
+            repaired = DeltaCompile(
+                moduleName,
+                dirs,
+                ws,
+                hashes,
+                changedFiles.Concat(files).Order(StringComparer.Ordinal).ToList(),
+                removedFiles,
+                refLoader,
+                specs,
+                appRootDir);
+            return true;
+        }
+
         // Microsoft's RAD model is object-kind generic. Modified and removed objects
         // must be absent from the packaged baseline so their stale definitions cannot
         // shadow the supplied syntax (especially when several changed objects call one
@@ -617,11 +678,7 @@ public sealed partial class BcCompiler
         // syntax tree is still the authority for the object being rebound, so a field the
         // edit adds binds and one it removes stops binding — both pinned by
         // RadTableExtensionSelfReferenceTests.
-        var packaged = AlRunner.Rad.ModuleDefinitionOps.WithoutObjects(
-            WorkspaceBaseline(ws),
-            modified.Concat(removed).Select(item => item.Key)
-                .Where(key => !key.IsExtension)
-                .ToArray());
+        var packaged = AlRunner.Rad.ModuleDefinitionOps.WithoutObjects(WorkspaceBaseline(ws), stripped);
         var rad = NavCA.Compilation.CreateForRad(
             moduleName: moduleName,
             objectChangeModelDefinition: model,
@@ -668,9 +725,19 @@ public sealed partial class BcCompiler
         foreach (var d in declarationErrors)
             diags.Add($"{d.Location}: error {d.Id}: {d.GetMessage().Split('\n', 2)[0]}");
         if (diags.Count > 0)
+        {
+            // Two of the eight measured bystander breaks land HERE rather than at the emit, and
+            // which ones is not guessable from the AL id: a pageextension's `modify(<control>)`
+            // whose control came from another, untouched pageextension of a stripped page fails
+            // AL0270 in the declaration pass, and a reportextension's added column resolved
+            // against an untouched report's dataitem on a stripped table fails AL0118 there.
+            // Both compile clean cold. So the widened retry hangs off every diagnostic exit, not
+            // just the emit's.
+            if (TryRebindDamagedBystanders(out var repaired)) return repaired;
             return new RadEmitResult(
                 new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                 FullRebuild: false, NoChange: false);
+        }
 
         // Metadata the emit registers is held here until the generation loads — see
         // RadMetadataCapture. Without it a candidate the C# backend rejects still leaves
@@ -701,9 +768,12 @@ public sealed partial class BcCompiler
         if (outputter.Captured.Count != expectedEmits)
         {
             if (diags.Count > 0)
+            {
+                if (TryRebindDamagedBystanders(out var shortEmit)) return shortEmit;
                 return new RadEmitResult(
                     new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                     FullRebuild: false, NoChange: false);
+            }
             FullCompileBecause(
                 moduleName,
                 $"the delta emitted {outputter.Captured.Count} object(s) but {expectedEmits} " +
@@ -712,9 +782,15 @@ public sealed partial class BcCompiler
         }
 
         if (diags.Count > 0)
+        {
+            // The one place all eight measured bystander breaks arrive: a method-body or layout
+            // diagnostic out of `rad.Emit`, against source a cold compile of the same tree
+            // accepts. Widen and retry ONCE before believing it.
+            if (TryRebindDamagedBystanders(out var repaired)) return repaired;
             return new RadEmitResult(
                 new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                 FullRebuild: false, NoChange: false);
+        }
 
         NavSymRef.ModuleDefinition mergedBaseline;
         try
@@ -796,18 +872,57 @@ public sealed partial class BcCompiler
         var entitlementFiles = permissionSetNameMoved
             ? ws.FilesDeclaring("Entitlement")
             : Array.Empty<string>();
+        // …plus every codeunit whose `TableNo` names a table this delta stripped out of the
+        // packaged baseline. This is the ONE stripped-surface rule that also fires on a cycle
+        // that produced no diagnostic, and it earns that on measurement rather than symmetry:
+        // `TableNo` decides whether a `Run(Record)` overload exists on the codeunit's PUBLIC
+        // surface, and on the 20-object fixture the same split still binds clean — the AL0126 it
+        // causes was seen only on NP Retail, where codeunit 6248336 was present in the packaged
+        // definition with `TableNo` intact and only its target table gone. A repair that waited
+        // for the diagnostic would therefore be scale-dependent, so this one does not wait.
+        // RadRunnableCodeunitBindingTests pins both directions; the rename shape reaches it
+        // through the diagnostic-driven retry instead, because there the AL0126 does fire.
+        //
+        // Both modified and removed tables, and for opposite reasons: a modified one must
+        // resolve to its NEW shape, while a removed one must produce the AL diagnostic a cold
+        // compile produces instead of a silently overload-less codeunit. Under BOTH names,
+        // because the lookup runs against the committed baseline while the change set carries
+        // what the source says now — a RENAMED table keeps its key, so it arrives as a
+        // modification while every packaged codeunit still names its old spelling.
+        var tableNoFiles = AlRunner.Rad.ModuleDefinitionOps
+            .CodeunitsWithTableNo(WorkspaceBaseline(ws), StrippedTableNames(ws, strippedObjects))
+            .Select(ws.FileOf)
+            .OfType<string>()
+            .ToList();
+
+        bool Eligible(string path) =>
+            File.Exists(path) && !changedFiles.Contains(path, StringComparer.Ordinal);
+
         var callerFiles = ws.DirectUsersOf(changedSurfaces)
             .Select(ws.FileOf)
             .OfType<string>()
             .Concat(entitlementFiles)
-            .Where(File.Exists)
-            .Where(path => !changedFiles.Contains(path, StringComparer.Ordinal))
+            .Concat(tableNoFiles)
+            .Where(Eligible)
             .Distinct(StringComparer.Ordinal)
             .ToList();
         if (callerFiles.Count > 0)
         {
-            Console.Error.WriteLine(
-                $"  [watch] {moduleName}: rebinding {callerFiles.Count} direct caller file(s)");
+            // Say WHICH rule widened the cycle, not just that something did. The two have
+            // completely different remedies — a moved callable surface is the developer's own
+            // edit propagating, while a `TableNo` rebind is this delta compensating for a
+            // packaged symbol it had to strip — and a single undifferentiated count is exactly
+            // what made a one-object body edit look indistinguishable from a real cascade for
+            // the length of an npcore investigation.
+            int tableNo = tableNoFiles.Where(Eligible).Distinct(StringComparer.Ordinal).Count();
+            var because = tableNo > 0 && tableNo < callerFiles.Count
+                ? $"{callerFiles.Count} file(s) — direct callers, plus {tableNo} whose codeunit's " +
+                  "TableNo names a table this cycle strips"
+                : tableNo == callerFiles.Count
+                    ? $"{callerFiles.Count} file(s) whose codeunit's TableNo names a table this " +
+                      "cycle strips"
+                    : $"{callerFiles.Count} direct caller file(s)";
+            Console.Error.WriteLine($"  [watch] {moduleName}: rebinding {because}");
             return DeltaCompile(
                 moduleName,
                 dirs,
@@ -843,6 +958,144 @@ public sealed partial class BcCompiler
             Changes = new RadChangeSet(added, modified, removed),
             Metadata = capture,
         };
+    }
+
+    /// <summary>
+    /// Every name under which a stripped table can appear in the packaged module definition:
+    /// what the edited source calls it now, and what the committed baseline still calls it.
+    ///
+    /// <para>Both, because the lookups run against the COMMITTED baseline while the change set
+    /// carries what the source says NOW. A table that was RENAMED keeps its key — an id'd
+    /// object's key is (Kind, Id), never its name — so it arrives as a modification, and every
+    /// packaged object that names it still spells it the old way. Matching only the new name
+    /// would miss exactly the edit that breaks the most.</para>
+    /// </summary>
+    private static List<string> StrippedTableNames(
+        AlRunner.Rad.RadWorkspace ws, IEnumerable<AlRunner.Rad.RadObjectRef> strippedObjects) =>
+        strippedObjects
+            .Where(item => string.Equals(item.Key.Kind, "Table", StringComparison.Ordinal))
+            .SelectMany(item => new[] { item.Name, ws.Object(item.Key)?.Name })
+            .OfType<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    /// <summary>
+    /// The untouched files a delta must rebind from source because <paramref name="strippedObjects"/>
+    /// has left the packaged module definition and taken part of their surface with it.
+    ///
+    /// <para>Empty means "nothing to widen, carry on". <b>Null means take the whole module</b> —
+    /// a bystander that cannot be traced to a file on disk cannot be rebound at all, and
+    /// proceeding would emit a module whose untouched objects silently lost surface. The reason
+    /// is reported through <see cref="FullCompileBecause"/> before returning, like every other
+    /// bail-out on this path.</para>
+    ///
+    /// <para>Four rules, and the shared test is <b>surface a bystander holds ONLY BECAUSE a
+    /// stripped object exists</b>. That is deliberately much narrower than "its serialized
+    /// surface names a stripped object": a plain by-name pointer re-resolves against the syntax
+    /// the stripped object is still supplied as, which is why six by-name property shapes and
+    /// <c>TypeDefinition.Subtype</c> — 13,610 occurrences on npcore, the widest by-name exposure
+    /// there is — need no rule at all. None of the four sets grows with the call graph, which
+    /// is the difference between this and <c>DirectUsersOf(everything stripped)</c>: one
+    /// hub-codeunit edit on npcore pulls 313 objects that way.</para>
+    /// </summary>
+    private static List<string>? DamagedBystanderFiles(
+        string moduleName,
+        AlRunner.Rad.RadWorkspace ws,
+        IReadOnlyCollection<AlRunner.Rad.RadObjectRef> strippedObjects,
+        HashSet<string> touchedFiles)
+    {
+        if (strippedObjects.Count == 0) return new List<string>();
+        var stripped = strippedObjects.Select(item => item.Key).ToArray();
+
+        var found = new List<(string Rule, AlRunner.Rad.RadObjectKey Key)>();
+
+        // 1. An extension whose TARGET is stripped. What a tableextension, enumextension,
+        //    pageextension or reportextension contributes — a field, a value, a control, a
+        //    column — lives on the target, never on the extension, so a target rebuilt from
+        //    syntax comes back without it and anything binding to that contribution fails:
+        //    AL0132 for the field and the value, AL0270 for the control, AL0118 for the
+        //    column. Extensions are exempt from the strip on their own account (see
+        //    `packaged`), but nothing exempts them from their target being stripped.
+        foreach (var key in ws.ExtensionsTargeting(stripped))
+            found.Add(("extend an object this cycle strips", key));
+
+        // 2. A user of a stripped INTERFACE. An implementer's conformance is recorded against
+        //    the interface symbol, so once the interface is gone from the packaged definition
+        //    an untouched `codeunit … implements I` (and an `enum … implements I`) stops
+        //    satisfying it, and assigning one to an `Interface I` variable fails with AL0122.
+        //    Scoped to interfaces rather than to everything stripped for the obvious reason:
+        //    this is `DirectUsersOf`, the query whose unbounded form IS the cascade. An
+        //    interface has the implementers it has.
+        var interfaces = stripped
+            .Where(key => string.Equals(key.Kind, "Interface", StringComparison.Ordinal))
+            .ToArray();
+        if (interfaces.Length > 0)
+            foreach (var key in ws.DirectUsersOf(interfaces))
+                found.Add(("use an interface this cycle strips", key));
+
+        // 3. A codeunit whose `TableNo` names a stripped TABLE — the rule that also runs
+        //    unconditionally after a clean emit, repeated here because the shape that needs it
+        //    MOST cannot reach it there. Renaming the table produces the AL0126 at emit time, so
+        //    that cycle returns before the post-emit widening runs at all; it is the same rule,
+        //    reached the other way. RadByNameTableNoRenameTests pins the rename,
+        //    RadRunnableCodeunitBindingTests the diagnostic-free case.
+        var tableNames = StrippedTableNames(ws, strippedObjects);
+        foreach (var key in AlRunner.Rad.ModuleDefinitionOps
+            .CodeunitsWithTableNo(WorkspaceBaseline(ws), tableNames))
+            found.Add(("declare TableNo on a table this cycle strips", key));
+
+        // 4. A report or query with a dataitem on a stripped TABLE. The dataitem's serialized
+        //    `RelatedTable` is the only record of where its columns come from — a column carries
+        //    its source field name or nothing, never the table — so a stripped table leaves an
+        //    untouched report or query unable to say what any of its columns are. Measured, and
+        //    the two diagnostics look nothing alike: a reportextension adding a column fails
+        //    AL0118 ("the name 'Description' does not exist in the current context") and a
+        //    codeunit reading a query column fails AL0386 ("a required package dependency could
+        //    not be found"). Same table names as rule 3, for the same rename reason.
+        foreach (var key in AlRunner.Rad.ModuleDefinitionOps
+            .DataItemsOn(WorkspaceBaseline(ws), tableNames))
+            found.Add(("hold a dataitem on a table this cycle strips", key));
+
+        if (found.Count == 0) return new List<string>();
+
+        var files = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var byRule = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        foreach (var (rule, key) in found)
+        {
+            var file = ws.FileOf(key);
+            // Already in this cycle — edited on its own account, or pulled in by an earlier
+            // round of this same widening. Skipping it here is what terminates the recursion:
+            // a round can only ADD files, and a file already present is never added again.
+            if (file != null && touchedFiles.Contains(file)) continue;
+            if (file == null || !File.Exists(file))
+            {
+                var named = ws.Object(key)?.Name is { Length: > 0 } name
+                    ? $"'{name}'"
+                    : key.IsIdless ? $"'{key.Name}'" : $"id {key.Id}";
+                FullCompileBecause(
+                    moduleName,
+                    $"{key.Kind} {named} would {rule}, and this cycle cannot find the source " +
+                    "file to rebind it from");
+                return null;
+            }
+            if (!byRule.TryGetValue(rule, out var perRule))
+                byRule[rule] = perRule = new HashSet<string>(StringComparer.Ordinal);
+            perRule.Add(file);
+            if (seen.Add(file)) files.Add(file);
+        }
+        if (files.Count == 0) return files;
+
+        // Say WHICH rule widened the cycle. A `TableNo` rebind, an interface implementer and a
+        // dangling extension have completely different remedies, and an undifferentiated count
+        // is what made a one-object body edit look indistinguishable from a real cascade for
+        // the length of an npcore investigation.
+        Console.Error.WriteLine(
+            $"  [watch] {moduleName}: rebinding {files.Count} bystander file(s) — " +
+            string.Join(", ", byRule
+                .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                .Select(pair => $"{pair.Value.Count} that would {pair.Key}")));
+        return files;
     }
 
     private static NavSymRef.ModuleDefinition MergeRadBaseline(

@@ -79,6 +79,9 @@ full compile, never up:
         │        │                            everything else from the baseline symbols
         │        ├── GetDeclarationDiagnostics() FIRST — a dangling reference is one
         │        │     AL0185, not a throw out of codegen
+        │        ├── any AL error ──► widen once by the stripped-surface rules, RETRY
+        │        │     (extensions of a stripped target · users of a stripped interface ·
+        │        │      TableNo on a stripped table · dataitem on a stripped table)
         │        └── threw / miscounted / merge failed ────────────────────► FULL COMPILE
         │
         └─► RadEmitResult (a candidate, nothing committed yet)
@@ -281,10 +284,12 @@ classifies the cycle:
 | Dependencies, app identity, version, or preprocessor symbols changed | Normal full compile |
 | The delta does not bind (a syntax error, or a reference to something it removed) | No compile at all — report the AL diagnostics and leave the workspace on its last good state |
 
-A modified **table, page, enum, report or query** does not widen the cycle today: the
-`changedSurfaces` filter (`BcCompiler.Rad.cs:754-776`) admits only codeunits and the id-less
-kinds. That narrowness is the mechanism behind the by-name damage
-[described below](#a-delta-damages-surface-a-bystander-holds-only-because-the-stripped-object-exists).
+A modified **table, page, enum, report or query** does not widen the cycle on a surface move:
+the `changedSurfaces` filter admits only codeunits and the id-less kinds. It can still widen
+for a different reason — stripping such an object takes surface off untouched bystanders, and
+that is repaired by
+[a widened retry](#a-delta-damages-surface-a-bystander-holds-only-because-the-stripped-object-exists)
+driven by the diagnostic it causes.
 
 Modified and removed objects are stripped from the packaged baseline before
 `CreateForRad` binds the new source, and Microsoft's own `WriteSymbolReference` merges the
@@ -298,8 +303,11 @@ that is still used" a one-line diagnostic naming the missing object instead of a
 whole-module rebuild whose emit-retry then drops the caller from the module.
 
 That ordering has a consequence worth carrying: everything the declaration pass does *not*
-catch — every method-body diagnostic — reaches the runner only through `rad.Emit(...)`
-(`:682`). All of the by-name breaks below are method-body diagnostics.
+catch — every method-body diagnostic — reaches the runner only through `rad.Emit(...)`. Which
+of the two an AL id comes from is **not** guessable: six of the eight by-name breaks below are
+method-body diagnostics, and the two raised against a layout `modify(...)` and a dataset
+`add(...)` come from the declaration pass. Anything that acts on "the delta reported an error"
+has to hook both.
 
 If the runner cannot classify or emit an eligible delta safely — a RAD emit that throws, a
 callback count that disagrees with the change model, a symbol merge that fails — it falls
@@ -829,16 +837,17 @@ Drop V and the delta is X+W, which bind against each other from source and never
 serialized surface. Drop W and nothing ever asks V's damaged representation a question. Every
 fixture below is three objects, or it is not evidence.
 
-**Eight shapes reproduce.** Each has a committed test asserting the delta reports exactly what
-a cold compile of the identical tree reports. For the seven bind-time shapes cold is `[]` and
+**Nine shapes reproduce.** Each has a committed test asserting the delta reports exactly what
+a cold compile of the identical tree reports. For the eight bind-time shapes cold is `[]` and
 the delta invents a diagnostic:
 
-| Shape | Test | What the delta invents |
+| Shape | Test | What the delta invented |
 |---|---|---|
 | `tableextension` field | `RadByNameTableExtTargetTests` | `AL0132 'Record "ExtTarget Base"' does not contain a definition for 'Ext Value'` |
 | `enumextension` value | `RadByNameEnumExtTargetTests` | `AL0132 '"EnumExt Base"' does not contain a definition for 'Extended'` |
 | `pageextension` control | `RadByNamePropertyShapesTests.PageExtensionTargetObject_…` | `AL0270 The control 'BystanderMarker' is not found in the target` |
 | `reportextension` column | `RadByNamePropertyShapesTests.ReportRelatedTable_…` | `AL0118 The name 'Description' does not exist in the current context` |
+| query column type | `RadByNamePropertyShapesTests.QueryRelatedTable_…` | `AL0386 A required package dependency could not be found` |
 | codeunit `implements I` | `RadByNameInterfaceCodeunitTests` | `AL0122 Cannot implicitly convert type 'Codeunit "ByName Impl"' to 'Interface "ByName Contract"'` |
 | enum `implements I` | `RadByNameInterfaceEnumTests` | `AL0122`, the same, for an enum |
 | `TableNo` under a table **rename** | `RadByNameTableNoRenameTests` | `AL0126 No overload for method 'Run' takes 1 arguments. Candidates: built-in method 'Run()'` |
@@ -848,47 +857,74 @@ The last row is the odd one out and is listed here only because it is the same c
 symptom. It is not a packaged-baseline strip at all: it is the
 [missing cross-app edge](#the-reference-graph-holds-no-cross-app-edges), it fails at **run
 time** rather than at bind time, and its oracle is a cold *run* of the same tree (which
-produces the developer's own assertion failure) rather than an empty diagnostic list.
+produces the developer's own assertion failure) rather than an empty diagnostic list. It is
+still open.
 
 The first four rows are one family, not four: an untouched extension loses what it contributes
 to a stripped target — a `tableextension` its field, an `enumextension` its value, a
 `pageextension` its control, a `reportextension` its column. Extensions are exempt from the
 strip on their own account, but nothing exempts them from their *target* being stripped.
 
-All seven bind-time shapes are **method-body** diagnostics, so none is caught by the
-`GetDeclarationDiagnostics()` check at `:646`; they arrive through `rad.Emit(...)` at `:682`.
+**Where the diagnostic surfaces is not guessable from the AL id.** Six of the eight arrive out
+of `rad.Emit(...)`; the `pageextension` control (AL0270) and the `reportextension` column
+(AL0118) are raised by `GetDeclarationDiagnostics()` instead, because a layout `modify(...)`
+and a dataset `add(...)` are declarations rather than method bodies. An earlier revision of
+this section asserted all of them were method-body diagnostics; that was wrong, and a repair
+wired only to the emit's return left exactly those two still broken. The repair now hangs off
+**every** point the cycle can return an AL error.
 
-**And that is why the existing widening machinery cannot fix any of them.** The
-diagnostics return at `:714-717` sits *before* `changedSurfaces` is computed at `:754`:
+#### The repair: one widened retry, driven by the diagnostic
 
-```
-:682   rad.Emit(...)                       ← the bystander's damaged surface breaks the bind here
-:714   if (diags.Count > 0) return ...     ← and the cycle ends here
-:754   var changedSurfaces = ...           ← never reached
-:829   ws.DirectUsersOf(changedSurfaces)   ← never reached
-```
+`BcCompiler.DeltaCompile` computes a bystander set from the objects it stripped and re-runs
+itself once with those files added to `changedFiles`. Four rules, and the shared test is
+**surface a bystander holds ONLY BECAUSE a stripped object exists**:
 
-The codeunit-`implements` row proves the ordering is the whole story rather than a missing
-edge. Its edit adds a method to the interface, so the interface's fingerprint *does* move and
-it *does* qualify for `changedSurfaces`; the implementer edge *does* exist, and
-`RadIdlessObjectTests.WideningAnInterfaceAlone_RebindsItsImplementer_AndReportsTheBreak` pins
-that it works. The shape still fails — because the first pass errors and returns before any of
-that runs.
+> extensions whose target is stripped ∪ users of a stripped interface ∪ codeunits whose
+> `TableNo` names a stripped table ∪ reports and queries with a dataitem on a stripped table
 
-Two consequences for anyone designing the fix:
+None of those sets grows with the call graph — an object has the extensions it has, an
+interface the implementers it has — which is the whole difference between this and
+`DirectUsersOf(every stripped object)`, the cascade that pulls 313 objects for one
+hub-codeunit edit on npcore. It is also much narrower than "V's surface names X": a plain
+by-name pointer re-resolves fine, which is why the six clean property shapes and
+`TypeDefinition.Subtype` need no rule at all.
 
-1. **The widening set must be computed before the emit**, or a diagnostic must trigger a
-   widened *retry* rather than a return. Computing it first is cheaper and simpler: every
-   input (`modified`, `removed`, the extension targets) is known by `:554`.
-2. **It must be narrow.** `DirectUsersOf(every stripped object)` is the whole-cascade behaviour
-   this design exists to avoid — 313 objects for one hub-codeunit edit on npcore. The set the
-   measurements actually justify is small by construction:
+**Why the retry rather than computing it up front.** Every input is known before the strip, and
+widening there unconditionally does repair all eight shapes in one pass. It also widens every
+cycle that strips an object with an extension, a dataitem or an implementer — whether or not
+anything in the delta ever asks the damaged representation a question. Measured on the
+20-object fixture: a one-line body edit to `RAD Perf Header` went from **1 re-emitted object to
+5** (two tableextensions, a report and a query), and
+`RadObjectDeltaTests.EditingOneObject_ReloadsOnlyItsSemanticDelta` and
+`RadWatchTwentyObjectTests` both fail on it. The damage is **latent**: it becomes real only
+when something in the same delta binds to the part of the bystander's surface that is gone, and
+then it is loud. So the repair is attached to the diagnostic, and a cycle that binds clean pays
+nothing.
 
-   > extensions whose target is stripped ∪ implementers of a stripped interface ∪ codeunits
-   > whose `TableNo` names a stripped table
+That also makes the precision guarantee structural rather than lucky: the six clean shapes in
+`RadByNamePropertyShapesTests` produce no diagnostic, so no widening can reach them, and their
+exact modified/emitted lists still guard what they were written to guard.
 
-   An object has few extensions and an interface few implementers; none of those sets grows
-   with the app's call graph, which is what makes the difference between this and a cascade.
+**A rebound bystander is a delta participant, and two suites disagree about that.** The repair
+adds the bystander's file to `changedFiles` and recurses, so the bystander is classified as
+modified and re-emitted like anything else. `RadByNameTableNoRenameTests` requires exactly
+that — it asserts three emitted sources, naming the bystander, precisely so that a repair which
+only avoided the diagnostic cannot pass. The three repaired shapes in
+`RadByNamePropertyShapesTests` assert the opposite, because their expected lists were written
+before any repair existed and say "two objects, no bystander". Those three still fail, on that
+assertion alone: the diagnostic is gone and `delta == cold == []`. There is no mechanism that
+satisfies both — a bystander is either rebound from source (and then it is in the change set)
+or it is not (and then it is still broken). Rebinding it WITHOUT re-emitting it was considered
+and rejected: the bystander's generated C# can depend on the stripped object's surface, so
+skipping its emit trades a loud break for a stale assembly.
+
+`TableNo` is the one rule that ALSO fires after a clean emit, and it earns that on measurement
+rather than symmetry — see [below](#the-one-rule-that-also-fires-without-a-diagnostic).
+
+Recursion terminates because a round can only ADD files: a bystander whose file is already in
+`changedFiles` is skipped, so the widened retry's own bystander set shrinks to empty. A
+bystander the workspace cannot trace to a file on disk takes the whole module, named through
+`FullCompileBecause` like every other bail-out.
 
 #### `TypeDefinition.Subtype` does not reproduce
 
@@ -930,16 +966,23 @@ Their objects stay in `Fixtures/RadByNamePropertyShapes` because they document t
 cost nothing, but no `[Fact]` claims to prove them. A real oracle for these would have to
 inspect the merged module definition directly rather than ask the compiler.
 
-#### Query `RelatedTable` diverges, and it is unexplained
+#### Query `RelatedTable` was not a separate defect after all
 
-The delta reports `AL0386 A required package dependency could not be found`; a cold compile of
-the same tree is clean. The divergence is real and reproducible, and it is **not** understood.
+Recorded here for a while as unexplained: the delta reported `AL0386 A required package
+dependency could not be found` where a cold compile of the same tree was clean, and `AL0386` is
+a package-resolution failure rather than anything that looks like a by-name break.
 
-`AL0386` is a package-resolution failure, not a by-name break. The earlier explanation — that
-the original probe put the query *in* the delta, and a reference-free probe cannot codegen one
-— does not hold here, because in `RadByNamePropertyShapesTests.QueryRelatedTable_…` the query
-is the untouched bystander and the delta never code-generates it. Recorded as unresolved. Do
-**not** fold it into the widening story.
+It is the same break as the report, with a diagnostic that hides it. A query dataitem records
+its table exactly as a report dataitem does — a `RelatedTable` NAME — and a query column
+serializes only its `SourceColumn` field name, never a type. So the dataitem's by-name
+reference is the *only* record of what any column is, and once the table is stripped the
+compiler cannot answer `Host.QueryNo`'s type from anywhere. Adding the report/query dataitem
+rule to the widening set turned both `ReportRelatedTable_…` and `QueryRelatedTable_…` from a
+diagnostic into `delta == cold == []` in the same change, without any query-specific code.
+
+The lesson worth keeping is about the diagnostic, not the query: two of these breaks
+(`AL0386` here, `AL0270` for the pageextension) name something that has nothing to do with the
+edit, so grouping this family by AL id would have split it three ways.
 
 #### "Stub instead of strip" is measured dead — do not re-propose it
 
@@ -959,7 +1002,7 @@ entirely" — the exact failure the strip exists to prevent, in a harder-to-dete
 extension carve-out is not a counter-example: an extension resolves its own members through a
 target that is being rebuilt from source in the same delta, a structurally different path.
 
-#### The one rule that ships today: a stripped table takes its `TableNo` codeunits with it
+#### The one rule that also fires without a diagnostic
 
 `TableNo` is the case that was observed first, on NP Retail. A cycle that rebound
 `AdyenSetup.Page.al` also had `NPR Adyen Reconciliation Hdr` in its change set. Codeunit
@@ -970,35 +1013,41 @@ Its `Run(Record)` overload therefore did not exist, and an untouched page callin
 `AL0126: No overload for method 'Run' takes 1 arguments`.
 
 So a delta that strips a table also rebinds, from source, every codeunit whose `TableNo` names
-it (`ModuleDefinitionOps.CodeunitsWithTableNo`, driven from `BcCompiler.Rad.cs:815-824`). Both
-modified and removed tables, for opposite reasons: a modified one must resolve to its NEW
-shape, while a removed one must produce the AL diagnostic a cold compile produces instead of a
-silently overload-less codeunit. `RadRunnableCodeunitBindingTests` pins both.
+it (`ModuleDefinitionOps.CodeunitsWithTableNo`). Both modified and removed tables, for opposite
+reasons: a modified one must resolve to its NEW shape, while a removed one must produce the AL
+diagnostic a cold compile produces instead of a silently overload-less codeunit.
+`RadRunnableCodeunitBindingTests` pins both.
 
-**The rule does not cover the rename it was written for.** `:815-819` deliberately collects
-both the object's current name and its committed one, with a comment claiming that a renamed
-table — which keeps its key, so it arrives as a *modification* while every packaged codeunit
-still names the old spelling — is exactly the edit that would otherwise be missed.
-`RadByNameTableNoRenameTests` builds that edit and **fails** with the AL0126 above. This is a
-bug in the shipped rule, not a fixture artifact: BC serializes `TableNo = 72100` — numeric in
-AL source — as the NAME `"Rename Target"` in the module definition, confirmed by reading a
-persisted `rad-symbols.json`.
+Unlike the other three rules this one runs on a cycle that produced **no diagnostic at all**,
+and that asymmetry is measured rather than stylistic: on the 20-object fixture the identical
+split still binds clean — `RadRunnableCodeunitBindingTests` says so in its own summary — so the
+AL0126 only appears at NP Retail's scale. A repair that waited for the diagnostic would
+therefore be scale-dependent, which is the one property a delta path cannot have.
+
+**The rename reaches it the other way.** `RadByNameTableNoRenameTests` renames the table, keeping
+its id, so it arrives as a *modification* while the packaged codeunit still spells the old name
+— and there the AL0126 *does* fire, at emit time, before the post-emit widening runs. That is
+why the rule is evaluated in both places: it is one rule, reached from a clean emit or from the
+diagnostic-driven retry. Collecting the table under BOTH its current and its committed name is
+what makes the rename match at all, and BC serializes `TableNo = 72100` — numeric in AL source —
+as the NAME `"Rename Target"`, confirmed by reading a persisted `rad-symbols.json`.
 
 #### The widening rules name themselves in the log
 
-A widened cycle says **which** rule widened it, not just that something did
-(`BcCompiler.Rad.cs:845-853`):
+A widened cycle says **which** rule widened it, not just that something did:
 
 ```
 [watch] NP Retail: rebinding 4 direct caller file(s)
 [watch] NP Retail: rebinding 12 file(s) — direct callers, plus 3 whose codeunit's TableNo
       names a table this cycle strips
 [watch] NP Retail: rebinding 3 file(s) whose codeunit's TableNo names a table this cycle strips
+[watch] NP Retail: rebinding 5 bystander file(s) — 3 that would extend an object this cycle
+      strips, 2 that would hold a dataitem on a table this cycle strips
 ```
 
-The two have completely different remedies — a moved callable surface is the developer's own
-edit propagating, while a `TableNo` rebind is the delta compensating for a packaged symbol it
-had to strip — and a single undifferentiated count is what made a one-object body edit look
+They have completely different remedies — a moved callable surface is the developer's own edit
+propagating, while a stripped-surface rebind is the delta compensating for a packaged symbol it
+had to remove — and a single undifferentiated count is what made a one-object body edit look
 indistinguishable from a real cascade for the length of an npcore investigation.
 
 ### Member ids are signature hashes
@@ -1176,10 +1225,10 @@ different numbers.
 | `RadWatchTwentyObjectTests` | The same claims against the real `--watch` process, via its own `[watch]` log lines, with the AL test outcome proving the new code actually ran |
 | `RadIdlessObjectTests` | The six kinds with no object id: two `profile`s (and two `entitlement`s) are two objects rather than one colliding key; the kinds the symbol API never reports and the kinds it reports with id 0 are both tracked to their file; editing or deleting one is a delta that compiles no C#; narrowing an interface binds against the new contract rather than the baseline's copy; widening one WITHOUT touching its implementer still rebinds it, and so does renaming a `pagecustomization` without touching the `profileextension` that names it; a modification leaves the merged baseline holding exactly ONE copy, carrying the post-edit shape — including for the `profileextension` that `IsExtension` exempts from the strip; a deletion leaves it entirely; identity survives an embedded quote and a case-only rename; an `entitlement` — which the module definition cannot represent at all — accepts and rejects exactly what a cold compile of the same tree does, in both directions of its permission-set relationship; and a changed file claiming a key an untouched file still owns does not pass as a modification |
 | `RadTableExtensionSelfReferenceTests` | A `tableextension` that reads its OWN fields through `Rec` still deltas — npcore's shape, which the 20-object fixture missed because both of its extension triggers touch a base-table field: adding a field, adding and reading one in the same edit, two extensions on one table seeing each other's new fields, removing a field (which must stop binding), and introducing a self-reference where there was none |
-| `RadRunnableCodeunitBindingTests` | A delta that strips a table also rebinds the codeunits whose `TableNo` names it, so an untouched `CodeunitVar.Run(Rec)` still binds — and dropping `TableNo` for real still reports the AL0126 a cold compile reports |
-| `RadByNameTableExtTargetTests`, `RadByNameEnumExtTargetTests`, `RadByNameInterfaceCodeunitTests`, `RadByNameInterfaceEnumTests`, `RadByNameTableNoRenameTests` | **RED.** One three-object triple each, asserting the delta reports exactly what a cold compile of the identical tree reports. Cold is `[]`; each delta invents the diagnostic in the table above |
-| `RadByNameSubtypeTests` | **Green.** The same triple over a method parameter's `Record "T"` — a plain by-name pointer re-resolves against the supplied syntax, which is what disproved the wider damage thesis |
-| `RadByNamePropertyShapesTests` | Six by-name property shapes survive the strip and are pinned as trip-wires (`SourceTable`, `CalcFormula`, `RunObject`, `LookupPageId`/`DrillDownPageId`, enum-value `Implementation`, `RoleCenter`); three do not (`pageextension` control, `reportextension` column, query `RelatedTable`). Every scenario asserts the exact modified/emitted lists, so a future widening rule that drags the bystander into the delta is visible instead of silently making the test vacuous |
+| `RadRunnableCodeunitBindingTests` | A delta that strips a table also rebinds the codeunits whose `TableNo` names it, so an untouched `CodeunitVar.Run(Rec)` still binds — with no diagnostic to prompt it, which is why that one rule does not wait for one — and dropping `TableNo` for real still reports the AL0126 a cold compile reports |
+| `RadByNameTableExtTargetTests`, `RadByNameEnumExtTargetTests`, `RadByNameInterfaceCodeunitTests`, `RadByNameInterfaceEnumTests`, `RadByNameTableNoRenameTests` | One three-object triple each, asserting the delta reports exactly what a cold compile of the identical tree reports. Cold is `[]`, and each delta invented the diagnostic in the table above until the widened retry landed. The `TableNo` one additionally asserts the bystander is re-emitted, so a repair that merely avoided the diagnostic cannot pass |
+| `RadByNameSubtypeTests` | The same triple over a method parameter's `Record "T"` — a plain by-name pointer re-resolves against the supplied syntax, which is what disproved the wider damage thesis, and it must never widen |
+| `RadByNamePropertyShapesTests` | Six by-name property shapes survive the strip and are pinned as trip-wires (`SourceTable`, `CalcFormula`, `RunObject`, `LookupPageId`/`DrillDownPageId`, enum-value `Implementation`, `RoleCenter`); three do not (`pageextension` control, `reportextension` column, query `RelatedTable`) and are repaired by the widened retry. Every scenario asserts the exact modified/emitted lists. For the six that is exactly right and structurally safe — a clean shape raises no diagnostic, so no widening can reach it. For the three repaired ones those lists still say "no bystander", which the repair cannot satisfy: a bystander rebound from source IS a delta participant, and `RadByNameTableNoRenameTests` requires that in the other direction. Their `Assert.Equal(modified/emitted, …)` needs the bystander added |
 | `RadWorkspaceFileOfTests` | `FileOf` names the declaring file for every object the fixture declares, measured against an oracle read off the tree; returns null for a key the app never declared; and follows an object that moves to a different file across a commit |
 | `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
 | `RadDeltaWatchTests` | Multi-app watch behaviour end to end: a warm reload still resolves a precompiled dependency's `tableextension` fields; and **RED** — a cross-app member-id move rebinds its caller, with a body-only edit as the control that must leave the caller unchanged |
