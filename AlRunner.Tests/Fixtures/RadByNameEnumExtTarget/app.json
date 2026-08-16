@@ -1,0 +1,11 @@
+{
+  "id": "b1000000-0000-4000-8000-000000000013",
+  "name": "RAD ByName EnumExt Target",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [{ "from": 72080, "to": 72099 }],
+  "dependencies": []
+}
