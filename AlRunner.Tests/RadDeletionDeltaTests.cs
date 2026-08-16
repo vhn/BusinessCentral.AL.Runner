@@ -120,7 +120,7 @@ public sealed class RadDeletionDeltaTests(BcEngineFixture engine)
             ]);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(Deletions))]
     public void DeletingUnusedObjects_RecompilesNothing_AndTombstonesExactlyThem(
         string scenario,
@@ -128,11 +128,7 @@ public sealed class RadDeletionDeltaTests(BcEngineFixture engine)
         string[] expectedRemovedKeys,
         string[] expectedTombstones)
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -200,14 +196,10 @@ public sealed class RadDeletionDeltaTests(BcEngineFixture engine)
     /// it. Binding errors are knowable before code generation; this asserts the contract
     /// the reject path should meet.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DeletingAUsedObject_IsRejected_AndCommitsNothing()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -251,14 +243,10 @@ public sealed class RadDeletionDeltaTests(BcEngineFixture engine)
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void DeletingThenReadding_RevivesOnlyThatObject()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try

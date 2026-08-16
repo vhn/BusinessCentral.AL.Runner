@@ -85,7 +85,7 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
     public static IEnumerable<object[]> MetadataEdits() => Edits.Select(edit =>
         new object[] { edit.Scenario, edit.FileName, edit.Before, edit.After, edit.Entry, edit.Marker });
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(MetadataEdits))]
     public void EditingOneObject_RefreshesOnlyItsMetadata(
         string scenario,
@@ -95,11 +95,7 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
         string expectedMovedEntry,
         string expectedMarker)
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -157,18 +153,14 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
     /// the ONLY thing the cycle does — if the entry survives, BC can still resolve an
     /// object that no longer exists in the source tree.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(MetadataDeletions))]
     public void DeletingOneObject_DropsOnlyItsMetadata(
         string scenario,
         string[] deletedFiles,
         string expectedMovedEntry)
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -214,14 +206,10 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
     /// one that was deleted. Deleting a page while adding an id-less object — the
     /// documented full-compile trigger — is the cheapest way to reach that combination.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DeletingOneObject_DropsItsMetadata_EvenWhenTheCycleFallsBackToAFullCompile()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -267,16 +255,12 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
     /// places: the delta buffers its writes and clears the old identity first, the full
     /// compile has already written through and clears it at commit.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData(true)]
     [InlineData(false)]
     public void RenamingAnEnumExtension_LeavesOneRegistration(bool forceFullCompile)
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -333,14 +317,10 @@ public sealed class RadMetadataDeltaTests(BcEngineFixture engine)
     /// This is the transactional gap the emit-time registry writes create — the AL emitter
     /// has already mutated the live runtime by the time the backend fails.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RejectedCandidate_LeaksNoMetadata()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try

@@ -80,7 +80,7 @@ public sealed class RadBulkSwitchDeltaTests(BcEngineFixture engine)
     /// says nothing about doing all three at once — additions and deletions share the
     /// baseline-merge step that a modification also rewrites.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void SwitchingToTheOtherVersion_RecompilesOnlyTheFilesThatDiffer()
     {
         RunSwitch("v1", "v2", expectedEmitted: [.. Modified, .. OnlyInV2],
@@ -96,7 +96,7 @@ public sealed class RadBulkSwitchDeltaTests(BcEngineFixture engine)
     /// by it — so this exercises resurrection over a tombstone, a state the forward
     /// direction never reaches.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void SwitchingBack_RestoresTheOriginalVersion_JustAsProportionally()
     {
         RunSwitch("v2", "v1", expectedEmitted: [.. Modified, .. OnlyInV1],
@@ -111,14 +111,10 @@ public sealed class RadBulkSwitchDeltaTests(BcEngineFixture engine)
     /// never re-committed — shows up as a third cycle believing there is still work to do,
     /// which on a real app is a phantom recompile after every branch switch.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void SwitchingOutAndBack_LeavesTheWorkspaceSettled()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = CopyVersion("v1");
         try
@@ -153,11 +149,7 @@ public sealed class RadBulkSwitchDeltaTests(BcEngineFixture engine)
         string[] expectedReloadedTypes,
         string[] expectedGoneTypes)
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = CopyVersion(from);
         try

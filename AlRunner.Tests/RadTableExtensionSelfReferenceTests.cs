@@ -27,14 +27,10 @@ public sealed class RadTableExtensionSelfReferenceTests(BcEngineFixture engine)
     /// Baseline already contains the self-reference; the edit adds an unrelated field.
     /// This is npcore's exact shape.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AddingAFieldToAnExtensionThatReadsItsOwnFields_StillDeltas()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -82,14 +78,10 @@ public sealed class RadTableExtensionSelfReferenceTests(BcEngineFixture engine)
     /// baseline lookup that happens to still hold the answer: the field being read is
     /// added by the SAME edit, so nothing outside the supplied syntax tree knows it exists.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AddingAFieldAndReadingItInTheSameEdit_StillDeltas()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -135,14 +127,10 @@ public sealed class RadTableExtensionSelfReferenceTests(BcEngineFixture engine)
     /// knows about the new field — only the supplied trees do — so this is where "the
     /// packaged module is what the target table's symbol is built from" would bite.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void TwoExtensionsOnOneTable_EditedTogether_SeeEachOthersNewFields()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -189,14 +177,10 @@ public sealed class RadTableExtensionSelfReferenceTests(BcEngineFixture engine)
     /// binding, and the cycle would go green against a schema that no longer exists. It
     /// must not: the supplied syntax tree is the authority for the object being rebound.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RemovingAnExtensionField_DoesNotKeepBindingAgainstTheOldDefinition()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -255,14 +239,10 @@ public sealed class RadTableExtensionSelfReferenceTests(BcEngineFixture engine)
     /// The other direction: the edit itself introduces the self-reference. Same binding
     /// question, but now the baseline the delta strips from has no record of the read.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void IntroducingASelfReferenceInAnExtension_StillDeltas()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try

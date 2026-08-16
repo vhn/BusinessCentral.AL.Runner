@@ -283,7 +283,16 @@ public class TestArtifactsGateTests
         // to assert.
         var shapes = new[]
         {
-            new Regex(@"\[skip\][^\n]*\breturn;", RegexOptions.None),
+            // The gap between the `[skip]` line and the `return;` it guards spans a NEWLINE —
+            // the shape is `Console.Error.WriteLine($"[skip] …");` and then `return;` on the
+            // next line, inside the braces of the `if`. This pattern used to be
+            // `\[skip\][^\n]*\breturn;` with RegexOptions.None, and `[^\n]*` cannot cross a
+            // newline by construction, so the guard matched NOTHING: 30 such gates across 7
+            // RAD suites sat here reporting Passed while this test stayed green. Singleline
+            // makes `.` cross the newline; the {0,200} bound (a few lines' worth of text)
+            // keeps the match local, so a `[skip]` string literal somewhere else cannot pair
+            // up with an unrelated `return;` further down the file. Do not narrow it back.
+            new Regex(@"\[skip\].{0,200}?\breturn;", RegexOptions.Singleline),
             new Regex(@"\breturn;\s*//[^\n]*\b(skip|not provisioned|no artifacts|nothing to assert|nothing to prove)\b",
                 RegexOptions.IgnoreCase),
         };

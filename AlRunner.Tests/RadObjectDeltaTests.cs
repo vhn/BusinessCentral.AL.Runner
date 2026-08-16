@@ -101,7 +101,7 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             []);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(ObjectBodyEdits))]
     public void EditingOneObject_ReloadsOnlyItsSemanticDelta(
         string objectKind,
@@ -179,7 +179,7 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             ["Page71001"]);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(StructuralEdits))]
     public void StructurallyEditingOneObject_StaysProportional(
         string scenario,
@@ -197,7 +197,7 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             expectedReloadedTypes);
     }
 
-    [Fact]
+    [SkippableFact]
     public void EditingACallableSurface_ReloadsTheChangedObjects_ButNotTheirTransitiveCaller()
     {
         RunOverlayScenario(
@@ -217,7 +217,7 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// that is the difference between a one-hop rebind and a whole-module rebuild on a
     /// deep dependency graph.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AddingAProcedure_RebindsDirectCallersOnly()
     {
         RunOverlayScenario(
@@ -255,7 +255,7 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// one that ignores too little: the body edit must stay at one object, and changing the
     /// actual signature immediately below must still rebind the caller.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void ABodyEdit_StaysOneObject_WhenTheCompileRecordsSourceFileNames()
     {
         RunOverlayScenario(
@@ -269,7 +269,7 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             withFileSystem: true);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ACallableSurfaceEdit_StillRebindsItsCaller_WhenTheCompileRecordsSourceFileNames()
     {
         RunOverlayScenario(
@@ -283,7 +283,130 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             withFileSystem: true);
     }
 
-    [Fact]
+    /// <summary>
+    /// The second way the two baselines describe one unchanged surface differently — and the
+    /// one that broke `--watch` on NP Retail outright, where every warm cycle re-emitted zero
+    /// objects and reported an AL error in a file the edit never touched.
+    ///
+    /// <para>The committed baseline comes from
+    /// <c>SerializableSymbolModelConverter.ConvertModuleToSerializableSymbolModel(Compilation)</c>
+    /// and is held as an object graph. The merged one is written by
+    /// <c>CompilationUtilities.WriteSymbolReference</c> and read back with
+    /// <c>SymbolReferenceJsonReader</c> — so it has been through a JSON round trip that the
+    /// committed one has not. A method ATTRIBUTE that takes no arguments is where the two
+    /// representations disagree: the converter leaves <c>Arguments</c> null, the round trip
+    /// materialises it as an empty array. Measured on NP Retail's `NPR Adyen Management`, whose
+    /// serialized surface is 36 KB — five argument-less attributes, ten characters of
+    /// difference, and the whole cascade below follows from it:</para>
+    ///
+    /// <code>
+    /// before …"NameForSerialization":"NonDebuggable","Arguments":null}]…
+    /// after  …"NameForSerialization":"NonDebuggable","Arguments":[]}]…
+    /// </code>
+    ///
+    /// <para>The codeunit then reads as "its surface moved", which pulls in its 30 direct caller
+    /// files, one of which cannot bind against the reduced packaged baseline — so the cycle
+    /// reported `EMIT-ZERO` plus an AL0126 and the watch loop never progressed. No fixture object
+    /// carried a method attribute, so nothing caught it: the divergence needs an attribute to
+    /// exist at all.</para>
+    ///
+    /// <para>`[NonDebuggable]` is the attribute used here because it takes no arguments, which
+    /// is the whole trigger — an attribute WITH arguments serializes the same on both sides.</para>
+    /// </summary>
+    [SkippableFact]
+    public void ABodyEdit_StaysOneObject_WhenTheEditedCodeunitCarriesAnArgumentLessAttribute()
+    {
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            // Before the baseline exists, so the attribute is part of what the full compile
+            // recorded — the edit below then changes nothing but a literal.
+            RadFixture.ReplaceExactlyOnce(
+                RadFixture.SourceFile(tempRoot, "RadPerfService.Codeunit.al"),
+                "    procedure Value(): Integer",
+                """
+                    [NonDebuggable]
+                    procedure Value(): Integer
+                """);
+            var baseline = RadFixture.Seed(tempRoot);
+
+            RadFixture.ReplaceExactlyOnce(
+                RadFixture.SourceFile(tempRoot, "RadPerfService.Codeunit.al"),
+                "exit(40);",
+                "exit(41);");
+
+            var delta = baseline.Cycle(tempRoot);
+
+            Assert.True(delta.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, delta.Emit.Diagnostics));
+            Assert.False(delta.FullRebuild);
+            // RAD Perf Caller calls Service.Coerce, so a spurious surface move shows up here
+            // as a second emitted object — exactly what npcore's cascade started as.
+            Assert.Equal(["RAD Perf Service"], RadFixture.EmittedNames(delta));
+
+            var overlay = RadFixture.AssembleAndLoad(baseline.Workspace, delta.Emit.Sources);
+            delta.Commit(baseline.Workspace, overlay);
+            baseline.AssertOwnership(overlay, ["Codeunit71000"]);
+            baseline.AssertSettled(tempRoot);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The other direction of the test above: ignoring an attribute's ARGUMENTS is not the fix.
+    /// An <c>[EventSubscriber]</c> names the object and event it binds to in its arguments, so
+    /// retargeting one is a real surface change and its callers must still rebind.
+    /// </summary>
+    [SkippableFact]
+    public void ChangingAnAttributesArguments_StillCountsAsASurfaceMove()
+    {
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            RadFixture.ReplaceExactlyOnce(
+                RadFixture.SourceFile(tempRoot, "RadPerfService.Codeunit.al"),
+                "    procedure Coerce(Input: Integer): Integer",
+                """
+                    [IntegrationEvent(false, false)]
+                    procedure OnSomething()
+                    begin
+                    end;
+
+                    procedure Coerce(Input: Integer): Integer
+                """);
+            var baseline = RadFixture.Seed(tempRoot);
+
+            RadFixture.ReplaceExactlyOnce(
+                RadFixture.SourceFile(tempRoot, "RadPerfService.Codeunit.al"),
+                "[IntegrationEvent(false, false)]",
+                "[IntegrationEvent(true, false)]");
+
+            var delta = baseline.Cycle(tempRoot);
+
+            Assert.True(delta.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, delta.Emit.Diagnostics));
+            Assert.False(delta.FullRebuild);
+            Assert.Equal(
+                ["RAD Perf Caller", "RAD Perf Service"], RadFixture.EmittedNames(delta));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [SkippableFact]
     public void AddingOneCodeunit_ReloadsOnlyTheAddedObject()
     {
         RunOverlayScenario(
@@ -299,14 +422,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// baseline that kept both definitions would let source still bind to the old name —
     /// a compile that succeeds here and fails on a cold full build.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RenamingAnObject_DropsTheOldNameFromTheBaseline()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -355,14 +474,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// rebuild all twenty. It generates no C#, so a correct delta compiles nothing at all and
     /// every existing runtime object stays exactly where it was.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AddingAnIdLessObject_IsADelta_AndCompilesNothing()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -425,14 +540,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// twenty baseline types still the identical <see cref="Type"/> instance, and not one
     /// full-recompile note recorded for the developer to read.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AFileThatDeclaresNoObject_CostsNoCompilerWork_WhenAddedEditedOrDeleted()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -493,14 +604,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// read off the changed file's syntax, while DELETING one can only come from the per-file
     /// record the previous compile left behind — there is no file left to parse.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AFileDeclaringADotNetPackage_StillForcesAFullCompile()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -569,14 +676,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// half and hide every real typo: a resource path that genuinely does not exist must still
     /// raise AL0327 naming that file.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AControlAddInResourcePath_IsAnsweredByTheFullCompile_NotSilencedAndNotFailed()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -641,14 +744,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// is a guard rather than a live path — and the reason it needs a test, since nothing else
     /// would notice it being dropped.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AFileTheWorkspaceCouldNotFullyRecord_StillForcesAFullCompile()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -715,14 +814,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// redirects stderr to `TextWriter.Null` while the bundle loop runs, so the note is the
     /// only form of it the developer ever sees.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void ChangingTheReferenceSurface_InvalidatesTheBaseline_AndSaysWhichFacetMoved()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -767,14 +862,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void AbandonedCandidate_IsRetriedUntilOneIsCommitted()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -816,14 +907,10 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     /// the same edit has to recompile next cycle, not report the app unchanged and run the
     /// previous generation's code as a green test.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RejectedCandidate_DoesNotAdvanceTheWorkspace()
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try
@@ -882,11 +969,7 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
         string[] expectedReloadedTypes,
         bool withFileSystem = false)
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = RadFixture.Copy(ScenarioDir);
         try

@@ -67,7 +67,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// baseline outright, so it is asserted before anything else: without a baseline there
     /// is no delta path to test.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void TwoProfiles_AreTwoDistinctObjects_NotOneCollidingKey()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -87,7 +87,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// declares them, their files stay untracked forever and every edit is a full compile —
     /// which is what this asserted the opposite of before.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("RadIdlessContract.Interface.al", "Interface:0:RAD Idless Contract")]
     [InlineData("RadIdlessAddin.ControlAddin.al", "ControlAddIn:0:RAD Idless Addin")]
     [InlineData("RadIdlessAddinB.ControlAddin.al", "ControlAddIn:0:RAD Idless Addin B")]
@@ -112,7 +112,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// is rebound — the same rule that rebinds an interface's implementers. Naming the extra
     /// object explicitly is what keeps the row honest about the cost.</para>
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("RadProfileB.Profile.al", "Enabled = true;", "Enabled = false;",
         new[] { "Profile:0:RAD Profile B" })]
     [InlineData("RadIdlessAddin.ControlAddin.al", "'idless-addin.js'", "'idless-addin-2.js'",
@@ -152,7 +152,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// implementer, and nothing else. If the interface were left in the packaged baseline
     /// its old shape would shadow the edit and the implementer would fail to satisfy it.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void WideningAnInterface_ReEmitsItsImplementer_AndNothingElse()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -188,7 +188,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// with an AL diagnostic. Widening cannot detect this: implementing a method the old
     /// contract did not ask for is not an error.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RenamingAnInterfaceMethod_BindsAgainstTheNewContract_NotTheBaselineCopy()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -238,7 +238,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// reported success, emitted nothing, and left the implementer bound to a contract it no
     /// longer satisfies. The correct answer is the compiler's: AL0582.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void WideningAnInterfaceAlone_RebindsItsImplementer_AndReportsTheBreak()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -263,7 +263,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// AL0582 comes back. Nothing else in the suite would notice, because every other name
     /// survives naive unquoting unchanged.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RenamingAMethodOnAQuotedInterface_BindsAgainstTheNewContract()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -288,7 +288,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// on the exact spelling it read as one addition plus one removal of an object that
     /// never went anywhere.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RenamingAnIdLessObjectsCaseOnly_IsAModification_NotAnAddAndRemove()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -313,7 +313,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// blanket full-compile fallback existed to avoid. Nothing references this one, so the
     /// delta is a pure removal.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DeletingAnIdLessObject_RemovesItFromTheBaseline()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -360,7 +360,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// id alone left them unkeyable and their files untracked: any edit, comment included,
     /// rebuilt the whole module.
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("RadProfileCust.PageCust.al", "PageCustomization:0:RAD Profile Cust")]
     [InlineData("RadProfileExt.ProfileExt.al", "ProfileExtension:0:RAD Profile Ext")]
     public void IdLessObjectsTheSymbolApiReportsWithoutAnId_AreTrackedToTheirFile(
@@ -385,7 +385,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// is decided by array order, so the cycle goes green either way and a fingerprint check
     /// answers with whichever came first. Count them.</para>
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("RadIdlessAddin.ControlAddin.al", "procedure Ping();",
         "procedure Pong();", "ControlAddIn", "RAD IDLESS ADDIN", "Pong")]
     [InlineData("RadProfileB.Profile.al", "Enabled = true;",
@@ -431,7 +431,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// `interface`, where the delta reported success, emitted nothing, and left the consumer
     /// bound to a name that no longer existed.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RenamingAPageCustomizationAlone_RebindsItsConsumer_AndReportsTheBreak()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -457,7 +457,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// makes for a controladdin. The profile extension that names the customization is deleted
     /// with it, because leaving it behind is (correctly) a dangling reference.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DeletingAPageCustomizationAndItsConsumer_LeavesNoBaselineCopyOfEither()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -498,7 +498,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// the point: "not a full rebuild" on its own would also pass if every permission set in a
     /// 7,000-object app came along for one entitlement edit.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void EditingAnEntitlement_IsADelta_OfItselfAndThePermissionSetsItMayName()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -533,7 +533,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// the delta re-emitted the renamed permission set, reported success, and left the
     /// entitlement pointing at a name that no longer exists. A cold compile says AL0185.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void RenamingAPermissionSet_RebindsTheEntitlementsThatMayNameIt()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -558,7 +558,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// drops the entitlement instead of binding it would report success here, so this is the
     /// test that says the object is really being compiled and not merely bookkept.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AnEntitlementNamingAMissingPermissionSet_ReportsWhatAColdCompileReports()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -578,7 +578,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// cost apps with two profiles their baseline outright: id-less objects of one kind all
     /// keying as `Kind:0` and colliding.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void TwoEntitlements_AreTwoDistinctObjects_NotOneCollidingKey()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -626,7 +626,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// load-bearing for them, because an entitlement has no module representation at all and
     /// this is the only place a duplicate one can be caught.</para>
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("DupCodeunit.Codeunit.al", """
         namespace AlRunner.Tests.RadProfileApp;
 
@@ -686,7 +686,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// no cycle in this state can advance the workspace, and that the developer is told the same
     /// thing a full build would tell them.</para>
     /// </summary>
-    [Theory]
+    [SkippableTheory]
     [InlineData("DupPairA.Codeunit.al", "DupPairB.Codeunit.al", """
         namespace AlRunner.Tests.RadProfileApp;
 
@@ -740,7 +740,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// paths — a rename keeps the permission set's id-based key and lands in `modified`, a
     /// deletion lands in `removed`.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void DeletingAPermissionSet_RebindsTheEntitlementsThatMayNameIt()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -760,7 +760,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// one kind added to this fixture that generates C#, which makes it the regression guard
     /// for the emit-count check that decides whether a delta is trusted.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void EditingAPermissionSet_IsStillOneObject_AndStillEmitsCode()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -790,7 +790,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// mechanism into noise: a parked reason must be consumed ONCE, and it must not survive a
     /// cycle that succeeded. Either way it ends up attached to an unrelated full compile.</para>
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AParkedFullCompileReason_IsReportedByTheCycleThatPaysForIt_AndOnlyOnce()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -842,7 +842,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// The regression guard: an app that declares id-less objects must still delta its
     /// ordinary ones by id, one object at a time.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void AnOrdinaryEdit_InAnAppWithIdLessObjects_IsStillOneObject()
     {
         Run((compiler, workspace, tempRoot) =>
@@ -863,11 +863,7 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// <summary>Seed a committed baseline over a private copy, then hand it to the scenario.</summary>
     private void Run(Action<BcCompiler, RadWorkspace, string> scenario)
     {
-        if (!engine.Ready)
-        {
-            Console.Error.WriteLine($"[skip] {engine.SkipReason}");
-            return;
-        }
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
         var tempRoot = Copy();
         try
