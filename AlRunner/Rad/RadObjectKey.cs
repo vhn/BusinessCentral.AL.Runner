@@ -77,8 +77,13 @@ public readonly record struct RadObjectKey(string Kind, int Id, string Name = ""
     /// module definition must also carry it, so a delta can strip the pre-edit copy that
     /// would otherwise shadow the supplied syntax. Five of these six kinds have an array in
     /// <c>ModuleDefinition</c> (<c>Interfaces</c>, <c>ControlAddIns</c>, <c>Profiles</c>,
-    /// <c>PageCustomizations</c>, <c>ProfileExtensions</c>) and are stripped like any
-    /// id-bearing object.</para>
+    /// <c>PageCustomizations</c>, <c>ProfileExtensions</c>), and FOUR of them are stripped
+    /// like any id-bearing object. <c>ProfileExtension</c> is not: the strip skips
+    /// <see cref="IsExtension"/>, which tests the KIND NAME for the suffix "Extension", so a
+    /// profileextension is carved out alongside the real extension kinds. That is not an
+    /// oversight — RadIdlessObjectTests.ModifyingAnIdLessObject_LeavesOneBaselineCopy_CarryingTheNewShape
+    /// covers it, and fails both if stripping breaks the bind and if leaving it in shadows
+    /// the edit.</para>
     ///
     /// <para><c>Entitlement</c> is the exception, and it is safe for the opposite reason:
     /// there is no <c>Entitlements</c> array and no <c>EntitlementDefinition</c> type at all,

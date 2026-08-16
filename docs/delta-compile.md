@@ -5,6 +5,12 @@ performs a normal full compile and records a baseline for each source app. Subse
 use those baselines when an edit is safe to load as a small overlay. Other runner modes use
 the normal compile path.
 
+`--watch` behaviour that concerns *runtime* state rather than compilation — what a reload
+drops and what survives it — is documented in
+[`docs/server-mode.md`](server-mode.md), under "The reload contract", because the server and
+the watch loop share that machinery. In particular, "Forgetting a cached BC object does not
+end its life" is a `--watch` finding written under a `--server` heading.
+
 ## How it fits together
 
 The runner's normal pipeline compiles a whole module per run. `--watch` keeps that pipeline
@@ -59,7 +65,9 @@ full compile, never up:
         │        └── a key an untouched file owns ────────────────────────► FULL COMPILE
         │
         ├─► classify → RadChangeSet          added / modified / removed RadObjectKeys
-        │        + one hop of reverse references when a callable surface moved
+        │        + one hop of reverse references when a codeunit's or id-less object's
+        │          surface moved
+        │        + every codeunit whose TableNo names a table this cycle strips
         │        + every permission set when an entitlement changed
         │
         ├─► ModuleDefinitionOps.WithoutObjects
@@ -95,7 +103,7 @@ constructs a workspace.
 | `Rad/RadWorkspace.cs` | The per-app baseline, and `RadWorkspaceStore` — the process-wide map of them |
 | `Rad/RadObjectKey.cs` | AL object identity: `(Kind, Id)`, or `(Kind, Name)` for the kinds with no id |
 | `Rad/BcCompiler.Rad.cs` | The cycle itself: `EmitIncremental` → `DeltaCompile` / `FullCompile`, and the baseline snapshot + merge |
-| `Rad/ModuleDefinitionOps.cs` | Symbol-reference surgery on BC's `ModuleDefinition` (strip objects, count them) |
+| `Rad/ModuleDefinitionOps.cs` | Symbol-reference surgery on BC's `ModuleDefinition` (strip objects, count them, fingerprint a surface, find `TableNo` bystanders) |
 | `Rad/AlObjectResolution.cs` | Which loaded generation owns each AL CLR type, and which names are tombstoned |
 | `Rad/RadMetadataCapture.cs` | Buffers the runtime metadata an AL emit registers, until the generation is committed |
 | `Rad/RadBaselineSidecar.cs` | Persists / restores a baseline beside the cached AL output |
@@ -107,21 +115,23 @@ constructs a workspace.
 ### `Rad/RadWorkspace.cs` — the baseline, and what may be committed to it
 
 One `RadWorkspace` per app, keyed in `RadWorkspaceStore` by module name + `AppId`, living for
-the whole watch process. It holds the SHA-256 of every `.al` file, the objects each file
-declares, the reverse one-hop reference graph, the extension→target edges, the compiler's
-symbol baseline, the reference signature it was armed under, and the loaded assembly
-generations.
-
-Its shape is the load-bearing part. Everything except the loaded assemblies is
-`RadWorkspaceUpdate` — the token `Commit` takes and `Snapshot()` hands back — so a map added
-to the workspace but not to the token cannot be committed at all. That is what keeps "what a
-delta reads", "what a cycle commits" and "what the sidecar persists" from drifting apart.
+the whole watch process. See [the baseline](#the-baseline) for what it holds and how it is
+persisted.
 
 `ArmFor(signature)` is the gate: a workspace that was armed under a different reference
 signature has its baseline dropped, with `DescribeSignatureChange` naming the facet that
 moved. `Invalidate(reason)` reports in the same cycle; `PendingFullCompileReason` parks a
 reason for a *later* cycle to report, for the case where the compile that discovered the
 problem is not the compile that pays for it.
+
+`FileOf(key)` — which file declares an object — is served from an index rebuilt at the end of
+`Commit` and cleared in `Invalidate`. It is derived, not committed, so neither
+`RadWorkspaceUpdate` nor the sidecar carries anything extra and it cannot drift. That matters
+because every caller asks in bulk: once per declared object in the added-vs-modified
+classifier, once per widened caller, and twice over, since a widened cycle recurses. Measured
+direct-user fan-in on NP Retail, in files: **p50 2, p90 10, p99 59, max 435**
+(`POSSale.Codeunit.al`); 28 objects exceed 100 files and none exceeds 500. A linear scan of
+the object map per key does not survive that. Guarded by `RadWorkspaceFileOfTests`.
 
 ### `Rad/RadObjectKey.cs` — identity, including for the id-less kinds
 
@@ -143,8 +153,8 @@ A partial class over `BcCompiler`, so a delta reuses the same reference loader, 
 property, because the two must not disagree about what the app is compiled against.
 
 - `EmitIncremental` — hash, arm, diff, then delegate. Public entry point.
-- `DeltaCompile` — the probe compilation, the change classification, the reverse-reference
-  hop, `CreateForRad`, and the merge back into the module definition. Returns `null` to mean
+- `DeltaCompile` — the probe compilation, the change classification, the rebind hops,
+  `CreateForRad`, and the merge back into the module definition. Returns `null` to mean
   "not expressible as a delta", which the caller turns into a full compile.
 - `FullCompile` — the ordinary `Emit`, plus `TryBuildBaselineSnapshot` to record a baseline
   from it. A compile whose emit-retry excluded objects deliberately records **no** baseline.
@@ -159,11 +169,16 @@ property, because the two must not disagree about what the app is compiled again
 `CreateForRad` binds the new source; left in, the stale symbol shadows the edit and a changed
 object calling another changed object fails to bind. Extensions are the exception — what a
 `tableextension` contributes is only visible on its target, so stripping one produces AL0132s
-against fields declared in its own file.
+against fields declared in its own file. The exemption is a test on the **kind name**
+(`IsExtension` is `Kind.EndsWith("Extension")`), which is why `pagecustomization` is stripped
+and `profileextension` is not.
 
 `CountObjects` exists for the tests: a *stale* copy of an object counts as one just as a
 fresh copy does, so a suite that only asserted "it is still there" would pass over a merged
 definition holding both.
+
+`ObjectSurfaceFingerprint` and `CodeunitsWithTableNo` are the two rebind inputs; both are
+described under [scope and edge cases](#scope-and-edge-cases).
 
 ### `Rad/AlObjectResolution.cs` — which generation answers
 
@@ -178,26 +193,49 @@ asserting 42 **green**. So ownership is recorded rather than inferred, and a nam
 used to declare and no longer does is tombstoned, so a deleted object resolves to nothing
 instead of resurrecting from the still-loaded previous generation.
 
+This is *object-type* resolution. The member-level half of the same problem — a cross-app
+caller still dispatching a member id the callee no longer has — is
+[a separate, open gap](#the-reference-graph-holds-no-cross-app-edges).
+
 ### `Rad/RadMetadataCapture.cs` — metadata that moves with the objects
 
 A page, report, xmlport or enum is not only its CLR type: BC resolves it through runtime
-metadata the AL emitter writes into process-wide registries as a *side effect* of the emit —
-which happens before Roslyn runs and before anything loads. On the delta path those writes
-are buffered here and applied only when the generation is committed, so a candidate the C#
-backend rejects leaks nothing into the live runtime.
+metadata the AL emitter writes into process-wide registries as a *side effect* of
+`Compilation.Emit` — which happens before Roslyn runs and before anything loads. On the delta
+path those writes are buffered here and applied only when the generation is committed, so a
+candidate the C# backend rejects leaks nothing into the live runtime.
+
+At commit the cycle also drops the previous identity of every modified and removed object,
+using the object map as it stood before the commit — which is what lets a renamed
+`enumextension` or a deleted report leave nothing behind.
+
+A **full** compile writes through immediately instead, because the AL-output cache sidecar is
+serialized straight off these registries while the compile is still in progress. It gets the
+identity cleanup at commit rather than the buffering: an object the source tree no longer
+declares has its metadata dropped, and so does the stale `(base enum, name)` pair of an
+`enumextension` that was renamed or retargeted — the one registration that is not keyed by its
+own object id, so a re-emit adds to it instead of replacing it. The residue that leaves is
+narrow and self-healing: a full compile whose generated C# is then rejected has already
+refreshed the entries of objects that still exist, and the next successful cycle overwrites
+them again.
+
+Warm reloads keep the registries only while every app in a single-bundle watch has a committed
+baseline and every changed path is a `.al` file under one of them
+(`RadWorkspaceStore.PrepareBundleReload`). Anything else — a manifest change, several bundles —
+takes the clean-slate path and refreshes all of it.
 
 ### `Rad/RadBaselineSidecar.cs` — a cache HIT that arrives delta-ready
 
-See [the next section](#the-al-output-cache-serves-the-first-cycle-and-can-serve-it-delta-ready)
-— it is the reason a HIT no longer costs a whole-module compile on the first edit.
+See [the baseline](#the-baseline). It is the reason a HIT costs a load rather than a
+whole-module compile on the first edit.
 
 ### `Rad/RadCycleNotes.cs` — why a cycle was slow, where it can be seen
 
-Every fallback already writes a `[watch]` line to stderr, and the interactive dashboard
-redirects both streams to `TextWriter.Null` while the bundle loop runs so its painted frame
-is not scrolled away — so in the one mode a developer actually watches, every reason was
-discarded. Notes are collected process-wide, drained by the watch loop after the streams are
-restored, and rendered as a yellow panel above the test tree.
+Every fallback writes a `[watch]` line to stderr, and the interactive dashboard redirects both
+streams to `TextWriter.Null` while the bundle loop runs so its painted frame is not scrolled
+away — so in the one mode a developer actually watches, a stderr-only reason is discarded.
+Notes are collected process-wide, drained by the watch loop after the streams are restored,
+and rendered as a yellow panel above the test tree. `FullCompileBecause` writes both, always.
 
 ### `WatchSource.cs` and the watch loop
 
@@ -216,10 +254,79 @@ Two things the delta path needs from the loop, beyond a "something changed" bit:
 The debounce is quiescence-based (`WaitForQuiescence`, from #1904): the wait re-arms on every
 further event and releases only after `AL_RUNNER_WATCH_QUIET_MS` of silence, capped at
 `AL_RUNNER_WATCH_MAX_WAIT_MS`. That matters more with delta compilation than without it,
-because a cycle is now short enough that a burst which used to be absorbed by a long compile
-would otherwise start one against a half-applied checkout.
+because a cycle is now short enough that a burst which would otherwise be absorbed by a long
+compile can start one against a half-applied checkout.
 
-## The AL-output cache serves the first cycle, and can serve it delta-ready
+## Cycle behavior
+
+Every watch cycle computes a content hash for every `.al` file in the app's source tree.
+This is whole-tree change detection, not an O(changed-files) operation. It avoids a
+compile when files were only touched or rewritten with identical bytes.
+
+After hashing, the changed files alone are parsed and a declaration-only compilation over
+them answers what they declare NOW. Diffing that against the workspace's object map
+classifies the cycle:
+
+| Change | Compile path |
+|---|---|
+| No content changed | Reuse the loaded module; do not compile |
+| An object of any kind was edited, added or removed | Re-emit exactly those objects with `Compilation.CreateForRad` and compile a C# overlay; a removal-only cycle produces no C# at all |
+| A modified **codeunit's** or **id-less object's** serialized surface moved, or an object was removed | Also re-emit the objects that directly reference it — one hop, not the transitive closure |
+| A table this cycle strips is named by an untouched codeunit's `TableNo` | Also re-emit that codeunit, under the table's new *and* previous name — see below |
+| A changed object declares a file resource the compiler must read (`AL0327`) | Normal full compile — see below |
+| An `entitlement` changed | Delta of it **plus the app's permission sets** — see below |
+| A changed file declares a key an untouched file still owns (a duplicate id or name) | Normal full compile, so the compiler reports the duplicate |
+| A changed file declares no AL object at all (a new empty file, a comment-only file) | Record the new hash and stop — no compiler runs |
+| A changed file declares a `dotnet` package | Normal full compile |
+| Dependencies, app identity, version, or preprocessor symbols changed | Normal full compile |
+| The delta does not bind (a syntax error, or a reference to something it removed) | No compile at all — report the AL diagnostics and leave the workspace on its last good state |
+
+A modified **table, page, enum, report or query** does not widen the cycle today: the
+`changedSurfaces` filter (`BcCompiler.Rad.cs:754-776`) admits only codeunits and the id-less
+kinds. That narrowness is the mechanism behind the by-name damage
+[described below](#a-delta-damages-surface-a-bystander-holds-only-because-the-stripped-object-exists).
+
+Modified and removed objects are stripped from the packaged baseline before
+`CreateForRad` binds the new source, and Microsoft's own `WriteSymbolReference` merges the
+result back into the previous module definition to produce the next baseline.
+
+Binding errors are collected from `GetDeclarationDiagnostics()` **before** code generation
+runs. BC's RAD emitter does not survive a dangling reference — it throws out of codegen
+with `Unexpected value 'None' of type NavTypeKind` rather than reporting the `AL0185` its
+own declaration pass already found — so asking first is what keeps "you deleted something
+that is still used" a one-line diagnostic naming the missing object instead of a
+whole-module rebuild whose emit-retry then drops the caller from the module.
+
+That ordering has a consequence worth carrying: everything the declaration pass does *not*
+catch — every method-body diagnostic — reaches the runner only through `rad.Emit(...)`
+(`:682`). All of the by-name breaks below are method-body diagnostics.
+
+If the runner cannot classify or emit an eligible delta safely — a RAD emit that throws, a
+callback count that disagrees with the change model, a symbol merge that fails — it falls
+back to a normal full compile. An AL or generated-C# error never advances the last good
+baseline: the emit prepares a commit token that is applied only after the overlay assembly
+loads.
+
+## The baseline
+
+`RadWorkspace` keeps, per app for the lifetime of the watch process:
+
+- the SHA-256 hash of every `.al` file;
+- the objects declared by each file, and the per-file record of what a compile could not
+  account for (`RadFileDeclarations`);
+- the reverse one-hop reference graph and the extension→target edges, both read off
+  Microsoft's bound semantic models during a full compile;
+- the compiler's full-emit symbol baseline (accepted overlays preserve that surface);
+- the reference signature it was armed under;
+- the loaded baseline and overlay assembly generations.
+
+Everything on that list except the loaded assemblies is `RadWorkspaceUpdate` — the token
+`Commit` takes, and what `RadWorkspace.Snapshot()` hands back. That symmetry is the
+load-bearing part: a map added to the workspace but not to the token cannot be committed at
+all, so "what a delta reads", "what a cycle commits" and "what the sidecar persists" cannot
+drift apart.
+
+### The AL-output cache serves the first cycle, and serves it delta-ready
 
 The cache answers cycle 1 and nothing after it: starting a watch on an unchanged tree should
 cost a load rather than minutes of compiling. Once a generation is loaded the workspace owns
@@ -227,10 +334,8 @@ the module — a later cache key that still matches (an `app.json`-only change d
 it, since the key hashes `.al` sources) must never resurrect the pre-edit DLL over the
 running one.
 
-A cached DLL on its own is not enough to delta against, so a HIT used to leave the workspace
-with no baseline and the developer's **first edit** paid one whole-module compile to
-establish one — 761–862 s on NP Retail, at exactly the moment they are blocked waiting for a
-result. So the baseline is cached too, in two artifacts beside the DLL:
+A cached DLL on its own is not enough to delta against, so the baseline is cached too, in two
+artifacts beside the DLL:
 
 ```text
 <key>.dll               the module
@@ -239,19 +344,20 @@ result. So the baseline is cached too, in two artifacts beside the DLL:
 <key>.rad-symbols.json  the compiler's ModuleDefinition, in BC's own serialized form
 ```
 
+Without them a HIT left the workspace with no baseline, and the developer's **first edit**
+paid one whole-module compile to establish one — 761–862 s on NP Retail, at exactly the moment
+they are blocked waiting for a result.
+
 `AlRunner/Rad/RadBaselineSidecar.cs` writes them and restores them. That the symbol baseline
 survives a round trip is not an assumption: the delta path already reads every merged
 baseline back through `SymbolReferenceJsonReader` (see `MergeRadBaseline`), and
 `RadBaselineSidecarTests` asserts a restored full-compile baseline re-serializes
 **byte-identically** to the one the compile produced.
 
-What is persisted is the whole commit token (`RadWorkspace.Snapshot`), not just the module
-definition — deliberately the same type `Commit` takes, so a map added to the workspace and
-not to `RadWorkspaceUpdate` cannot be committed at all and the persisted set cannot fall
-behind the set a delta reads. Three of those maps are absent from the module definition, and
-two of the three fail *silently* if dropped: without the reference graph a moved callable
-surface rebinds nobody and its callers keep executing the previous contract, and without the
-extension targets a renamed enumextension leaves its old registration behind.
+Three of the persisted maps are absent from the module definition, and two of the three fail
+*silently* if dropped: without the reference graph a moved callable surface rebinds nobody
+and its callers keep executing the previous contract, and without the extension targets a
+renamed `enumextension` leaves its old registration behind.
 
 **Hydration is validated and fails closed.** The pair is refused — leaving the workspace
 exactly as it was, so the cycle behaves as it did before any of this existed — when either
@@ -270,10 +376,10 @@ publisher or id, so a HIT can legitimately serve a tree whose `app.json` identit
 
 ### One-shot writes it too, so switching modes stays fast
 
-Switching between one-shot and `--watch` over one tree has to feel like one tool, so the baseline
-is produced by **whichever of the two compiled** — not only by `--watch`. Both go through
-`BcCompiler.TryBuildBaselineSnapshot`, so a baseline written by one is indistinguishable from the
-other's:
+Switching between one-shot and `--watch` over one tree has to feel like one tool, so the
+baseline is produced by **whichever of the two compiled** — not only by `--watch`. Both go
+through `BcCompiler.TryBuildBaselineSnapshot`, so a baseline written by one is
+indistinguishable from the other's:
 
 | Mode | Writes it |
 |---|---|
@@ -286,9 +392,11 @@ the first edit costs one object. Pinned by
 `WatchTests.Watch_AfterAOneShotRun_ServesTheCache_AndDeltasTheFirstEdit`. The reverse direction
 (watch, then one-shot) was already a plain cache HIT and is unaffected.
 
-It costs almost nothing to produce. Measured on `tests/runner-extras` (25 compiled apps, BC 28.1,
-`BCCOMPILER_TIMING=1`): **105 ms total**, against 17.4 s of compiling and a 47.4 s run — 0.6% of
-compile time, 0.2% of wall clock. Nearly all of it is one phase:
+### What the snapshot costs
+
+On a small app, almost nothing. Measured on `tests/runner-extras` (25 compiled apps, BC 28.1,
+`BCCOMPILER_TIMING=1`): **105 ms total**, against 17.4 s of compiling and a 47.4 s run — 0.6%
+of compile time, 0.2% of wall clock. Nearly all of it is one phase:
 
 | Snapshot phase | 25 apps |
 |---|---:|
@@ -296,7 +404,34 @@ compile time, 0.2% of wall clock. Nearly all of it is one phase:
 | object map | 3 ms |
 | file declarations / extension targets / module definition | <1 ms each |
 
-Three limits, all stated because each looks like a bug from outside:
+**That percentage does not generalise, and the reason is visible in the table above.** Four of
+the five phases read symbols the compilation has already computed, but the reference graph asks
+Microsoft for a semantic model *per syntax tree* and calls `GetSymbolInfo` on *every node of
+every file* — so it scales with the **source tree**, not with the object count, and 25 apps of a
+few files each is the cheapest possible shape for it.
+
+Measured on NP Retail (7,339 `.al` files across the bundle, 6,949 objects in the Application,
+BC 28.1, `--watch --no-cache`), the cold cycle grows from **1,125.9 s** without the snapshot to
+**1,375.7 s** with it: **~250 s, or +22%** — not 0.6%. So quote the 25-app figure only for apps
+of that size; for anything larger, budget the cold overhead against the size of the source tree
+rather than as a fixed percentage. (The without-snapshot leg needs
+`AL_RUNNER_EMIT_TIMEOUT_SEC=7200` to finish at all — the default 120 s emit timeout aborts an
+app this size. A cycle that has a RAD workspace waits indefinitely instead, which is why the
+with-snapshot leg needs no override.)
+
+The cold cycle is not what `--watch` optimises, but it is not *unchanged* either: that +22% is
+the price of delta-readiness, paid once per full compile, and it is what a warm cycle on the
+same app buys back.
+
+### Neither artifact gates a cache HIT
+
+Neither is part of `AlCacheSidecars.IsCompleteEntry`, unlike the enum-registry and
+query-symbols sidecars. Those carry side effects a HIT cannot function without, so their
+absence must force a MISS. These carry an optimisation: gating a HIT on them would turn every
+pre-existing entry into a MISS, and would force a cache-schema bump that discards every one —
+both to withhold something that is only ever a speedup.
+
+### Three limits, all stated because each looks like a bug from outside
 
 - **A HIT never writes it** — nothing compiled, so there is no compilation to snapshot. In the
   CLI that gate is `cachedBytes == null` and it is load-bearing: one `BcCompiler` serves every
@@ -315,52 +450,6 @@ Three limits, all stated because each looks like a bug from outside:
   server run, and `--server` has no delta workspace to hydrate it into. Unifying the two names is
   the actual fix, and it is not local to caching — the name feeds the emitted assembly name,
   module identity, the protocol's responses and the phase log — so it belongs in its own change.
-
-Neither artifact is part of `AlCacheSidecars.IsCompleteEntry`, unlike the enum-registry and
-query-symbols sidecars. Those carry side effects a HIT cannot function without, so their
-absence must force a MISS. These carry an optimisation: gating a HIT on them would turn every
-pre-existing entry into a MISS, and would force a cache-schema bump that discards every one —
-both to withhold something that is only ever a speedup.
-
-## Cycle behavior
-
-Every watch cycle computes a content hash for every `.al` file in the app's source tree.
-This is whole-tree change detection, not an O(changed-files) operation. It avoids a
-compile when files were only touched or rewritten with identical bytes.
-
-After hashing, the changed files alone are parsed and a declaration-only compilation over
-them answers what they declare NOW. Diffing that against the workspace's object map
-classifies the cycle:
-
-| Change | Compile path |
-|---|---|
-| No content changed | Reuse the loaded module; do not compile |
-| An object of any kind was edited, added or removed | Re-emit exactly those objects with `Compilation.CreateForRad` and compile a C# overlay; a removal-only cycle produces no C# at all |
-| A modified codeunit's callable surface moved, or an object was removed | Also re-emit the objects that directly reference it — one hop, not the transitive closure |
-| A changed object declares a file resource the compiler must read (`AL0327`) | Normal full compile — see below |
-| An `entitlement` changed | Delta of it **plus the app's permission sets** — see below |
-| A changed file declares a key an untouched file still owns (a duplicate id or name) | Normal full compile, so the compiler reports the duplicate |
-| A changed file declares no AL object at all (a new empty file, a comment-only file) | Record the new hash and stop — no compiler runs |
-| A changed file declares a `dotnet` package | Normal full compile |
-| Dependencies, app identity, version, or preprocessor symbols changed | Normal full compile |
-| The delta does not bind (a syntax error, or a reference to something it removed) | No compile at all — report the AL diagnostics and leave the workspace on its last good state |
-
-Modified and removed objects are stripped from the packaged baseline before
-`CreateForRad` binds the new source, and Microsoft's own `WriteSymbolReference` merges the
-result back into the previous module definition to produce the next baseline.
-
-Binding errors are collected from `GetDeclarationDiagnostics()` **before** code generation
-runs. BC's RAD emitter does not survive a dangling reference — it throws out of codegen
-with `Unexpected value 'None' of type NavTypeKind` rather than reporting the `AL0185` its
-own declaration pass already found — so asking first is what keeps "you deleted something
-that is still used" a one-line diagnostic naming the missing object instead of a
-whole-module rebuild whose emit-retry then drops the caller from the module.
-
-If the runner cannot classify or emit an eligible delta safely — a RAD emit that throws, a
-callback count that disagrees with the change model, a symbol merge that fails — it falls
-back to a normal full compile. An AL or generated-C# error never advances the last good
-baseline: the emit prepares a commit token that is applied only after the overlay assembly
-loads.
 
 ## Bulk changes
 
@@ -385,63 +474,11 @@ reload — and the app-identity half of that is re-checked independently by `Arm
 
 [#1904]: https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1904
 
-## What the baseline contains
-
-`AlRunner/Rad/RadWorkspace.cs` keeps, per app for the lifetime of the watch process:
-
-- the SHA-256 hash of every `.al` file;
-- the objects declared by each file;
-- the compiler's full-emit symbol baseline (accepted overlays preserve that surface);
-- the loaded baseline and overlay assembly generations.
-
-plus the reverse one-hop reference graph and the extension→target edges, both read off
-Microsoft's bound semantic models during a full compile.
-
-Everything on that list except the loaded assemblies is `RadWorkspaceUpdate` — the token
-`Commit` takes — and `RadWorkspace.Snapshot()` hands it back. That symmetry is what
-`RadBaselineSidecar` persists, and it is deliberate: a map added to the workspace but not to
-`RadWorkspaceUpdate` cannot be committed at all, so "what is persisted" cannot silently fall
-behind "what a delta reads".
-
-## Runtime metadata moves with the objects
-
-A page, report, xmlport or enum is not only its generated CLR type: BC resolves it through
-runtime metadata the AL emitter writes into process-wide registries as a side effect of
-`Compilation.Emit`. Those writes happen before Roslyn compiles the generated C# and before
-the assembly loads, so on the delta path they are buffered in
-`AlRunner/Rad/RadMetadataCapture.cs` and applied only when the generation is committed. At
-that point the cycle also drops the previous identity of every modified and removed
-object, using the object map as it stood before the commit — which is what lets a renamed
-enumextension or a deleted report leave nothing behind. A candidate the C# backend rejects
-applies nothing at all.
-
-A **full** compile writes through immediately instead, because the AL-output cache sidecar
-is serialized straight off these registries while the compile is still in progress. It gets
-the identity cleanup at commit rather than the buffering: an object the source tree no
-longer declares has its metadata dropped, and so does the stale `(base enum, name)` pair of
-an enumextension that was renamed or retargeted — the one registration that is not keyed by
-its own object id, so a re-emit adds to it instead of replacing it. The residue that leaves
-is narrow and self-healing: a full compile whose generated C# is then rejected has already
-refreshed the entries of objects that still exist, and the next successful cycle overwrites
-them again.
-
-Warm reloads keep the registries only while every app in a single-bundle watch has a
-committed baseline and every changed path is a `.al` file under one of them
-(`RadWorkspaceStore.PrepareBundleReload`). Anything else — a manifest change, several
-bundles — takes the clean-slate path and refreshes all of it.
-
-Generated C# for the changed objects is compiled into a small, uniquely named generation
-assembly and loaded beside the current module. `AlRunner/Rad/AlObjectResolution.cs` records
-which generation owns each AL object type and tombstones the names a committed deletion
-removed, so a still-loaded previous generation cannot answer for a deleted object. A later
-full compile replaces the whole generation chain and establishes a fresh baseline.
-
 ## Measured on NP Retail
 
 Measured on NP Retail (7,053 AL files / 6,949 objects) and its test app (286 files / 286
-objects), watched together as ONE bundle on BC 28.1, 6-core / 12 GB, one test codeunit
-selected. Cold first cycle: **~1,100 s**, of which 649 s is the Application's AL emit. The
-cold cycle is not what `--watch` optimises and is unchanged by any of this.
+objects) — 7,339 files across the bundle — watched together as ONE bundle on BC 28.1,
+6-core / 12 GB, one test codeunit selected.
 
 A successful warm cycle reports the changed-object delta and overlay explicitly:
 
@@ -451,11 +488,12 @@ A successful warm cycle reports the changed-object delta and overlay explicitly:
 [watch] NP Retail Tests: unchanged — reusing the loaded module
 ```
 
-One edit costs one object, for every object kind and every file operation — with two named
-exceptions, both below the table: a change to a **callable or binding surface** also rebinds its
-direct users (one hop, not the transitive closure), and an **entitlement** edit also binds the
-app's permission sets, because BC will not let one resolve a permission set from the packaged
-baseline.
+One edit costs one object, for every object kind and every file operation — with three named
+exceptions, all detailed under [scope and edge cases](#scope-and-edge-cases): a change to a
+**codeunit's or id-less object's** serialized surface also rebinds its direct users (one hop,
+not the transitive closure); a delta that strips a **table** also rebinds every codeunit whose
+`TableNo` names it; and an **entitlement** edit also binds the app's permission sets, because
+BC will not let one resolve a permission set from the packaged baseline.
 
 | Edit | Delta | AL emit | Overlay | Cycle |
 |---|---|---:|---:|---:|
@@ -475,42 +513,133 @@ baseline.
 | Touched, identical bytes | no compile at all | — | — | 41 s |
 | Two files in one app | `+0 ~2 -0` → 2 | 1.1 s | 0.25 s | 43 s |
 | One file in each app | 1 + 1 | 1.2 + 0.9 s | 0.19 + 0.13 s | 42 s |
-| Id-less object (`interface`, `controladdin`, `profile`, `pagecustomization`, `profileextension`, `entitlement`) | `+0 ~1 -0` → 0 | — | — | see below |
+| Id-less object (`interface`, `controladdin`, `profile`, `pagecustomization`, `profileextension`, `entitlement`) | `+0 ~1 -0` → 0 | — | — | not re-measured |
 
-The id-less row used to read **full compile, 761–862 s**. `RadObjectKey` was `(Kind, Id)`,
-and `interface`, `controladdin` and `profile` have no id, so they could not be told apart —
-on NP Retail that was 84 of 7,339 files (60 interface, 16 controladdin, 8 profile), each a
-guaranteed whole-module rebuild on any edit including a comment. They are now keyed by name
-and delta like anything else. That row's timing has NOT been re-measured on NP Retail; the
-behaviour is pinned by `RadIdlessObjectTests` against a fixture instead, and a delta that
-compiles nothing has no plausible way to cost minutes.
+The id-less row's timing has **not** been re-measured on NP Retail; the behaviour is pinned by
+`RadIdlessObjectTests` against a fixture instead, and a delta that compiles nothing has no
+plausible way to cost minutes. Before those kinds were keyable at all, an edit to one — a
+comment included — was a guaranteed whole-module rebuild, and NP Retail has 84 such files of
+7,339 (60 `interface`, 16 `controladdin`, 8 `profile`).
 
-`pagecustomization`, `profileextension` and `entitlement` joined them. The first two are
-returned by `GetDeclaredApplicationObjectSymbols()` and then report **id 0** — they satisfy
-every "is this an application object?" test and have no id to be told apart by, which is why
-keying on the id alone left them unkeyable. An `entitlement` is not returned at all, so its
-declaration is read off the syntax tree like an `interface`'s.
+### Cold versus warm, whole cycle
 
-The claim that they had no representation to strip was only true of one of them:
-`ModuleDefinition` does carry `PageCustomizations` and `ProfileExtensions` (and
-`ProfileExtensionDefinition` carries `Name` + `TargetObject`), so both are stripped from the
-packaged baseline like any other modified object. `Entitlements` is the one that genuinely
-does not exist — there is no `EntitlementDefinition` type in the compiler — which cuts the
-other way: an entitlement has no serialized copy that could shadow an edit, and nothing
-downstream can resolve one. The map in `ModuleDefinitionOps` previously claimed an
-`Entitlements` property; it cost nothing only because `GetProperty` returned null and the
-loop skipped it in silence.
+One codeunit body edit, same tree, `--watch`:
+
+| Phase | Cold cycle | Warm cycle 1 | Warm cycle 2 |
+|---|---:|---:|---:|
+| AL emit | 950.3 s | 4.4 s | 1.5 s |
+| C# compile | 663.6 s | 6.2 s | 0.3 s |
+| AL test run | 140.3 s | 120.2 s | 107.5 s |
+| **total** | **1,754.2 s** | **130.8 s** | **109.2 s** |
+
+`main` has no baseline to delta against, so every warm cycle there re-emits all 6,949 objects:
+739–766 s of AL emit, ~1,070 s total. The interesting part of the warm column is that
+compilation has stopped being the cost at all — a warm cycle is now dominated by **running the
+AL tests**, which is work the developer actually asked for.
+
+> **Cold-cycle figures on this page come from three different runs and do not agree.** This
+> table's 1,754.2 s, the snapshot A/B's 1,125.9 s → 1,375.7 s, and an earlier "~1,100 s, of
+> which 649 s is the Application's AL emit" were taken at different times under different
+> flags. Each is reported as measured; none has been reconciled against the others. Treat the
+> order of magnitude as the claim, not the digits.
+
+### Where a warm cycle's time actually goes
+
+The delta is not the cost. `BCCOMPILER_TIMING=1` instruments the bundle-level phases as well
+as the per-app ones — without that, a measured cycle accounted for about half of itself and
+the remainder was guesswork. Steady state (cycles 2–3 after the baseline; a one-procedure
+edit to one codeunit, which moves five objects because four files call it):
+
+| Phase | Time |
+|---|---:|
+| Running the selected test codeunit (30 tests) | 11.0 s |
+| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | 7.9 s |
+| **AL delta emit (`CreateForRad`)** | **2.4 s** |
+| `NP Retail Tests` establishing it has nothing to do | 2.9 s |
+| Register + publish symbols | 2.5 s |
+| Roslyn compile + assembly load of the overlay | ~1.4 s |
+| `GetSharedReferences` (warm) | 1.0 s |
+| Resolve + load dependencies | 1.0 s |
+| Whole-tree hashing (7,053 files) | 0.14 s |
+| Field-trigger wiring and record prewarm | 0.20 s |
+| C# overlay compile | 0.15 s |
+
+The `AddSourceDir` row is the post-[#1903] figure and this branch carries that fix
+(`4732a66d`, PR #1911): the phase builds one AL syntax tree per **file** rather than one per
+**extractor**, so npcore's 7,339 files cost 7,339 AL parses per cycle rather than ~59,000. A
+direct probe of the phase on the same corpus measured **7.0–7.9 s** at one parse per file
+against **29.7 s** at eight.
+
+`AddSourceDir` is still the largest overhead in the cycle, and it is O(whole tree) by
+construction: the reload clears every parsed dictionary, so all of it is rebuilt to service an
+edit to one file. Making it O(changed files) needs file→parsed-entry provenance, which does not
+exist in `RecordPatches` today — the tableextension dictionaries are keyed by base-table name
+and accumulate, so one file's contribution cannot currently be retracted.
+
+Two figures the instrumentation corrected: post-registration field-trigger wiring and record
+prewarm are **0.2 s**, not the ~12 s previously attributed to them; and `GetSharedReferences`
+is cheap only when the bundle is configured as two source apps — leave a precompiled
+`NP Retail.app` in `Test/.alpackages` and it re-reads 136 MB of packages per call, 8–15 s per
+app per cycle.
+
+[#1903]: https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1903
+
+### The developer loop it is meant to serve
+
+The same corpus, driven through a scripted session that alternates application and test
+edits with one test codeunit selected — the AL results are what prove each cycle ran the
+new code, not just that a cycle happened:
+
+| Step | Result | Cycle |
+|---|---|---:|
+| Add a local helper to an application codeunit | 30P/0F | 44 s |
+| Change a label the test asserts on | **28P/2F** — the edited application code really ran | 41 s |
+| Update the test's expectation to match | 30P/0F | 45 s |
+| Add another helper | 30P/0F | 48 s |
+| Add a public procedure (callable-surface change) | 30P/0F | 46 s |
+| Add a test method calling it | **31P/0F** — the new test ran | 44 s |
+| Edit two application codeunits at once | 31P/0F | 45 s |
+
+## Scope and edge cases
+
+Design, not measurement. Each subsection states a rule the delta path applies, the evidence
+behind it, and — where the evidence is missing — says so.
+
+### Id-less objects: the name is the identity, end to end
+
+`interface`, `controladdin`, `profile`, `pagecustomization`, `profileextension` and
+`entitlement` have no AL object id. The first two and `entitlement` are not returned by
+`GetDeclaredApplicationObjectSymbols()` at all, so their declarations are read off the syntax
+tree; `pagecustomization` and `profileextension` *are* returned and then report **id 0** —
+they satisfy every "is this an application object?" test and have no id to be told apart by,
+which is why keying on the id alone left them unkeyable.
+
+Five of the six have an array in `ModuleDefinition` (`Interfaces`, `ControlAddIns`,
+`Profiles`, `PageCustomizations`, `ProfileExtensions`), so their pre-edit copy *can* be
+stripped. **Four actually are.** `ModuleDefinitionOps.WithoutObjects` is called with
+`.Where(key => !key.IsExtension)`, and `IsExtension` is `Kind.EndsWith("Extension")` — so
+`ProfileExtension` is carved out along with the real extension kinds and is never stripped.
+That is not a bug: a `profileextension` resolves through a target profile that is itself
+resolved from the baseline, and
+`RadIdlessObjectTests.ModifyingAnIdLessObject_LeavesOneBaselineCopy_CarryingTheNewShape`
+pins the outcome for it — the test fails both if stripping breaks the bind and if not
+stripping shadows the edit.
+
+`Entitlements` is the one that genuinely does not exist — there is no `EntitlementDefinition`
+type in the compiler — which cuts the other way: an entitlement has no serialized copy that
+could shadow an edit, and nothing downstream can resolve one.
 
 An id-less object is a binding contract as much as a codeunit is, so its users are rebound
 when its surface moves: the reverse dependency graph records edges onto it even though it is
 not an application object and `ContainingApplicationObject` never returns one. Without that
-edge, widening an interface without touching its implementer reported success, emitted
-nothing, and left the implementer bound to the previous contract. Two more places where the
-name has to be the identity end to end: a removed one is stripped from the previous module
-by name before Microsoft's symbol writer merges (the writer matches the change element, and
-a serialized id-less element carries a synthesized id that source cannot reproduce), and key
-names are decoded and case-folded, because AL escapes a quote by doubling it and its
-identifiers are case-insensitive.
+edge, widening an interface without touching its implementer reports success, emits nothing,
+and leaves the implementer bound to the previous contract.
+
+Two more places where the name has to be the identity end to end: a removed one is stripped
+from the previous module **by name** before Microsoft's symbol writer merges (the writer
+matches the change element, and a serialized id-less element carries a synthesized id that
+source cannot reproduce), and key names are decoded and case-folded, because AL escapes a
+quote by doubling it and its identifiers are case-insensitive.
 
 A **modified** id-less object needs no such pre-strip, and that was measured rather than
 assumed: the writer merges one into exactly one copy carrying the post-edit shape. The
@@ -522,7 +651,7 @@ and the shape. A second copy would not fail any compile — which of the two a l
 answers with is decided by array order — so a settled next cycle can be green over the
 pre-edit definition.
 
-#### An entitlement is compiled with the app's permission sets
+### An entitlement is compiled with the app's permission sets
 
 `ObjectEntitlements` may only name permission sets declared in the **same module**, and BC
 does not accept one resolved from the packaged baseline: the delta fails with **AL0683**
@@ -535,33 +664,31 @@ entitlement.
 
 The reverse edge needs the same treatment for the opposite reason. An entitlement produces no
 compiler symbol, so no semantic model ever reports that it names a permission set, and
-renaming one left every entitlement naming it pointing at something gone — delta green, cold
+renaming one leaves every entitlement naming it pointing at something gone — delta green, cold
 build **AL0185**. So a cycle that renames or removes a permission set rebinds every
 entitlement. Only the *name* triggers it: a permission set has a real object id, so a rename
 keeps its key and arrives as a modification rather than a removal plus an addition, and
-changing `Assignable` or a permission line cannot break a reference by name. Rename and deletion
-are pinned separately because they arrive on different code paths — `modified` and `removed`.
-All of it is pinned by `RadIdlessObjectTests` against a cold compile of the same tree, which is
-the only oracle available for an object the module definition does not represent.
+changing `Assignable` or a permission line cannot break a reference by name. Rename and
+deletion are pinned separately because they arrive on different code paths — `modified` and
+`removed`. All of it is pinned by `RadIdlessObjectTests` against a cold compile of the same
+tree, which is the only oracle available for an object the module definition does not
+represent.
 
-#### A file that declares nothing costs nothing
+### A file that declares nothing costs nothing
 
-Creating an empty `.al` file, editing a comment-only one or deleting it again used to rebuild
-the whole module — for a file that contributes not one line of generated code. On NP Retail a
-whole-module rebuild is the 761–862 s the id-less row above cites. It no longer compiles
-anything at all: the cycle records the new hashes and returns, keeping every loaded type. Not
-re-measured on NP Retail — the behaviour is pinned against the fixture instead, and a cycle
-that invokes no compiler has no plausible way to cost minutes.
+Creating an empty `.al` file, editing a comment-only one or deleting it again compiles
+nothing at all: the cycle records the new hashes and returns, keeping every loaded type. Not
+measured on NP Retail — the behaviour is pinned against the fixture instead, and a cycle that
+invokes no compiler has no plausible way to cost minutes.
 
-What made that unsafe was reading "declares nothing" as the *absence* of a symbol, which is
-equally what an unidentifiable declaration looks like. It is now read positively, off BC's own
-parser: `ObjectSyntax` is the base type of every AL top-level declaration — the id-bearing
-kinds through `ApplicationObjectSyntax`, and `profile`, `interface`, `controladdin`,
-`entitlement` and `dotnet` directly — so a tree with no `ObjectSyntax` node declares nothing,
-full stop. A declaration of a shape the delta does **not** recognise is therefore visible as
-such rather than indistinguishable from an empty file, and takes the full-compile path naming
-its syntax kind; that is what keeps an AL kind some future compiler adds from being silently
-skipped.
+What makes that safe is reading "declares nothing" **positively**, off BC's own parser, rather
+than as the *absence* of a symbol — which is equally what an unidentifiable declaration looks
+like. `ObjectSyntax` is the base type of every AL top-level declaration — the id-bearing kinds
+through `ApplicationObjectSyntax`, and `profile`, `interface`, `controladdin`, `entitlement`
+and `dotnet` directly — so a tree with no `ObjectSyntax` node declares nothing, full stop. A
+declaration of a shape the delta does **not** recognise is therefore visible as such rather
+than indistinguishable from an empty file, and takes the full-compile path naming its syntax
+kind; that is what keeps an AL kind some future compiler adds from being silently skipped.
 
 The other half is a per-file record of what a compile could *not* account for
 (`RadFileDeclarations`), because "the workspace has no objects for this path" is also what a key
@@ -577,58 +704,421 @@ Pinned by `RadObjectDeltaTests.AFileThatDeclaresNoObject_CostsNoCompilerWork_Whe
 (add, edit and delete, each asserting zero emitted sources and twenty untouched runtime types)
 and the two guard tests beside it.
 
-#### What still forces a full compile
+### What still forces a full compile
 
 Every AL **object** kind is keyable. Two cases remain:
 
 - **A `dotnet` package declaration.** Not an AL object: it changes what every object in the
   module can bind to, and a RAD object compilation carries no package declaration trees —
-  `MergeRadBaseline` deliberately restores the previously committed `DotNetPackages`. This used
-  to fall out of the empty-file rule; now that such files delta, it is a rule of its own, and it
-  fires in both directions. Declaring one is read off the changed file's syntax; **deleting**
-  one can only come from the workspace's per-file record, since there is no file left to parse.
-  Pinned both ways by `RadObjectDeltaTests.AFileDeclaringADotNetPackage_StillForcesAFullCompile`.
+  `MergeRadBaseline` deliberately restores the previously committed `DotNetPackages`. It fires
+  in both directions. Declaring one is read off the changed file's syntax; **deleting** one can
+  only come from the workspace's per-file record, since there is no file left to parse. Pinned
+  both ways by `RadObjectDeltaTests.AFileDeclaringADotNetPackage_StillForcesAFullCompile`.
 - **A duplicate declaration** — a changed file claiming a key an untouched file still owns.
-  `ws.Declares` only answers "does the module declare this key", which is true either way, so
-  the new object used to be classified as a *modification* of the other file's object and the
-  cycle reported success on a tree that does not compile. Measured against a cold compile: a
-  duplicated `interface` name is four AL0197s cold and **no diagnostic at all** through the
-  delta; a duplicated codeunit id is four AL0264s cold and one unrelated AL0185. Only the
-  compiler can say what a duplicate means, so it gets the whole module.
+  `ws.FileOf` answers *which file* owns a key, which is the question that distinguishes a
+  modification from a duplicate; `ws.Declares` only answered "does the module declare this
+  key", which is true either way, so the new object was classified as a *modification* of the
+  other file's object and the cycle reported success on a tree that does not compile. Measured
+  against a cold compile: a duplicated `interface` name is four AL0197s cold and **no
+  diagnostic at all** through the delta; a duplicated codeunit id is four AL0264s cold and one
+  unrelated AL0185. Only the compiler can say what a duplicate means, so it gets the whole
+  module.
 
 Adding a future kind is a line in `RadObjectKey.IsIdlessKind` (plus `IdlessKindOf` if the
 symbol API omits it, plus a `ModuleDefinitionOps` array entry if one exists) and a fixture
 that declares one — a kind counts as supported when a test proves the round trip, not when
 it has a key.
 
-#### A file resource is a question only the full compile can answer
+### A file resource is a question only the full compile can answer
 
 BC resolves a `controladdin`'s `Scripts` / `StartupScript` / `StyleSheets` / `Images` through
-an `IFileSystem` attached to the compilation, anchored at the app root (#1899/#1912). A RAD
-compilation cannot have one: `Compilation.CreateForRad` takes no file-system parameter, and
-attaching one afterwards with `WithFileSystem` returns a compilation that has **lost its
-packaged module definition** — measured, everything outside the delta stops resolving, e.g.
-`AL0247` for the target table of an untouched `tableextension`.
-
-So the delta cannot tell a resource that is present from one that is missing, and an
-`AL0327` from a RAD compilation is not evidence of anything. It is treated as "not
-expressible as a delta" and the cycle compiles the module in full, which resolves the path
-or reports a genuine typo. Both directions are pinned by
+an `IFileSystem` attached to the compilation, anchored at the app root (#1899/#1912). The RAD
+call this runner makes does not attach one, so the delta cannot tell a resource that is present
+from one that is missing, and an `AL0327` from a RAD compilation is not evidence of anything.
+It is treated as "not expressible as a delta" and the cycle compiles the module in full, which
+resolves the path or reports a genuine typo. Both directions are pinned by
 `RadObjectDeltaTests.AControlAddInResourcePath_IsAnsweredByTheFullCompile_NotSilencedAndNotFailed`
 — a fix that merely suppressed AL0327 would hide every real one.
 
-The same asymmetry has a second consequence, in the surface fingerprint. A full compile with
-a file system records a `ReferenceSourceFileName` on every symbol it writes; a RAD-emitted
-one comes back with it null. `ObjectSurfaceFingerprint` therefore strips it before comparing
-— otherwise **every** re-emitted object reads as "its surface moved" and pulls in its direct
-callers, whose fingerprints then differ for the same reason. Measured on the 20-object
-fixture: a one-line body edit went from 1 re-emitted object to 3, over two rounds of
-rebinding. Where a symbol was read from is not part of any binding contract; what it offers
-is. Pinned in both directions by
+> **`CreateForRad` does take an `IFileSystem`, and the code comment saying otherwise
+> (`BcCompiler.Rad.cs:650-658`) is wrong.** Read by reflection off BC 28.1
+> (`Microsoft.Dynamics.Nav.CodeAnalysis` 17.0.36.40629): `IFileSystem fileSystem` is parameter
+> index 12, optional, defaulting to `null`, with `dotNetResolverFactory` at index 13. The call
+> at `:625-638` simply omits it. `Compilation.WithFileSystem(IFileSystem)` also exists as a
+> separate public instance method.
+>
+> **What is still unmeasured:** whether passing a file system through the *constructor*
+> preserves the packaged module definition. The recorded reason for avoiding
+> `.WithFileSystem(...)` is that it loses it — measured, as `AL0247` for the target table of an
+> untouched `tableextension` — but a constructor parameter is a different path and may not have
+> that defect. Nobody has run it. Until someone does, the AL0327 fallback above stands and the
+> provenance canonicalisation below stands with it.
+
+### The fingerprint compares two different producers, so it canonicalises
+
+`ObjectSurfaceFingerprint` decides whether a modified codeunit's or id-less object's surface
+moved, and therefore whether its direct users are rebound. The two sides of that comparison are
+built by **different code paths**. The committed baseline comes from
+`SerializableSymbolModelConverter.ConvertModuleToSerializableSymbolModel(Compilation)` and
+stays an object graph. The merged one is written by `CompilationUtilities.WriteSymbolReference`
+and read back with `SymbolReferenceJsonReader` — a JSON round trip the committed one never
+sees. Anything either side represents differently, for reasons of its own, reads as a surface
+move — and a spurious move cascades, because the callers it drags in have fingerprints that
+differ for the same reason.
+
+Two such differences are known, and both are handled by **shape** rather than by property
+name, because a list of individual offending properties has already proved incomplete twice.
+
+**1. Provenance.** A full compile given an app root (#1912 — what the CLI passes on every
+cycle) records a `ReferenceSourceFileName` on every symbol it writes; a RAD-emitted one comes
+back with it null. Comparing raw serialized symbols therefore reported "the surface moved" for
+**every** re-emitted object. Measured on the 20-object fixture: a one-line body edit went from
+1 re-emitted object to 3, over two rounds of rebinding. Where a symbol was read from is not
+part of any binding contract; what it offers is. Pinned in both directions by
 `ABodyEdit_StaysOneObject_WhenTheCompileRecordsSourceFileNames` and
 `ACallableSurfaceEdit_StillRebindsItsCaller_WhenTheCompileRecordsSourceFileNames`.
 
-#### Every full compile says why, where the developer is looking
+**2. Null versus empty.** The second instance cost a real app its watch loop. On NP Retail a
+body-only edit to `NPR Adyen Management` diverged on this, in a 36 KB serialized surface:
+
+```
+before …"NameForSerialization":"NonDebuggable","Arguments":null}]…
+after  …"NameForSerialization":"NonDebuggable","Arguments":[]}]…
+```
+
+An argument-less method attribute: `null` from the converter, `[]` after the round trip. Ten
+characters. The codeunit read as moved, pulled in its **30 direct caller files**, and one of
+those then failed to bind — so every warm cycle reported `EMIT-ZERO` plus an AL0126 and the
+loop never progressed. The 20-object fixture missed it because no fixture object carried a
+method attribute at all.
+
+So the fingerprint is canonicalised by shape: provenance is stripped, and any property that is
+absent — whether it says so with `null` or with an empty array — is dropped from both sides.
+That cannot hide a real change, because a surface that genuinely gained or lost a member has
+the property non-empty on exactly one side, and the two still differ. Both directions are
+pinned: `ABodyEdit_StaysOneObject_WhenTheEditedCodeunitCarriesAnArgumentLessAttribute` (a body
+edit stays one object) and `ChangingAnAttributesArguments_StillCountsAsASurfaceMove`
+(retargeting an `[EventSubscriber]` still rebinds its callers, so ignoring attribute
+*arguments* is not the fix).
+
+### A delta damages surface a bystander holds only because the stripped object exists
+
+Every modified or removed non-extension object is stripped from the packaged module definition
+before `CreateForRad` binds the new source (`:620-624`), or its pre-edit shape shadows the
+edit. That is correct and unavoidable. Everything the delta did not touch is still resolved
+**from that stripped definition** — the syntax trees a RAD compilation is handed do not
+participate in it.
+
+**The thesis this section used to state is wrong, and too broad.** It said damage follows
+whenever an untouched object's *serialized surface names* a stripped object. Measured: a plain
+by-name pointer re-resolves fine, because the stripped object is still handed to the compiler
+as a syntax tree and the syntax is the authority for that name. `RadByNameSubtypeTests` edits
+a table whose name an untouched codeunit's `Record` parameter mentions, and **passes**.
+
+What actually breaks is narrower: **surface the bystander holds ONLY BECAUSE the stripped
+object exists.** A contributed field or enum value, conformance to an implemented interface,
+the `Run(Record)` overload `TableNo` confers — none of that is in the bystander's own source,
+so re-resolving a name does not put it back.
+
+Damage needs a **triple**, which is why lone edits never showed it:
+
+> **X** stripped ∧ **V** untouched, resolved from the packaged baseline, holding surface it
+> derives from X ∧ **W** in the same delta, binding to exactly that part of V's surface.
+
+Drop V and the delta is X+W, which bind against each other from source and never consult a
+serialized surface. Drop W and nothing ever asks V's damaged representation a question. Every
+fixture below is three objects, or it is not evidence.
+
+**Eight shapes reproduce.** Each has a committed test asserting the delta reports exactly what
+a cold compile of the identical tree reports. For the seven bind-time shapes cold is `[]` and
+the delta invents a diagnostic:
+
+| Shape | Test | What the delta invents |
+|---|---|---|
+| `tableextension` field | `RadByNameTableExtTargetTests` | `AL0132 'Record "ExtTarget Base"' does not contain a definition for 'Ext Value'` |
+| `enumextension` value | `RadByNameEnumExtTargetTests` | `AL0132 '"EnumExt Base"' does not contain a definition for 'Extended'` |
+| `pageextension` control | `RadByNamePropertyShapesTests.PageExtensionTargetObject_…` | `AL0270 The control 'BystanderMarker' is not found in the target` |
+| `reportextension` column | `RadByNamePropertyShapesTests.ReportRelatedTable_…` | `AL0118 The name 'Description' does not exist in the current context` |
+| codeunit `implements I` | `RadByNameInterfaceCodeunitTests` | `AL0122 Cannot implicitly convert type 'Codeunit "ByName Impl"' to 'Interface "ByName Contract"'` |
+| enum `implements I` | `RadByNameInterfaceEnumTests` | `AL0122`, the same, for an enum |
+| `TableNo` under a table **rename** | `RadByNameTableNoRenameTests` | `AL0126 No overload for method 'Run' takes 1 arguments. Candidates: built-in method 'Run()'` |
+| cross-app member-id move | `RadDeltaWatchTests.Watch_MovingAMemberIdInOneApp_RebindsItsCrossAppCaller` | `NavNCLCompilationException: Function ID … was called. The object with ID … does not have a member with that ID.` |
+
+The last row is the odd one out and is listed here only because it is the same class of
+symptom. It is not a packaged-baseline strip at all: it is the
+[missing cross-app edge](#the-reference-graph-holds-no-cross-app-edges), it fails at **run
+time** rather than at bind time, and its oracle is a cold *run* of the same tree (which
+produces the developer's own assertion failure) rather than an empty diagnostic list.
+
+The first four rows are one family, not four: an untouched extension loses what it contributes
+to a stripped target — a `tableextension` its field, an `enumextension` its value, a
+`pageextension` its control, a `reportextension` its column. Extensions are exempt from the
+strip on their own account, but nothing exempts them from their *target* being stripped.
+
+All seven bind-time shapes are **method-body** diagnostics, so none is caught by the
+`GetDeclarationDiagnostics()` check at `:646`; they arrive through `rad.Emit(...)` at `:682`.
+
+**And that is why the existing widening machinery cannot fix any of them.** The
+diagnostics return at `:714-717` sits *before* `changedSurfaces` is computed at `:754`:
+
+```
+:682   rad.Emit(...)                       ← the bystander's damaged surface breaks the bind here
+:714   if (diags.Count > 0) return ...     ← and the cycle ends here
+:754   var changedSurfaces = ...           ← never reached
+:829   ws.DirectUsersOf(changedSurfaces)   ← never reached
+```
+
+The codeunit-`implements` row proves the ordering is the whole story rather than a missing
+edge. Its edit adds a method to the interface, so the interface's fingerprint *does* move and
+it *does* qualify for `changedSurfaces`; the implementer edge *does* exist, and
+`RadIdlessObjectTests.WideningAnInterfaceAlone_RebindsItsImplementer_AndReportsTheBreak` pins
+that it works. The shape still fails — because the first pass errors and returns before any of
+that runs.
+
+Two consequences for anyone designing the fix:
+
+1. **The widening set must be computed before the emit**, or a diagnostic must trigger a
+   widened *retry* rather than a return. Computing it first is cheaper and simpler: every
+   input (`modified`, `removed`, the extension targets) is known by `:554`.
+2. **It must be narrow.** `DirectUsersOf(every stripped object)` is the whole-cascade behaviour
+   this design exists to avoid — 313 objects for one hub-codeunit edit on npcore. The set the
+   measurements actually justify is small by construction:
+
+   > extensions whose target is stripped ∪ implementers of a stripped interface ∪ codeunits
+   > whose `TableNo` names a stripped table
+
+   An object has few extensions and an interface few implementers; none of those sets grows
+   with the app's call graph, which is what makes the difference between this and a cascade.
+
+#### `TypeDefinition.Subtype` does not reproduce
+
+Carried into this work as "the important one" — a method parameter's `Record "T"` serializes
+`T` as a bare string, counted at **13,610** occurrences on npcore, ~54× more common than
+`TableNo`. `RadByNameSubtypeTests` builds the triple over it and **passes**: editing a table
+whose name an untouched codeunit's `Record` parameter mentions is fine, because the stripped
+table is still supplied as syntax and the parameter's type re-resolves against it.
+
+That result is what disproved the wider thesis, and it deletes the claim that `Subtype` is the
+widest exposure. It is not exposure at all.
+
+#### Six by-name property shapes are clean, and are now pinned
+
+`RadByNamePropertyShapesTests` builds the same triple over each and asserts delta == cold:
+`SourceTable`, `CalcFormula`, `RunObject`, `LookupPageId`/`DrillDownPageId`, enum-value
+`Implementation`, and `RoleCenter`. All six survive the strip.
+
+Two of the six are blunter than the rest and the suite says so: `LookupPageId`/`DrillDownPageId`
+and `RoleCenter` are *object-level* properties with no member for a W to aim at, so the
+strongest available W merely forces the bystander to resolve (`Record V`,
+`profileextension extends V`). They would not notice a degradation that left V's members intact.
+
+The trip-wires are worth their runtime because a broken shape here really would look different
+from a working one: each reference was first pointed at a name that does not exist and the
+fixture recompiled cold, confirming this pipeline diagnoses the break at all. All nine shapes
+that got a `[Fact]` are diagnosable that way.
+
+#### Three shapes are untestable with a cold-compile oracle — a known coverage gap
+
+`TableRelation`, `Permissions` and `IncludedPermissionSets` are **not** tested, and are not
+"clean". Measured: a dangling `TableRelation` — to a missing table *or* to a missing field of a
+table that exists — compiles **silently**, and so do `Permissions` and `IncludedPermissionSets`
+naming things that do not exist. A cold compile therefore cannot tell a surviving reference
+from a destroyed one, so `delta == cold == no diagnostics` would be green by construction.
+
+That is a test asserting nothing dressed as coverage, which is worse than an acknowledged gap.
+Their objects stay in `Fixtures/RadByNamePropertyShapes` because they document the shape and
+cost nothing, but no `[Fact]` claims to prove them. A real oracle for these would have to
+inspect the merged module definition directly rather than ask the compiler.
+
+#### Query `RelatedTable` diverges, and it is unexplained
+
+The delta reports `AL0386 A required package dependency could not be found`; a cold compile of
+the same tree is clean. The divergence is real and reproducible, and it is **not** understood.
+
+`AL0386` is a package-resolution failure, not a by-name break. The earlier explanation — that
+the original probe put the query *in* the delta, and a reference-free probe cannot codegen one
+— does not hold here, because in `RadByNamePropertyShapesTests.QueryRelatedTable_…` the query
+is the untouched bystander and the delta never code-generates it. Recorded as unresolved. Do
+**not** fold it into the widening story.
+
+#### "Stub instead of strip" is measured dead — do not re-propose it
+
+Leaving a member-less stub in the packaged definition instead of removing the object is
+constructible (every definition type has a parameterless constructor and settable properties)
+and it does repair the shapes above. It also **shadows the supplied syntax**, on all five
+object kinds tested:
+
+| Scenario | STRIP | STUB |
+|---|---|---|
+| table stubbed, another delta object reads its fields | clean | `AL0132 … no definition for 'Code'` |
+| codeunit stubbed, another delta object calls its method | clean | `AL0132 … no definition for 'Ping'` |
+| interface stubbed, another delta object calls it | `AL0122` | `AL0132 … no definition for 'Ping'` |
+
+It converts "one dangling bystander" into "every consumer in this delta loses the edited object
+entirely" — the exact failure the strip exists to prevent, in a harder-to-detect form. The
+extension carve-out is not a counter-example: an extension resolves its own members through a
+target that is being rebuilt from source in the same delta, a structurally different path.
+
+#### The one rule that ships today: a stripped table takes its `TableNo` codeunits with it
+
+`TableNo` is the case that was observed first, on NP Retail. A cycle that rebound
+`AdyenSetup.Page.al` also had `NPR Adyen Reconciliation Hdr` in its change set. Codeunit
+6248336 declares `TableNo` on that table, was **not** in the delta, and was confirmed still
+present in the packaged definition with the property intact — only the table it names was gone.
+Its `Run(Record)` overload therefore did not exist, and an untouched page calling
+`AdyenRecreateRecDoc.Run(ReconHeader)` — code that compiles clean cold — failed with
+`AL0126: No overload for method 'Run' takes 1 arguments`.
+
+So a delta that strips a table also rebinds, from source, every codeunit whose `TableNo` names
+it (`ModuleDefinitionOps.CodeunitsWithTableNo`, driven from `BcCompiler.Rad.cs:815-824`). Both
+modified and removed tables, for opposite reasons: a modified one must resolve to its NEW
+shape, while a removed one must produce the AL diagnostic a cold compile produces instead of a
+silently overload-less codeunit. `RadRunnableCodeunitBindingTests` pins both.
+
+**The rule does not cover the rename it was written for.** `:815-819` deliberately collects
+both the object's current name and its committed one, with a comment claiming that a renamed
+table — which keeps its key, so it arrives as a *modification* while every packaged codeunit
+still names the old spelling — is exactly the edit that would otherwise be missed.
+`RadByNameTableNoRenameTests` builds that edit and **fails** with the AL0126 above. This is a
+bug in the shipped rule, not a fixture artifact: BC serializes `TableNo = 72100` — numeric in
+AL source — as the NAME `"Rename Target"` in the module definition, confirmed by reading a
+persisted `rad-symbols.json`.
+
+#### The widening rules name themselves in the log
+
+A widened cycle says **which** rule widened it, not just that something did
+(`BcCompiler.Rad.cs:845-853`):
+
+```
+[watch] NP Retail: rebinding 4 direct caller file(s)
+[watch] NP Retail: rebinding 12 file(s) — direct callers, plus 3 whose codeunit's TableNo
+      names a table this cycle strips
+[watch] NP Retail: rebinding 3 file(s) whose codeunit's TableNo names a table this cycle strips
+```
+
+The two have completely different remedies — a moved callable surface is the developer's own
+edit propagating, while a `TableNo` rebind is the delta compensating for a packaged symbol it
+had to strip — and a single undifferentiated count is what made a one-object body edit look
+indistinguishable from a real cascade for the length of an npcore investigation.
+
+### Member ids are signature hashes
+
+Generated calls bake Microsoft's member id, so what moves one decides who must be rebound.
+Established by static analysis of npcore's 24 MB `rad-symbols.json` (2,420 codeunits / 12,354
+methods), a controlled experiment, and decompiling the algorithm.
+
+`MethodSymbol.CalculateMethodId` hashes the **upper-cased** method name (FNV), the return
+type's **bare `NavTypeKind`**, and per parameter `(index, IsVar, NavTypeKind)`, plus a
+per-parameter subtype term **only** when the method requires overload disambiguation. The same
+`get_Id` feeds the serialized `Id`, the `case <id>:` in `OnInvoke`, and the caller's
+`Target.Invoke(<id>, …)` — verified: 3,997 of 4,000 symbol-file ids appear verbatim as
+`ldc.i4` constants in npcore's emitted 61 MB DLL.
+
+| Does **not** move the id | **Moves** the id |
+|---|---|
+| insert a method before another · append · reorder | parameter type |
+| body-only edit | return type |
+| parameter **rename** | `var` / byref on a parameter |
+| an overload **added** | return removed |
+| made `internal` | method renamed |
+| attribute added | |
+| global var added | |
+| object `Access` changed | |
+| containing codeunit renamed | |
+
+A RAD delta re-emit reproduces ids bit-identically to a full compile — verified both in the
+emitted C# and by a cache-HIT caller dispatching correctly against a delta-re-emitted callee.
+Nothing in the AL surface is ordinally numbered: methods hash, table fields carry
+author-assigned numbers, enum values and add-in events bind by name.
+
+**Four contract changes are id-invisible.** The id cannot be used as a proxy for "the contract
+moved":
+
+- **access** (`internal` / `local`),
+- **attributes** (`[NonDebuggable]`, `[TryFunction]`, `[IntegrationEvent]`),
+- **parameter names**,
+- **the return type's subtype** — only the bare `NavTypeKind` is hashed, so
+  `Codeunit A` → `Codeunit B` and `List<Integer>` → `List<Text>` are invisible.
+
+**The overload hazard is silent.** Adding `Which(Integer)` alongside an existing
+`Which(Decimal)` does **not** move the existing member's id — and *does* move which id the
+caller bakes, because the new overload changes disambiguation:
+
+| | `Which(Decimal)` id | caller bakes | runtime |
+|---|---|---|---|
+| before | `-460041644` | `-460041644` | `BOUND-TO=DECIMAL` |
+| after adding `Which(Integer)` | `-460041644` *unmoved* | **`-460041642`** | `BOUND-TO=INTEGER` |
+
+The old `case` label survives in the callee, so a stale caller keeps working and answers with
+the wrong overload. Nothing throws.
+
+**Inferred, not measured:** BC's `CanBeOverloaded()` appears to exclude events, subscribers and
+handlers from the subtype term, which would make `OnFoo(Record Customer)` and
+`OnFoo(Record Item)` collide on one id. Nobody has run it.
+
+### The reference graph holds no cross-app edges
+
+`ReferenceTargetKey` (`BcCompiler.Rad.cs:1324-1338`) returns `null` for every target outside
+the compiling app — at `:1328` for application objects and `:1334` for id-less ones — so an
+edge from a Test-app codeunit to an Application codeunit is discarded when the graph is built.
+Measured on npcore: the Test app's persisted baseline records **1 cross-app edge in 505**, and
+that one is an extension target, not a call.
+
+The consequence is a hole in the rebind rules that no other mechanism covers. Editing app A
+re-emits A's objects; app B never enters `changedFiles`, takes the `NoChange` short-circuit at
+`:203-206`, and keeps executing IL that bakes A's **previous** member ids. Only the reference
+graph could say otherwise, and it has nothing to say.
+
+Two failure modes, and the difference matters for
+[`.claude/rules/loud-failures.md`](../.claude/rules/loud-failures.md):
+
+- **Loud**, when the retired member id is absent from the re-emitted callee — a
+  `NavNCLCompilationException` naming a function id no AL author has ever seen, where a cold
+  compile of the same tree reports the developer's own assertion failure. Loud is not correct,
+  but it is at least visible.
+- **Silent**, when the old id survives on the new object. The overload case above is exactly
+  that shape: the caller keeps dispatching an id that still resolves, to the wrong member.
+
+Both halves have RED tests, and the pair exists because measuring only the first one would have
+understated the bug.
+
+`Watch_MovingAMemberIdInOneApp_RebindsItsCrossAppCaller` is the loud half. It retypes
+`Delta Lib`'s parameter from `Integer` to `Decimal` — which moves the id, per the contract
+above — while leaving `Delta Bridge`'s own source valid, because an Integer argument widens to
+a Decimal parameter. It asserts that `Delta Bridge` is re-emitted in the same cycle, that the
+AL result matches a cold run of the identical tree, and — as a control — that a body-only edit
+leaves `Delta Bridge` **unchanged**, so a fix cannot be "rebind everything".
+
+`Watch_AddingAnOverloadInOneApp_RebindsItsCrossAppCaller` is the silent half, and the reason
+loudness must not be taken for a mitigation. Adding `Pick(Integer)` beside `Pick(Decimal)`
+leaves the Decimal overload's id *and* its `case` label intact; what moves is which id the
+caller bakes. Measured:
+
+```
+[watch] Delta Bridge: unchanged — reusing the loaded module
+FAIL  Codeunit60941.PickBindsTheOnlyOverload
+      NavNCLDialogException: Delta Lib Pick returned 1, expected 2
+```
+
+No exception, no diagnostic, no log line — just the previous overload's answer. The only thing
+between that and a green run over wrong code is an assertion that happens to check the value.
+The test pins the silence explicitly, so reading it cannot leave the opposite impression.
+
+So the loudness of the retyped-parameter case is an accident of which edit was measured first,
+not a property of the bug.
+
+This is distinct from the cross-app *object-type* staleness `AlObjectResolution` already
+handles. That one is fixed; this one is not.
+
+### Reloaded dependency tableextensions
+
+Watch reloads preserve the symbol paths for precompiled dependency apps and re-merge their
+`tableextension` fields when per-cycle record metadata is rebuilt. A second or later cycle
+can therefore resolve fields supplied by a warm precompiled dependency; the
+`extension field ... not found in NCLMetaTable` reload regression is covered by
+`RadDeltaWatchTests`.
+
+### Every full compile says why, where the developer is looking
 
 A whole-module rebuild in a warm watch loop is the difference between a one-second cycle and a
 several-minute one, and an unexplained one is indistinguishable from the delta path being
@@ -654,108 +1144,52 @@ facet by facet (`ReferenceSignature` writes `<facet>|<value>` lines for exactly 
 `DescribeSignatureChange` reads them), so it names what moved instead of listing everything that
 could have.
 
-**These lines are also collected, not only logged.** The interactive dashboard redirects both
-console streams to `TextWriter.Null` for the duration of the bundle loop so its painted frame is
-not scrolled away — which meant that in the one mode a developer actually watches, every reason
-was discarded. `Rad/RadCycleNotes.cs` is a process-wide collector the watch loop drains after the
-loop restores the streams, and the dashboard renders a yellow **full recompile** panel above the
-test tree. Yellow, not red: the results below it are correct, the cycle was only slow. On a
-plain delta cycle the panel is absent entirely, so "no full recompile happened" is readable
-without parsing anything.
+**These lines are collected, not only logged.** The interactive dashboard redirects both console
+streams to `TextWriter.Null` for the duration of the bundle loop so its painted frame is not
+scrolled away — which means a stderr-only reason is invisible in the one mode a developer
+actually watches. `FullCompileBecause` therefore does both, always: `Rad/RadCycleNotes.cs` is a
+process-wide collector the watch loop drains after the loop restores the streams, and the
+dashboard renders a yellow **full recompile** panel above the test tree. Yellow, not red: the
+results below it are correct, the cycle was only slow. On a plain delta cycle the panel is
+absent entirely, so "no full recompile happened" is readable without parsing anything.
 
 One reason is reported by a *later* cycle than the one that discovers it. A compile that cannot
 record a baseline makes every subsequent cycle a full compile, and those later cycles know
-nothing — so they rebuilt in silence while the reason had scrolled past one cycle before the
-slowdown anyone noticed. `RadWorkspace.PendingFullCompileReason` parks it, and the compile that
-acts on it consumes it. Exactly once, and a committed baseline retires it, so it cannot end up
-attached to some unrelated later rebuild. The invalidation paths deliberately do NOT park —
-`Invalidate` reports in the same cycle, and doing both would say it twice.
-
-### Where a warm cycle's time actually goes
-
-The delta is not the cost. `BCCOMPILER_TIMING=1` instruments the bundle-level phases as well
-as the per-app ones — before that, a measured cycle only accounted for about half of itself,
-and the unattributed remainder was guessed at. Steady state (cycles 2–3 after the baseline; a
-one-procedure edit to one codeunit, which moves five objects because four files call it):
-
-| Phase | Time |
-|---|---:|
-| Running the selected test codeunit (30 tests) | 11.0 s |
-| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | 7.9 s* |
-| **AL delta emit (`CreateForRad`)** | **2.4 s** |
-| `NP Retail Tests` establishing it has nothing to do | 2.9 s |
-| Register + publish symbols | 2.5 s |
-| Roslyn compile + assembly load of the overlay | ~1.4 s |
-| `GetSharedReferences` (warm) | 1.0 s |
-| Resolve + load dependencies | 1.0 s |
-| Whole-tree hashing (7,053 files) | 0.14 s |
-| Field-trigger wiring and record prewarm | 0.20 s |
-| C# overlay compile | 0.15 s |
-
-\* **The `AddSourceDir` row, and therefore the cycle total, is measured with a change this
-branch does not carry.** That phase builds one AL syntax tree **per extractor** rather than per
-file, so npcore's 7,339 files cost ~59,000 AL parses per cycle instead of 7,339. A direct probe
-of the phase on the same corpus measured **29.7 s** at eight parses per file against
-**7.0–7.9 s** at one; the table above was taken with the latter. Deduplicating the parse is
-tracked separately as
-[#1903](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1903), so as this
-branch stands the row is ~29.7 s and the cycle is roughly 22 s longer than the rows sum to.
-That composite has not been re-measured in this configuration.
-
-`AddSourceDir` is the largest overhead in the cycle either way, and it is O(whole tree) by
-construction: the reload clears every parsed dictionary, so all of it is rebuilt to service an
-edit to one file. Making it O(changed files) needs file→parsed-entry provenance, which does not
-exist in `RecordPatches` today — the tableextension dictionaries are keyed by base-table name
-and accumulate, so one file's contribution cannot currently be retracted.
-
-Two corrections to what this section used to claim, both from the new instrumentation:
-post-registration field-trigger wiring and record prewarm are **0.2 s**, not ~12 s; and
-`GetSharedReferences` is cheap only when the bundle is configured as two source apps —
-leave a precompiled `NP Retail.app` in `Test/.alpackages` and it re-reads 136 MB of
-packages per call, 8–15 s per app per cycle.
-
-### The developer loop it is meant to serve
-
-The same corpus, driven through a scripted session that alternates application and test
-edits with one test codeunit selected — the AL results are what prove each cycle ran the
-new code, not just that a cycle happened:
-
-| Step | Result | Cycle |
-|---|---|---:|
-| Add a local helper to an application codeunit | 30P/0F | 44 s |
-| Change a label the test asserts on | **28P/2F** — the edited application code really ran | 41 s |
-| Update the test's expectation to match | 30P/0F | 45 s |
-| Add another helper | 30P/0F | 48 s |
-| Add a public procedure (callable-surface change) | 30P/0F | 46 s |
-| Add a test method calling it | **31P/0F** — the new test ran | 44 s |
-| Edit two application codeunits at once | 31P/0F | 45 s |
+nothing about why — so they rebuild in silence while the reason has scrolled past.
+`RadWorkspace.PendingFullCompileReason` parks it, and the compile that acts on it consumes it.
+Exactly once, and a committed baseline retires it, so it cannot end up attached to some
+unrelated later rebuild. The invalidation paths deliberately do NOT park — `Invalidate` reports
+in the same cycle, and doing both would say it twice.
 
 ## What the tests pin
 
 Timings drift with the machine, so the executable contract is stated as identities and
 counts instead. The first four suites share one real 20-object app,
 `AlRunner.Tests/Fixtures/RadTwentyObject`, so "all of it" and "the one that changed" are
-different numbers:
+different numbers.
 
 | Suite | Claim |
 |---|---|
-| `RadObjectDeltaTests` | One edit → exactly which objects re-emit and which CLR types change owner, for ten object kinds plus schema additions, a rename, a callable-surface change, and a rejected or abandoned candidate |
+| `RadObjectDeltaTests` | One edit → exactly which objects re-emit and which CLR types change owner, for ten object kinds plus schema additions, a rename, a callable-surface change, and a rejected or abandoned candidate; and the two ways the committed and merged baselines describe one unchanged surface differently — a recorded source file name, and an argument-less method attribute that is `null` on one side and `[]` on the other — each with the opposite direction pinned beside it |
 | `RadDeletionDeltaTests` | One deletion → zero objects re-emitted, exactly those object identities removed, exactly those CLR names tombstoned, every survivor still the identical baseline `Type` |
 | `RadMetadataDeltaTests` | One edit → exactly one page/report/xmlport/enum metadata entry moves; a deletion drops its entry, on the delta path and on the full-compile fallback; a renamed enumextension leaves one registration; a rejected candidate leaves none behind |
 | `RadWatchTwentyObjectTests` | The same claims against the real `--watch` process, via its own `[watch]` log lines, with the AL test outcome proving the new code actually ran |
-| `RadIdlessObjectTests` | The six kinds with no object id: two `profile`s (and two `entitlement`s) are two objects rather than one colliding key; the kinds the symbol API never reports and the kinds it reports with id 0 are both tracked to their file; editing or deleting one is a delta that compiles no C#; narrowing an interface binds against the new contract rather than the baseline's copy; widening one WITHOUT touching its implementer still rebinds it, and so does renaming a `pagecustomization` without touching the `profileextension` that names it; a modification leaves the merged baseline holding exactly ONE copy, carrying the post-edit shape; a deletion leaves it entirely; identity survives an embedded quote and a case-only rename; an `entitlement` — which the module definition cannot represent at all — accepts and rejects exactly what a cold compile of the same tree does, in both directions of its permission-set relationship; and a changed file claiming a key an untouched file still owns does not pass as a modification |
+| `RadIdlessObjectTests` | The six kinds with no object id: two `profile`s (and two `entitlement`s) are two objects rather than one colliding key; the kinds the symbol API never reports and the kinds it reports with id 0 are both tracked to their file; editing or deleting one is a delta that compiles no C#; narrowing an interface binds against the new contract rather than the baseline's copy; widening one WITHOUT touching its implementer still rebinds it, and so does renaming a `pagecustomization` without touching the `profileextension` that names it; a modification leaves the merged baseline holding exactly ONE copy, carrying the post-edit shape — including for the `profileextension` that `IsExtension` exempts from the strip; a deletion leaves it entirely; identity survives an embedded quote and a case-only rename; an `entitlement` — which the module definition cannot represent at all — accepts and rejects exactly what a cold compile of the same tree does, in both directions of its permission-set relationship; and a changed file claiming a key an untouched file still owns does not pass as a modification |
+| `RadTableExtensionSelfReferenceTests` | A `tableextension` that reads its OWN fields through `Rec` still deltas — npcore's shape, which the 20-object fixture missed because both of its extension triggers touch a base-table field: adding a field, adding and reading one in the same edit, two extensions on one table seeing each other's new fields, removing a field (which must stop binding), and introducing a self-reference where there was none |
+| `RadRunnableCodeunitBindingTests` | A delta that strips a table also rebinds the codeunits whose `TableNo` names it, so an untouched `CodeunitVar.Run(Rec)` still binds — and dropping `TableNo` for real still reports the AL0126 a cold compile reports |
+| `RadByNameTableExtTargetTests`, `RadByNameEnumExtTargetTests`, `RadByNameInterfaceCodeunitTests`, `RadByNameInterfaceEnumTests`, `RadByNameTableNoRenameTests` | **RED.** One three-object triple each, asserting the delta reports exactly what a cold compile of the identical tree reports. Cold is `[]`; each delta invents the diagnostic in the table above |
+| `RadByNameSubtypeTests` | **Green.** The same triple over a method parameter's `Record "T"` — a plain by-name pointer re-resolves against the supplied syntax, which is what disproved the wider damage thesis |
+| `RadByNamePropertyShapesTests` | Six by-name property shapes survive the strip and are pinned as trip-wires (`SourceTable`, `CalcFormula`, `RunObject`, `LookupPageId`/`DrillDownPageId`, enum-value `Implementation`, `RoleCenter`); three do not (`pageextension` control, `reportextension` column, query `RelatedTable`). Every scenario asserts the exact modified/emitted lists, so a future widening rule that drags the bystander into the delta is visible instead of silently making the test vacuous |
+| `RadWorkspaceFileOfTests` | `FileOf` names the declaring file for every object the fixture declares, measured against an oracle read off the tree; returns null for a key the app never declared; and follows an object that moves to a different file across a commit |
+| `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
+| `RadDeltaWatchTests` | Multi-app watch behaviour end to end: a warm reload still resolves a precompiled dependency's `tableextension` fields; and **RED** — a cross-app member-id move rebinds its caller, with a body-only edit as the control that must leave the caller unchanged |
 | `WatchTests` | Cycle 1 of a watch is served from the AL-output cache, and the first edit really runs (never a second HIT): delta'd when the entry carries a baseline — after a one-shot run, and after an earlier watch — and building one when it does not |
 | `RadBaselineSidecarTests` | A persisted baseline restores the compiler's symbol picture **byte-identically**, and a workspace hydrated from it deltas the first edit, rebinds the direct caller of a moved surface, classifies a deletion as a removal, and still rebuilds for a deleted `dotnet` package — plus the five ways hydration must fail closed (tree moved, file edited in place, symbols missing, unknown schema, app identity changed) |
-| `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
-| `WatchDashboardTests` | …and, for the reason-reporting above: a recorded full-recompile reason reaches the dashboard verbatim with the app it belongs to, and the panel is absent on a delta cycle |
-
-## Reloaded dependency tableextensions
-
-Watch reloads preserve the symbol paths for precompiled dependency apps and re-merge their
-`tableextension` fields when per-cycle record metadata is rebuilt. A second or later cycle
-can therefore resolve fields supplied by a warm precompiled dependency; the former
-`extension field ... not found in NCLMetaTable` reload regression is covered by
-`RadDeltaWatchTests`.
+| `WatchSourceTests` | The watch loop's own contract, deterministically: an edit made from inside `onArmed` is always seen (#1822's race); watchers arm exactly once; a burst below the quiet window releases only after it settles; a single save releases within one quiet window; and a watcher-buffer overflow is handled loudly rather than swallowed |
+| `WatchBurstSwitchTests` | The same quiescence claim against the real `--watch` process: a seven-file version switch produces exactly ONE cycle, against the settled tree, with the correct result — not a phantom failure mid-checkout followed by a second cycle |
+| `WatchStateResidencyTests` | One test re-run across three `--watch` cycles sees no state from any earlier one: no manual event binding (from a test-codeunit global *or* a `SingleInstance` one), no `SingleInstance` field value, no committed row. The AL fixture also proves it can observe each kind of state while it IS live, so a gutted runtime cannot pass by making it all unobservable |
+| `WatchOutputSlicingTests` | The test harness's own reading of a live watch process: which cycle a `[watch]`/`[emit-timing]` line belongs to, over synthetic line sequences that reproduce a starved stderr pump — so a flaky read cannot be mistaken for a flaky cycle |
+| `WatchDashboardTests` | A recorded full-recompile reason reaches the dashboard verbatim with the app it belongs to, and the panel is absent on a delta cycle |
 
 ## Control
 

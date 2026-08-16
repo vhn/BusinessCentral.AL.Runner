@@ -191,6 +191,47 @@ same-named types still loaded from the previous run.
 Edits to triggers and procedure/codeunit bodies are picked up fully — the new
 compiled IL runs because the CLR type is resolved fresh against the new assembly.
 
+### Forgetting a cached BC object does not end its life
+
+The reset above is a *runner* concern; the per-test-isolation reset
+(`RecordPatches.ResetPerTestState`, which runs at every codeunit — or, under
+`--test-isolation method`, every test — boundary) is where BC-side state is dropped, and
+it has a rule of its own worth stating because it cost a real bug.
+
+Every `NavCodeunit` the runner caches is *also* rooted in the skeleton session's own tree.
+Clearing the runner's dictionary drops the runner's pointer; BC's reference count never
+moves and the instance lives on. For most state that is invisible — the next lookup builds
+a fresh instance and the stale one is simply unreachable AL. One kind of state is not
+invisible, because BC keeps it on the session rather than on the instance:
+**manual event bindings**.
+
+`Session.EventBindings` is BC's own record of every `BindSubscription`, and BC removes an
+entry as the bound instance's tree is disposed — which is how AL's *"the binding ends when
+the variable goes out of scope"* is implemented. `TestExecutor` disposes the test codeunit
+at the end of its run, so a subscriber bound through a test-codeunit global is unbound
+correctly. A subscriber owned by a `SingleInstance` codeunit is not: that instance is only
+forgotten, never disposed, so the binding stayed live for the whole **process** — firing
+into every later test codeunit and every later `--watch` cycle, none of which had bound
+anything. Reading the SingleInstance codeunit's own fields could not reveal this; a reset
+that hands out a fresh instance zeroes the fields while the old instance, and its binding,
+carry on.
+
+`ResetPerTestState` therefore also calls `BcRuntime.ClearManualEventBindings()`, which
+empties that list — the same operation AL's `UnbindSubscription` performs, applied to
+everything still bound at the boundary.
+
+**Sweeping the list, not destroying the instances, is deliberate.** Disposing cached
+`SingleInstance` codeunits at this boundary was tried and rejected: BC's own machinery
+still holds references to some of them, and the reporting path then died with
+`ObjectDisposedException: 'Tree'` out of `NavSystemCodeunit.Invoke` — 11 corpus tests,
+measured. The binding list is the piece of that instance's state that actually reaches
+the next test, and it is BC's own bookkeeping, so emptying it is both sufficient and safe.
+
+Pinned by `AlRunner.Tests/WatchStateResidencyTests` (fixture
+`Fixtures/WatchStateResidency`), which re-runs one test across three `--watch` cycles and
+fails if a binding, a `SingleInstance` field or a committed row from any earlier execution
+is still visible at the start of a later one.
+
 ### Known limitation: field / table **shape** edits
 
 The runner does **not** clear BC's own skeleton `NCLMetadata.metadataCacheEntries`
