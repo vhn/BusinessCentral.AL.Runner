@@ -19,4 +19,13 @@ codeunit 60941 "Delta Lib Tests"
         Assert.AreEqual(11, Base."Bridge Value", 'Chained tableextension');
         Assert.AreEqual(42, Bridge.Answer(), 'Delta Lib Answer');
     end;
+
+    [Test]
+    procedure ScaledIsEightyFour()
+    var
+        Assert: Codeunit "Delta Assert";
+        Bridge: Codeunit "Delta Bridge";
+    begin
+        Assert.AreEqual(84, Bridge.Scaled(), 'Delta Lib Scaled');
+    end;
 }

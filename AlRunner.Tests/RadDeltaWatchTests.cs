@@ -262,6 +262,162 @@ public class RadDeltaWatchTests
         }
     }
 
+    /// <summary>
+    /// A member-id move in one app rebinds the caller that lives in ANOTHER app.
+    ///
+    /// <para>Generated calls bake Microsoft's member id, and
+    /// <c>MethodSymbol.CalculateMethodId</c> hashes each parameter's <c>NavTypeKind</c> — so
+    /// retyping <c>Scaled(Factor: Integer)</c> to <c>Scaled(Factor: Decimal)</c> moves the id
+    /// while leaving <c>Delta Bridge</c>'s own source valid, because an Integer argument
+    /// widens to a Decimal parameter. Bridge is therefore never in <c>changedFiles</c>, and
+    /// only the reference graph can say it must be rebound.</para>
+    ///
+    /// <para>It could not say so: <c>BcCompiler.ReferenceTargetKey</c> returns null for every
+    /// cross-app target, so the Bridge→Lib edge is discarded when the graph is built. Bridge
+    /// takes the <c>NoChange</c> short-circuit and keeps executing IL that dispatches the
+    /// previous id.</para>
+    ///
+    /// <para><b>Observed before the fix — loud, not silent.</b> The retired id is absent from
+    /// the re-emitted callee, so dispatch fails with
+    /// <c>NavNCLCompilationException: Function ID 1446680415 was called. The object with ID
+    /// 60921 does not have a member with that ID.</c> rather than answering wrongly. That
+    /// satisfies <c>.claude/rules/loud-failures.md</c> as far as it goes, but it is still the
+    /// wrong answer: a cold compile of the same tree reports the developer's actual assertion
+    /// failure (<c>returned 42, expected 84</c>), and the delta reports an internal dispatch
+    /// error naming a function id no AL author has ever seen. Loudness is not correctness
+    /// here, and it is not general either — when the old id SURVIVES on the new object, the
+    /// same staleness is silent. Adding an overload is exactly that case.</para>
+    ///
+    /// <para>So the oracle is the cold compile of the identical tree, not "some error".</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Watch_MovingAMemberIdInOneApp_RebindsItsCrossAppCaller()
+    {
+        TestArtifacts.SkipIfMissing();
+
+        var bundle = Path.Combine(Path.GetTempPath(), "al-runner-rad-xapp", Guid.NewGuid().ToString("N"));
+        CopyTree(FixtureSrc, bundle);
+        var scaleSource = Path.Combine(bundle, "Lib", "src", "DeltaLibScale.Codeunit.al");
+
+        var lines = new List<string>();
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                + $" \"{bundle}\" --watch --no-cache",
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+        using var p = Process.Start(psi)!;
+        void Pump(StreamReader r) => Task.Run(async () =>
+        {
+            string? l;
+            while ((l = await r.ReadLineAsync()) != null) lock (lines) lines.Add(l);
+        });
+        Pump(p.StandardOutput);
+        Pump(p.StandardError);
+
+        async Task<int> WaitForMarkerAfter(int fromIndex, TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline)
+            {
+                lock (lines)
+                    for (int i = fromIndex; i < lines.Count; i++)
+                        if (lines[i].Contains("[watch] waiting for AL source")) return i;
+                await Task.Delay(200);
+            }
+            string dump; lock (lines) dump = string.Join("\n", lines.TakeLast(40));
+            throw new TimeoutException($"watch marker not seen.\n--- last output ---\n{dump}");
+        }
+
+        string Segment(int from, int to)
+        {
+            lock (lines) return string.Join("\n", lines.GetRange(from, Math.Max(0, to - from)));
+        }
+
+        try
+        {
+            // Cycle 1 (cold): the cross-app call answers 42 * 2.
+            int m1 = await WaitForMarkerAfter(0, TimeSpan.FromSeconds(240));
+            var cycle1 = Segment(0, m1);
+            Assert.Contains("PASS  Codeunit60941.ScaledIsEightyFour", cycle1);
+            Assert.DoesNotContain("FAIL  Codeunit", cycle1);
+
+            // The id-moving edit. The body changes too, so that RUNNING the new code is
+            // observable: a correctly rebound caller answers 21 * 2 = 42, and the AL test
+            // (which expects 84) then fails for the developer's own reason.
+            var scale = await File.ReadAllTextAsync(scaleSource);
+            var retyped = scale
+                .Replace("procedure Scaled(Factor: Integer): Integer",
+                         "procedure Scaled(Factor: Decimal): Integer")
+                .Replace("exit(42 * Factor);", "exit(21 * Factor);");
+            Assert.NotEqual(scale, retyped);
+            await File.WriteAllTextAsync(scaleSource, retyped);
+
+            int m2 = await WaitForMarkerAfter(m1 + 1, TimeSpan.FromSeconds(240));
+            var cycle2 = Segment(m1 + 1, m2);
+
+            // The edited app deltas its one object…
+            Assert.Contains("[watch] Delta Lib: delta +0 ~1 -0", cycle2);
+            // …and the app that CALLS it is rebound rather than reused wholesale.
+            Assert.DoesNotContain("[watch] Delta Bridge: unchanged", cycle2);
+            Assert.Contains("[watch] Delta Bridge: delta", cycle2);
+
+            // The answer is the one a cold compile of this exact tree gives.
+            var cold = await ColdCompileAsync(bundle);
+            Assert.Contains("Delta Lib Scaled returned 42, expected 84", cold);
+            Assert.Contains("Delta Lib Scaled returned 42, expected 84", cycle2);
+            Assert.DoesNotContain("does not have a member with that ID", cycle2);
+
+            // Control — precision, not "rebind everything". A body-only edit leaves every
+            // member id where it was, so the cross-app caller must stay warm.
+            await File.WriteAllTextAsync(
+                scaleSource, retyped.Replace("exit(21 * Factor);", "exit(42 * Factor);"));
+            int m3 = await WaitForMarkerAfter(m2 + 1, TimeSpan.FromSeconds(240));
+            var cycle3 = Segment(m2 + 1, m3);
+            Assert.Contains("[watch] Delta Lib: delta +0 ~1 -0", cycle3);
+            Assert.Contains("[watch] Delta Bridge: unchanged", cycle3);
+            Assert.Contains("PASS  Codeunit60941.ScaledIsEightyFour", cycle3);
+        }
+        finally
+        {
+            try { p.Kill(true); } catch { }
+            try { Directory.Delete(bundle, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Compile and run a copy of <paramref name="tree"/> from scratch — no watch, no cache,
+    /// no baseline. Whatever a cold build says about the tree is what the delta has to say
+    /// about it. Copied first so the live watcher cannot observe the run.
+    /// </summary>
+    private static async Task<string> ColdCompileAsync(string tree)
+    {
+        var copy = Path.Combine(Path.GetTempPath(), "al-runner-rad-xapp-cold", Guid.NewGuid().ToString("N"));
+        CopyTree(tree, copy);
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                    + $" \"{copy}\" --no-cache",
+                RedirectStandardOutput = true, RedirectStandardError = true,
+                UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+            };
+            using var cold = Process.Start(psi)!;
+            var stdout = cold.StandardOutput.ReadToEndAsync();
+            var stderr = cold.StandardError.ReadToEndAsync();
+            await cold.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(240));
+            return (await stdout) + (await stderr);
+        }
+        finally
+        {
+            try { Directory.Delete(copy, recursive: true); } catch { }
+        }
+    }
+
     [SkippableFact]
     public async Task Watch_PrecompiledTableExtensionDependency_RehydratesFieldsAfterReload()
     {
