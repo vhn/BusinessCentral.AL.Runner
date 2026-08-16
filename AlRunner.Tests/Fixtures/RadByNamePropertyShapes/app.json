@@ -1,0 +1,16 @@
+{
+  "id": "b1000000-0000-4000-8000-000000000015",
+  "name": "RAD ByName Property Shapes",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [
+    {
+      "from": 72120,
+      "to": 72199
+    }
+  ],
+  "dependencies": []
+}
