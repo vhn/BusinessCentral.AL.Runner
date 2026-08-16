@@ -28,4 +28,13 @@ codeunit 60941 "Delta Lib Tests"
     begin
         Assert.AreEqual(84, Bridge.Scaled(), 'Delta Lib Scaled');
     end;
+
+    [Test]
+    procedure PickBindsTheOnlyOverload()
+    var
+        Assert: Codeunit "Delta Assert";
+        Bridge: Codeunit "Delta Bridge";
+    begin
+        Assert.AreEqual(1, Bridge.Pick(), 'Delta Lib Pick');
+    end;
 }

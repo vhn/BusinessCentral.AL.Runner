@@ -8,4 +8,14 @@ codeunit 60922 "Delta Lib Scale"
     begin
         exit(42 * Factor);
     end;
+
+    // One overload only, deliberately. Delta Bridge calls this with an INTEGER, which binds
+    // here by widening — so adding a `Pick(Seed: Integer)` overload later moves which id the
+    // caller bakes WITHOUT moving this method's own id, and this method's `case` label
+    // survives in the callee. That is the silent half of the cross-app staleness bug:
+    // Watch_AddingAnOverloadInOneApp_RebindsItsCrossAppCaller.
+    procedure Pick(Seed: Decimal): Integer
+    begin
+        exit(1);
+    end;
 }

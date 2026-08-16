@@ -19,4 +19,16 @@ codeunit 60961 "Delta Bridge"
         Factor := 2;
         exit(Lib.Scaled(Factor));
     end;
+
+    // Passes an INTEGER to a method that currently only has a Decimal overload, so overload
+    // resolution here is what changes when Delta Lib gains an Integer overload — while this
+    // file stays byte-for-byte identical.
+    procedure Pick(): Integer
+    var
+        Lib: Codeunit "Delta Lib Scale";
+        Seed: Integer;
+    begin
+        Seed := 3;
+        exit(Lib.Pick(Seed));
+    end;
 }

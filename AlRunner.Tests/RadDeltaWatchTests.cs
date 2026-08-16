@@ -388,6 +388,141 @@ public class RadDeltaWatchTests
     }
 
     /// <summary>
+    /// The SILENT half of cross-app member-id staleness: adding an overload.
+    ///
+    /// <para>Watch_MovingAMemberIdInOneApp_RebindsItsCrossAppCaller retypes a parameter, which
+    /// RETIRES the old member id — so the un-rebound caller dispatches an id the callee no
+    /// longer has and BC throws. Loud, and therefore survivable.</para>
+    ///
+    /// <para>Adding an overload is the same staleness with the safety net removed.
+    /// <c>CalculateMethodId</c> is method-local, so <c>Pick(Decimal)</c> keeps its id and its
+    /// <c>case</c> label; what moves is which id the CALLER bakes, because an Integer argument
+    /// now binds to the new <c>Pick(Integer)</c> instead of widening to the Decimal one. A
+    /// caller that is never rebound therefore dispatches a member that still exists and gets a
+    /// perfectly ordinary answer — the PREVIOUS one. No exception, no diagnostic, no log line.
+    /// The only thing that notices is an assertion that happens to check the value.</para>
+    ///
+    /// <para>This is what <c>.claude/rules/loud-failures.md</c> calls a green test that lies,
+    /// and it is why "the cross-app bug fails loudly" is not a reason to downgrade it: loudness
+    /// was an accident of which edit was measured first.</para>
+    ///
+    /// <para>The test asserts the wrong answer is not merely absent but that the RIGHT one is
+    /// present, and separately that the failure mode really is silent — no dispatch exception
+    /// anywhere in the cycle — so the claim in the paragraph above is pinned rather than
+    /// asserted in prose.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Watch_AddingAnOverloadInOneApp_RebindsItsCrossAppCaller()
+    {
+        TestArtifacts.SkipIfMissing();
+
+        var bundle = Path.Combine(Path.GetTempPath(), "al-runner-rad-xovl", Guid.NewGuid().ToString("N"));
+        CopyTree(FixtureSrc, bundle);
+        var scaleSource = Path.Combine(bundle, "Lib", "src", "DeltaLibScale.Codeunit.al");
+        var testSource = Path.Combine(bundle, "LibTests", "src", "DeltaLibTests.Codeunit.al");
+
+        var lines = new List<string>();
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                + $" \"{bundle}\" --watch --no-cache",
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+        using var p = Process.Start(psi)!;
+        void Pump(StreamReader r) => Task.Run(async () =>
+        {
+            string? l;
+            while ((l = await r.ReadLineAsync()) != null) lock (lines) lines.Add(l);
+        });
+        Pump(p.StandardOutput);
+        Pump(p.StandardError);
+
+        async Task<int> WaitForMarkerAfter(int fromIndex, TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline)
+            {
+                lock (lines)
+                    for (int i = fromIndex; i < lines.Count; i++)
+                        if (lines[i].Contains("[watch] waiting for AL source")) return i;
+                await Task.Delay(200);
+            }
+            string dump; lock (lines) dump = string.Join("\n", lines.TakeLast(40));
+            throw new TimeoutException($"watch marker not seen.\n--- last output ---\n{dump}");
+        }
+
+        string Segment(int from, int to)
+        {
+            lock (lines) return string.Join("\n", lines.GetRange(from, Math.Max(0, to - from)));
+        }
+
+        try
+        {
+            // Cycle 1 (cold): one overload, and the Integer argument widens to it.
+            int m1 = await WaitForMarkerAfter(0, TimeSpan.FromSeconds(240));
+            var cycle1 = Segment(0, m1);
+            Assert.Contains("PASS  Codeunit60941.PickBindsTheOnlyOverload", cycle1);
+            Assert.DoesNotContain("FAIL  Codeunit", cycle1);
+
+            // Add the Integer overload in the library app, and move the test app's expectation
+            // with it. Delta Bridge — which is what actually chooses between the two — is not
+            // touched, and is the whole subject of the test.
+            var scale = await File.ReadAllTextAsync(scaleSource);
+            var overloaded = scale.Replace(
+                """
+                    procedure Pick(Seed: Decimal): Integer
+                    begin
+                        exit(1);
+                    end;
+                """,
+                """
+                    procedure Pick(Seed: Decimal): Integer
+                    begin
+                        exit(1);
+                    end;
+
+                    procedure Pick(Seed: Integer): Integer
+                    begin
+                        exit(2);
+                    end;
+                """);
+            Assert.NotEqual(scale, overloaded);
+            await File.WriteAllTextAsync(scaleSource, overloaded);
+
+            var tests = await File.ReadAllTextAsync(testSource);
+            var expectTwo = tests.Replace(
+                "Assert.AreEqual(1, Bridge.Pick(), 'Delta Lib Pick');",
+                "Assert.AreEqual(2, Bridge.Pick(), 'Delta Lib Pick');");
+            Assert.NotEqual(tests, expectTwo);
+            await File.WriteAllTextAsync(testSource, expectTwo);
+
+            int m2 = await WaitForMarkerAfter(m1 + 1, TimeSpan.FromSeconds(240));
+            var cycle2 = Segment(m1 + 1, m2);
+
+            // The app that chooses the overload must be rebound…
+            Assert.DoesNotContain("[watch] Delta Bridge: unchanged", cycle2);
+            // …and the answer must be the one a cold compile of this tree gives.
+            var cold = await ColdCompileAsync(bundle);
+            Assert.Contains("PASS  Codeunit60941.PickBindsTheOnlyOverload", cold);
+            Assert.Contains("PASS  Codeunit60941.PickBindsTheOnlyOverload", cycle2);
+            Assert.DoesNotContain("Delta Lib Pick returned 1, expected 2", cycle2);
+
+            // The failure this test exists for is SILENT. Pin that: the retired-id bug announces
+            // itself with a dispatch exception, and this one has nothing to announce it with, so
+            // an assertion on the value is the only thing standing between it and a green run.
+            Assert.DoesNotContain("does not have a member with that ID", cycle2);
+            Assert.DoesNotContain("NavNCLCompilationException", cycle2);
+        }
+        finally
+        {
+            try { p.Kill(true); } catch { }
+            try { Directory.Delete(bundle, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>
     /// Compile and run a copy of <paramref name="tree"/> from scratch — no watch, no cache,
     /// no baseline. Whatever a cold build says about the tree is what the delta has to say
     /// about it. Copied first so the live watcher cannot observe the run.
