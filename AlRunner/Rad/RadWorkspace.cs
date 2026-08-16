@@ -118,6 +118,18 @@ public sealed class RadWorkspace
     private readonly Dictionary<RadObjectKey, RadObjectKey> _extensionTargets = new();
 
     /// <summary>
+    /// Reverse index over <see cref="_objectsByFile"/>: which file declares a given key.
+    ///
+    /// <para>Deliberately NOT committed state. It is a pure function of
+    /// <see cref="_objectsByFile"/>, rebuilt from it by <see cref="ReindexObjectFiles"/> at the
+    /// end of every <see cref="Commit"/>, so it cannot drift from the map it indexes and there
+    /// is nothing extra for <see cref="RadWorkspaceUpdate"/> or the sidecar to carry. A map
+    /// that is genuinely new state must go through the token instead — see
+    /// <see cref="Snapshot"/>.</para>
+    /// </summary>
+    private readonly Dictionary<RadObjectKey, string> _fileOfObject = new();
+
+    /// <summary>
     /// Drop everything derived from a compile. Called when the reference surface moves,
     /// or when a delta compile fails and the next one must start from a full rebuild.
     /// </summary>
@@ -135,6 +147,7 @@ public sealed class RadWorkspace
         _declarationsByFile.Clear();
         _referencesByObject.Clear();
         _extensionTargets.Clear();
+        _fileOfObject.Clear();
         // Generations are deliberately kept: the assemblies are already loaded into the
         // process and .NET cannot unload them. A full rebuild adds a new generation that
         // supersedes all of them (see AlObjectResolution).
@@ -242,8 +255,18 @@ public sealed class RadWorkspace
     internal IReadOnlyList<RadObjectRef> AllObjects() =>
         _objectsByFile.Values.SelectMany(list => list).ToArray();
 
+    /// <summary>
+    /// The file the previous compile saw declare <paramref name="key"/>, or null.
+    ///
+    /// <para>Answered from <see cref="_fileOfObject"/> rather than by scanning. The scan was
+    /// O(files x objects-per-file) PER KEY, and every caller asks in bulk: once per declared
+    /// object in the delta's added-vs-modified classifier, and once per widened caller — twice
+    /// over, since a widened cycle recurses. Measured fan-in on NP Retail is p50 2 files, p90
+    /// 10, p99 59, max 435, so widening the rebind rules multiplies the call count against a
+    /// 7,000-object map.</para>
+    /// </summary>
     internal string? FileOf(RadObjectKey key) =>
-        _objectsByFile.FirstOrDefault(pair => pair.Value.Any(item => item.Key == key)).Key;
+        _fileOfObject.TryGetValue(key, out var file) ? file : null;
 
     /// <summary>
     /// Every file declaring an object of <paramref name="kind"/>. Used for the two AL kinds
@@ -315,10 +338,34 @@ public sealed class RadWorkspace
         foreach (var (extension, target) in update.ExtensionTargets)
             _extensionTargets[extension] = target;
 
+        ReindexObjectFiles();
+
         Baseline = update.Baseline;
         // A recorded baseline retires any parked "you have no baseline" reason, so it cannot be
         // reported against some unrelated future full compile.
         PendingFullCompileReason = null;
+    }
+
+    /// <summary>
+    /// Rebuild <see cref="_fileOfObject"/> from <see cref="_objectsByFile"/>.
+    ///
+    /// <para>Wholesale rather than incrementally, because a commit already touches the map by
+    /// path (add, replace, remove and two vanished-file prunes) and reconstructing which keys
+    /// each of those moved is more ways to be wrong than a rebuild is to be slow: one pass over
+    /// the objects the app declares, against a compile that just parsed and bound them.</para>
+    ///
+    /// <para><see cref="Dictionary{TKey,TValue}.TryAdd"/>, not the indexer: a key claimed by two
+    /// files is the duplicate-declaration case, and the FIRST file wins so that
+    /// <c>BcCompiler.DeltaCompile</c>'s ownership guard still finds a declaring file to name.
+    /// Which of the two it names was already unspecified — the scan this replaces returned
+    /// whichever came first in dictionary order.</para>
+    /// </summary>
+    private void ReindexObjectFiles()
+    {
+        _fileOfObject.Clear();
+        foreach (var (path, objects) in _objectsByFile)
+            foreach (var item in objects)
+                _fileOfObject.TryAdd(item.Key, path);
     }
 
     /// <summary>
