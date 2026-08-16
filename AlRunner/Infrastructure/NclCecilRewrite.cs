@@ -19,7 +19,7 @@ namespace AlRunner.Infrastructure;
 
 public static class NclCecilRewrite
 {
-    private const int CACHE_VERSION = 124;
+    private const int CACHE_VERSION = 126;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Cecil-owned skip registry (JmpHook→Cecil migration enabler).
@@ -68,6 +68,17 @@ public static class NclCecilRewrite
         "Microsoft.Dynamics.Nav.Runtime.NavMethodScope::ProcessException/1",
         "Microsoft.Dynamics.Nav.Runtime.ALMethodScope::AssignScopeId/0",
         "Microsoft.Dynamics.Nav.Runtime.NavMethodScope::ThrowStackOverflow/1",
+        // StmtHit/CStmtHit — --coverage hook (issue #1922). Not previously JmpHook'd
+        // (grep for StmtHit across AlRunner/ was empty before this), listed for symmetry
+        // with the rest of the NavMethodScope cluster and to guard against a future
+        // JmpHook targeting them by name. CStmtHit is the inline-expression form BC uses
+        // for if/while/repeat CONDITIONS (`if (CStmtHit(1) & (this.flag))`) — confirmed
+        // by decompiling generated C# for a scratch if/else fixture; without hooking it
+        // too, every conditional's own line would read permanently 0 regardless of
+        // whether it ran.
+        "Microsoft.Dynamics.Nav.Runtime.NavMethodScope::StmtHit/1",
+        "Microsoft.Dynamics.Nav.Runtime.NavMethodScope::CStmtHit/1",
+        "Microsoft.Dynamics.Nav.Runtime.NavMethodScope::CStmtHit/2",
         // ALFunctionTimingExecutionListener (Batch 2).
         "Microsoft.Dynamics.Nav.Runtime.ALFunctionTimingExecutionListener::EnsureRegistered/0",
         "Microsoft.Dynamics.Nav.Runtime.ALFunctionTimingExecutionListener::Start/1",
@@ -88,6 +99,12 @@ public static class NclCecilRewrite
         // NCLMetaQuery.CreateObjectInstance — same null-ApplicationObjectConstructor story,
         // for the STATIC Query.SaveAsXml/Csv/Json(id, …) forms.
         "Microsoft.Dynamics.Nav.Runtime.NCLMetaQuery::CreateObjectInstance/2",
+        // NCLMetaForm.CreateObjectInstance(NavRecord) — #1897, the form/page twin of the
+        // XmlPort/Query pair above. Static Page.RunModal(id[, Record]) (and, transitively,
+        // Base App Codeunit 700 "Page Management".PageRunModal/PageRun) reach this instead
+        // of NavFormHandle.CreateTarget (the AL-variable path, which already had its own
+        // construction) and NRE on the null ApplicationObjectConstructor delegate.
+        "Microsoft.Dynamics.Nav.Runtime.NCLMetaForm::CreateObjectInstance/1",
         // ALSystemOperatingSystem.get_ALGuiAllowed — AL's GuiAllowed(). True, because the
         // runner registers a client callback and dispatches UI to test handlers.
         "Microsoft.Dynamics.Nav.Runtime.ALSystemOperatingSystem::get_ALGuiAllowed/0",
@@ -1380,6 +1397,45 @@ public static class NclCecilRewrite
 
             ReplaceBodyWithHelper(asm.MainModule, qCreate, qHelper);
             Console.Error.WriteLine("[Cecil] Rewrote NCLMetaQuery.CreateObjectInstance → BcRuntime.NCLMetaQuery_CreateObjectInstance");
+        }
+
+        // 8b2. NCLMetaForm.CreateObjectInstance(NavRecord) — #1897, the form/page twin of
+        //      the XmlPort/Query pair above. The AL-variable page form
+        //      (`P: Page "X"; P.SetRecord(Rec); P.RunModal();`) already has its own working
+        //      construction path (NavFormHandle.CreateTarget); the STATIC forms
+        //      (Page.RunModal(id[, Record]), and transitively Base App Codeunit 700
+        //      "Page Management".PageRunModal/PageRun) reach NavForm.RunModalAsync
+        //      (static) → NCLMetadata.GetMetaFormById(id).CreateObjectInstance(record)
+        //      instead, and NRE on the null ApplicationObjectConstructor delegate.
+        //      NCLMetaForm declares THREE CreateObjectInstance overloads — (), (NavRecord),
+        //      (string personalizationId) — only the (NavRecord) one is rewritten here; the
+        //      0-arg overload chains to it (`CreateObjectInstance((NavRecord)null)`, covered
+        //      automatically) and the personalizationId overload is unrelated.
+        {
+            var metaFormType = asm.MainModule.Types
+                .FirstOrDefault(t => t.FullName == "Microsoft.Dynamics.Nav.Runtime.NCLMetaForm")
+                ?? throw new InvalidOperationException(
+                    "[Cecil] NCLMetaForm type not found — Ncl shape changed; do not commit");
+
+            var fCreate = metaFormType.Methods
+                .FirstOrDefault(m => m.Name == "CreateObjectInstance" && m.HasBody
+                    && m.Parameters.Count == 1
+                    && m.Parameters[0].ParameterType.FullName == "Microsoft.Dynamics.Nav.Runtime.NavRecord")
+                ?? throw new InvalidOperationException(
+                    "[Cecil] NCLMetaForm.CreateObjectInstance(NavRecord) not found — Ncl shape changed; do not commit");
+
+            var fHelper = typeof(AlRunner.BcRuntime).GetMethod(
+                nameof(AlRunner.BcRuntime.NCLMetaForm_CreateObjectInstance),
+                BindingFlags.Public | BindingFlags.Static)
+                ?? throw new InvalidOperationException(
+                    "[Cecil] BcRuntime.NCLMetaForm_CreateObjectInstance not found");
+
+            if (fCreate.ReturnType.FullName != fHelper.ReturnType.FullName)
+                throw new InvalidOperationException(
+                    "[Cecil] NCLMetaForm.CreateObjectInstance/helper return type mismatch — do not commit");
+
+            ReplaceBodyWithHelper(asm.MainModule, fCreate, fHelper);
+            Console.Error.WriteLine("[Cecil] Rewrote NCLMetaForm.CreateObjectInstance(NavRecord) → BcRuntime.NCLMetaForm_CreateObjectInstance");
         }
 
         // 8c. ALSystemOperatingSystem.get_ALGuiAllowed → true. This is AL's GuiAllowed().
@@ -6266,6 +6322,70 @@ public static class NclCecilRewrite
                     throw new InvalidOperationException(
                         $"[Cecil] NavMethodScope.ThrowStackOverflow returns {tso.ReturnType.FullName}, expected void — Ncl shape changed; do not commit");
                 ReplaceBodyConst(tso, ConstResult.Void);
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // NavMethodScope.StmtHit(int) / CStmtHit(int[, bool]) — --coverage hook (issue
+        // #1922, first slice of #1640).
+        //
+        // BC's own AL compiler already instruments every AL statement with a StmtHit(N)
+        // (plain statements) or CStmtHit(N) (if/while/repeat CONDITIONS, folded into the
+        // boolean expression: `if (CStmtHit(1) & (this.flag))`) call, where N indexes the
+        // scope class's [SourceSpans] attribute. Decompiling StmtHit confirmed it does
+        // exactly two things (CStmtHit's two overloads are the same shape, returning bool
+        // so they compose into an expression):
+        //
+        //   public void StmtHit(int currentStatementNumber)
+        //   {
+        //       statementNumber = currentStatementNumber;
+        //       ExecutionListener.Instance?.ProcessStatementHit(this);
+        //   }
+        //
+        // `statementNumber` backs NavMethodScope.StatementNumber, which
+        // AlCallStackCapture reads to produce "line L" in every AL stack trace — so this
+        // rewrite MUST NOT replace or reorder that assignment. It only PREPENDS a call to
+        // AlCoverageTracker.OnStmtHit(this, currentStatementNumber) before each method's
+        // existing first instruction, leaving the rest of the body — and therefore
+        // StatementNumber tracking — completely untouched. Regression-tested by
+        // AlCallStackLineRegressionTests (stack-trace lines identical with the rewrite
+        // active, --coverage on or off).
+        //
+        // (ExecutionListener.Instance is permanently null in this runtime — its cctor and
+        // AddListener/RemoveListener are already no-op'd elsewhere in this file/BcRuntime
+        // for R2R-stability reasons predating this issue — so that line was already inert
+        // before this rewrite and stays inert after it.)
+        //
+        // PrependStaticCall (used elsewhere in this file) can't be reused here: it only
+        // forwards reference-typed arg slots (to avoid boxing), and the second argument
+        // here is `int currentStatementNumber` — a value type that must reach
+        // OnStmtHit's `int` parameter unboxed. So this block emits its own
+        // `ldarg.0; ldarg.1; call` prologue instead.
+        {
+            var nclMod = asm.MainModule;
+            const string MsType = "Microsoft.Dynamics.Nav.Runtime.NavMethodScope";
+            var hookMi = typeof(AlRunner.Infrastructure.AlCoverageTracker).GetMethod(
+                nameof(AlRunner.Infrastructure.AlCoverageTracker.OnStmtHit), BindingFlags.Public | BindingFlags.Static)
+                ?? throw new InvalidOperationException(
+                    "[Cecil] AlCoverageTracker.OnStmtHit not found — runner-side rename?");
+            var hookRef = nclMod.ImportReference(hookMi);
+
+            foreach (var (name, paramCount) in new[] { ("StmtHit", 1), ("CStmtHit", 1), ("CStmtHit", 2) })
+            {
+                var target = FindNclMethod(nclMod, MsType, name, paramCount);
+                if (target.Parameters[0].ParameterType.FullName != "System.Int32")
+                    throw new InvalidOperationException(
+                        $"[Cecil] NavMethodScope.{name}/{paramCount}'s first parameter is "
+                        + $"{target.Parameters[0].ParameterType.FullName}, expected System.Int32 — Ncl shape changed; do not commit");
+
+                var body = target.Body;
+                var il = body.GetILProcessor();
+                var first = body.Instructions[0];
+                il.InsertBefore(first, il.Create(OpCodes.Ldarg_0));
+                il.InsertBefore(first, il.Create(OpCodes.Ldarg_1));
+                il.InsertBefore(first, il.Create(OpCodes.Call, hookRef));
+                if (body.MaxStackSize < 2) body.MaxStackSize = 2;
+                Console.Error.WriteLine($"[Cecil] Prepended AlCoverageTracker.OnStmtHit to NavMethodScope.{name}/{paramCount}");
             }
         }
 

@@ -73,7 +73,10 @@ Pages are not rendered. There is no layout engine, no field visibility evaluatio
 no report dataset. `TestPage` provides expanded field access, navigation, and handler
 dispatch, and report/request-page variables support a limited standalone surface, but:
 
-- Field `Visible`, `Enabled`, and `Editable` are not evaluated against real page metadata.
+- Field `Visible`, `Enabled`, and `Editable` ARE evaluated against real page metadata,
+  live, including a control's `Visible` combined with every enclosing `group`'s `Visible`
+  up to the content area — but nothing renders, so this only affects what `TestPage`
+  reports back, not any actual layout.
 - `TestPage` methods like `GoToRecord`, `Next`, `New`, `GetPart`, and filter reads are
   mock-backed rather than UI-backed.
 - `TestPage` action `Invoke()` saves the row the page is on and then dispatches the
@@ -87,7 +90,14 @@ dispatch, and report/request-page variables support a limited standalone surface
   the last row. Tracked in
   [#1755](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1755).
 - `Page.Run()` is a no-op. `Page.RunModal()` dispatches to `[ModalPageHandler]` if
-  registered, otherwise throws.
+  registered, otherwise throws — both the page-variable form
+  (`P.SetRecord(Rec); P.RunModal();`) and the static-by-id forms
+  (`Page.RunModal(id, Record)`, `Page.RunModal(Page::"X", Record)`, and Base App
+  `Codeunit 700 "Page Management"` code that routes through them). The static
+  `Page.RunModal(0, Record)` form, which real BC resolves via the record table's
+  `LookupPageId`, is not yet implemented and throws
+  [#1918](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1918); pass an
+  explicit page id in the meantime.
 - Request pages can be handled via `[RequestPageHandler]`, but this is handler dispatch
   only, not real request-page rendering.
 - Report variables support `Run()`, `RunRequestPage()`, `SetTableView()`, and
