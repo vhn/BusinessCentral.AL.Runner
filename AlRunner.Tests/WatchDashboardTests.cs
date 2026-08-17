@@ -14,12 +14,14 @@ namespace AlRunner.Tests;
 public class WatchDashboardTests
 {
     private static string Render(IReadOnlyList<BucketResult> results, WatchStatus status,
-        DateTime ts, TimeSpan dur, IReadOnlyList<string>? fullCompileNotes = null)
+        DateTime ts, TimeSpan dur, IReadOnlyList<string>? fullCompileNotes = null,
+        IReadOnlyList<string>? rebindNotes = null)
     {
         var console = new TestConsole();
         // Wide enough that the table columns aren't truncated away in the test.
         console.Profile.Width = 120;
-        console.Write(WatchDashboard.Build(results, "my-bundle", status, ts, dur, fullCompileNotes));
+        console.Write(WatchDashboard.Build(
+            results, "my-bundle", status, ts, dur, fullCompileNotes, rebindNotes));
         return console.Output;
     }
 
@@ -220,5 +222,56 @@ public class WatchDashboardTests
             Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2)));
         Assert.DoesNotContain("full recompile",
             Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2), []));
+    }
+
+    /// <summary>
+    /// The same argument, for the other reason an app can be re-emitted without the developer
+    /// having touched it: a SIBLING app moved a callable surface this one's generated calls bake
+    /// the member ids of, so it must rebind. That decision is made deep in the compile path and
+    /// announced on stderr — which the bundle loop has redirected to <c>TextWriter.Null</c> while
+    /// it runs. Without this panel the dashboard shows an app recompiling for no visible cause,
+    /// which is the exact confusion the full-recompile notes exist to remove.
+    ///
+    /// <para>A SEPARATE panel, not an extra line in the full-recompile one, because the two say
+    /// opposite things about the cycle. A full compile is the slow path and the note explains a
+    /// cost; a cross-app rebind is the narrow path working correctly, and mislabelling it "full
+    /// recompile" would send a developer hunting a cascade that did not happen.</para>
+    /// </summary>
+    [Fact]
+    public void Render_RebindNotes_ShowTheProducerAndTheCount_InTheirOwnPanel()
+    {
+        var results = new List<BucketResult>
+        {
+            Bucket(new TestResult("A", "One", TestOutcome.Pass, null, null, TimeSpan.FromMilliseconds(5)))
+        };
+
+        var output = Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2),
+            fullCompileNotes: null,
+            rebindNotes: ["NP Retail Test: 3 that call NP Retail"]);
+
+        Assert.Contains("cross-app rebind", output);
+        Assert.Contains("NP Retail Test", output);
+        Assert.Contains("3 that call NP Retail", output);
+        // Not the slow path, and must not be reported as it.
+        Assert.DoesNotContain("full recompile", output);
+    }
+
+    /// <summary>
+    /// And absent on a cycle that rebound nothing — a body-only edit in a sibling publishes no
+    /// surface move, so the panel that says "something else made this app recompile" must not be
+    /// on screen claiming otherwise.
+    /// </summary>
+    [Fact]
+    public void Render_NoRebindNotes_OmitsThePanelEntirely()
+    {
+        var results = new List<BucketResult>
+        {
+            Bucket(new TestResult("A", "One", TestOutcome.Pass, null, null, TimeSpan.FromMilliseconds(5)))
+        };
+
+        Assert.DoesNotContain("cross-app rebind",
+            Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2)));
+        Assert.DoesNotContain("cross-app rebind",
+            Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2), [], []));
     }
 }

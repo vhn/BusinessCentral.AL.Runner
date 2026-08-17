@@ -782,6 +782,11 @@ var results = new List<BucketResult>();
 // the end of a cycle — draining the collector at paint time would show the notes once and then
 // blank them. Populated after the bundle loop restores the console streams.
 var fullCompileNotes = new List<string>();
+// …and why an app re-emitted objects its own source did not change, because a sibling
+// in the bundle moved a callable surface it binds to. Same lifetime and same reason as
+// the list above; a separate one because the dashboard renders them as separate panels
+// — a full recompile is a cost, a cross-app rebind is the narrow path working.
+var rebindNotes = new List<string>();
 
 // ── Layered source build pre-pass ─────────────────────────────────────────
 // When multiple bundles are passed and one depends on another (by AppId or
@@ -890,7 +895,8 @@ List<string> RenderDashboardLines(WatchStatus status, DateTime ts, TimeSpan dur)
         Out = new Spectre.Console.AnsiConsoleOutput(sw),
     });
     rec.Profile.Width = width;
-    rec.Write(WatchDashboard.Build(results, watchBundleName, status, ts, dur, fullCompileNotes));
+    rec.Write(WatchDashboard.Build(
+        results, watchBundleName, status, ts, dur, fullCompileNotes, rebindNotes));
     return sw.ToString().Replace("\r\n", "\n").TrimEnd('\n').Split('\n').ToList();
 }
 
@@ -958,7 +964,9 @@ if (sourceWatch != null)
         cycleChangedPaths.Add(changedPath);
 results.Clear();
 fullCompileNotes.Clear();
-AlRunner.Rad.RadCycleNotes.Drain();   // discard anything left over from the previous cycle
+rebindNotes.Clear();
+AlRunner.Rad.RadCycleNotes.Drain();          // discard anything left over from the previous cycle
+AlRunner.Rad.RadCycleNotes.DrainRebinds();
 // Clean loading (#5): the interactive dashboard owns the whole screen, but the
 // run-cycle body emits diagnostic Console.WriteLine noise ("[bundle] resolved N
 // dep(s)", "loaded N assembl(ies)", "[i/N] … suites", …) that would scroll over
@@ -2236,6 +2244,7 @@ if (stdoutSilenced)
 // Collected here rather than logged: the `[watch]` lines carrying these reasons were written to
 // the stderr just restored above, i.e. to TextWriter.Null. See RadCycleNotes.
 fullCompileNotes.AddRange(AlRunner.Rad.RadCycleNotes.Drain());
+rebindNotes.AddRange(AlRunner.Rad.RadCycleNotes.DrainRebinds());
 
 if (!watchMode)
     break;   // normal mode: one pass, fall through to the summary below

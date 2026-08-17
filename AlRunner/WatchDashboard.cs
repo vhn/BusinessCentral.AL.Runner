@@ -41,13 +41,20 @@ public static class WatchDashboard
     /// it runs, so the <c>[watch]</c> log lines that carry these reasons never reach this screen:
     /// a cycle that suddenly cost minutes looked identical to one that cost a second.
     /// </param>
+    /// <param name="rebindNotes">
+    /// Why an app re-emitted objects its own source did not change — a sibling in the bundle
+    /// moved a callable surface whose member ids this app's generated calls bake. Same reason
+    /// for rendering as <paramref name="fullCompileNotes"/> and a separate panel for the
+    /// opposite one: this is the narrow path working, not the slow path.
+    /// </param>
     public static IRenderable Build(
         IReadOnlyList<BucketResult> results,
         string bundleName,
         WatchStatus status,
         DateTime lastRun,
         TimeSpan lastDuration,
-        IReadOnlyList<string>? fullCompileNotes = null)
+        IReadOnlyList<string>? fullCompileNotes = null,
+        IReadOnlyList<string>? rebindNotes = null)
     {
         var rows = new List<IRenderable>
         {
@@ -57,6 +64,11 @@ public static class WatchDashboard
         if (fullCompileNotes is { Count: > 0 })
         {
             rows.Add(FullCompileNotes(fullCompileNotes));
+            rows.Add(new Text(string.Empty));
+        }
+        if (rebindNotes is { Count: > 0 })
+        {
+            rows.Add(RebindNotes(rebindNotes));
             rows.Add(new Text(string.Empty));
         }
         rows.Add(BuildTree(results));
@@ -78,6 +90,24 @@ public static class WatchDashboard
             .Header("[yellow]full recompile[/]")
             .Border(BoxBorder.Rounded)
             .BorderColor(Color.Yellow)
+            .Expand();
+    }
+
+    /// <summary>
+    /// The "this app recompiled and you did not touch it" panel. Blue rather than yellow, because
+    /// unlike a full recompile this is not a cost to explain away: the cycle stayed narrow and
+    /// re-emitted one file per caller. What it explains is why an app the developer never edited
+    /// appears in the cycle at all — without it, the correct behaviour looks like a cascade.
+    /// </summary>
+    private static IRenderable RebindNotes(IReadOnlyList<string> notes)
+    {
+        var body = string.Join(
+            Environment.NewLine,
+            notes.Select(note => $"[blue]·[/] [grey]{Markup.Escape(note)}[/]"));
+        return new Panel(new Markup(body))
+            .Header("[blue]cross-app rebind[/]")
+            .Border(BoxBorder.Rounded)
+            .BorderColor(Color.Blue)
             .Expand();
     }
 

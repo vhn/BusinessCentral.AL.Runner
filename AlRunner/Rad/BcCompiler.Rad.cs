@@ -310,9 +310,18 @@ public sealed partial class BcCompiler
         }
 
         if (files.Count > 0)
-            Console.Error.WriteLine(
-                $"  [watch] {moduleName}: rebinding {files.Count} cross-app caller file(s) — " +
-                string.Join(", ", because));
+        {
+            var reason = $"rebinding {files.Count} cross-app caller file(s) — "
+                + string.Join(", ", because);
+            Console.Error.WriteLine($"  [watch] {moduleName}: {reason}");
+            // …and recorded, not only logged, for the same reason every FullCompileBecause
+            // decision is: the interactive dashboard redirects stderr to TextWriter.Null while
+            // the bundle loop runs, so this line never reaches the developer watching. An app
+            // recompiling with no visible cause is exactly the confusion RadCycleNotes exists to
+            // remove — and here the cause is in ANOTHER app, so there is nothing on screen to
+            // infer it from either.
+            AlRunner.Rad.RadCycleNotes.Rebind(moduleName, reason);
+        }
         return files;
     }
 

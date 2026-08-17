@@ -33,6 +33,7 @@ internal static class RadCycleNotes
     private const int MaxRetained = 256;
 
     private static readonly ConcurrentQueue<string> _notes = new();
+    private static readonly ConcurrentQueue<string> _rebinds = new();
 
     /// <summary>
     /// Record that <paramref name="moduleName"/> is being compiled in full, and why.
@@ -46,6 +47,23 @@ internal static class RadCycleNotes
     }
 
     /// <summary>
+    /// Record that <paramref name="moduleName"/> re-emitted objects it did not itself change,
+    /// because a SIBLING app in the bundle moved a callable surface this one's generated calls
+    /// bake the member ids of.
+    ///
+    /// <para>Kept apart from <see cref="FullCompile"/> rather than sharing its queue, because the
+    /// two say opposite things about the cycle. A full compile is the slow path and its note
+    /// explains a cost; a cross-app rebind is the NARROW path working correctly — one file per
+    /// caller instead of the whole module. Rendering it under a "full recompile" heading would
+    /// send a developer hunting a cascade that did not happen.</para>
+    /// </summary>
+    internal static void Rebind(string moduleName, string reason)
+    {
+        _rebinds.Enqueue($"{moduleName}: {reason}");
+        while (_rebinds.Count > MaxRetained) _rebinds.TryDequeue(out _);
+    }
+
+    /// <summary>
     /// Take and clear everything recorded since the last drain. Called once per watch cycle,
     /// after the bundle loop has restored the console streams.
     /// </summary>
@@ -53,6 +71,14 @@ internal static class RadCycleNotes
     {
         var drained = new List<string>();
         while (_notes.TryDequeue(out var note)) drained.Add(note);
+        return drained;
+    }
+
+    /// <summary>Same, for the cross-app rebind notes recorded by <see cref="Rebind"/>.</summary>
+    internal static IReadOnlyList<string> DrainRebinds()
+    {
+        var drained = new List<string>();
+        while (_rebinds.TryDequeue(out var note)) drained.Add(note);
         return drained;
     }
 }
