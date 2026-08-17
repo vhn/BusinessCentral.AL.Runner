@@ -1,5 +1,5 @@
-// RadProducerEquivalenceTests — do the two producers describe one unchanged surface the
-// same way, MEMBER BY MEMBER?
+// RadProducerEquivalenceTests — do the producers describe one unchanged surface the same way,
+// MEMBER BY MEMBER?
 //
 // A delta decides whether an object's callers must rebind by comparing that object's
 // serialized surface across two DIFFERENT producers:
@@ -11,6 +11,12 @@
 //   B. the merged delta baseline, written by `CompilationUtilities.WriteSymbolReference`
 //      and read back with `SymbolReferenceJsonReader` (BcCompiler.MergeRadBaseline) — so it
 //      has been through a JSON round trip that A never sees.
+//
+// …and a third the delta meets whenever `--watch` starts from an AL-output cache HIT:
+//
+//   C. the sidecar baseline, written by `SymbolReferenceJsonWriter.WriteModule` and hydrated
+//      by `SymbolReferenceJsonReader.ReadModule` (RadBaselineSidecar). A workspace hydrated
+//      that way holds a baseline that is already round-tripped, so it is not A at all.
 //
 // The whole-object compare in `ModuleDefinitionOps.ObjectSurfaceFingerprint` has already
 // needed canonicalisation twice for exactly this reason (provenance, and null-versus-empty).
@@ -35,7 +41,9 @@
 //   * Canonicalised through `ObjectSurfaceFingerprint`'s own rules, they agree on all thirteen.
 //
 // The FIRST delta after a full baseline is where the producer transition happens and is the
-// case pinned here; `TheSecondDelta_...` shows why a same-producer comparison proves nothing.
+// case pinned here; `TheSecondDelta_...` shows why a same-producer comparison proves nothing,
+// and `TheSidecarRoundTrip_...` shows the divergence is absent entirely on a cache HIT — so it
+// is present on exactly the runs a member diff is least likely to be developed against.
 
 using System.Text.Json;
 using System.Text.Json.Nodes;
