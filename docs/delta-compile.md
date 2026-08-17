@@ -1235,6 +1235,19 @@ a schema-2 reader handed a schema-1 envelope deserializes it happily and gets **
 edges — a hydrated workspace that silently rebinds no sibling caller, which is the exact bug
 those edges exist to fix.
 
+#### A one-way hole, same-app and cross-app alike
+
+`MapObjectReferences` walks the objects `UniquelyKeyedObjects` returns, and that is only
+`IApplicationObjectTypeSymbol`. An `interface`, a `controladdin` and an `entitlement` are not,
+so they are recorded correctly as reference **targets** and never as reference **sources**.
+Whatever such an object names is invisible to the graph in both directions of app boundary.
+
+Untested and unmeasured. The impact is bounded by what those kinds can reference at all — an
+interface's method signatures can name objects, an entitlement's `ObjectEntitlements` names
+permission sets (which the permission-set-rename rule covers separately, by name, precisely
+because no semantic model reports that edge) — but "bounded" is not "none", and nobody has run
+it.
+
 ### Reloaded dependency tableextensions
 
 Watch reloads preserve the symbol paths for precompiled dependency apps and re-merge their
