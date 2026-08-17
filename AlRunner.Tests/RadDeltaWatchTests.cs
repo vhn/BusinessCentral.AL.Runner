@@ -250,7 +250,26 @@ public class RadDeltaWatchTests
             var cycle8 = Segment(m7 + 1, m8);
             Assert.Contains("[watch] Delta Lib: delta +0 ~1 -0", cycle8);
             Assert.Contains("[watch] Delta Lib: overlay", cycle8);
-            Assert.Contains("[watch] Delta Bridge: unchanged", cycle8);
+            // Unlike cycle 3's body-only edit, the repair restores the ORIGINAL file — so it
+            // also removes Marker() and BrokenMarker() from codeunit 60921. Removing a member
+            // moves that object's callable surface, and Delta Bridge calls into it from another
+            // app with its generated calls baking member ids taken from the surface this cycle
+            // just replaced. So Bridge must rebind. Before cross-app edges existed the graph
+            // could not say so and this line read `Delta Bridge: unchanged`; that expectation
+            // was the bug, not the behaviour.
+            //
+            // Asserted with the count and the reason rather than just "something was rebound":
+            // the widening has to come from the per-key rule over the one surface that moved.
+            // A rebind logged as `which rebuilt in full` would mean the producer had broadcast
+            // "assume everything moved", which on a one-object delta is the cascade this work
+            // exists to remove. Cycle 3 is the other half of that guarantee — a body-only edit
+            // publishes nothing, so Bridge stays unchanged there.
+            Assert.Contains(
+                "[watch] Delta Bridge: rebinding 1 cross-app caller file(s) — 1 that call Delta Lib",
+                cycle8);
+            Assert.DoesNotContain("rebuilt in full", cycle8);
+            // …and the widening does not cascade. Bridge is re-emitted, but its own surface did
+            // not move, so it publishes nothing and the app that calls BRIDGE is left alone.
             Assert.Contains("[watch] Delta Lib Tests: unchanged", cycle8);
             Assert.Contains("FAIL  Codeunit60941.AnswerIsFortyTwo", cycle8);
             Assert.Contains("Delta Lib Answer returned 44, expected 42", cycle8);
@@ -724,12 +743,40 @@ public class RadDeltaWatchTests
         }
         """;
 
+    /// <summary>
+    /// Copy a tree without the live watcher noticing.
+    /// </summary>
+    /// <remarks>
+    /// The stream copy is not a style choice. <see cref="File.Copy(string,string,bool)"/> on
+    /// macOS/APFS clones the source file, which touches the SOURCE inode's metadata — and
+    /// FSEvents reports that as a change, so <c>FileSystemWatcher</c> raises <c>Changed</c> for
+    /// every file of a tree that was only READ. Measured against the real runner: copying the
+    /// watched bundle with <c>File.Copy</c> starts a whole watch cycle (a full rebuild of every
+    /// app, since a byte-identical <c>app.json</c> counts as "not AL source" to
+    /// <c>RadWorkspaceStore.PrepareBundleReload</c>), while the same copy done with
+    /// <c>ReadAllBytes</c> or a <c>FileStream</c> raises nothing at all.
+    ///
+    /// <para>That matters here because <see cref="ColdCompileAsync"/> copies the LIVE bundle
+    /// mid-test and its whole premise is that the watcher cannot observe it. With
+    /// <c>File.Copy</c> the spurious cycle lands between the cycle under test and the next
+    /// edit, so the next <c>WaitForMarkerAfter</c> returns the WRONG cycle and the assertions
+    /// are read against a segment that compiled the pre-edit tree.</para>
+    ///
+    /// <para>The runner is not blameless — a read-only event costing every app in the bundle a
+    /// whole-module rebuild is a real defect — but it is a separate one from anything these
+    /// tests assert, and it is not what this helper should be measuring.</para>
+    /// </remarks>
     private static void CopyTree(string from, string to)
     {
         Directory.CreateDirectory(to);
         foreach (var dir in Directory.GetDirectories(from, "*", SearchOption.AllDirectories))
             Directory.CreateDirectory(dir.Replace(from, to));
         foreach (var file in Directory.GetFiles(from, "*", SearchOption.AllDirectories))
-            File.Copy(file, file.Replace(from, to), overwrite: true);
+        {
+            using var source = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var target = new FileStream(
+                file.Replace(from, to), FileMode.Create, FileAccess.Write, FileShare.None);
+            source.CopyTo(target);
+        }
     }
 }

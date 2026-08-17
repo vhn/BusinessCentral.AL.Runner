@@ -8,6 +8,27 @@ namespace AlRunner.Rad;
 public sealed record RadObjectRef(RadObjectKey Key, string Name, string Namespace);
 
 /// <summary>
+/// One AL object in a NAMED app — what a reference edge needs when the target lives in a
+/// DIFFERENT app of the same bundle.
+///
+/// <para><see cref="RadObjectKey"/> is deliberately not widened to carry this. It is the key
+/// type of the object map, the extension-target map, <c>RadChangeSet</c> and every RAD test,
+/// and it is scoped to one app by construction: two apps can each declare
+/// <c>interface "Contract"</c> and both key as <c>("Interface", 0, "CONTRACT")</c>. Qualifying
+/// only the cross-app edges keeps that scoping intact and leaves every same-app path
+/// unchanged.</para>
+/// </summary>
+/// <param name="App">
+/// The producing app's workspace identity, exactly as <see cref="RadWorkspaceStore.IdentityOf"/>
+/// computes it — an <c>app.json</c> id when there is one, and <c>name:&lt;module&gt;</c> when
+/// there is not. The <c>app.json</c>-less case is not hypothetical: a bundle's orphan suites are
+/// merged into one <c>AppGroup</c> with a null <c>AppId</c>, and the compilation it produces
+/// still has a Guid (a deterministic hash of the module name), so the two cannot be matched on
+/// the compiler's Guid alone.
+/// </param>
+public readonly record struct RadAppObjectRef(string App, RadObjectKey Key);
+
+/// <summary>
 /// What a file declared that the workspace's object map cannot express. Everything a compile
 /// fully recorded leaves this at its default, so the map holds an entry only for the rare file
 /// a delta may NOT assume it can skip.
@@ -32,13 +53,29 @@ public readonly record struct RadFileDeclarations(bool DotNetPackage, bool Unrec
 /// compiled and loaded successfully. Keeping this token separate prevents a rejected
 /// backend generation from advancing the next watch cycle's hashes or symbol baseline.
 /// </summary>
+/// <param name="CrossAppReferencesByObject">
+/// The same one-hop relation as <paramref name="ReferencesByObject"/>, for targets in a
+/// SIBLING SOURCE APP of the same bundle. Separate rather than merged because the two are
+/// consumed by different rules — the same-app map drives <c>DirectUsersOf</c> within one
+/// compile, this one drives the cross-workspace rebind between them — and because keeping the
+/// same-app map's value type is what leaves every existing path untouched.
+/// </param>
+/// <param name="MovedSurfaces">
+/// The objects whose CALLABLE SURFACE this compile moved, and which therefore have to rebind
+/// their users: exactly what <c>BcCompiler.DeltaCompile</c> feeds to <c>DirectUsersOf</c> for
+/// the same app. Carried on the token so the commit — which is the first moment the generation
+/// is known to have loaded — can publish it to the other apps in the bundle. A commit that
+/// carries none publishes none, which is what keeps a body-only edit from rebinding anything.
+/// </param>
 internal sealed record RadWorkspaceUpdate(
     Dictionary<string, string> FileHashes,
     IReadOnlyDictionary<string, List<RadObjectRef>> ObjectsByFile,
     IReadOnlyDictionary<string, RadFileDeclarations> DeclarationsByFile,
     IReadOnlyDictionary<RadObjectKey, HashSet<RadObjectKey>> ReferencesByObject,
+    IReadOnlyDictionary<RadObjectKey, HashSet<RadAppObjectRef>> CrossAppReferencesByObject,
     IReadOnlyDictionary<RadObjectKey, RadObjectKey> ExtensionTargets,
     IReadOnlyCollection<RadObjectKey> RemovedObjects,
+    IReadOnlyCollection<RadObjectKey> MovedSurfaces,
     object Baseline,
     bool Full);
 
@@ -55,15 +92,34 @@ public sealed class RadWorkspace
     private readonly string _assemblyNamePrefix;
     private int _assemblyGeneration;
 
-    public RadWorkspace(string moduleName, string sourceRoot)
+    public RadWorkspace(string moduleName, string sourceRoot, string? identity = null, string? bundleRoot = null)
     {
         ModuleName = moduleName;
         SourceRoot = Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar);
+        Identity = identity ?? RadWorkspaceStore.IdentityOf(null, moduleName);
+        BundleRoot = bundleRoot == null
+            ? SourceRoot
+            : Path.GetFullPath(bundleRoot).TrimEnd(Path.DirectorySeparatorChar);
         _assemblyNamePrefix = $"{moduleName}#rad{Guid.NewGuid():N}";
     }
 
     public string ModuleName { get; }
     public string SourceRoot { get; }
+
+    /// <summary>
+    /// How the other apps of this bundle name this one in their reference graphs — the same
+    /// string <see cref="RadWorkspaceStore.For"/> keys the store by. See
+    /// <see cref="RadAppObjectRef"/> for why it is a string and not the compiler's Guid.
+    /// </summary>
+    public string Identity { get; }
+
+    /// <summary>
+    /// The bundle this app was compiled as part of. The cross-app queries are scoped by it and
+    /// not by identity alone: <see cref="RadWorkspaceStore"/>'s map is process-wide, never
+    /// cleared, and its key admits the SAME app id at two different source roots — so an
+    /// unscoped lookup can hand one checkout's consumers a producer from another.
+    /// </summary>
+    public string BundleRoot { get; }
 
     /// <summary>
     /// A process-unique assembly name for each full or overlay generation. Loaded
@@ -115,7 +171,34 @@ public sealed class RadWorkspace
     private readonly Dictionary<string, List<RadObjectRef>> _objectsByFile = new(StringComparer.Ordinal);
     private readonly Dictionary<string, RadFileDeclarations> _declarationsByFile = new(StringComparer.Ordinal);
     private readonly Dictionary<RadObjectKey, HashSet<RadObjectKey>> _referencesByObject = new();
+    private readonly Dictionary<RadObjectKey, HashSet<RadAppObjectRef>> _crossAppReferences = new();
     private readonly Dictionary<RadObjectKey, RadObjectKey> _extensionTargets = new();
+
+    // ── cross-app surface moves: a committed broadcast, not a drainable event ──────────
+    //
+    // Generated calls bake Microsoft's member id, and an id is a hash of the callee's
+    // signature — so when app A moves a callable surface, every app that CALLS it holds IL
+    // that dispatches the previous id, whether or not the caller's own source moved. Only a
+    // cross-app edge can say so, and until this existed the graph held none.
+    //
+    // Why a generation counter and a per-consumer watermark rather than a queue the way
+    // RadCycleNotes drains one: a bundle can have TWO dependents of one producer, and a
+    // drained signal is consumed by whichever asks first — the second one then never learns
+    // the surface moved and is left dispatching the old id, silently. A watermark is read, not
+    // taken, so every consumer sees every publish exactly once regardless of order, and a
+    // consumer that compiles BEFORE its producer in a cycle (BuildAppGroups falls back to
+    // declaration order on a dependency cycle) simply picks the signal up on the next one
+    // instead of dropping it.
+    //
+    // Deliberately NOT committed state and NOT persisted: a generation is a process-local
+    // counter. A watermark restored from disk would be compared against a fresh producer's
+    // counter starting at zero, so every publish would read as already-consumed and the rebind
+    // would be suppressed — the same silent staleness this exists to remove, reintroduced by
+    // the persistence of the fix.
+    private long _publishGeneration;
+    private long _fullRebuildGeneration;
+    private readonly Dictionary<RadObjectKey, long> _surfaceMoveGenerations = new();
+    private readonly Dictionary<string, long> _producerWatermarks = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Reverse index over <see cref="_objectsByFile"/>: which file declares a given key.
@@ -146,8 +229,13 @@ public sealed class RadWorkspace
         _objectsByFile.Clear();
         _declarationsByFile.Clear();
         _referencesByObject.Clear();
+        _crossAppReferences.Clear();
         _extensionTargets.Clear();
         _fileOfObject.Clear();
+        // The publish history and the watermarks deliberately survive. They are not derived
+        // from a compile: the history is what OTHER apps have not consumed yet — dropping it
+        // would silently un-tell them — and a watermark is refreshed by this app's next
+        // commit anyway.
         // Generations are deliberately kept: the assemblies are already loaded into the
         // process and .NET cannot unload them. A full rebuild adds a new generation that
         // supersedes all of them (see AlObjectResolution).
@@ -289,6 +377,76 @@ public sealed class RadWorkspace
             .ToArray();
     }
 
+    /// <summary>
+    /// The objects THIS app declares that reference something in <paramref name="producer"/> —
+    /// restricted to <paramref name="keys"/>, or all of them when it is null.
+    ///
+    /// <para>Null means the producer rebuilt in full and cannot say which of its surfaces
+    /// moved; see <see cref="PublishSurfaceMoves"/>.</para>
+    /// </summary>
+    internal IReadOnlyList<RadObjectKey> CrossAppUsersOf(
+        string producer, IReadOnlySet<RadObjectKey>? keys) => _crossAppReferences
+        .Where(pair => pair.Value.Any(target =>
+            string.Equals(target.App, producer, StringComparison.Ordinal)
+            && (keys == null || keys.Contains(target.Key))))
+        .Select(pair => pair.Key)
+        .ToArray();
+
+    /// <summary>Every sibling app this workspace's committed graph holds an edge into.</summary>
+    internal IReadOnlyCollection<string> CrossAppProducers() => _crossAppReferences.Values
+        .SelectMany(targets => targets)
+        .Select(target => target.App)
+        .ToHashSet(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Announce the surfaces a just-LOADED generation moved, so the other apps in the bundle
+    /// can rebind the calls that bake their member ids.
+    ///
+    /// <para><paramref name="fullRebuild"/> is not "a bigger version of the same thing". A full
+    /// compile is preceded by <see cref="Invalidate"/>, which drops the object map — so by the
+    /// time the new module exists there is no record of what the previous one declared and a
+    /// per-key answer cannot be reconstructed. Broadcasting "assume everything moved" is the
+    /// honest answer, and it is the correct one: the reasons a watch cycle rebuilds in full —
+    /// a dependency, identity or preprocessor-symbol change, a <c>dotnet</c> package, an edit
+    /// the delta could not classify — are exactly the ones able to move any member id in the
+    /// module. Snapshotting the surfaces before invalidating was the alternative and was
+    /// rejected: it would fingerprint a whole module on the cycle that is already the expensive
+    /// one, to sharpen the rare case.</para>
+    /// </summary>
+    internal void PublishSurfaceMoves(IReadOnlyCollection<RadObjectKey> keys, bool fullRebuild)
+    {
+        if (fullRebuild)
+        {
+            _fullRebuildGeneration = ++_publishGeneration;
+            return;
+        }
+        if (keys.Count == 0) return;
+        var generation = ++_publishGeneration;
+        foreach (var key in keys) _surfaceMoveGenerations[key] = generation;
+    }
+
+    internal long PublishGeneration => _publishGeneration;
+
+    internal long WatermarkFor(string producer) =>
+        _producerWatermarks.TryGetValue(producer, out var generation) ? generation : 0;
+
+    internal void RecordConsumed(string producer, long generation) =>
+        _producerWatermarks[producer] = generation;
+
+    /// <summary>
+    /// What this app has published since <paramref name="watermark"/>. <c>Everything</c> means
+    /// a full rebuild landed and no per-key answer exists.
+    /// </summary>
+    internal (bool Everything, IReadOnlySet<RadObjectKey> Keys) MovesSince(long watermark)
+    {
+        if (_fullRebuildGeneration > watermark)
+            return (true, new HashSet<RadObjectKey>());
+        return (false, _surfaceMoveGenerations
+            .Where(pair => pair.Value > watermark)
+            .Select(pair => pair.Key)
+            .ToHashSet());
+    }
+
     internal bool TryGetExtensionTarget(RadObjectKey extension, out RadObjectKey target) =>
         _extensionTargets.TryGetValue(extension, out target);
 
@@ -325,6 +483,7 @@ public sealed class RadWorkspace
             _objectsByFile.Clear();
             _declarationsByFile.Clear();
             _referencesByObject.Clear();
+            _crossAppReferences.Clear();
             _extensionTargets.Clear();
         }
         _fileHashes.Clear();
@@ -354,10 +513,13 @@ public sealed class RadWorkspace
         foreach (var key in refreshed)
         {
             _referencesByObject.Remove(key);
+            _crossAppReferences.Remove(key);
             _extensionTargets.Remove(key);
         }
         foreach (var (source, targets) in update.ReferencesByObject)
             _referencesByObject[source] = new HashSet<RadObjectKey>(targets);
+        foreach (var (source, targets) in update.CrossAppReferencesByObject)
+            if (targets.Count > 0) _crossAppReferences[source] = new HashSet<RadAppObjectRef>(targets);
         foreach (var (extension, target) in update.ExtensionTargets)
             _extensionTargets[extension] = target;
 
@@ -409,7 +571,12 @@ public sealed class RadWorkspace
             _objectsByFile.ToDictionary(pair => pair.Key, pair => pair.Value.ToList(), StringComparer.Ordinal),
             new Dictionary<string, RadFileDeclarations>(_declarationsByFile, StringComparer.Ordinal),
             _referencesByObject.ToDictionary(pair => pair.Key, pair => new HashSet<RadObjectKey>(pair.Value)),
+            _crossAppReferences.ToDictionary(pair => pair.Key, pair => new HashSet<RadAppObjectRef>(pair.Value)),
             new Dictionary<RadObjectKey, RadObjectKey>(_extensionTargets),
+            Array.Empty<RadObjectKey>(),
+            // Not baseline state: a surface move is an instruction to ONE commit, already
+            // published by the compile this snapshot describes. Persisting it would make a
+            // cache HIT re-announce a move the consumers acted on processes ago.
             Array.Empty<RadObjectKey>(),
             Baseline,
             Full: true);
@@ -451,11 +618,91 @@ public static class RadWorkspaceStore
     /// </summary>
     public static bool Enabled { get; set; }
 
-    public static RadWorkspace For(string moduleName, Guid? appId, string sourceRoot)
+    /// <summary>
+    /// How one app is named across workspaces: its <c>app.json</c> id when it has one, and its
+    /// module name otherwise. The second case is real — a bundle's suites without an
+    /// <c>app.json</c> are merged into a single <c>AppGroup</c> carrying a null <c>AppId</c> —
+    /// and it is the reason the identity is a string rather than a Guid. The COMPILATION for
+    /// such a group is not id-less: it is given <c>DeterministicGuid(moduleName)</c>. So a
+    /// reference graph that mapped the compiler's Guid straight to a workspace would silently
+    /// never match one, and every edge into it would be dropped. See
+    /// <c>RadAppCohort</c>, which owns that translation.
+    /// </summary>
+    public static string IdentityOf(Guid? appId, string moduleName) =>
+        appId?.ToString("N") ?? "name:" + moduleName;
+
+    public static RadWorkspace For(string moduleName, Guid? appId, string sourceRoot, string? bundleRoot = null)
     {
-        var identity = appId?.ToString("N") ?? "name:" + moduleName;
+        var identity = IdentityOf(appId, moduleName);
         var key = identity + "|" + Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar);
-        return _byKey.GetOrAdd(key, _ => new RadWorkspace(moduleName, sourceRoot));
+        return _byKey.GetOrAdd(key, _ => new RadWorkspace(moduleName, sourceRoot, identity, bundleRoot));
+    }
+
+    /// <summary>
+    /// The workspaces of one bundle. Scoped by the bundle root that each was created under,
+    /// because <see cref="_byKey"/> is process-wide and never cleared and its key admits the
+    /// same app id at two different source roots — so an identity lookup across the whole store
+    /// can hand one checkout's consumer a producer belonging to another.
+    /// </summary>
+    internal static IReadOnlyList<RadWorkspace> InBundle(string bundleRoot)
+    {
+        var root = Path.GetFullPath(bundleRoot).TrimEnd(Path.DirectorySeparatorChar);
+        return _byKey.Values
+            .Where(ws => string.Equals(ws.BundleRoot, root, StringComparison.Ordinal))
+            .ToList();
+    }
+
+    /// <summary>What one app must re-bind because a SIBLING app's callable surface moved.</summary>
+    /// <param name="Producer">The app that moved.</param>
+    /// <param name="Everything">
+    /// The producer rebuilt in full, so every consumer of it rebinds rather than the users of
+    /// named keys — see <see cref="RadWorkspace.PublishSurfaceMoves"/>.
+    /// </param>
+    /// <param name="Users">Objects of the CONSUMING app that have to be re-emitted.</param>
+    internal readonly record struct CrossAppRebind(
+        RadWorkspace Producer, bool Everything, IReadOnlyList<RadObjectKey> Users);
+
+    /// <summary>
+    /// Everything <paramref name="consumer"/> has to rebind because another app in its bundle
+    /// published a surface move it has not consumed yet.
+    ///
+    /// <para>Precision is the whole point: only the consumer's own objects that hold an edge
+    /// onto a MOVED surface are returned. A body-only edit in the producer publishes nothing,
+    /// so this is empty and the consumer takes the unchanged path exactly as before.</para>
+    /// </summary>
+    internal static IReadOnlyList<CrossAppRebind> PendingCrossAppRebinds(RadWorkspace consumer)
+    {
+        var producers = consumer.CrossAppProducers();
+        if (producers.Count == 0) return Array.Empty<CrossAppRebind>();
+
+        var pending = new List<CrossAppRebind>();
+        foreach (var producer in InBundle(consumer.BundleRoot))
+        {
+            if (ReferenceEquals(producer, consumer)) continue;
+            if (!producers.Contains(producer.Identity)) continue;
+            var (everything, keys) = producer.MovesSince(consumer.WatermarkFor(producer.Identity));
+            if (!everything && keys.Count == 0) continue;
+            var users = consumer.CrossAppUsersOf(producer.Identity, everything ? null : keys);
+            if (users.Count > 0) pending.Add(new CrossAppRebind(producer, everything, users));
+        }
+        return pending;
+    }
+
+    /// <summary>
+    /// Mark <paramref name="consumer"/> as bound against every sibling's current publish
+    /// generation. Called from <c>RadEmitResult.Commit</c> — that is, only once the consumer's
+    /// generation has actually loaded — so a rejected C# candidate leaves the watermark where
+    /// it was and the next cycle re-widens instead of dropping the rebind.
+    ///
+    /// <para>Every sibling, not only the ones this app has edges into: an edit can ADD an edge
+    /// to an app this one never referenced before, and starting that edge from a zero watermark
+    /// would replay the sibling's whole publish history as pending work.</para>
+    /// </summary>
+    internal static void RecordConsumedGenerations(RadWorkspace consumer)
+    {
+        foreach (var producer in InBundle(consumer.BundleRoot))
+            if (!ReferenceEquals(producer, consumer))
+                consumer.RecordConsumed(producer.Identity, producer.PublishGeneration);
     }
 
     /// <summary>

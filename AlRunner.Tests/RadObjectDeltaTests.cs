@@ -771,7 +771,9 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
                     [opaque] = new(DotNetPackage: false, Unrecorded: true),
                 },
                 new Dictionary<RadObjectKey, HashSet<RadObjectKey>>(),
+                new Dictionary<RadObjectKey, HashSet<RadAppObjectRef>>(),
                 new Dictionary<RadObjectKey, RadObjectKey>(),
+                Array.Empty<RadObjectKey>(),
                 Array.Empty<RadObjectKey>(),
                 baseline.Workspace.Baseline!,
                 Full: false));

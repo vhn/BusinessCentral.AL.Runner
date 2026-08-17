@@ -105,6 +105,17 @@ public sealed record RadEmitResult(
         // enumextension or a removed report needs the object map as it was.
         Metadata?.Apply(workspace, Changes);
         workspace.Commit(WorkspaceUpdate);
+
+        // Only HERE — after the generated C# compiled and the assembly loaded. Announcing a
+        // surface move at AL-emit time would let a candidate the backend then rejects make
+        // every dependent in the bundle rebind against a generation that never loaded, and
+        // the dependents would record having consumed it.
+        workspace.PublishSurfaceMoves(WorkspaceUpdate.MovedSurfaces, FullRebuild);
+        // …and, symmetrically, this app is now bound against whatever its siblings had
+        // published by the time it compiled. Recorded at the commit rather than where the
+        // widening was computed, so a delta that fails to load leaves the watermark behind and
+        // the next cycle re-widens instead of silently dropping the rebind.
+        AlRunner.Rad.RadWorkspaceStore.RecordConsumedGenerations(workspace);
     }
 }
 
@@ -200,6 +211,22 @@ public sealed partial class BcCompiler
         }
 
         var (changedFiles, removedFiles) = ws.DiffFiles(hashes);
+
+        // BEFORE the no-change short-circuit, because this app's OWN source is exactly what did
+        // not move: a sibling in this bundle re-emitted a surface whose member ids this app's
+        // generated calls bake, and nothing in this app's file hashes can say so. Reaching the
+        // short-circuit first is how that staleness survived — the dependent never entered the
+        // delta path at all.
+        var crossAppFiles = CrossAppRebindFiles(moduleName, ws, hashes, changedFiles);
+        if (crossAppFiles == null)
+            return FullCompile(alFolders, moduleName, ws, hashes, appRootDir);
+        if (crossAppFiles.Count > 0)
+            changedFiles = changedFiles
+                .Concat(crossAppFiles)
+                .Distinct(StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal)
+                .ToList();
+
         if (changedFiles.Count == 0 && removedFiles.Count == 0)
             return new RadEmitResult(
                 new BcEmitOutput(Array.Empty<EmittedSource>(), Array.Empty<string>(), Array.Empty<string>()),
@@ -220,6 +247,73 @@ public sealed partial class BcCompiler
         // A fallback is still only a candidate until its generated C# loads. Keep the
         // committed hashes/baseline intact so a backend failure retries the same edit.
         return FullCompile(alFolders, moduleName, ws, hashes, appRootDir);
+    }
+
+    /// <summary>
+    /// The files this app must re-emit because a SIBLING app in the same bundle moved a
+    /// callable surface it binds to.
+    ///
+    /// <para>Empty means "nothing to widen". <b>Null means take the whole module</b> — a
+    /// consumer this cycle cannot trace to a file on disk cannot be rebound at all, so
+    /// proceeding would ship a module still dispatching the sibling's previous member ids. The
+    /// reason is reported through <see cref="FullCompileBecause"/> first, like every other
+    /// bail-out on this path.</para>
+    ///
+    /// <para><paramref name="hashes"/> is the enumeration of THIS app's <c>.al</c> tree, and
+    /// membership in it is the ownership check. <c>DeltaCompile</c> parses whatever
+    /// <c>changedFiles</c> it is handed without asking whose file it is, and the store is
+    /// process-wide and never cleared — so a widened path from outside this workspace's own
+    /// source set is refused rather than compiled into this module.</para>
+    /// </summary>
+    private static List<string>? CrossAppRebindFiles(
+        string moduleName,
+        AlRunner.Rad.RadWorkspace ws,
+        Dictionary<string, string> hashes,
+        List<string> changedFiles)
+    {
+        var pending = AlRunner.Rad.RadWorkspaceStore.PendingCrossAppRebinds(ws);
+        if (pending.Count == 0) return new List<string>();
+
+        var already = changedFiles.ToHashSet(StringComparer.Ordinal);
+        var files = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var because = new List<string>();
+
+        foreach (var rebind in pending)
+        {
+            var perProducer = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var key in rebind.Users)
+            {
+                var file = ws.FileOf(key);
+                if (file == null || !hashes.ContainsKey(file))
+                {
+                    var named = ws.Object(key)?.Name is { Length: > 0 } name
+                        ? $"'{name}'"
+                        : key.IsIdless ? $"'{key.Name}'" : $"id {key.Id}";
+                    FullCompileBecause(
+                        moduleName,
+                        $"{key.Kind} {named} calls {rebind.Producer.ModuleName}, which this cycle " +
+                        "re-emitted, and " + (file == null
+                            ? "this cycle cannot find the source file to rebind it from"
+                            : $"the file it was declared in ({Path.GetFileName(file)}) is not part " +
+                              "of this app's source tree"));
+                    return null;
+                }
+                if (already.Contains(file)) continue;
+                perProducer.Add(file);
+                if (seen.Add(file)) files.Add(file);
+            }
+            if (perProducer.Count > 0)
+                because.Add(
+                    $"{perProducer.Count} that call {rebind.Producer.ModuleName}"
+                    + (rebind.Everything ? ", which rebuilt in full" : string.Empty));
+        }
+
+        if (files.Count > 0)
+            Console.Error.WriteLine(
+                $"  [watch] {moduleName}: rebinding {files.Count} cross-app caller file(s) — " +
+                string.Join(", ", because));
+        return files;
     }
 
     /// <summary>
@@ -327,8 +421,14 @@ public sealed partial class BcCompiler
                 hashes,
                 objectsByFile,
                 declarations,
-                references,
+                references.SameApp,
+                references.CrossApp,
                 extensionTargets,
+                Array.Empty<AlRunner.Rad.RadObjectKey>(),
+                // A whole-module compile does not enumerate the surfaces it moved — the object
+                // map it would have to diff against was cleared before it ran. Its commit
+                // broadcasts "assume everything moved" instead, from RadWorkspaceUpdate.Full;
+                // see RadWorkspace.PublishSurfaceMoves.
                 Array.Empty<AlRunner.Rad.RadObjectKey>(),
                 module,
                 Full: true);
@@ -584,7 +684,9 @@ public sealed partial class BcCompiler
                     objectsByFile,
                     fileDeclarations,
                     new Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadObjectKey>>(),
+                    new Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadAppObjectRef>>(),
                     new Dictionary<AlRunner.Rad.RadObjectKey, AlRunner.Rad.RadObjectKey>(),
+                    Array.Empty<AlRunner.Rad.RadObjectKey>(),
                     Array.Empty<AlRunner.Rad.RadObjectKey>(),
                     WorkspaceBaseline(ws),
                     Full: false),
@@ -935,13 +1037,19 @@ public sealed partial class BcCompiler
                 appRootDir);
         }
 
+        var references = MapObjectReferences(rad);
         var update = new AlRunner.Rad.RadWorkspaceUpdate(
             hashes,
             objectsByFile,
             fileDeclarations,
-            MapObjectReferences(rad),
+            references.SameApp,
+            references.CrossApp,
             MapExtensionTargets(rad),
             removed.Select(item => item.Key).ToArray(),
+            // The same set the same-app rebind above consulted, carried to the commit so the
+            // OTHER apps in the bundle can rebind the calls that bake these objects' member
+            // ids. Empty for a body-only edit, which is what keeps a sibling untouched.
+            changedSurfaces,
             mergedBaseline,
             Full: false);
 
@@ -1454,14 +1562,15 @@ public sealed partial class BcCompiler
     /// baseline. A later callable-surface change uses the reverse one-hop relation to
     /// rebind direct callers without dragging in their transitive users.
     /// </summary>
-    private static Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadObjectKey>>
-        MapObjectReferences(NavCA.Compilation compilation)
+    private static RadReferenceGraph MapObjectReferences(NavCA.Compilation compilation)
     {
+        var cohort = BundleCohort;
         var declared = UniquelyKeyedObjects(compilation);
         var ownAppId = declared.FirstOrDefault()?.ContainingModule?.AppId;
-        var result = declared.ToDictionary(
+        var sameApp = declared.ToDictionary(
             ObjectKey,
             _ => new HashSet<AlRunner.Rad.RadObjectKey>());
+        var crossApp = new Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadAppObjectRef>>();
 
         foreach (var group in declared
             .Where(symbol => symbol.DeclaringSyntaxReference?.SyntaxTree != null)
@@ -1486,18 +1595,37 @@ public sealed partial class BcCompiler
 
             void AddReference(NavCA.ISymbol? symbol)
             {
-                if (ReferenceTargetKey(symbol, ownAppId) is not { } targetKey) return;
+                if (ReferenceTarget(symbol, ownAppId, cohort) is not { } target) return;
                 foreach (var source in sources)
-                    if (source != targetKey) result[source].Add(targetKey);
+                {
+                    if (target.App == null)
+                    {
+                        if (source != target.Key) sameApp[source].Add(target.Key);
+                        continue;
+                    }
+                    if (!crossApp.TryGetValue(source, out var targets))
+                        crossApp[source] = targets = new HashSet<AlRunner.Rad.RadAppObjectRef>();
+                    targets.Add(new AlRunner.Rad.RadAppObjectRef(target.App, target.Key));
+                }
             }
         }
 
         foreach (var extension in declared.OfType<NavCA.IApplicationObjectExtensionTypeSymbol>())
             if (IsKeyable(extension.Target))
-                result[ObjectKey(extension)].Add(ObjectKey(extension.Target));
+                sameApp[ObjectKey(extension)].Add(ObjectKey(extension.Target));
 
-        return result;
+        return new RadReferenceGraph(sameApp, crossApp);
     }
+
+    /// <summary>
+    /// The one-hop reference relation a compile produces, split by whether the target is in
+    /// this app or in a sibling app of the same bundle. Two maps rather than one qualified one
+    /// so the same-app half — which every existing rebind rule reads — keeps its key type and
+    /// its cost.
+    /// </summary>
+    private readonly record struct RadReferenceGraph(
+        Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadObjectKey>> SameApp,
+        Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadAppObjectRef>> CrossApp);
 
     private static Dictionary<AlRunner.Rad.RadObjectKey, AlRunner.Rad.RadObjectKey>
         MapExtensionTargets(NavCA.Compilation compilation)
@@ -1519,8 +1647,23 @@ public sealed partial class BcCompiler
     }
 
     /// <summary>
-    /// The object a referenced symbol belongs to, as a dependency-graph key — or null when
-    /// the reference leaves this app or names nothing trackable.
+    /// The object a referenced symbol belongs to, as a dependency-graph target — or null when
+    /// the reference names nothing trackable, or leaves the bundle entirely.
+    ///
+    /// <para><c>App</c> is null for a target in the compiling app itself, and the sibling's
+    /// workspace identity for one in another app of the same bundle. Everything else — the Base
+    /// Application, the System Application, every precompiled <c>.app</c> — is dropped, exactly
+    /// as every cross-app target used to be: those cannot change between two watch cycles, and
+    /// if one is replaced the reference signature moves and the workspace invalidates whole.
+    /// See <see cref="AlRunner.Rad.RadAppCohort"/>.</para>
+    ///
+    /// <para>Retaining the sibling edge is the fix for cross-app member-id staleness. Generated
+    /// calls bake Microsoft's member id, which is a hash of the callee's signature — so an edit
+    /// in app A that moves a surface leaves app B executing IL that dispatches A's PREVIOUS id,
+    /// and B never enters its own changed-file set. Loud when the id was retired (BC throws on
+    /// an unknown function id) and completely silent when it survives — adding an overload
+    /// moves which id the CALLER bakes without moving the callee's own. Only this edge can say
+    /// so.</para>
     ///
     /// <para>The id-less walk is the half that is easy to miss. A codeunit that implements an
     /// interface, or a page that hosts a control add-in, depends on it exactly as much as on
@@ -1531,20 +1674,29 @@ public sealed partial class BcCompiler
     /// the previous contract. Verified against the compiler — the semantic model answers the
     /// <c>implements</c> clause with the interface symbol.</para>
     /// </summary>
-    private static AlRunner.Rad.RadObjectKey? ReferenceTargetKey(NavCA.ISymbol? symbol, Guid? ownAppId)
+    private static (string? App, AlRunner.Rad.RadObjectKey Key)? ReferenceTarget(
+        NavCA.ISymbol? symbol, Guid? ownAppId, AlRunner.Rad.RadAppCohort? cohort)
     {
         var target = ContainingApplicationObject(symbol);
         if (target != null && IsKeyable(target))
-            return target.ContainingModule?.AppId == ownAppId ? ObjectKey(target) : null;
+            return Qualify(target.ContainingModule?.AppId, ObjectKey(target));
 
         for (var current = symbol; current != null; current = current.ContainingSymbol)
         {
             var kind = current.Kind.ToString();
             if (!AlRunner.Rad.RadObjectKey.IsIdlessKind(kind)) continue;
-            if (current.ContainingModule?.AppId != ownAppId) return null;
-            return AlRunner.Rad.RadObjectKey.For(kind, 0, current.Name);
+            return Qualify(
+                current.ContainingModule?.AppId,
+                AlRunner.Rad.RadObjectKey.For(kind, 0, current.Name));
         }
         return null;
+
+        (string? App, AlRunner.Rad.RadObjectKey Key)? Qualify(Guid? appId, AlRunner.Rad.RadObjectKey key)
+        {
+            if (appId == ownAppId) return (null, key);
+            if (appId is not { } id || cohort?.IdentityOf(id) is not { } identity) return null;
+            return (identity, key);
+        }
     }
 
     private static AlRunner.Rad.RadObjectKey ObjectKey(NavCA.IApplicationObjectTypeSymbol symbol) =>

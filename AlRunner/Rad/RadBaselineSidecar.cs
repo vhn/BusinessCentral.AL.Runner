@@ -69,8 +69,15 @@ public static class RadBaselineSidecar
     /// the cycle falls back to building a baseline the old way. Bumping the cache key instead
     /// would discard every existing DLL — including all of CI's — to withhold an
     /// optimisation.</para>
+    ///
+    /// <para><b>2</b> adds <see cref="EnvelopeDto.CrossAppReferences"/>. The bump is not
+    /// cosmetic: <c>System.Text.Json</c> ignores members it does not find, so a schema-2 reader
+    /// handed a schema-1 envelope would deserialize it happily and get ZERO cross-app edges —
+    /// a hydrated workspace that silently rebinds no sibling caller, which is the exact bug
+    /// those edges exist to fix. Refusing the older envelope costs one full compile and states
+    /// its reason; accepting it would cost correctness and state nothing.</para>
     /// </summary>
-    internal const int Schema = 1;
+    internal const int Schema = 2;
 
     private static readonly JsonSerializerOptions _json = new()
     {
@@ -130,6 +137,29 @@ public static class RadBaselineSidecar
         public KeyDto[] To { get; set; } = Array.Empty<KeyDto>();
     }
 
+    /// <summary>
+    /// A reference into another app of the same bundle: the sibling's workspace identity plus
+    /// the object's own key. The identity is stored, not derived, for the same reason
+    /// <see cref="KeyDto"/> stores the triple verbatim — it is produced by one rule
+    /// (<c>RadWorkspaceStore.IdentityOf</c>) whose output must not be re-derived on read.
+    /// </summary>
+    private sealed class AppKeyDto
+    {
+        public string App { get; set; } = string.Empty;
+        public KeyDto Key { get; set; } = new();
+
+        public static AppKeyDto From(RadAppObjectRef item) =>
+            new() { App = item.App, Key = KeyDto.From(item.Key) };
+
+        public RadAppObjectRef ToRef() => new(App, Key.ToKey());
+    }
+
+    private sealed class CrossAppEdgeDto
+    {
+        public KeyDto From { get; set; } = new();
+        public AppKeyDto[] To { get; set; } = Array.Empty<AppKeyDto>();
+    }
+
     private sealed class ExtensionDto
     {
         public KeyDto Extension { get; set; } = new();
@@ -148,6 +178,8 @@ public static class RadBaselineSidecar
         public string Root { get; set; } = string.Empty;
         public FileDto[] Files { get; set; } = Array.Empty<FileDto>();
         public EdgeDto[] References { get; set; } = Array.Empty<EdgeDto>();
+        /// <summary>Edges into a SIBLING app of the same bundle — schema 2 onwards.</summary>
+        public CrossAppEdgeDto[] CrossAppReferences { get; set; } = Array.Empty<CrossAppEdgeDto>();
         public ExtensionDto[] Extensions { get; set; } = Array.Empty<ExtensionDto>();
     }
 
@@ -218,6 +250,14 @@ public static class RadBaselineSidecar
                     {
                         From = KeyDto.From(pair.Key),
                         To = pair.Value.Select(KeyDto.From).ToArray(),
+                    })
+                    .ToArray(),
+                CrossAppReferences = state.CrossAppReferencesByObject
+                    .Where(pair => pair.Value.Count > 0)
+                    .Select(pair => new CrossAppEdgeDto
+                    {
+                        From = KeyDto.From(pair.Key),
+                        To = pair.Value.Select(AppKeyDto.From).ToArray(),
                     })
                     .ToArray(),
                 Extensions = state.ExtensionTargets
@@ -350,8 +390,14 @@ public static class RadBaselineSidecar
                     envelope.References.ToDictionary(
                         edge => edge.From.ToKey(),
                         edge => edge.To.Select(item => item.ToKey()).ToHashSet()),
+                    envelope.CrossAppReferences.ToDictionary(
+                        edge => edge.From.ToKey(),
+                        edge => edge.To.Select(item => item.ToRef()).ToHashSet()),
                     envelope.Extensions.ToDictionary(
                         item => item.Extension.ToKey(), item => item.Target.ToKey()),
+                    Array.Empty<RadObjectKey>(),
+                    // Hydration is not a compile and must announce nothing: the module it
+                    // restores is byte-identical to the one the sidecar describes.
                     Array.Empty<RadObjectKey>(),
                     module,
                     Full: true),

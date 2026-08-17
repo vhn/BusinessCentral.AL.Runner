@@ -175,6 +175,41 @@ public sealed partial class BcCompiler
         lock (_refSync) { _siblingSymbols?.Reindex(); }
     }
 
+    // The apps of the bundle currently being compiled, so the RAD reference graph can keep the
+    // edges that point at a SIBLING SOURCE app and drop the ones that point at a precompiled
+    // dependency. Static and per-bundle for the same reason SetSiblingSymbolsDir is: symbol
+    // publication constructs a BcCompiler of its own, and every compile in one bundle has to
+    // agree about who the siblings are.
+    private static AlRunner.Rad.RadAppCohort? _bundleCohort;
+
+    /// <summary>
+    /// Declare the bundle whose apps are about to be compiled. Pass null to clear — a mode with
+    /// no app graph (a dependency's own compile, <c>--emit</c>) then retains no cross-app edges,
+    /// which is exactly the behaviour that predates them.
+    /// </summary>
+    public static void SetBundleCohort(AlRunner.Rad.RadAppCohort? cohort)
+    {
+        lock (_refSync) { _bundleCohort = cohort; }
+    }
+
+    internal static AlRunner.Rad.RadAppCohort? BundleCohort
+    {
+        get { lock (_refSync) return _bundleCohort; }
+    }
+
+    /// <summary>Set <see cref="BundleCohort"/> for the duration of a scope. For tests.</summary>
+    internal static IDisposable ScopeBundleCohort(AlRunner.Rad.RadAppCohort? cohort)
+    {
+        AlRunner.Rad.RadAppCohort? saved;
+        lock (_refSync) { saved = _bundleCohort; _bundleCohort = cohort; }
+        return new CohortScope(saved);
+    }
+
+    private sealed class CohortScope(AlRunner.Rad.RadAppCohort? saved) : IDisposable
+    {
+        public void Dispose() { lock (_refSync) { _bundleCohort = saved; } }
+    }
+
     /// <summary>
     /// Temporarily drop resolved deps whose .app carries no <c>SymbolReference.json</c> from
     /// the compile spec list, restoring the full set on dispose.
@@ -715,6 +750,7 @@ public sealed partial class BcCompiler
             _cachedJsonLoaders = null;
             _refSpecs = null;
             _siblingSymbols = null;
+            _bundleCohort = null;
             _extraSymbolDirs = null;
             _resolvedDeps = null;
             _packageCacheDirs = null;
@@ -2178,6 +2214,19 @@ public sealed partial class BcCompiler
             }
         }
     }
+
+    /// <summary>
+    /// The <c>AppId</c> a compilation of <paramref name="moduleName"/> is actually built with.
+    ///
+    /// <para>Never null, even for an app group with no <c>app.json</c>: both
+    /// <see cref="Emit"/> and <c>DeltaCompile</c> substitute a deterministic hash of the module
+    /// name. Exposed because the RAD reference graph has to translate the compiler's id back to
+    /// a workspace identity, and the two differ for exactly that group — see
+    /// <see cref="AlRunner.Rad.RadAppCohort"/>. Deriving it a second way there would be a
+    /// silent mismatch rather than a compile error.</para>
+    /// </summary>
+    internal static Guid CompilationAppId(Guid? declaredAppId, string moduleName) =>
+        declaredAppId ?? DeterministicGuid(moduleName);
 
     private static Guid DeterministicGuid(string seed)
     {

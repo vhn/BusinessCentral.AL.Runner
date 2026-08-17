@@ -1280,6 +1280,19 @@ foreach (var bundle in bundles)
         using (AlRunner.Infrastructure.PhaseLog.Stage("build-app-groups"))
             appGroups = BuildAppGroups(suites, bucketRoot, bundleAbs);
 
+        // Who this bundle's apps are, for the RAD reference graph. It keeps an edge whose
+        // target is a SIBLING SOURCE app — those are the only ones that can change between two
+        // watch cycles, and a call into one bakes a member id that moves when its signature
+        // does — and drops every edge into a precompiled dependency, which cannot.
+        //
+        // Derived from the app graph rather than from the live workspaces on purpose: a
+        // one-shot run has no workspace at all and still writes the baseline sidecar a later
+        // --watch hydrates, so deciding from workspaces would persist an envelope with no
+        // cross-app edges and leave that watch exactly as stale as before.
+        var radCohort = AlRunner.Rad.RadAppCohort.Build(
+            bundleAbs, appGroups.Select(group => (group.AppId, group.ModuleName)));
+        BcCompiler.SetBundleCohort(radCohort);
+
         // ── in-bundle sibling symbols ──────────────────────────────────────
         // BuildAppGroups orders an app after every sibling it depends on, but ordering
         // alone does not make the sibling VISIBLE: references come from the resolved dep
@@ -1440,8 +1453,12 @@ foreach (var bundle in bundles)
         // Held across cycles per app identity: per-file content hashes, the compiler's
         // symbol baseline, and loaded overlay generations. With it warm, a save
         // recompiles only the objects that changed — see BcCompiler.EmitIncremental.
+        // bundleAbs is not decoration: the store is process-wide and never cleared, and its key
+        // admits the same AppId at two different source roots, so the cross-app queries scope
+        // themselves by the bundle a workspace was created under rather than by identity alone.
         AlRunner.Rad.RadWorkspace? radWs = needCompile && AlRunner.Rad.RadWorkspaceStore.Enabled
-            ? AlRunner.Rad.RadWorkspaceStore.For(moduleName, appGroup.AppId, appGroup.SuiteDir)
+            ? AlRunner.Rad.RadWorkspaceStore.For(
+                moduleName, appGroup.AppId, appGroup.SuiteDir, radCohort.BundleRoot)
             : null;
         // A cache entry serves the FIRST cycle and nothing after it: starting a watch on an
         // unchanged tree should cost a load, not a whole-module compile. Whether that first
