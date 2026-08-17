@@ -15,6 +15,8 @@
 //   Runner --precompile <input.app> --out <output.dll>
 using System.Reflection;
 using AlRunner;
+using NavCA = Microsoft.Dynamics.Nav.CodeAnalysis;
+using NavSyntax = Microsoft.Dynamics.Nav.CodeAnalysis.Syntax;
 
 // Diagnostic: AL_RUNNER_DIAG_FIRSTCHANCE=<substring> prints the FULL stack of
 // every first-chance exception whose type name contains the substring (use e.g.
@@ -2690,6 +2692,13 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
     // ─────────────────────────────────────────────────────────────────────────
     void HandleServerRunTests(AlRunner.ServerRequest req, System.IO.TextWriter output)
     {
+        // #1936: real wall-clock duration of THIS request (received → summary
+        // written), for the `wallSeconds` field on the terminal summary line. Not
+        // the process's total uptime — a warm server serves many requests, so
+        // "since process start" is only meaningful for the very first one. Started
+        // here (before the sourcePaths/isolation validation below) so it also
+        // captures those cheap up-front checks, not just the run itself.
+        var reqSw = System.Diagnostics.Stopwatch.StartNew();
         if (req.SourcePaths == null || req.SourcePaths.Length == 0)
         {
             lock (outputLock)
@@ -2789,7 +2798,7 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
                 output.WriteLine(AlRunner.ServerProtocol.Summary(
                     allTests, exitCode, cached, changed,
                     allCompileErrors.Count > 0 ? allCompileErrors : null,
-                    cancelled: cancelled));
+                    cancelled: cancelled, wallSeconds: reqSw.Elapsed.TotalSeconds));
                 output.Flush();
             }
         }
@@ -2806,41 +2815,170 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
     }
 
     // ── execute: run every requested bundle's first OnRun-bearing codeunit
-    // (run-mode), aggregating the results. v1 also accepted an inline `code`
-    // string; v2 has no inline-AL compile path yet, so that case fails LOUD
-    // (never a silent fake) per .claude/rules/loud-failures.md.
+    // (run-mode), aggregating the results. #1917: v1 also accepted an inline
+    // `code` string — a temp single-file bundle is synthesised from it (see
+    // SynthesizeInlineCodeBundle) and run through the SAME compile pipeline a
+    // sourcePaths-based execute already uses (RunAllBundlesForServer →
+    // RunBundleForServer → RunFirstCodeunitOnRun), rather than inventing a
+    // second execution path. `captureValues` stays out of scope — it needs the
+    // Cecil instrumentation pass tracked on #1640 — so that case still fails
+    // LOUD (never a silent fake) per .claude/rules/loud-failures.md.
     string HandleServerExecute(AlRunner.ServerRequest req)
     {
-        if (!string.IsNullOrWhiteSpace(req.Code))
-            return AlRunner.ServerProtocol.Error(
-                "execute: inline AL 'code' is not yet supported in v2 — pass 'sourcePaths' "
-                + "to run the bundle's OnRun codeunit. See docs/server-mode.md.");
         if (req.CaptureValues == true)
             return AlRunner.ServerProtocol.Error(
                 "execute: 'captureValues' is not yet supported in v2. See docs/server-mode.md.");
-        if (req.SourcePaths == null || req.SourcePaths.Length == 0)
-            return AlRunner.ServerProtocol.Error("sourcePaths is required");
-        foreach (var p in req.SourcePaths)
-            if (!Directory.Exists(p))
-                return AlRunner.ServerProtocol.Error($"bundle directory not found: {p}");
+
+        string? scratchDir = null;
+        string[] sourcePaths;
+        if (!string.IsNullOrWhiteSpace(req.Code))
+        {
+            if (req.SourcePaths != null && req.SourcePaths.Length > 0)
+                return AlRunner.ServerProtocol.Error(
+                    "execute: 'code' and 'sourcePaths' are mutually exclusive — pass one or the other.");
+            scratchDir = SynthesizeInlineCodeBundle(req.Code!);
+            sourcePaths = new[] { scratchDir };
+        }
+        else
+        {
+            if (req.SourcePaths == null || req.SourcePaths.Length == 0)
+                return AlRunner.ServerProtocol.Error("sourcePaths is required");
+            foreach (var p in req.SourcePaths)
+                if (!Directory.Exists(p))
+                    return AlRunner.ServerProtocol.Error($"bundle directory not found: {p}");
+            sourcePaths = req.SourcePaths;
+        }
 
         var isolationError = ApplyRequestIsolation(req);
         if (isolationError != null) return isolationError;
 
-        var runs = RunAllBundlesForServer(req.SourcePaths, req.PackagePaths, RunFirstCodeunitOnRun);
+        try
+        {
+            var runs = RunAllBundlesForServer(sourcePaths, req.PackagePaths, RunFirstCodeunitOnRun);
 
-        var allTests = runs.SelectMany(r => r.Tests).ToList();
-        var allCompileErrors = runs.SelectMany(r => r.CompileErrors ?? Array.Empty<CompilationErrorGroup>()).ToList();
-        var exitCode = runs.Count > 0 ? runs.Max(r => r.ExitCode) : 0;
+            var allTests = runs.SelectMany(r => r.Tests).ToList();
+            var allCompileErrors = runs.SelectMany(r => r.CompileErrors ?? Array.Empty<CompilationErrorGroup>()).ToList();
+            var exitCode = runs.Count > 0 ? runs.Max(r => r.ExitCode) : 0;
 
-        var combinedHashes = new Dictionary<string, string>();
-        foreach (var r in runs)
-            foreach (var kv in r.FileHashes)
-                combinedHashes[kv.Key] = kv.Value;
-        lastFileHashes = combinedHashes;
+            var combinedHashes = new Dictionary<string, string>();
+            foreach (var r in runs)
+                foreach (var kv in r.FileHashes)
+                    combinedHashes[kv.Key] = kv.Value;
+            lastFileHashes = combinedHashes;
 
-        return AlRunner.ServerProtocol.Execute(allTests, exitCode, null,
-            allCompileErrors.Count > 0 ? allCompileErrors : null);
+            return AlRunner.ServerProtocol.Execute(allTests, exitCode, null,
+                allCompileErrors.Count > 0 ? allCompileErrors : null);
+        }
+        finally
+        {
+            // Best-effort cleanup: the scratch dir's contents are fully consumed
+            // once RunBundleForServer has emitted+compiled them into an in-memory
+            // assembly (or failed trying) — nothing downstream needs the files on
+            // disk after this call returns, and a leaked temp dir per `execute`
+            // call would otherwise accumulate for the life of the server process.
+            if (scratchDir != null)
+            {
+                try { Directory.Delete(scratchDir, recursive: true); }
+                catch { /* not fatal — OS temp cleanup will catch it eventually */ }
+            }
+        }
+    }
+
+    // #1917: synthesise a temp single-file AL bundle from an inline `code`
+    // string so `execute`'s "code" field can go through the same compile
+    // pipeline as a sourcePaths-based execute, instead of a separate inline-AL
+    // execution path. v1 parity (see git history for e1a22f84, "fixes #12"):
+    // `code` that already looks like a full AL object definition is used
+    // verbatim; anything else is treated as a bare statement list and wrapped
+    // in a scratch codeunit's OnRun trigger body, matching v1's CLI `-e` shape.
+    //
+    // #1931: "already looks like a full AL object" used to be
+    // `trimmed.StartsWith("codeunit"/"table")` — a two-keyword allowlist that
+    // misclassified every other object type (page/enum/report/query/xmlport/
+    // interface/...) AND any codeunit behind a leading `//` comment (TrimStart
+    // leaves the `//` in place, so it never matched). See IsFullAlObjectDeclaration
+    // for the fix: ask BC's own parser instead of maintaining a keyword list.
+    static string SynthesizeInlineCodeBundle(string code)
+    {
+        var isFullObject = IsFullAlObjectDeclaration(code);
+        var source = isFullObject
+            ? code
+            : $"codeunit 50100 \"AL Runner Inline Execute\" {{ trigger OnRun() begin {code} end; }}";
+
+        var dir = Path.Combine(Path.GetTempPath(), "al-runner-server-inline", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "Scratch.al"), source);
+        return dir;
+    }
+
+    // #1931: is `code` already a full AL object declaration (should be used
+    // verbatim), or a bare statement list (needs wrapping in a scratch OnRun
+    // body)? Answered by asking BC's OWN parser rather than maintaining a
+    // keyword allowlist that drifts as AL gains object types — the same
+    // approach RecordPatches.AlSourceParser.ParseAlObjects already uses for
+    // table/tableextension extraction (#1696). SyntaxTree.ParseObjectText needs
+    // only a ParseOptions, no Compilation and no reference closure, so this is
+    // cheap and side-effect-free.
+    //
+    // Every top-level AL object syntax type shares one common base,
+    // Microsoft.Dynamics.Nav.CodeAnalysis.Syntax.ObjectSyntax — verified via
+    // reflection over the shipped CodeAnalysis DLL: table/codeunit/page/report/
+    // query/xmlport/enum/(+ extension variants) all derive from
+    // ApplicationObjectSyntax : ObjectSyntax, while interface/controladdin/
+    // profile/dotnet/entitlement derive from ObjectSyntax directly (they have no
+    // object id, so they don't go through ApplicationObjectSyntax) — so "did the
+    // compilation-unit root produce at least one ObjectSyntax child" answers
+    // "is this a full object declaration" for the whole AL object-keyword set at
+    // once, with no list to keep in sync.
+    //
+    // Leading trivia (a `//` comment, a blank line, a `#pragma`) needs no manual
+    // skipping: comments/blank lines are trivia the parser already attaches to
+    // the first real token when it scans for the object keyword, so a
+    // `//`-prefixed codeunit still yields a CodeunitSyntax child.
+    //
+    // A malformed-but-recognisable object (e.g. `codeunit 50100 "X" { trigger
+    // OnRun() begin Error(` with an unclosed paren) still parses to exactly one
+    // ObjectSyntax child — BC's parser recovers past the syntax error and still
+    // recognises the object shape — so it is STILL used verbatim. That is
+    // deliberate: the caller's real compile error then names the caller's real
+    // code (via the normal `compilationErrors` channel `execute` already
+    // returns), not a wrapper the caller never wrote. A genuine bare statement
+    // list, or text that isn't AL at all, produces zero children (BC's parser
+    // reports AL0198 "expected one of the application object keywords" and
+    // recovers to an empty compilation unit) and falls through to wrapping.
+    //
+    // Never throws: this is fed arbitrary text a human may have typed by hand,
+    // and a parse ParseObjectText itself cannot make sense of must fall back to
+    // "not a full object" (wrap it) rather than blow up the request — the same
+    // never-throw contract RecordPatches.AlSourceParser.ParseAlObjects documents
+    // for the identical call.
+    //
+    // Classification is deterministic (yes/no), never ambiguous, so there is no
+    // third "couldn't tell" state to surface as a request-level protocol error:
+    // whichever branch is chosen, a real problem in the caller's AL still comes
+    // back through the existing `compilationErrors` channel that
+    // Execute_InlineCode_CompileError_ReturnsCompilationErrors already proves —
+    // exactly where every other AL-content problem in this protocol surfaces.
+    // The top-level `error` field stays reserved for request-shape problems
+    // (unknown command, missing sourcePaths, mutually exclusive fields) that
+    // have nothing to do with what the AL says.
+    static bool IsFullAlObjectDeclaration(string code)
+    {
+        try
+        {
+            var parseOpts = new NavCA.ParseOptions(
+                runtimeVersion: null!,
+                preprocessorSymbols: Enumerable.Range(1, 25).Select(n => $"CLEANSCHEMA{n}")
+                    .Concat(AlRunner.BcCompiler.GetExtraPreprocessorSymbols()),
+                documentationMode: NavCA.DocumentationMode.None);
+            var tree = NavSyntax.SyntaxTree.ParseObjectText(code, path: "", encoding: null!, parseOpts, default);
+            return tree.GetRoot() is NavSyntax.CompilationUnitSyntax root &&
+                   root.ChildNodes().Any(n => n is NavSyntax.ObjectSyntax);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // Runs every bundle in sourcePaths in order and returns one ServerRunResult per

@@ -6,6 +6,121 @@ All notable changes to this project are documented here. Format based on
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-08-17
+
+### Added
+- --count-baseline so a shrunken run can no longer report green
+
+### Fixed
+- Field virtual table now reports declared ObsoleteState/ObsoleteReason
+- TestPage field DrillDown() dispatches OnDrillDown
+- MediaSet.ImportStream membership lost after Modify()+Get() (#1773)
+
+### Changed
+- chore(corpus): bump al-language pin to eb300810, and remap AssertError exceptions as BC does
+- fix(testpage): SetValue(Boolean) on Rec-bound Boolean controls
+- fix(server): classify inline AL code with BC's own parser, not a keyword prefix
+- fix(testpage): resolve Enum-typed controls by Caption and refuse the member name
+- feat(server): compile and run inline AL code from the execute command
+- fix(page): materialise pages with Enum-typed controls via AlEnumMetadataRegistry
+- fix(report): apply the caller's table view before OnPreReport so GetFilter() reads it
+- fix(runtime): static Page.RunModal(0, Record) resolves the page via the table's LookupPageId
+- feat(coverage): --coverage via BC's own StmtHit instrumentation
+- fix(testpage): TestPage field Visible() must walk the enclosing group chain
+- fix(watch): make the burst quiescence test deterministic, not real-clock-dependent
+- fix(runtime): construct Page{id} for static Page.RunModal(id, Record)
+- perf(startup): drop two JmpHook-era JIT guards; grant orchestrator GitHub access
+- fix(watch): wait for quiescence instead of a fixed debounce
+- fix(deps): honour the dependency's app.json manifest in source-dependency compiles
+- fix(runtime): resolve AL objects against the current generation across a cross-app cycle boundary
+- perf(tests): share one --server process per test class, not one per fact
+- fix(compile): give BC's compiler a file system so ControlAddIn resources resolve
+- perf(parser): parse each .al file once for all eight extractors
+- fix(server): register per-request bundles in the cross-bundle AppId cache
+- fix(parser): thread --define symbols into the table-metadata parser
+- fix(cache): key ncl-cecil on the runner's content hash, not its mtime
+- perf(startup): drop two JmpHook-era JIT guards, ~27% off every runner spawn
+- fix(phase-log): stop the cohort-ratio false verdict; wire phase-log into --server mode
+- fix(unit-tests): recover CollectionCostOrderer's stale weight table
+- test(server): add reload regression coverage for #1860 (refuted)
+- fix(xmlport): resolve the NavXmlPort orphaned-JmpHook cluster
+- fix(cache): stop embedding the git commit SHA into al-runner.dll's bytes
+- fix(record): run OnValidate triggers on tableextension-added fields
+- chore(corpus): bump al-language pin dadffa2 -> 848831a
+- perf: cache dependency Install-trigger + Company-Initialize baseline per dependency set
+- fix(events): unwrap ByRef-wrapped publisher scope args for by-value subscriber parameters
+- refactor: de-duplicate FindBucketRoot between Program.cs and WatchSource.cs
+- fix(cache): compiled-deps / workspace-deps / ncl-cecil / bc-symbols honour --cache
+- fix(testpage): eliminate literal Visible = false controls from the page
+- fix(cache): content-address the bc-symbols cache key, not .app mtime
+- fix(testpage): Boolean SetValue() works on page-variable-bound controls
+- perf(phase-log): attribute the flat per-app-group tax inside test run
+- fix(tests): make WatchTests' warm-timing assertion independent of pump scheduling
+- fix(deps): discriminate genuine same-app reuse from AppId collisions
+- fix(tests): replace ServerCancelTests' calibrated spin race with a deterministic barrier
+- perf(record-patches): seed report ids from PE bytes instead of Assembly.GetTypes()
+- docs(agents): rebut the run_in_background rationalization behind the stall
+- docs(agents): name the no-poll guidance conflict that keeps killing agent work
+- perf(unit-tests): --print-cache-key mode cuts CacheKeyDependencyClosureTests cost
+- docs(agents): widen the no-backgrounding rule and split flake budgets asymmetrically
+- runner-extras: consolidate 16 standalone bundles into one app
+- perf(record-patches): batch AddSourceDir into one NCLMetadata cache pass
+- docs(agents): land the unmerged rules branch, and stop agents re-running the whole suite before every push
+- fix(ci): bump xunit.runner.visualstudio to 3.1.5 so a green run cannot exit 1
+- perf(compiler): keep the warm loader when the dep set only narrows
+- test(corpus): bump tests/al-language 15d18e8 -> dadffa2
+- test(corpus): bump tests/al-language f915a4c -> 15d18e8
+- perf(compiler): hide the self-app instead of rescanning, so one warm loader serves every dep compile
+- perf(diag): attribute the runner-extras bundle overhead with PhaseLog stages
+- perf(tests): schedule test collections heaviest-first to remove the single-threaded tail
+- perf(diag): add AL_RUNNER_PHASE_LOG, a per-app/bundle/process cost instrument
+- fix(cache): content-address the runner fingerprint in cache keys, add an explicit bc: line
+- perf(tests): parallelize the 76 subprocess integration tests, fix the TOCTOUs it exposed
+- fix(watch): arm FileSystemWatchers before announcing --watch is ready
+- fix(tests): make the in-process BC engine tests actually execute on CI
+- perf(tests): spawn al-runner.dll directly instead of dotnet run --no-build
+- fix(cache): publish AL-output cache entries atomically
+- test(AlRunner.Tests): one artifacts gate, visible skips, CI-fatal when artifacts are absent
+- chore(corpus): bump al-language pin 9e75879 -> f915a4c
+- fix(events): dispatch manually-declared IntegrationEvents from Page/Report/Query/XmlPort
+- fix(mediaset): hook BC 27.x's synchronous AddMediaToSet, hard-error on unknown shapes
+- docs(agents): fix impl-agent.md for v2 layout, add operational rules
+- test(server): calibrate ServerCancelTests' workload live instead of a fixed dev-box constant
+- fix(record): make NavRecord.GetCallerRecord track the real AL frame
+- fix(reports): route static Report.Run/RunModal through real execution, not a dead JmpHook
+- fix(testpage): TestPage.Caption() and field Caption() now return real captions
+- fix(streams): match BC's Rename BLOB-loss for temporary records
+- fix(test-executor): run [Test] procedures in AL source declaration order
+- fix(events): dispatch manually-declared table-published IntegrationEvents
+- Add managed providers for Page Metadata and Page Control Field virtual tables
+- fix(enum): ingest declared Caption at emit time so Format(enum) returns it
+- feat(server): add the cancel command — cooperative mid-run cancellation (#1641)
+- chore(runner): remove dead protocol-v2 TestFilter record, add --test filter coverage
+- fix(testpage): capture the insert position at New() so AutoSplitKey covers mid-grid, negative and typed keys
+- chore(corpus): bump al-language pin to 9e75879, declare the four AutoSplitKey range gaps
+- fix(record): resolve a CalcFormula where-condition whose field() names a FlowField
+- fix(record): keep a database-backed row's BLOB out of the record that inserted it
+- fix(testpage): number AutoSplitKey rows from the data, not from a constant
+- fix(events): honor EventSubscriberInstance = Manual for table-event subscribers
+- feat(server): populate protocol-v2 errorKind + stackFrames on streamed test events
+- fix(events): honor EventSubscriberInstance = Manual in codeunit-event dispatch
+- fix(record): apply the flow-filter family of CalcFormula where-conditions
+- fix(testpage): action invoke saves the new subpage row, and AutoSplitKey assigns its key
+- fix(record): CalcFields on a BLOB keeps an uncommitted in-memory write
+- fix(page): page-driven Modify holds the before-image in xRec
+- fix(report): Report.Run() iterates the data item, and SetTableView no longer NREs
+- fix(record): Rename propagates through conditional and where-filtered TableRelations
+- fix(deps): persist source-dep enum sidecar and build the symbols loader with zero package caches
+- fix(expectations): expect-oos matches the message convention, add expect-divergence
+- chore(corpus): bump al-language pin to c1a6733, retire migrated bundles, declare report gaps
+- Add new BC versions 28.2, 28.3, and 28.4
+- fix(expectations): wire the ExpectationManifest into the run (#1734)
+- fix(page): bind Rec on a plain page-variable, not just TestPage
+- fix(scheduler): CreateTask hits the documented NavCreateScheduledTasksNotAllowedException, not a codeunit-resolution error
+- fix(record): Rename propagates to validated TableRelation fields
+- fix(moduleinfo): GetCallerModuleInfo must name the caller across an app boundary
+- feat(metadata): populate the Table Metadata virtual table; fix the docs-only CI bypass
+
 ## [2.1.2] - 2026-08-10
 
 ### Fixed

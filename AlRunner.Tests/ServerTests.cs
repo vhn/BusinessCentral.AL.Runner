@@ -184,15 +184,260 @@ public class ServerTests : IClassFixture<SharedCliServer>
         Assert.Contains("executed-onrun-boom", tests[0].GetProperty("message").GetString());
     }
 
+    // #1917: 'captureValues' still needs the Cecil instrumentation pass tracked
+    // on #1640 — that half of v1 parity stays a loud, structured error.
     [SkippableFact]
-    public async Task Execute_InlineCode_NotSupported_ReturnsError()
+    public async Task Execute_CaptureValues_NotSupported_ReturnsError()
     {
         TestArtifacts.SkipIfMissing();
         var server = await _fixture.GetAsync();
-        var r = await server.SendAsync("{\"command\":\"execute\",\"code\":\"Message('hi');\"}");
+        var r = await server.SendAsync(
+            "{\"command\":\"execute\",\"code\":\"Message('hi');\",\"captureValues\":true}");
         var d = JsonSerializer.Deserialize<JsonElement>(r);
         Assert.True(d.TryGetProperty("error", out var err));
-        Assert.Contains("inline AL", err.GetString());
+        Assert.Contains("captureValues", err.GetString());
+    }
+
+    // #1917: inline `code` that is a bare statement list (no leading `codeunit`/
+    // `table`) is wrapped in a scratch OnRun trigger and actually executed — the
+    // failure message below carries a value AL computed (6 * 7), which a stub
+    // that always answered "no error" or always answered the same fixed string
+    // could not reproduce. This is the "positive" half of the compile path: the
+    // codeunit compiles and its trigger genuinely runs.
+    [SkippableFact]
+    public async Task Execute_InlineCode_BareStatements_ComputesRealValue()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "Error('computed %1', 6 * 7);"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        Assert.Equal(1, d.GetProperty("exitCode").GetInt32());
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("fail", tests[0].GetProperty("status").GetString());
+        Assert.Contains("computed 42", tests[0].GetProperty("message").GetString());
+    }
+
+    // A bare statement list with no error at all must compile+run to a genuine
+    // pass — proves the "no exception" path isn't itself a swallowed failure.
+    [SkippableFact]
+    public async Task Execute_InlineCode_BareStatements_PassesWhenNoError()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "if 6 * 7 <> 42 then Error('math is broken');"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        Assert.Equal(0, d.GetProperty("exitCode").GetInt32());
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("pass", tests[0].GetProperty("status").GetString());
+    }
+
+    // #1917: inline `code` that is already a full AL object definition (starts
+    // with "codeunit") is used verbatim, not double-wrapped — matches v1's CLI
+    // `-e` shape (fixes #12).
+    [SkippableFact]
+    public async Task Execute_InlineCode_FullObjectDefinition_UsedVerbatim()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "codeunit 60170 \"Inline Full Object SX\" { trigger OnRun() begin " +
+                   "Error('full-object %1', 100 + 1); end; }"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        Assert.Equal(1, d.GetProperty("exitCode").GetInt32());
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("fail", tests[0].GetProperty("status").GetString());
+        Assert.Contains("full-object 101", tests[0].GetProperty("message").GetString());
+    }
+
+    // #1931: the old classifier only matched `trimmed.StartsWith("codeunit"/
+    // "table")`, so a `page`/`enum`/`report` (or any other AL object type) fell
+    // through to the bare-statement branch and got nested INSIDE a scratch
+    // codeunit's OnRun trigger body — invalid AL, a syntax error pointing at the
+    // wrapper. Each fact below pairs the object type under test with a companion
+    // codeunit in the SAME inline `code` string (BC's own parser handles
+    // multiple objects per file — see ParseObjectText probe backing this PR).
+    // Under the fix, IsFullAlObjectDeclaration recognises the whole text as
+    // object declarations via BC's own parser (not a keyword list) and uses it
+    // verbatim, so both objects compile as siblings and RunFirstCodeunitOnRun
+    // finds and runs the companion's OnRun — a distinct computed value in the
+    // failure message is proof the trigger genuinely ran, not that compilation
+    // merely didn't error.
+    [SkippableFact]
+    public async Task Execute_InlineCode_FullPageDefinition_CompanionCodeunitRuns()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "page 60180 \"Inline Full Page SX\" { layout { area(content) { } } } " +
+                   "codeunit 60181 \"Inline Full Page Companion SX\" { trigger OnRun() begin " +
+                   "Error('page-companion-ran %1', 200 + 1); end; }"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        Assert.False(d.TryGetProperty("compilationErrors", out _), $"unexpected compile error: {r}");
+        Assert.Equal(1, d.GetProperty("exitCode").GetInt32());
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("fail", tests[0].GetProperty("status").GetString());
+        Assert.Contains("page-companion-ran 201", tests[0].GetProperty("message").GetString());
+    }
+
+    [SkippableFact]
+    public async Task Execute_InlineCode_FullEnumDefinition_CompanionCodeunitRuns()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "enum 60182 \"Inline Full Enum SX\" { value(0; A) { } } " +
+                   "codeunit 60183 \"Inline Full Enum Companion SX\" { trigger OnRun() begin " +
+                   "Error('enum-companion-ran %1', 300 + 1); end; }"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        Assert.False(d.TryGetProperty("compilationErrors", out _), $"unexpected compile error: {r}");
+        Assert.Equal(1, d.GetProperty("exitCode").GetInt32());
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("fail", tests[0].GetProperty("status").GetString());
+        Assert.Contains("enum-companion-ran 301", tests[0].GetProperty("message").GetString());
+    }
+
+    [SkippableFact]
+    public async Task Execute_InlineCode_FullReportDefinition_CompanionCodeunitRuns()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "report 60184 \"Inline Full Report SX\" { dataset { } } " +
+                   "codeunit 60185 \"Inline Full Report Companion SX\" { trigger OnRun() begin " +
+                   "Error('report-companion-ran %1', 400 + 1); end; }"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        Assert.False(d.TryGetProperty("compilationErrors", out _), $"unexpected compile error: {r}");
+        Assert.Equal(1, d.GetProperty("exitCode").GetInt32());
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("fail", tests[0].GetProperty("status").GetString());
+        Assert.Contains("report-companion-ran 401", tests[0].GetProperty("message").GetString());
+    }
+
+    // #1931: `TrimStart()` leaves a leading `//` comment in place, so the old
+    // `StartsWith("codeunit")` check never matched a codeunit preceded by one —
+    // it silently fell through to wrapping, nesting a full object declaration
+    // inside a trigger body. BC's own parser treats the comment as leading
+    // trivia on the `codeunit` token, so IsFullAlObjectDeclaration recognises it
+    // regardless. The computed failure value again proves real execution.
+    [SkippableFact]
+    public async Task Execute_InlineCode_CommentPrefixedCodeunit_UsedVerbatim()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "// setup note the caller left on their inline snippet\n" +
+                   "codeunit 60186 \"Inline Comment Prefixed CU SX\" { trigger OnRun() begin " +
+                   "Error('comment-prefixed-ran %1', 500 + 1); end; }"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        Assert.False(d.TryGetProperty("compilationErrors", out _), $"unexpected compile error: {r}");
+        Assert.Equal(1, d.GetProperty("exitCode").GetInt32());
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("fail", tests[0].GetProperty("status").GetString());
+        Assert.Contains("comment-prefixed-ran 501", tests[0].GetProperty("message").GetString());
+    }
+
+    // #1931 negative: a malformed-but-recognisable object (here a `report`
+    // whose dataset references a table that doesn't exist) is still used
+    // verbatim, so the compile diagnostic that comes back is the REAL semantic
+    // error about the caller's actual object — it names the caller's own
+    // undeclared table text — rather than a generic "unexpected token 'report'"
+    // syntax error a mis-wrap into the scratch OnRun body would have produced.
+    // That distinguishes "recognised as an object, then failed to compile" from
+    // "not recognised, wrapped, then failed to compile for an unrelated reason".
+    [SkippableFact]
+    public async Task Execute_InlineCode_MalformedObject_CompileErrorNamesRealProblem()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "report 60187 \"Inline Malformed Report SX\" { dataset { " +
+                   "dataitem(NoSuchTable; \"This Table Does Not Exist SX\") { } } }"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected top-level error response: {r}");
+        Assert.NotEqual(0, d.GetProperty("exitCode").GetInt32());
+        Assert.True(d.TryGetProperty("compilationErrors", out var compileErrors),
+            $"expected compilationErrors on a compile failure: {r}");
+        Assert.True(compileErrors.GetArrayLength() > 0);
+        var allErrorText = string.Join(" | ", compileErrors.EnumerateArray()
+            .SelectMany(g => g.GetProperty("errors").EnumerateArray().Select(e => e.GetString())));
+        // Positive: the real semantic diagnostic — the caller's own undeclared
+        // table name — is present, so the caller can actually see their bug.
+        Assert.Contains("This Table Does Not Exist SX", allErrorText);
+        // Negative (the actual RED/GREEN discriminator): a mis-wrap nests the
+        // report's `report`/`dataset`/`dataitem` keywords as bare-expression
+        // statements inside the scratch OnRun body, and once that body's closing
+        // `end;`/`}` is reached the leftover text triggers a FRESH top-level
+        // object parse attempt — which fails with AL0198 ("expected one of the
+        // application object keywords"). That code never appears when the report
+        // is recognised and compiled verbatim, because it is a syntactically
+        // complete, single object with nothing left over to mis-parse. Its
+        // presence here would mean classification took the wrong branch.
+        Assert.DoesNotContain("AL0198", allErrorText);
+        var tests = d.GetProperty("tests");
+        Assert.Equal(0, tests.GetArrayLength());
+    }
+
+    // Negative: inline code that fails to COMPILE must surface a real compiler
+    // diagnostic, not be silently swallowed into a false "success".
+    [SkippableFact]
+    public async Task Execute_InlineCode_CompileError_ReturnsCompilationErrors()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            // UndeclaredInlineVariable is never declared — a real AL compile error.
+            code = "if UndeclaredInlineVariable then Error('unreachable');"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected top-level error response: {r}");
+        Assert.NotEqual(0, d.GetProperty("exitCode").GetInt32());
+        Assert.True(d.TryGetProperty("compilationErrors", out var compileErrors),
+            $"expected compilationErrors on a compile failure: {r}");
+        Assert.True(compileErrors.GetArrayLength() > 0);
+        var tests = d.GetProperty("tests");
+        Assert.Equal(0, tests.GetArrayLength());
     }
 
     // Reproduces #1658: a request naming an app bundle + its separate test-app

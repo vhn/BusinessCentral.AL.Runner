@@ -1517,6 +1517,7 @@ public static partial class RecordPatches
         };
     }
 
+    // Metadata-backed lookup — see FindRecordTypeIn in RecordPatches.NclMetaTableBuilder.cs.
     private static Type? FindClrTypeByName(string name)
     {
         var owned = AlRunner.Rad.AlObjectResolution.FindOwned(name, requiredBase: null);
@@ -1526,7 +1527,7 @@ public static partial class RecordPatches
         {
             try
             {
-                var t = Array.Find(asm.GetTypes(), x => x.Name == name);
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(asm).FindFirst(name);
                 if (t != null) return t;
             }
             catch { }

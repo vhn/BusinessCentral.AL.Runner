@@ -971,8 +971,8 @@ public static partial class BcRuntime
         {
             try
             {
-                var t = Array.Find(_currentTestAssembly.GetTypes(),
-                    x => x.Name == name && (queryBase == null || queryBase.IsAssignableFrom(x)));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(_currentTestAssembly)
+                    .FindFirst(name, x => (queryBase == null || queryBase.IsAssignableFrom(x)));
                 if (t != null) return t;
             }
             catch { }
@@ -987,8 +987,8 @@ public static partial class BcRuntime
             if (IsStaleBundleAssembly(asm)) continue;
             try
             {
-                var t = Array.Find(asm.GetTypes(),
-                    x => x.Name == name && (queryBase == null || queryBase.IsAssignableFrom(x)));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(asm)
+                    .FindFirst(name, x => (queryBase == null || queryBase.IsAssignableFrom(x)));
                 if (t != null) return t;
             }
             catch { }
@@ -1008,8 +1008,8 @@ public static partial class BcRuntime
         {
             try
             {
-                var t = Array.Find(_currentTestAssembly.GetTypes(),
-                    x => x.Name == name && (reportBase == null || reportBase.IsAssignableFrom(x)));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(_currentTestAssembly)
+                    .FindFirst(name, x => (reportBase == null || reportBase.IsAssignableFrom(x)));
                 if (t != null) return t;
             }
             catch { }
@@ -1024,8 +1024,8 @@ public static partial class BcRuntime
             if (IsStaleBundleAssembly(asm)) continue;
             try
             {
-                var t = Array.Find(asm.GetTypes(),
-                    x => x.Name == name && (reportBase == null || reportBase.IsAssignableFrom(x)));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(asm)
+                    .FindFirst(name, x => (reportBase == null || reportBase.IsAssignableFrom(x)));
                 if (t != null) return t;
             }
             catch { }
@@ -1048,8 +1048,8 @@ public static partial class BcRuntime
         {
             try
             {
-                var t = Array.Find(_currentTestAssembly.GetTypes(),
-                    x => x.Name == name && (formBase == null || formBase.IsAssignableFrom(x)));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(_currentTestAssembly)
+                    .FindFirst(name, x => (formBase == null || formBase.IsAssignableFrom(x)));
                 if (t != null) return t;
             }
             catch { }
@@ -1064,8 +1064,8 @@ public static partial class BcRuntime
             if (IsStaleBundleAssembly(asm)) continue;
             try
             {
-                var t = Array.Find(asm.GetTypes(),
-                    x => x.Name == name && (formBase == null || formBase.IsAssignableFrom(x)));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(asm)
+                    .FindFirst(name, x => (formBase == null || formBase.IsAssignableFrom(x)));
                 if (t != null) return t;
             }
             catch { }
@@ -1089,8 +1089,8 @@ public static partial class BcRuntime
         {
             try
             {
-                var t = Array.Find(_currentTestAssembly.GetTypes(),
-                    x => x.Name == name && (testPageBase == null || testPageBase.IsAssignableFrom(x)));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(_currentTestAssembly)
+                    .FindFirst(name, x => (testPageBase == null || testPageBase.IsAssignableFrom(x)));
                 if (t != null) return t;
             }
             catch { }
@@ -1105,8 +1105,8 @@ public static partial class BcRuntime
             if (IsStaleBundleAssembly(asm)) continue;
             try
             {
-                var t = Array.Find(asm.GetTypes(),
-                    x => x.Name == name && (testPageBase == null || testPageBase.IsAssignableFrom(x)));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(asm)
+                    .FindFirst(name, x => (testPageBase == null || testPageBase.IsAssignableFrom(x)));
                 if (t != null) return t;
             }
             catch { }
@@ -1172,8 +1172,8 @@ public static partial class BcRuntime
         {
             try
             {
-                var t = Array.Find(_currentTestAssembly.GetTypes(),
-                    x => x.Name == name && baseCu.IsAssignableFrom(x));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(_currentTestAssembly)
+                    .FindFirst(name, baseCu.IsAssignableFrom);
                 if (t != null) return t;
             }
             catch { }
@@ -1189,8 +1189,8 @@ public static partial class BcRuntime
             if (IsStaleBundleAssembly(asm)) continue;
             try
             {
-                var t = Array.Find(asm.GetTypes(),
-                    x => x.Name == name && baseCu.IsAssignableFrom(x));
+                var t = AlRunner.Infrastructure.AssemblyTypeIndex.For(asm)
+                    .FindFirst(name, baseCu.IsAssignableFrom);
                 if (t != null) return t;
             }
             catch { /* skip dynamic/reflection-only assemblies */ }
