@@ -1235,6 +1235,41 @@ a schema-2 reader handed a schema-1 envelope deserializes it happily and gets **
 edges — a hydrated workspace that silently rebinds no sibling caller, which is the exact bug
 those edges exist to fix.
 
+**What the refusal costs, measured rather than assumed.** On an ordinary upgrade it costs
+nothing, because it never fires: the AL-output cache key's second line is
+`runner:<sha256 of al-runner.dll>`, so changing `Schema` changes the binary, which changes the
+key — a schema-2 reader computes a different key and never opens the schema-1 envelope at all.
+The `.dll` misses too, and the full compile that follows writes a fresh schema-2 pair.
+
+When it *does* fire — an envelope hand-edited, or a build that changed the schema without
+changing the binary — it is a whole-**bundle** compile, not one app's: `PrepareBundleReload`
+invalidates every workspace while any app lacks a baseline, so one refused envelope turned a
+2-object delta into all 9 on the three-app fixture. **And it does not heal.** `TrySave` is
+guarded on sidecar paths that are only assigned while no generation is loaded, and a cache HIT
+loads one immediately — so on the cycle that pays the compile those paths are null and the
+schema-1 envelope is still on disk afterwards. Every subsequent watch session pays it again.
+
+#### One-shot then watch still pays a full compile, for a dependency target
+
+Measured while proving the hydration path: the sidecar written by a one-shot run does hydrate,
+and its cross-app edges do rebind a sibling caller on the first edit — but only for apps nothing
+else depends on. For a **dependency target**, the producer's own hydration does not survive:
+
+```
+[watch] Delta Lib: full rebuild — the resolved dependency set changed (1 → 0)
+```
+
+A one-shot publishes each dependency-target app's symbols in a pre-pass (`EmitSiblingSymbols`,
+which the RAD path skips), so by the time `Delta Lib` compiles, the sibling-symbols directory
+already holds *Delta Bridge*'s symbols and they enter Lib's resolved reference set. Lib's
+persisted signature therefore carries a `ref|…|Delta Bridge|…` line the watch path can never
+reproduce, and `ArmFor` invalidates.
+
+So for any app another app depends on, one-shot-then-watch still costs a whole-module compile on
+the first edit — the exact cost the sidecar exists to remove. Unfixed, and pinned by an assertion
+in `RadDeltaWatchTests.OneShotSidecar_ThenWatch_HydratesCrossAppEdges_AndRebindsTheSiblingCaller`
+so it cannot quietly change.
+
 #### A one-way hole, same-app and cross-app alike
 
 `MapObjectReferences` walks the objects `UniquelyKeyedObjects` returns, and that is only
