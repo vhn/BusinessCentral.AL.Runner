@@ -58,9 +58,20 @@ internal static class RadFixture
     /// `--watch` process reaches at the end of its first cycle. Every later
     /// assertion is relative to this.
     /// </summary>
-    internal static SeededBaseline Seed(string tempRoot, string? appRootDir = null)
+    /// <param name="bundleRoot">
+    /// When set, the workspace is registered in <see cref="RadWorkspaceStore"/> under this
+    /// bundle instead of being a private instance. Only the cross-app rules need it: the
+    /// store is what <c>PendingCrossAppRebinds</c> fans out over, and it scopes that fan-out
+    /// by bundle root — an unregistered workspace has no siblings by construction. Left null
+    /// (every other suite) the fixture stays a private single-app workspace, so nothing this
+    /// seed compiles can be reached by another suite's bundle.
+    /// </param>
+    internal static SeededBaseline Seed(
+        string tempRoot, string? appRootDir = null, string? bundleRoot = null)
     {
-        var workspace = new RadWorkspace(ModuleName, tempRoot);
+        var workspace = bundleRoot == null
+            ? new RadWorkspace(ModuleName, tempRoot)
+            : RadWorkspaceStore.For(ModuleName, AppId, tempRoot, bundleRoot);
         var compiler = new BcCompiler();
         var result = compiler.EmitIncremental([tempRoot], ModuleName, workspace, appRootDir);
         Assert.True(result.FullRebuild);
