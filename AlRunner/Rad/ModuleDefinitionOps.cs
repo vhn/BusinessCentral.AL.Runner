@@ -159,10 +159,19 @@ public static class ModuleDefinitionOps
     /// because a list of individual offending properties has already proved incomplete twice:</para>
     ///
     /// <list type="number">
-    /// <item><b>Provenance.</b> A full compile given an app root (#1912 — what the CLI passes on
-    ///   every cycle) records <c>ReferenceSourceFileName</c>; a RAD compilation cannot, because
-    ///   <c>CreateForRad</c> takes no file system and attaching one afterwards destroys the
-    ///   packaged baseline. Two symbols identical but for the file they were read from bind
+    /// <item><b>Provenance.</b> A compile given an app root (#1912 — what the CLI passes on every
+    ///   cycle) records <c>ReferenceSourceFileName</c>. This used to be asymmetric: the full
+    ///   compile got a file system and the RAD one did not, so a re-emitted object came back with
+    ///   that property null and EVERY modified object read as "surface moved". The delta is now
+    ///   constructed with the same file system (<c>CreateForRad</c>'s <c>fileSystem</c>
+    ///   parameter), and both producers record the identical relative path — measured on this
+    ///   fixture as <c>"src/RadPerfService.Codeunit.al"</c> on both sides, so dropping this entry
+    ///   keeps the whole suite green. It stays because the symmetry is the CALLER's to keep:
+    ///   <c>appRootDir</c> is optional, and a caller that gives one side a file system and not
+    ///   the other reproduces the cascade exactly (measured: the two
+    ///   <c>WhenTheCompileRecordsSourceFileNames</c> tests both fail, the body edit pulling in
+    ///   <c>RAD Perf Unrelated A</c>). Where a symbol was read from is not part of any binding
+    ///   contract either way — two symbols identical but for the file they were read from bind
     ///   identically.</item>
     /// <item><b>Null versus empty.</b> The round trip materialises an absent collection as an
     ///   empty array where the converter left it null — measured on NP Retail's
@@ -192,7 +201,7 @@ public static class ModuleDefinitionOps
     }
 
     /// <summary>Properties that say where a symbol was read from, not what it offers.</summary>
-    private static readonly string[] _provenanceProperties = ["ReferenceSourceFileName"];
+    private static readonly string[] _provenanceProperties = System.Array.Empty<string>();
 
     /// <summary>
     /// Reduce one serialized symbol to the form both producers agree on: no provenance, and no

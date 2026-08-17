@@ -737,30 +737,44 @@ symbol API omits it, plus a `ModuleDefinitionOps` array entry if one exists) and
 that declares one — a kind counts as supported when a test proves the round trip, not when
 it has a key.
 
-### A file resource is a question only the full compile can answer
+### A file resource is a question the delta answers itself
 
-BC resolves a `controladdin`'s `Scripts` / `StartupScript` / `StyleSheets` / `Images` through
-an `IFileSystem` attached to the compilation, anchored at the app root (#1899/#1912). The RAD
-call this runner makes does not attach one, so the delta cannot tell a resource that is present
-from one that is missing, and an `AL0327` from a RAD compilation is not evidence of anything.
-It is treated as "not expressible as a delta" and the cycle compiles the module in full, which
-resolves the path or reports a genuine typo. Both directions are pinned by
-`RadObjectDeltaTests.AControlAddInResourcePath_IsAnsweredByTheFullCompile_NotSilencedAndNotFailed`
+BC resolves a `controladdin`'s `Scripts` / `StartupScript` / `StyleSheets` / `Images` — and a
+report's layout — through an `IFileSystem` attached to the compilation, anchored at the app
+root (#1899/#1912). The delta is constructed with one, from the same
+`BcCompiler.AppFileSystem(appRootDir)` the full compile uses and under the same
+`appRootDir != null && Directory.Exists` guard, so neither path can answer a resource question
+the other cannot. A present file resolves; an absent one raises `AL0327` naming it, from the
+delta. Both directions are pinned by
+`RadObjectDeltaTests.AControlAddInResourcePath_IsAnsweredByTheDelta_NotSilencedAndNotFailed`
 — a fix that merely suppressed AL0327 would hide every real one.
 
-> **`CreateForRad` does take an `IFileSystem`, and the code comment saying otherwise
-> (`BcCompiler.Rad.cs:650-658`) is wrong.** Read by reflection off BC 28.1
-> (`Microsoft.Dynamics.Nav.CodeAnalysis` 17.0.36.40629): `IFileSystem fileSystem` is parameter
-> index 12, optional, defaulting to `null`, with `dotNetResolverFactory` at index 13. The call
-> at `:625-638` simply omits it. `Compilation.WithFileSystem(IFileSystem)` also exists as a
-> separate public instance method.
+Until this was measured, the delta had no file system, so an `AL0327` from it was not evidence
+of anything and the cycle handed the whole module to a full compile. On the 20-object fixture
+that cost **20 re-emitted objects for a one-line property edit to an add-in that emits no C#
+at all**.
+
+> **The constructor parameter and `WithFileSystem` are not interchangeable — this is the
+> measurement that decided it.** `CreateForRad` takes `IFileSystem fileSystem` as optional
+> parameter 12 on BC 28.1 (`Microsoft.Dynamics.Nav.CodeAnalysis` 17.0.36.40629), with
+> `dotNetResolverFactory` at 13; `Compilation.WithFileSystem(IFileSystem)` exists separately.
 >
-> **What is still unmeasured:** whether passing a file system through the *constructor*
-> preserves the packaged module definition. The recorded reason for avoiding
-> `.WithFileSystem(...)` is that it loses it — measured, as `AL0247` for the target table of an
-> untouched `tableextension` — but a constructor parameter is a different path and may not have
-> that defect. Nobody has run it. Until someone does, the AL0327 fallback above stands and the
-> provenance canonicalisation below stands with it.
+> Attaching one **afterwards** returns a compilation that has lost its packaged module
+> definition. Run against a body edit to `RadPerfHeaderExtA.TableExt.al`, whose target table is
+> not in the delta:
+>
+> ```
+> RadPerfHeaderExtA.TableExt.al@3:54: error AL0247:
+>     The target Table 'RAD Perf Header' for the extension object is not found
+> ```
+>
+> …with zero objects emitted. Passing the same file system through the **constructor** does
+> not: the identical edit deltas to its one tableextension, clean, and binds the target out of
+> the packaged definition. Pinned by
+> `RadObjectDeltaTests.ADeltaGivenAFileSystem_StillResolvesAnUntouchedExtensionTarget`, which
+> fails with exactly that AL0247 if the two are ever swapped. A body edit to a plain codeunit
+> does **not** catch this — it needs nothing from the packaged definition and stays green
+> either way; the probe has to be an extension object whose target is untouched.
 
 ### The fingerprint compares two different producers, so it canonicalises
 
@@ -777,14 +791,31 @@ differ for the same reason.
 Two such differences are known, and both are handled by **shape** rather than by property
 name, because a list of individual offending properties has already proved incomplete twice.
 
-**1. Provenance.** A full compile given an app root (#1912 — what the CLI passes on every
-cycle) records a `ReferenceSourceFileName` on every symbol it writes; a RAD-emitted one comes
-back with it null. Comparing raw serialized symbols therefore reported "the surface moved" for
-**every** re-emitted object. Measured on the 20-object fixture: a one-line body edit went from
-1 re-emitted object to 3, over two rounds of rebinding. Where a symbol was read from is not
-part of any binding contract; what it offers is. Pinned in both directions by
+**1. Provenance.** A compile given an app root (#1912 — what the CLI passes on every cycle)
+records a `ReferenceSourceFileName` on every symbol it writes. This used to be asymmetric: only
+the full compile had a file system, so a RAD-emitted symbol came back with it null and
+comparing raw serialized symbols reported "the surface moved" for **every** re-emitted object.
+Measured on the 20-object fixture: a one-line body edit went from 1 re-emitted object to 3,
+over two rounds of rebinding. Where a symbol was read from is not part of any binding contract;
+what it offers is. Pinned in both directions by
 `ABodyEdit_StaysOneObject_WhenTheCompileRecordsSourceFileNames` and
 `ACallableSurfaceEdit_StillRebindsItsCaller_WhenTheCompileRecordsSourceFileNames`.
+
+> **The asymmetry is gone, and this entry is now removable — measured, not assumed.** With the
+> delta constructed with the same file system, both producers record the identical value:
+> `"ReferenceSourceFileName":"src/RadPerfService.Codeunit.al"` on both sides, **relative to the
+> app root**, so it is stable across checkouts and machines. Dropping `ReferenceSourceFileName`
+> from `_provenanceProperties` leaves all 31 `RadObjectDeltaTests` green.
+>
+> It is kept because the symmetry is now the **caller's** to maintain: `appRootDir` is an
+> optional parameter, and a caller that gives one side a file system and not the other
+> reproduces the cascade exactly. Measured with the strip removed and the file system withheld
+> from the RAD compilation alone — both tests above fail, the body edit pulling in
+> `RAD Perf Unrelated A`. The CLI cannot hit that (`appGroup.SuiteDir` is always a real
+> directory), but `BcCompiler.EmitIncremental` is public and defaults it to `null`.
+>
+> Removing it is therefore a live option for whoever rewrites this fingerprint per-member
+> (W2) — with the evidence above, not as a guess.
 
 **2. Null versus empty.** The second instance cost a real app its watch loop. On NP Retail a
 body-only edit to `NPR Adyen Management` diverged on this, in a 36 KB serialized surface:
