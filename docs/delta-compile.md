@@ -197,8 +197,8 @@ used to declare and no longer does is tombstoned, so a deleted object resolves t
 instead of resurrecting from the still-loaded previous generation.
 
 This is *object-type* resolution. The member-level half of the same problem — a cross-app
-caller still dispatching a member id the callee no longer has — is
-[a separate, open gap](#the-reference-graph-holds-no-cross-app-edges).
+caller still dispatching a member id the callee no longer has — is a different mechanism
+entirely, and lives in [the reference graph](#a-sibling-app-whose-callee-moved-rebinds-too).
 
 ### `Rad/RadMetadataCapture.cs` — metadata that moves with the objects
 
@@ -855,10 +855,10 @@ the delta invents a diagnostic:
 
 The last row is the odd one out and is listed here only because it is the same class of
 symptom. It is not a packaged-baseline strip at all: it is the
-[missing cross-app edge](#the-reference-graph-holds-no-cross-app-edges), it fails at **run
-time** rather than at bind time, and its oracle is a cold *run* of the same tree (which
-produces the developer's own assertion failure) rather than an empty diagnostic list. It is
-still open.
+[cross-app edge](#a-sibling-app-whose-callee-moved-rebinds-too), it fails at **run time**
+rather than at bind time, and its oracle is a cold *run* of the same tree (which produces the
+developer's own assertion failure) rather than an empty diagnostic list. It is fixed by a
+different mechanism from the other rows — the sibling-app rebind, not the widened retry.
 
 The first four rows are one family, not four: an untouched extension loses what it contributes
 to a stripped target — a `tableextension` its field, an `enumextension` its value, a
@@ -1105,18 +1105,18 @@ the wrong overload. Nothing throws.
 handlers from the subtype term, which would make `OnFoo(Record Customer)` and
 `OnFoo(Record Item)` collide on one id. Nobody has run it.
 
-### The reference graph holds no cross-app edges
+### A sibling app whose callee moved rebinds too
 
-`ReferenceTargetKey` (`BcCompiler.Rad.cs:1324-1338`) returns `null` for every target outside
-the compiling app — at `:1328` for application objects and `:1334` for id-less ones — so an
-edge from a Test-app codeunit to an Application codeunit is discarded when the graph is built.
-Measured on npcore: the Test app's persisted baseline records **1 cross-app edge in 505**, and
-that one is an extension target, not a call.
+`ReferenceTarget` keeps an edge whose target is a **sibling source app of the same bundle**,
+and drops every edge into a precompiled `.app` dependency. It used to drop both, which is the
+bug this section is mostly about.
 
-The consequence is a hole in the rebind rules that no other mechanism covers. Editing app A
-re-emits A's objects; app B never enters `changedFiles`, takes the `NoChange` short-circuit at
-`:203-206`, and keeps executing IL that bakes A's **previous** member ids. Only the reference
-graph could say otherwise, and it has nothing to say.
+The hole that left: editing app A re-emits A's objects; app B never enters `changedFiles`,
+takes the `NoChange` short-circuit, and keeps executing IL that bakes A's **previous** member
+ids. Nothing in B's own file hashes can say so, and the graph — which was the only thing that
+could — had nothing to say. Measured on npcore before the fix: the Test app's persisted
+baseline recorded **1 cross-app edge in 505**, and that one was an extension target, not a
+call.
 
 Two failure modes, and the difference matters for
 [`.claude/rules/loud-failures.md`](../.claude/rules/loud-failures.md):
@@ -1128,8 +1128,8 @@ Two failure modes, and the difference matters for
 - **Silent**, when the old id survives on the new object. The overload case above is exactly
   that shape: the caller keeps dispatching an id that still resolves, to the wrong member.
 
-Both halves have RED tests, and the pair exists because measuring only the first one would have
-understated the bug.
+Both halves have tests that were RED before the fix, and the pair exists because measuring only
+the first one would have understated the bug.
 
 `Watch_MovingAMemberIdInOneApp_RebindsItsCrossAppCaller` is the loud half. It retypes
 `Delta Lib`'s parameter from `Integer` to `Decimal` — which moves the id, per the contract
@@ -1156,8 +1156,84 @@ The test pins the silence explicitly, so reading it cannot leave the opposite im
 So the loudness of the retyped-parameter case is an accident of which edit was measured first,
 not a property of the bug.
 
-This is distinct from the cross-app *object-type* staleness `AlObjectResolution` already
-handles. That one is fixed; this one is not.
+This is distinct from the cross-app *object-type* staleness `AlObjectResolution` handles.
+Both are fixed now, by different mechanisms.
+
+#### How the rebind is decided
+
+Four constraints shaped it, and each one is a way to get it silently wrong.
+
+**Identity is not the compiler's `AppId`.** `RadWorkspaceStore` keys an app group with no
+`app.json` as `name:<module>`, while the compilation built for that group is given
+`DeterministicGuid(moduleName)`. Mapping the compiler's Guid straight to a workspace therefore
+never matches such a group — and it fails as *zero retained edges*, which is indistinguishable
+from "this app calls nothing". `Rad/RadAppCohort.cs` owns the translation, in one place, so the
+two halves cannot drift.
+
+**The cohort comes from the app graph, not from the live workspaces.** A one-shot run has no
+`RadWorkspace` at all — the store is only enabled under `--watch` — and it still writes the
+baseline sidecar a later watch hydrates. Deciding what to retain from live workspaces would
+persist an envelope with no cross-app edges, so the first watch over a cached tree would be
+exactly as stale as before, with nothing to show for it.
+
+**Precompiled dependencies stay out.** Only apps compiled from source in this bundle can change
+between two watch cycles. A `.app` in `.alpackages` cannot, and if one is replaced,
+`ReferenceSignature`'s `ref|…|version|appId` line moves and the workspace invalidates wholesale.
+Retaining those edges would cost 70k–210k additional edges on npcore — a 2–4× sidecar — for
+edges that can never be actionable.
+
+**`RadObjectKey` is not widened.** It is the key type of the object map, the extension-target
+map, `RadChangeSet` and every RAD test, and it is scoped to one app by construction: two apps
+can each declare `interface "Contract"` and both key as `("Interface", 0, "CONTRACT")`.
+Cross-app edges live in a map of their own, keyed `(app identity, RadObjectKey)`, so every
+same-app path keeps its type and its cost.
+
+The signal itself is a **committed broadcast, not a drainable event**: each producer carries a
+publish generation, each consumer a per-producer watermark. A queue drained by the first asker
+would leave the *second* dependent of one producer silently bound to the old ids — so the
+watermark is read, not taken. It is published from `RadEmitResult.Commit`, which is the first
+moment the generation is known to have loaded; a candidate the C# backend rejects announces
+nothing, and the consumer's watermark stays put so the next cycle re-widens rather than
+dropping the rebind. A consumer that compiles *before* its producer — `BuildAppGroups` falls
+back to declaration order on a dependency cycle — picks the signal up on the next cycle instead
+of losing it.
+
+The widening is computed **before** the no-change short-circuit, because the consumer's own
+source is exactly what did not move. A consumer this cycle cannot trace to a file inside its own
+app's source tree takes the full compile with a named reason, rather than shipping a module that
+still dispatches the sibling's previous ids.
+
+A full rebuild broadcasts "assume everything moved". That is not laziness: a full compile is
+preceded by `Invalidate`, which drops the object map, so by the time the new module exists there
+is no record of what the previous one declared and a per-key answer cannot be reconstructed. The
+reasons a cycle rebuilds in full — a dependency, identity or preprocessor-symbol change, a
+`dotnet` package, an edit the delta could not classify — are exactly the ones able to move any
+member id in the module.
+
+Neither the generations nor the watermarks are persisted. A watermark restored from disk would
+be compared against a fresh producer's counter starting at zero, so every publish would read as
+already-consumed and the rebind would be suppressed — the same silent staleness, reintroduced by
+the persistence of the fix.
+
+#### What it costs, measured on the three-app fixture
+
+A body-only edit still logs `Delta Bridge: unchanged`. The cycle that removes a member logs:
+
+```
+[watch] Delta Lib: delta +0 ~1 -0 over 1 changed file(s) → 1 object(s) re-emitted
+[watch] Delta Bridge: rebinding 1 cross-app caller file(s) — 1 that call Delta Lib
+[watch] Delta Lib Tests: unchanged — reusing the loaded module
+```
+
+Two properties in three lines: the widening names its count and its producer rather than being
+an undifferentiated re-emit, and it does **not** cascade — Bridge is re-emitted but its own
+surface did not move, so it publishes nothing and the app that calls *Bridge* is left alone.
+
+The sidecar schema went 1 → 2 to carry these edges, and a schema-1 envelope is refused rather
+than read. That refusal is not pedantry: `System.Text.Json` ignores members it does not find, so
+a schema-2 reader handed a schema-1 envelope deserializes it happily and gets **zero** cross-app
+edges — a hydrated workspace that silently rebinds no sibling caller, which is the exact bug
+those edges exist to fix.
 
 ### Reloaded dependency tableextensions
 
@@ -1228,10 +1304,10 @@ different numbers.
 | `RadRunnableCodeunitBindingTests` | A delta that strips a table also rebinds the codeunits whose `TableNo` names it, so an untouched `CodeunitVar.Run(Rec)` still binds — with no diagnostic to prompt it, which is why that one rule does not wait for one — and dropping `TableNo` for real still reports the AL0126 a cold compile reports |
 | `RadByNameTableExtTargetTests`, `RadByNameEnumExtTargetTests`, `RadByNameInterfaceCodeunitTests`, `RadByNameInterfaceEnumTests`, `RadByNameTableNoRenameTests` | One three-object triple each, asserting the delta reports exactly what a cold compile of the identical tree reports. Cold is `[]`, and each delta invented the diagnostic in the table above until the widened retry landed. The `TableNo` one additionally asserts the bystander is re-emitted, so a repair that merely avoided the diagnostic cannot pass |
 | `RadByNameSubtypeTests` | The same triple over a method parameter's `Record "T"` — a plain by-name pointer re-resolves against the supplied syntax, which is what disproved the wider damage thesis, and it must never widen |
-| `RadByNamePropertyShapesTests` | Six by-name property shapes survive the strip and are pinned as trip-wires (`SourceTable`, `CalcFormula`, `RunObject`, `LookupPageId`/`DrillDownPageId`, enum-value `Implementation`, `RoleCenter`); three do not (`pageextension` control, `reportextension` column, query `RelatedTable`) and are repaired by the widened retry. Every scenario asserts the exact modified/emitted lists. For the six that is exactly right and structurally safe — a clean shape raises no diagnostic, so no widening can reach it. For the three repaired ones those lists still say "no bystander", which the repair cannot satisfy: a bystander rebound from source IS a delta participant, and `RadByNameTableNoRenameTests` requires that in the other direction. Their `Assert.Equal(modified/emitted, …)` needs the bystander added |
+| `RadByNamePropertyShapesTests` | Six by-name property shapes survive the strip and are pinned as trip-wires (`SourceTable`, `CalcFormula`, `RunObject`, `LookupPageId`/`DrillDownPageId`, enum-value `Implementation`, `RoleCenter`); three do not (`pageextension` control, `reportextension` column, query `RelatedTable`) and are repaired by the widened retry. Every scenario asserts the exact modified/emitted lists. For the six that is exactly right and structurally safe — a clean shape raises no diagnostic, so no widening can reach it. For the three repaired ones those lists now INCLUDE the bystander, because a bystander rebound from source IS a delta participant; the original "no bystander" expectation encoded the premise that those shapes were clean, which measurement disproved |
 | `RadWorkspaceFileOfTests` | `FileOf` names the declaring file for every object the fixture declares, measured against an oracle read off the tree; returns null for a key the app never declared; and follows an object that moves to a different file across a commit |
 | `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
-| `RadDeltaWatchTests` | Multi-app watch behaviour end to end: a warm reload still resolves a precompiled dependency's `tableextension` fields; and **RED** — a cross-app member-id move rebinds its caller, with a body-only edit as the control that must leave the caller unchanged |
+| `RadDeltaWatchTests` | Multi-app watch behaviour end to end: a warm reload still resolves a precompiled dependency's `tableextension` fields; a cross-app member-id move rebinds its caller in both its loud form (a retyped parameter, so the old id is gone) and its silent one (an added overload, so the old id survives and the caller would otherwise get the previous overload's answer); and the precision controls — a body-only edit leaves the caller `unchanged`, while a real surface move names its count and its producer and is asserted **not** to come from a full-rebuild broadcast |
 | `WatchTests` | Cycle 1 of a watch is served from the AL-output cache, and the first edit really runs (never a second HIT): delta'd when the entry carries a baseline — after a one-shot run, and after an earlier watch — and building one when it does not |
 | `RadBaselineSidecarTests` | A persisted baseline restores the compiler's symbol picture **byte-identically**, and a workspace hydrated from it deltas the first edit, rebinds the direct caller of a moved surface, classifies a deletion as a removal, and still rebuilds for a deleted `dotnet` package — plus the five ways hydration must fail closed (tree moved, file edited in place, symbols missing, unknown schema, app identity changed) |
 | `WatchSourceTests` | The watch loop's own contract, deterministically: an edit made from inside `onArmed` is always seen (#1822's race); watchers arm exactly once; a burst below the quiet window releases only after it settles; a single save releases within one quiet window; and a watcher-buffer overflow is handled loudly rather than swallowed |
