@@ -214,6 +214,49 @@ public sealed class RadProducerEquivalenceTests(BcEngineFixture engine)
     }
 
     /// <summary>
+    /// A THIRD producer, and the one Task 20 will meet on any `--watch` that starts from an
+    /// AL-output cache HIT: <c>RadBaselineSidecar</c> persists the committed baseline with
+    /// <c>SymbolReferenceJsonWriter.WriteModule</c> and hydrates it with
+    /// <c>SymbolReferenceJsonReader.ReadModule</c>. A workspace hydrated that way is NOT
+    /// producer A — the baseline its first delta compares against has already been through a
+    /// round trip.
+    ///
+    /// <para>So whether the divergence above is present at all depends on how the watch
+    /// process obtained its baseline, which is exactly the kind of path-dependence that
+    /// survives a warm-cache developer loop and then fails on a cold one. Measured rather than
+    /// assumed: the writer is a DIFFERENT one from the merge path's
+    /// (<c>CompilationUtilities.WriteSymbolReference</c>), even though the reader is the same,
+    /// so agreement could not be inferred from the merge measurement.</para>
+    /// </summary>
+    [SkippableFact]
+    public void TheSidecarRoundTrip_NormalisesTheSameTwoMembersTheMergeDoes()
+    {
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
+
+        RadByName.Run(FixtureName, ModuleName, AppId, EmittedObjectCount, (compiler, ws, tempRoot) =>
+        {
+            var full = Surface.Of(ws, ProbeKey);
+
+            var path = BcCompiler.WriteWorkspaceSymbols(
+                ws, Path.Combine(tempRoot, "baseline.symbols.json"));
+            NavSymRef.ModuleDefinition hydrated;
+            using (var stream = File.OpenRead(path))
+                hydrated = NavSymRef.SymbolReferenceJsonReader.ReadModule(stream);
+            var restored = Surface.Of(hydrated, ProbeKey);
+
+            Assert.Equal(ExpectedMembers, Describe(restored.Raw));
+            Assert.Equal(MemberKeys(full.Raw), MemberKeys(restored.Raw));
+            // The same two members, the same field, the same values — so a baseline restored
+            // from the sidecar is producer-B-shaped, and a delta run against it never sees the
+            // divergence at all.
+            Assert.Equal(
+                ExpectedRawObjectDivergences,
+                Differences(string.Empty, full.Raw, restored.Raw).ToArray());
+            Assert.Equal(full.Canonical.ToJsonString(), restored.Canonical.ToJsonString());
+        });
+    }
+
+    /// <summary>
     /// Run one warm cycle, assert it is a clean delta that emitted exactly
     /// <paramref name="expectedEmitted"/>, commit it, and hand back the merged baseline's view
     /// of the probe.
@@ -395,9 +438,11 @@ public sealed class RadProducerEquivalenceTests(BcEngineFixture engine)
     /// </summary>
     private sealed record Surface(JsonObject Raw, JsonObject Canonical)
     {
-        internal static Surface Of(RadWorkspace ws, RadObjectKey key)
+        internal static Surface Of(RadWorkspace ws, RadObjectKey key) =>
+            Of((NavSymRef.ModuleDefinition)ws.Baseline!, key);
+
+        internal static Surface Of(NavSymRef.ModuleDefinition module, RadObjectKey key)
         {
-            var module = (NavSymRef.ModuleDefinition)ws.Baseline!;
             // Fail closed on the duplicate the plan calls out: two elements under one key mean
             // whichever the array happens to list first answers, and everything below would be
             // comparing an arbitrary one of them.
