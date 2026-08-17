@@ -259,8 +259,24 @@ public static partial class BcRuntime
     {
         var result = new List<object>();
         if (codeunitId == 0) return result;
+        if (SessionEventBindings() is not System.Collections.IEnumerable bindings) return result;
+        foreach (var bound in bindings)
+        {
+            if (bound != null && ExtractCodeunitIdFromTypeName(bound.GetType()) == codeunitId)
+                result.Add(bound);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The live <c>Session.EventBindings</c> list on the skeleton session, or null when the
+    /// session or the property is not there. Read through one accessor so the "bound" question
+    /// and the "unbind everything" answer below can never end up looking at different lists.
+    /// </summary>
+    private static System.Collections.IList? SessionEventBindings()
+    {
         var session = SkeletonSession;
-        if (session == null) return result;
+        if (session == null) return null;
         if (_piSessionEventBindings == null && !_eventBindingsLookupFailed)
         {
             _piSessionEventBindings = session.GetType().GetProperty("EventBindings",
@@ -273,15 +289,40 @@ public static partial class BcRuntime
                     + "manually-bound event subscribers will never fire");
             }
         }
-        if (_piSessionEventBindings?.GetValue(session) is not System.Collections.IEnumerable bindings)
-            return result;
-        foreach (var bound in bindings)
-        {
-            if (bound != null && ExtractCodeunitIdFromTypeName(bound.GetType()) == codeunitId)
-                result.Add(bound);
-        }
-        return result;
+        return _piSessionEventBindings?.GetValue(session) as System.Collections.IList;
     }
+
+    /// <summary>
+    /// Drop every manual <c>BindSubscription</c> still recorded on the skeleton session.
+    /// Called from <c>RecordPatches.ResetPerTestState</c>, i.e. at whichever boundary the
+    /// active isolation mode resets at.
+    ///
+    /// Why it is needed at all, when BC already unbinds on its own: BC removes an entry as
+    /// the bound instance's tree is disposed, which is how AL's "the binding ends when the
+    /// variable goes out of scope" works, and it covers the common case here — TestExecutor
+    /// disposes the test codeunit at the end of its run, taking any subscriber a test-codeunit
+    /// global had bound with it. It does NOT cover an instance owned by something the runner
+    /// keeps alive across that boundary. A <c>SingleInstance</c> codeunit is exactly that: it
+    /// is rooted in the session's own tree, <see cref="ResetSingleInstanceCache"/> drops the
+    /// runner's pointer without ending its life, and a subscriber it had bound therefore
+    /// stayed live for the whole PROCESS — firing into every later test codeunit and every
+    /// later --watch cycle, none of which had bound anything.
+    ///
+    /// Sweeping the list rather than destroying those instances is deliberate. Disposing a
+    /// cached SingleInstance codeunit at this boundary was tried and rejected: BC's own
+    /// machinery still holds references to some of them, and the reporting path then died with
+    /// <c>ObjectDisposedException: 'Tree'</c> out of <c>NavSystemCodeunit.Invoke</c> — 11
+    /// corpus tests, measured. The binding list is the one piece of that instance's state that
+    /// reaches the NEXT test, and it is BC's own record, maintained by
+    /// BindSubscription/UnbindSubscription, so emptying it is the same operation AL's
+    /// UnbindSubscription performs, applied to everything still bound.
+    ///
+    /// This is consistent with the divergence the runner has already chosen for SingleInstance
+    /// codeunits: BC scopes them to the session, the runner resets them at the isolation
+    /// boundary to mirror per-test rollback. Anything such an instance OWNS has to be scoped
+    /// the same way, or the reset only appears to have happened.
+    /// </summary>
+    internal static void ClearManualEventBindings() => SessionEventBindings()?.Clear();
 
     /// <summary>
     /// <paramref name="publisher"/> when its tree is still usable, otherwise the skeleton

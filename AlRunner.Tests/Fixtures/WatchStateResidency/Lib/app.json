@@ -1,0 +1,11 @@
+{
+  "id": "3f8c6a51-7b29-4d0e-8a34-9e15c2b7d604",
+  "name": "Watch Residency Lib",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [{ "from": 60970, "to": 60979 }],
+  "dependencies": []
+}

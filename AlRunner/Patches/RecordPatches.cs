@@ -1211,6 +1211,15 @@ public static partial class RecordPatches
         // this a SingleInstance codeunit's instance-variable state would leak from one test into
         // the next. See BcRuntime._singleInstanceCache / BcRuntime.ResetSingleInstanceCache.
         AlRunner.BcRuntime.ResetSingleInstanceCache();
+
+        // Manual BindSubscriptions still recorded on the session. BC unbinds on its own as a
+        // bound instance's tree is disposed, which covers a subscriber bound by a test
+        // codeunit (TestExecutor disposes those). It does not cover one owned by an instance
+        // the line above only FORGETS — a SingleInstance codeunit stays alive in the session's
+        // tree, so a subscriber it bound outlived every boundary and every --watch cycle. See
+        // BcRuntime.ClearManualEventBindings for why the list is swept rather than those
+        // instances destroyed.
+        AlRunner.BcRuntime.ClearManualEventBindings();
     }
 
     public static object NavDataAccessSource_GetDataAccessForTable(object self, NCLMetaTable table, bool isTemporary)
