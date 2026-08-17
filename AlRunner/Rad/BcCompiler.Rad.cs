@@ -147,11 +147,12 @@ public sealed partial class BcCompiler
     /// </summary>
     /// <param name="appRootDir">
     /// The app's own app.json directory, forwarded to every Compilation this method builds —
-    /// the delta ones as well as the full-compile fallback. Same contract, and same reason, as
-    /// <see cref="Emit"/>'s parameter of that name (#1899): without an <c>IFileSystem</c> BC
-    /// cannot resolve a ControlAddIn's resource paths, so a delta that re-emits an add-in would
-    /// raise AL0327 for files the full compile resolves — the delta path must not answer
-    /// differently from the compile it stands in for.
+    /// the declaration probe, the RAD delta and the full-compile fallback. Same contract, and
+    /// same reason, as <see cref="Emit"/>'s parameter of that name (#1899): without an
+    /// <c>IFileSystem</c> BC cannot resolve a ControlAddIn's resource paths, so a delta that
+    /// re-emits an add-in would raise AL0327 for files the full compile resolves — the delta
+    /// path must not answer differently from the compile it stands in for. All three take it
+    /// from <see cref="BcCompiler.AppFileSystem"/>, so none of them can drift from the others.
     /// </param>
     public RadEmitResult EmitIncremental(
         IEnumerable<string> alFolders, string moduleName, AlRunner.Rad.RadWorkspace ws,
@@ -790,6 +791,17 @@ public sealed partial class BcCompiler
         // edit adds binds and one it removes stops binding — both pinned by
         // RadTableExtensionSelfReferenceTests.
         var packaged = AlRunner.Rad.ModuleDefinitionOps.WithoutObjects(WorkspaceBaseline(ws), stripped);
+        // The file system goes in through the CONSTRUCTOR, and that is not interchangeable with
+        // attaching one afterwards. `rad.WithFileSystem(...)` returns a compilation that has
+        // LOST its packaged module definition: every object the delta did not re-parse stops
+        // resolving, measured on the 20-object fixture as
+        //   RadPerfHeaderExtA.TableExt.al@3:54: error AL0247:
+        //     The target Table 'RAD Perf Header' for the extension object is not found
+        // with zero objects emitted. `CreateForRad`'s own `fileSystem` parameter (optional,
+        // position 12 on BC 28.1) does not have that defect — the same edit deltas to its one
+        // tableextension, clean. Pinned by
+        // RadObjectDeltaTests.ADeltaGivenAFileSystem_StillResolvesAnUntouchedExtensionTarget,
+        // which fails with exactly that AL0247 if anyone swaps the two.
         var rad = NavCA.Compilation.CreateForRad(
             moduleName: moduleName,
             objectChangeModelDefinition: model,
@@ -803,6 +815,7 @@ public sealed partial class BcCompiler
             internalsVisibleTo: ivt,
             syntaxTrees: trees,
             options: compOpts,
+            fileSystem: AppFileSystem(appRootDir),
             dotNetResolverFactory: GetOrCreateDotNetFactory());
 
         // Ask for binding errors BEFORE code generation. BC's RAD emitter does not
@@ -815,24 +828,13 @@ public sealed partial class BcCompiler
             .Where(d => d.Severity == NavDiag.DiagnosticSeverity.Error)
             .ToList();
 
-        // One diagnostic the delta is not entitled to report: AL0327 "Missing file", raised
-        // for a ControlAddIn resource path (Scripts/StartupScript/StyleSheets/Images). BC
-        // resolves those through an IFileSystem attached to the compilation, and a RAD
-        // compilation cannot have one — CreateForRad takes no such parameter, and attaching
-        // one afterwards with WithFileSystem returns a compilation that has LOST its packaged
-        // module definition (measured: AL0247 for the target table of an untouched
-        // tableextension). So a delta cannot tell a resource that is present from one that is
-        // missing, while a full compile — which does get a file system, #1899/#1912 — can.
-        // Hand it the question. A genuinely absent file still raises AL0327 from there.
-        if (declarationErrors.Any(d => string.Equals(d.Id, "AL0327", StringComparison.Ordinal)))
-        {
-            FullCompileBecause(
-                moduleName,
-                "a changed object declares a file resource (AL0327), which only a whole-module "
-                + "compile can resolve");
-            return null;
-        }
-
+        // AL0327 "Missing file" — raised for a ControlAddIn resource path
+        // (Scripts/StartupScript/StyleSheets/Images) and for a report layout — used to be
+        // handed to a full compile from here, because the delta had no IFileSystem and so could
+        // not tell a resource that is present from one that is missing. It has one now, under
+        // the same guard the full compile uses, so it reports AL0327 itself: present resolves,
+        // absent is named. Pinned in both directions by
+        // RadObjectDeltaTests.AControlAddInResourcePath_IsAnsweredByTheDelta_NotSilencedAndNotFailed.
         foreach (var d in declarationErrors)
             diags.Add($"{d.Location}: error {d.Id}: {d.GetMessage().Split('\n', 2)[0]}");
         if (diags.Count > 0)
