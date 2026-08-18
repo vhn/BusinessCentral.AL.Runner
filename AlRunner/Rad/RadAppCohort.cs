@@ -69,10 +69,26 @@ public sealed class RadAppCohort
             // report for this app, the value is what the STORE keys its workspace by.
             var compilerAppId = BcCompiler.CompilationAppId(appId, moduleName);
             var identity = RadWorkspaceStore.IdentityOf(appId, moduleName);
-            // First wins. Two groups reporting one compiler id is a duplicate-identity bundle,
-            // which #1850 already fails loudly elsewhere; here the only sane thing is to not
-            // let the second silently retarget the first's edges.
-            map.TryAdd(compilerAppId, identity);
+            // Two groups whose compilations would be built with ONE AppId is not a bundle this
+            // can answer questions about: whichever lost would have its edges silently retargeted
+            // at the winner, and the loss is invisible downstream because "no edges" is also what
+            // a correct answer looks like for an app that calls nothing.
+            //
+            // Duplicate app.json ids are rejected earlier (#1850) — but that check compares STORE
+            // identities, and the collision left over is between a declared id and the
+            // deterministic hash given to an app.json-less group, whose identities differ
+            // (`<guid>` versus `name:<module>`) and which therefore passes it.
+            if (map.TryGetValue(compilerAppId, out var existing)
+                && !string.Equals(existing, identity, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"two apps in this bundle compile under the same AppId {compilerAppId}: "
+                    + $"'{existing}' and '{identity}'. The RAD reference graph cannot tell their "
+                    + "objects apart, so cross-app rebinding would silently bind one app's callers "
+                    + "to the other's surface. Give each app a distinct 'id' in its app.json.");
+            }
+            // Same app listed twice agrees with itself; nothing to disambiguate.
+            map[compilerAppId] = identity;
         }
         return new RadAppCohort(
             Path.GetFullPath(bundleRoot).TrimEnd(Path.DirectorySeparatorChar), map);
