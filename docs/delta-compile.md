@@ -1390,6 +1390,40 @@ the first edit — the exact cost the sidecar exists to remove. Unfixed, and pin
 in `RadDeltaWatchTests.OneShotSidecar_ThenWatch_HydratesCrossAppEdges_AndRebindsTheSiblingCaller`
 so it cannot quietly change.
 
+#### The hole this does not close: a cache HIT never asks
+
+**Open, and the most valuable thing left in this area.** Everything above happens on the delta
+path — inside `EmitIncremental`. A consumer served from the **AL-output cache** never gets
+there: `Program.cs` loads the cached DLL and skips Emit+Compile entirely, so no cross-app
+question is asked.
+
+`ComputeAlCacheKey` hashes the cache schema, the runner binary, the module name, the
+preprocessor defines, one `dep:<id>` line per resolved dependency, and one
+`al:<relative path>:<sha256>` line per **this app's own** `.al` file. A sibling *source* app's
+content is not in it. So B's key does not move when A's surface does, and B hits an entry
+compiled against A's **previous** member ids — the same staleness this section is about,
+arriving through a different door.
+
+The exposure is bounded but real:
+
+- Under `--watch` it is **cycle 1 only** — the cache is consulted while
+  `radWs is null or { Generations.Count: 0 }`, so from cycle 2 the delta path runs and the
+  rebind works.
+- In a **one-shot run** there is no workspace at all, so every app is eligible every time. A
+  run where A misses and B hits executes B's stale bindings.
+
+The two symptoms are the ones described above: loud when the retired id is gone, silent when it
+survives.
+
+Fixing it means either putting the sibling apps' surface identity into the consumer's cache key,
+or consulting pending producer generations before accepting a cached DLL. The first is the
+honest one and is **not** a free change — it invalidates every existing entry, CI's included,
+which is exactly the trade `RadBaselineSidecar` declined to make for the sidecar. That is a
+decision to take deliberately rather than in passing, which is why it is written down here
+rather than done.
+
+Note that the cross-app tests run with `--no-cache`, so none of them covers this.
+
 #### A one-way hole, same-app and cross-app alike
 
 `MapObjectReferences` walks the objects `UniquelyKeyedObjects` returns, and that is only
@@ -1399,9 +1433,13 @@ Whatever such an object names is invisible to the graph in both directions of ap
 
 Untested and unmeasured. The impact is bounded by what those kinds can reference at all — an
 interface's method signatures can name objects, an entitlement's `ObjectEntitlements` names
-permission sets (which the permission-set-rename rule covers separately, by name, precisely
-because no semantic model reports that edge) — but "bounded" is not "none", and nobody has run
-it.
+permission sets — but "bounded" is not "none", and nobody has run it.
+
+The permission-set case is covered **within one app** by the rename rule above, which works by
+name precisely because no semantic model reports that edge. It is *not* covered across apps: if
+app B's entitlement names a permission set in app A and A renames or removes it, B holds no
+recorded edge, takes `NoChange`, and keeps metadata a cold compile of the same tree would
+reject.
 
 ### Reloaded dependency tableextensions
 
