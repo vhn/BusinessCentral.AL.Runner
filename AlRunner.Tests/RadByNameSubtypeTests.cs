@@ -27,6 +27,14 @@ namespace AlRunner.Tests;
 /// <b>13,610</b> occurrences — so it is the one that decides whether a real app can trust a
 /// watch cycle at all.</para>
 ///
+/// <para><b>The clean result below holds only because this fixture declares a namespace.</b> For
+/// a long time that was read as "a by-name subtype is not exposure at all", and it is not: remove
+/// the namespace and the identical shape breaks, because
+/// <c>RadReferenceModuleSymbol.BuildGlobalNamespace</c> only re-parents the packaged objects onto
+/// the module whose symbol map merges the supplied syntax when the packaged module definition
+/// holds namespaces. The second test here is that measurement, and
+/// <see cref="RadByNameSelfSubtypeTests"/> carries the mechanism and the npcore witness.</para>
+///
 /// <para><b>Why the fixture is a triple, not a pair.</b> The damage needs three distinct
 /// roles, and a two-object fixture goes green while proving nothing because it never asks
 /// the damaged representation a question:</para>
@@ -128,5 +136,49 @@ public sealed class RadByNameSubtypeTests(BcEngineFixture engine)
                 Assert.Contains("Subtype Target", emitted);
                 Assert.Contains("Subtype Caller", emitted);
             });
+    }
+
+    /// <summary>
+    /// The same edit on the same three objects with every `namespace …;` declaration removed, which
+    /// is what the test above would have measured had this fixture been written the way most real
+    /// AL is written. A `Record "T"` parameter is NOT immune: the untouched bystander resolves it
+    /// against a packaged module symbol the delta removed the table from, and the caller's argument
+    /// stops matching with the same <c>'__MissingTypeSymbol__'</c> a Codeunit subtype produces.
+    ///
+    /// <para>So the required answer is the whole module rather than a delta whose diagnostics no
+    /// cold compile of this tree produces. The oracle is unchanged; only the route to it is.</para>
+    /// </summary>
+    [SkippableFact]
+    public void WithoutANamespace_TheSameEdit_TakesTheWholeModuleInstead()
+    {
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
+
+        RadByName.Run(
+            "RadByNameSubtype", ModuleName, AppId, EmittedObjectCount,
+            (compiler, workspace, tempRoot) =>
+            {
+                RadByName.Replace(
+                    RadByName.SourceFile(tempRoot, "SubtypeTarget.Table.al"),
+                    "        field(2; Amount; Decimal) { DataClassification = CustomerContent; }",
+                    "        field(2; Amount; Decimal) { DataClassification = CustomerContent; }\n"
+                    + "        field(3; Quantity; Decimal) { DataClassification = CustomerContent; }");
+                RadByName.Replace(
+                    RadByName.SourceFile(tempRoot, "SubtypeCaller.Codeunit.al"),
+                    "Take(Target) + 1", "Take(Target) + 2");
+
+                var cold = RadByName.ColdCompile(tempRoot, ModuleName);
+                Assert.True(cold.Emit.Diagnostics.Count == 0,
+                    "the edited tree does not compile from scratch, so the fixture — not the "
+                    + "delta path — is what this run measured:" + Environment.NewLine
+                    + string.Join(Environment.NewLine, cold.Emit.Diagnostics));
+
+                var delta = compiler.EmitIncremental([tempRoot], ModuleName, workspace);
+
+                RadByName.AssertMatchesColdCompile(delta, tempRoot, ModuleName);
+                Assert.True(delta.FullRebuild,
+                    "a delta that cannot resolve the packaged baseline's own references reported "
+                    + "a delta anyway");
+            },
+            withoutNamespaces: true);
     }
 }

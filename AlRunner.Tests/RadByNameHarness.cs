@@ -44,7 +44,8 @@ internal static class RadByName
         string moduleName,
         Guid appId,
         int expectedObjectCount,
-        Action<BcCompiler, RadWorkspace, string> scenario)
+        Action<BcCompiler, RadWorkspace, string> scenario,
+        bool withoutNamespaces = false)
     {
         var source = FixtureRoot(fixtureName);
         Assert.True(Directory.Exists(source), $"fixture not found: {source}");
@@ -57,6 +58,7 @@ internal static class RadByName
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             File.Copy(file, target);
         }
+        if (withoutNamespaces) RemoveNamespaceDeclarations(tempRoot);
 
         try
         {
@@ -81,6 +83,38 @@ internal static class RadByName
         {
             try { Directory.Delete(tempRoot, recursive: true); } catch { }
         }
+    }
+
+    /// <summary>
+    /// Delete every `namespace …;` declaration from the copied tree, leaving the objects
+    /// themselves byte-identical.
+    ///
+    /// <para>This exists so that a namespaced and a namespace-free run of the same shape differ
+    /// by exactly this transformation rather than by two fixtures a maintainer has to keep in
+    /// step. The distinction is load-bearing and not cosmetic: whether the app declares a
+    /// namespace decides which module BC re-parents the packaged objects onto in
+    /// <c>RadReferenceModuleSymbol.BuildGlobalNamespace</c>, and therefore whether an untouched
+    /// object's by-name reference to a stripped object still resolves. Namespaces arrived in AL
+    /// 11, so the namespace-free shape is the majority of real AL — including all 7,053 files of
+    /// the npcore corpus this work benchmarks against.</para>
+    /// </summary>
+    private static void RemoveNamespaceDeclarations(string tempRoot)
+    {
+        var pattern = new System.Text.RegularExpressions.Regex(
+            @"^\s*namespace\s+[^;]+;\s*$\r?\n?",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        var stripped = 0;
+        foreach (var file in Directory.EnumerateFiles(tempRoot, "*.al", SearchOption.AllDirectories))
+        {
+            var source = File.ReadAllText(file);
+            var without = pattern.Replace(source, string.Empty);
+            if (ReferenceEquals(source, without) || source == without) continue;
+            File.WriteAllText(file, without);
+            stripped++;
+        }
+        Assert.True(stripped > 0,
+            "the fixture declares no namespace to remove, so a namespace-free run of it would "
+            + "be identical to the namespaced one and prove nothing");
     }
 
     /// <summary>
