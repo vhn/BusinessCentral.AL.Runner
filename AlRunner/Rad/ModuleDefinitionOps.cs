@@ -262,10 +262,15 @@ public static class ModuleDefinitionOps
     ///
     /// <para>This is the gate on the delta's one-hop rebind (BcCompiler.DeltaCompile's
     /// <c>changedSurfaces</c>), and through <c>RadWorkspaceUpdate.MovedSurfaces</c> on the
-    /// cross-app one as well. Answering "yes" too often is not a correctness bug but a cascade:
-    /// a hub codeunit's callers are re-emitted, and on NP Retail one added procedure on
-    /// `NPR POS Session` re-emitted 313 objects in 22–54 s. Answering "no" too often is a
-    /// correctness bug, and a SILENT one — see the overload hazard below.</para>
+    /// cross-app one as well. Answering "yes" too often was assumed to be a cost rather than a
+    /// correctness bug — a hub codeunit's callers get re-emitted and the cycle is slow.
+    /// Measured on NP Retail, it is worse than that: adding one procedure to `NPR POS Session`
+    /// under the whole-object rule widened to 312 direct-caller files plus 21 bystanders, and
+    /// the widened delta then produced <c>EMIT-ZERO — 0 sources emitted, 130 AL error(s)</c> and
+    /// ended the cycle in COMPILE FAIL, three cycles out of three. It never re-emitted those
+    /// objects at all. Under the member-level rule the same edit is 1 object in 1.1–2.0 s.
+    /// Answering "no" too often is a correctness bug of the other kind, and a SILENT one — see
+    /// the overload hazard below.</para>
     ///
     /// <para><b>Codeunits are diffed member by member. Everything else is all-or-nothing.</b>
     /// The one thing generated code bakes about another object is the callee's METHOD ID, so

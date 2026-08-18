@@ -814,6 +814,44 @@ calling.
 A consequence worth naming: because members are compared as a keyed set, **reordering
 procedures no longer rebinds anyone**.
 
+#### Measured on NP Retail — and the old figure was wrong in both units
+
+Adding one public procedure under a new name to `NPR POS Session`, same tree, same edit, two
+binaries, steady-state cycles 2–3:
+
+| | objects re-emitted | delta | cycle |
+|---|---|---|---|
+| **member-level** | **1** | 1.1–2.0 s | 74–76 s (of which 72–80 s is npcore's own test run) |
+| **whole-object** | **never emits any** | — | **COMPILE FAIL** |
+
+The first row is the claim, confirmed. The second is not what this doc used to say. The
+whole-object rule was described as re-emitting *313 objects in 22–54 s* — a cost. It does not:
+it widens to `rebinding 312 direct caller file(s)` plus `rebinding 21 bystander file(s)`, and
+the widened delta then produces `EMIT-ZERO — 0 sources emitted, 130 AL error(s)` and the cycle
+ends in COMPILE FAIL. Three cycles out of three. Failing is cheaper than succeeding, which is
+why the old figure also looked *faster* per cycle.
+
+313 does correspond to something real — 312 direct-caller files plus the edited one, and 312 is
+independently confirmable by grep (exactly 312 files under `Application/` textually reference
+`Codeunit "NPR POS Session"`). But it counts **files widened in**, not objects re-emitted, and
+it omits the 21 bystanders.
+
+So the argument for deciding this member by member is stronger than a speed argument: on this
+corpus the whole-object rule did not make the tail case slow, it made it **not work**.
+
+**Scope, stated honestly.** Median in-degree over npcore's 7,030 objects is **1**, and only
+**14 of 2,501** rebind-capable objects have ≥100 referrers. This is a tail optimisation. It
+happens to land on the hub codeunits a developer edits daily.
+
+**`NPR POS Sale` (the claimed 436 → 0) is unverified and currently unverifiable here.** Both
+binaries fail it identically — `EMIT-ZERO`, 7 × `AL0133: cannot convert from
+'Codeunit "NPR POS Sale"' to '__MissingTypeSymbol__'` — at the seven sites where the codeunit
+passes *itself* into another codeunit's parameter. `POSSession` has no self-pass, which is why
+it is unaffected. Since both legs fail the same way this is pre-existing and unrelated to the
+member-level rule; it is the `TypeDefinition.Subtype` shape, whose RED tests are not written.
+Worth noting that the bystander retry does **not** fire on that AL0133 and no full-compile
+fallback line prints either — the cycle simply returns COMPILE FAIL in 0.3–0.4 s.
+
 #### Failing closed, in two different ways
 
 The two failure modes are not the same and are not treated the same.
@@ -1004,8 +1042,8 @@ itself once with those files added to `changedFiles`. Four rules, and the shared
 
 None of those sets grows with the call graph — an object has the extensions it has, an
 interface the implementers it has — which is the whole difference between this and
-`DirectUsersOf(every stripped object)`, the cascade that pulls 313 objects for one
-hub-codeunit edit on npcore. It is also much narrower than "V's surface names X": a plain
+`DirectUsersOf(every stripped object)`, the cascade a hub-codeunit edit on npcore sets off. It
+is also much narrower than "V's surface names X": a plain
 by-name pointer re-resolves fine, which is why the six clean property shapes and
 `TypeDefinition.Subtype` need no rule at all.
 
