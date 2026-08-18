@@ -92,13 +92,69 @@ public static class ModuleDefinitionOps
         return (NavSymRef.ModuleDefinition)StripObjects(source, objects.ToHashSet());
     }
 
-    private static object StripObjects(object source, HashSet<RadObjectKey> objects)
+    /// <summary>
+    /// Put <paramref name="objects"/> back into <paramref name="target"/>'s own object arrays,
+    /// taking each one's definition from <paramref name="source"/>.
+    ///
+    /// <para>The inverse of <see cref="WithoutObjects"/>, and the repair for the namespace-free
+    /// binder selecting the plain packaged copy of an untouched object after one of the targets
+    /// named by that copy was stripped. Handing the packaged copy the target's <b>freshly
+    /// compiled</b> definition is what makes this safe where handing it the committed definition
+    /// is not — see <c>BcCompiler.DeltaCompile</c>'s <c>TryReplaceStrippedSurface</c> for the whole
+    /// argument.</para>
+    ///
+    /// <para>Appended at the TOP LEVEL, never into a namespace node. The caller filters this set to
+    /// definitions the current compile itself emitted at top level; that also handles an app
+    /// part-way through namespace adoption without moving its namespaced objects. Guessing which
+    /// namespace node owns a definition would be unsafe. <see cref="CountObjects"/> is the caller's
+    /// check that the result holds exactly one copy of each.</para>
+    /// </summary>
+    public static NavSymRef.ModuleDefinition WithObjectsFrom(
+        NavSymRef.ModuleDefinition target,
+        NavSymRef.ModuleDefinition source,
+        IReadOnlyCollection<RadObjectKey> objects)
+    {
+        if (objects.Count == 0) return target;
+        var found = new Dictionary<string, List<object>>(StringComparer.Ordinal);
+        foreach (var key in objects)
+        {
+            if (ArrayPropertyFor(key.Kind) is not { } propertyName) continue;
+            foreach (var element in FindElements(source, key))
+            {
+                if (!found.TryGetValue(propertyName, out var list))
+                    found[propertyName] = list = new List<object>();
+                list.Add(element);
+            }
+        }
+        if (found.Count == 0) return target;
+
+        var type = target.GetType();
+        var copy = (NavSymRef.ModuleDefinition)ShallowCopy(target);
+        foreach (var (propertyName, added) in found)
+        {
+            var property = type.GetProperty(propertyName)!;
+            var kept = (property.GetValue(target) as Array)?.Cast<object>() ?? [];
+            property.SetValue(
+                copy,
+                ToTypedArray(property.PropertyType.GetElementType()!, kept.Concat(added).ToList()));
+        }
+        return copy;
+    }
+
+    private static object ShallowCopy(object source)
     {
         var type = source.GetType();
         var copy = Activator.CreateInstance(type)!;
         foreach (var property in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
             if (property.CanRead && property.CanWrite)
                 property.SetValue(copy, property.GetValue(source));
+        return copy;
+    }
+
+    private static object StripObjects(object source, HashSet<RadObjectKey> objects)
+    {
+        var type = source.GetType();
+        var copy = ShallowCopy(source);
 
         foreach (var (propertyName, kind) in _kindByArrayProperty)
         {
@@ -124,21 +180,13 @@ public static class ModuleDefinitionOps
         return copy;
     }
 
-    /// <summary>
-    /// Whether <paramref name="module"/> declares any namespace at all.
-    ///
-    /// <para>This decides whether a delta can re-resolve a stripped object's name from the
-    /// supplied syntax. <c>RadReferenceModuleSymbol.BuildGlobalNamespace</c> re-parents the
-    /// packaged objects onto the RAD module symbol — whose symbol map merges the packaged
-    /// definition with the source namespaces — only when the packaged definition holds
-    /// namespaces; otherwise the packaged module symbol's own global namespace is kept, and
-    /// <c>ReferenceManager.GetObjectSymbolsByIdAcrossModules</c> asks that module and nothing
-    /// else. So an untouched object in a namespace-free app cannot name an object the delta
-    /// stripped. Namespaces arrived in AL 11, so answering false here is the common case.</para>
-    /// </summary>
-    public static bool DeclaresNamespaces(NavSymRef.ModuleDefinition module) =>
-        module.GetType().GetProperty("Namespaces")?.GetValue(module) is Array namespaces
-        && namespaces.Length > 0;
+    // There is deliberately no "does this module declare any namespace" helper. One existed, and
+    // it was the wrong question asked in the one place it mattered: whether a packaged object
+    // reference re-resolves is decided by the binder BC gives the edited compilation unit
+    // (`BinderFactory.VisitCompilationUnitInternal`, keyed on that unit's own
+    // `NamespaceDeclaration`), never by what the module declares somewhere else. An app part-way
+    // through adopting namespaces answers "yes" module-wide and still has namespace-free files that
+    // resolve against the un-re-parented copy. `BcCompiler.DeclaresNoNamespace` asks per file.
 
     private static Array ToTypedArray(Type elementType, IReadOnlyList<object> items)
     {
@@ -551,12 +599,11 @@ public static class ModuleDefinitionOps
     /// <paramref name="tableNames"/>.
     ///
     /// <para>Why a delta has to ask: <c>TableNo</c> is serialized as the target table's NAME,
-    /// and BC resolves that name against the packaged module definition alone — the syntax
-    /// trees a RAD compilation is handed do not participate. So stripping a table from the
-    /// packaged baseline (which every delta that touches one must do, or its pre-edit shape
-    /// shadows the edit) silently costs every codeunit that names it its <c>Run(Record)</c>
-    /// overload, even though the codeunit itself was not touched and its own definition still
-    /// carries the property.</para>
+    /// and BC derives a <c>Run(Record)</c> overload from that relationship when it materialises
+    /// the untouched codeunit's packaged surface. Stripping the table from the packaged baseline
+    /// (which every delta that touches one must do, or its pre-edit shape shadows the edit) can
+    /// therefore leave the codeunit present with its <c>TableNo</c> property intact but without
+    /// that derived overload. Rebinding the codeunit from source reconstructs it.</para>
     ///
     /// <para>Measured on NP Retail: a cycle that rebound `AdyenSetup.Page.al` also had
     /// `NPR Adyen Reconciliation Hdr` in its change set, and the page's
@@ -568,19 +615,13 @@ public static class ModuleDefinitionOps
     /// <para>Names are compared case-insensitively because AL identifiers are.</para>
     ///
     /// <para><b>Deliberately narrow, and this is the part to read before extending it.</b>
-    /// <c>TableNo</c> is not the only property that names another object by name — counted
-    /// over NP Retail's own committed baseline, so is <c>SourceTable</c> (1,827 pages),
-    /// <c>TableRelation</c> (2,910 tables), <c>CalcFormula</c> (899), <c>RunObject</c> (1,042),
-    /// <c>Implementation</c> (592 enums) and the report/query <c>DataItem*</c> family. Any of
-    /// them could in principle be left dangling by the same stripping.</para>
-    ///
-    /// <para>Only <c>TableNo</c> is handled because only <c>TableNo</c> has been OBSERVED to
-    /// break, and it is the one with an obvious reason to: it decides whether a
-    /// <c>Run(Record)</c> overload exists on the codeunit's PUBLIC surface, so losing it
-    /// changes what other objects can bind to. The rest are field- or control-level metadata
-    /// that no caller binds against — plausible, unproven, and not worth pre-emptively
-    /// widening a delta for. Reproduce one before adding it here; see
-    /// `.claude/rules/no-assumption-fixes.md`.</para>
+    /// Many serialized properties name another object, but the bound semantic graph already
+    /// records those edges and most plain pointers re-resolve without rebinding their owner.
+    /// This helper exists for the measured, derived-surface loss above. Reports and queries
+    /// whose dataitems lose their source table are the other measured table-target family and
+    /// are handled separately by <see cref="DataItemsOn"/>. Extensions and interface users are
+    /// discovered from their own workspace indexes. Reproduce another derived-surface loss
+    /// before adding it here; see `.claude/rules/no-assumption-fixes.md`.</para>
     /// </summary>
     public static IReadOnlyList<RadObjectKey> CodeunitsWithTableNo(
         NavSymRef.ModuleDefinition module, IReadOnlyCollection<string> tableNames)
@@ -598,14 +639,13 @@ public static class ModuleDefinitionOps
     /// Every report and query in <paramref name="module"/> with a dataitem whose source table is
     /// one of <paramref name="tableNames"/>.
     ///
-    /// <para>Same mechanism as <see cref="CodeunitsWithTableNo"/> and the same reason a delta has
-    /// to ask, on the other kind of holder. A report dataitem and a query dataitem each record
-    /// their table as a NAME — the serialized property is called <c>RelatedTable</c> on both —
-    /// and that name is resolved against the packaged module definition alone. It is also the
-    /// ONLY record of which table the dataitem's columns come from: a column serializes its
-    /// source field name (<c>SourceColumn</c>) or nothing at all, never the table. So stripping
-    /// the table costs an untouched report or query the ability to say what any of its columns
-    /// are, even though its own definition is intact.</para>
+    /// <para>Same derived-surface class as <see cref="CodeunitsWithTableNo"/>, on another kind of
+    /// holder. A report dataitem and a query dataitem each record their table as a NAME — the
+    /// serialized property is called <c>RelatedTable</c> on both. It is also the ONLY record of
+    /// which table the dataitem's columns come from: a column serializes its source field name
+    /// (<c>SourceColumn</c>) or nothing at all, never the table. Stripping the table can therefore
+    /// cost an untouched report or query the ability to say what any of its columns are even
+    /// though its own definition is intact; rebinding the holder from source reconstructs it.</para>
     ///
     /// <para>Two measurements, one cause, two very different-looking diagnostics — which is why
     /// they were originally filed as unrelated. With table X stripped and the holder untouched:
@@ -692,9 +732,43 @@ public static class ModuleDefinitionOps
     public static int CountObjects(NavSymRef.ModuleDefinition module, RadObjectKey key) =>
         FindElements(module, key).Count();
 
+    private static string? ArrayPropertyFor(string kind) =>
+        _kindByArrayProperty.FirstOrDefault(pair => pair.Value == kind).Key;
+
+    /// <summary>
+    /// Whether <paramref name="kind"/> has a serialized array in <c>ModuleDefinition</c> at all,
+    /// and therefore whether a delta can strip it and hand it back.
+    ///
+    /// <para>False for exactly one AL kind: <c>entitlement</c>. There is no <c>Entitlements</c>
+    /// array and no <c>EntitlementDefinition</c> type, so a modified entitlement is neither
+    /// stripped nor restorable — and a caller that expects to find one copy of everything it asked
+    /// for would otherwise read that absence as a failure. Asked through this rather than by
+    /// listing kinds at the call site, so <see cref="_kindByArrayProperty"/> stays the one place
+    /// that knows.</para>
+    /// </summary>
+    public static bool HasSerializedForm(string kind) => ArrayPropertyFor(kind) != null;
+
+    /// <summary>
+    /// Whether <paramref name="module"/> holds <paramref name="key"/> in its own object arrays
+    /// rather than inside one of its namespace nodes.
+    ///
+    /// <para>Asked before <see cref="WithObjectsFrom"/>, which appends at the top level: putting a
+    /// namespaced definition there would MOVE it, and a definition that holds namespaces has its
+    /// top-level arrays re-parented verbatim by the compiler
+    /// (<c>RadReferenceModuleSymbol.CreateNamespaceDefinition</c>), so the move would be visible to
+    /// every namespaced file's binder as an object in the wrong namespace. False is therefore the
+    /// caller's signal to leave the object stripped and let the whole module answer.</para>
+    /// </summary>
+    public static bool HoldsAtTopLevel(NavSymRef.ModuleDefinition module, RadObjectKey key)
+    {
+        if (ArrayPropertyFor(key.Kind) is not { } propertyName) return false;
+        return module.GetType().GetProperty(propertyName)?.GetValue(module) is Array items
+            && items.Cast<object>().Any(item => item != null && KeyOf(item, key.Kind) == key);
+    }
+
     private static IEnumerable<object> FindElements(object container, RadObjectKey key)
     {
-        var arrayProperty = _kindByArrayProperty.FirstOrDefault(pair => pair.Value == key.Kind).Key;
+        var arrayProperty = ArrayPropertyFor(key.Kind);
         return arrayProperty == null
             ? Enumerable.Empty<object>()
             : Elements(container, arrayProperty, key);

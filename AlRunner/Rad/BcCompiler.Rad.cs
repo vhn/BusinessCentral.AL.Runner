@@ -459,7 +459,8 @@ public sealed partial class BcCompiler
         List<string> removedFiles,
         NavCA.ISymbolReferenceLoader? refLoader,
         NavCA.SymbolReferenceSpecification[] specs,
-        string? appRootDir)
+        string? appRootDir,
+        NavSymRef.ModuleDefinition? packagedOverride = null)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var parseOpts = ParseOptionsForCompile();
@@ -770,53 +771,6 @@ public sealed partial class BcCompiler
         // another). Added objects, by definition, have no baseline entry to strip.
         var diags = new List<string>();
 
-        // The one diagnostic that says the DELTA is wrong rather than the source. A serialized
-        // subtype BC cannot resolve becomes `MissingTypeSymbol.Instance`, and its display name is
-        // `__MissingTypeSymbol__`; only a REFERENCE symbol produces one, because only a reference
-        // symbol resolves its types out of a module definition — source binds against the
-        // declaration table and reports AL0185 / AL0247 / "does not exist" instead. So the marker
-        // in a diagnostic means an object this cycle did not touch lost the ability to name an
-        // object this cycle stripped, and the surrounding diagnostic is the delta's invention.
-        //
-        // WHY IT CANNOT BE WIDENED AWAY, unlike the four rules in DamagedBystanderFiles. Those
-        // sets are bounded — an object has the extensions and implementers it has. This one is
-        // `DirectUsersOf(everything stripped)`, and it does not converge: every bystander the
-        // widening pulls in is itself then stripped, which damages the next ring of bystanders
-        // that name IT. On npcore a single hub-codeunit edit enters that loop at 313 files and
-        // ends in `EMIT-ZERO — 0 sources emitted, 130 AL error(s)`.
-        //
-        // WHEN IT FIRES. `RadReferenceModuleSymbol.BuildGlobalNamespace` re-parents the packaged
-        // objects onto the RAD module symbol — whose symbol map merges the packaged definition
-        // with the source namespaces, so a stripped object is found as syntax — but only when the
-        // packaged module definition holds namespaces. An app that declares none keeps the
-        // packaged module symbol's own global namespace, and
-        // `ReferenceManager.GetObjectSymbolsByIdAcrossModules` asks that module first and last.
-        // Namespaces arrived in AL 11, so this is the majority of real AL: npcore declares none in
-        // any of its 7,053 files. Pinned both ways by RadByNameSelfSubtypeTests, which runs one
-        // fixture with and without its namespace declarations and gets opposite verdicts.
-        //
-        // Taking the whole module is a strict improvement on what this replaces, which was a
-        // COMPILE FAIL on a tree that builds clean — and it is named, because the unresolvable
-        // reference lives in a file the developer did not edit and cannot infer from the edit.
-        bool PackagedSurfaceWentUnresolvable()
-        {
-            if (!diags.Any(text => text.Contains("__MissingTypeSymbol__", StringComparison.Ordinal)))
-                return false;
-            // Name the namespace cause only when it IS the cause. The marker means "a reference
-            // symbol did not resolve", and a namespaced app can in principle reach that some other
-            // way — a dependency package whose own surface is broken, say. Blaming namespaces there
-            // would send someone to rewrite their app over an unrelated fault, so the reason
-            // degrades to what is actually known instead.
-            var because = AlRunner.Rad.ModuleDefinitionOps.DeclaresNamespaces(WorkspaceBaseline(ws))
-                ? "and this cycle cannot tell which reference, so it cannot rebind it"
-                : "because the app declares no namespace, which is what would have let the " +
-                  "packaged symbols re-resolve against the supplied syntax";
-            FullCompileBecause(
-                moduleName,
-                "an object this cycle did not touch could not resolve its own reference to one " +
-                $"this cycle changed, {because}");
-            return true;
-        }
         var model = new NavCA.ObjectChangeModelDefinition
         {
             Added = added.Select(ToChangeElement).ToArray(),
@@ -838,7 +792,12 @@ public sealed partial class BcCompiler
         // syntax tree is still the authority for the object being rebound, so a field the
         // edit adds binds and one it removes stops binding — both pinned by
         // RadTableExtensionSelfReferenceTests.
-        var packaged = AlRunner.Rad.ModuleDefinitionOps.WithoutObjects(WorkspaceBaseline(ws), stripped);
+        //
+        // …and with one more: the second pass of a cycle whose first pass could not resolve the
+        // packaged surface hands its own definition in (see TryReplaceStrippedSurface), so the
+        // strip is not recomputed over it — it has already been applied and then partly undone.
+        var packaged = packagedOverride
+            ?? AlRunner.Rad.ModuleDefinitionOps.WithoutObjects(WorkspaceBaseline(ws), stripped);
         // The file system goes in through the CONSTRUCTOR, and that is not interchangeable with
         // attaching one afterwards. `rad.WithFileSystem(...)` returns a compilation that has
         // LOST its packaged module definition: every object the delta did not re-parse stops
@@ -865,6 +824,173 @@ public sealed partial class BcCompiler
             options: compOpts,
             fileSystem: AppFileSystem(appRootDir),
             dotNetResolverFactory: GetOrCreateDotNetFactory());
+
+        // The narrow repair that keeps the change set unchanged: the namespace-free binder has
+        // selected the plain packaged copy of an untouched object, and that copy cannot resolve
+        // its serialized reference to an object this cycle stripped. Put the stripped objects
+        // back — as the shapes THIS compile just gave them — and bind the same files again.
+        //
+        // HOW THE BREAK HAPPENS, measured on BC 28.1 rather than inferred. A file that declares no
+        // `namespace` is bound by `LegacyInContainerBinder` (`BinderFactory`
+        // .VisitCompilationUnitInternal picks it whenever `compilationUnit.NamespaceDeclaration ==
+        // null`), and that binder resolves an object name through
+        // `Compilation.GetObjectSymbolsByNameAcrossModules` → `RadReferenceManager` → the PACKAGED
+        // module symbol first. That symbol is the plain `ReferenceModuleSymbol` built by
+        // `CompilationOptionsExtensions.CreatePackagedRadModuleSymbol`, whose resolver is a
+        // `ReferenceManager` over an EMPTY reference list and whose `ReferenceModules` are only the
+        // `.alpackages` dependencies — so it cannot see this app's source, and a `TypeDefinition
+        // .Subtype` naming a stripped object degrades to `MissingTypeSymbol.Instance`. A file that
+        // DOES declare a namespace gets `NamespaceContainerBinder` instead, which looks the name up
+        // in the merged namespace and lands on the copy owned by `RadReferenceModuleSymbol` — whose
+        // resolver falls through to the RAD symbol map and finds the source object.
+        //
+        // So both copies exist and they disagree, and which one a cycle gets is decided by the
+        // EDITED FILE's binder. Two consequences worth stating because each was believed otherwise:
+        // the broken copy is what the resolver returns for a NAMESPACED app too — namespaces were
+        // never the discriminator, the binder is — and injecting a namespace into the packaged
+        // definition does flip `RadReferenceModuleSymbol.BuildGlobalNamespace` onto its re-parenting
+        // branch and still changes nothing, because `LegacyInContainerBinder` never consults the
+        // global namespace's object members at all (only `GetNamespaceMembers()`).
+        //
+        // WHY REPLACING IS SAFE WHERE NOT STRIPPING IS NOT. Leaving the committed definition in
+        // place repairs this shape and breaks a worse one: `RadReferenceManager` skips the packaged
+        // copy for a by-ID lookup of a changed object but NOT for a by-NAME one — its by-name probe
+        // builds an `ObjectChangeElement` with `Id = null`, and
+        // `ObjectChangeElement.NamespaceAgnosticEqualityComparer` hashes on `(Name, Kind)` when the
+        // id is absent and on `(Id, Kind)` when it is present, so an id'd object is never found and
+        // the STALE packaged copy wins every by-name lookup. That is the measured 18 failures
+        // across 7 suites. Replacing removes the staleness rather than the strip: the definition
+        // handed back is the one `rad` just produced from the edited source, so a caller resolving
+        // the name by either route sees the same surface the edit created, and the argument and the
+        // parameter of the failing conversion resolve to the same symbol.
+        //
+        // Both sides of the comparison come from one producer for the same reason
+        // `ModuleDefinitionOps.ObjectSurfaceFingerprint` canonicalises: this uses
+        // `SymbolJsonWriter.BuildModuleDefinition`, the same
+        // `SerializableSymbolModelConverter(Compilation)` the committed baseline comes from, so the
+        // re-inserted definition is shaped like the one it replaces.
+        //
+        // One replacement per recursion branch: `packagedOverride` non-null means this repair has
+        // already been applied on THAT branch, so a marker that survives it is not this delta's to
+        // fix and the whole module goes — with the reason said out loud, because the unresolvable
+        // reference lives in a file the developer did not edit and cannot infer from the edit. A
+        // diagnostic-driven bystander retry can start a wider branch before reaching this repair;
+        // its own replacement is independently subject to the same one-pass gate.
+        bool TryReplaceStrippedSurface(out RadEmitResult? repaired)
+        {
+            repaired = null;
+            if (!diags.Any(text => text.Contains("__MissingTypeSymbol__", StringComparison.Ordinal)))
+                return false;
+            // The marker alone is NOT proof the delta caused it: an incomplete dependency CLOSURE
+            // degrades cross-module types in a dependency's own signatures to the same marker and
+            // the same AL0133, with nothing stripped and nothing to do with this cycle (#1546, and
+            // the two comments recording it in SymbolJson.cs). Two cheap conditions separate the
+            // two, and BOTH are about this cycle rather than about the app:
+            //
+            //  * something was stripped, so there is a removal that could have dangled at all;
+            //  * at least one file in this delta declares no namespace, so at least one of them is
+            //    bound by `LegacyInContainerBinder` and can therefore reach the broken copy.
+            //
+            // The second used to ask `DeclaresNamespaces(WorkspaceBaseline(ws))` — whether the APP
+            // declares any namespace anywhere. That is the wrong question, and gets a mixed app
+            // wrong in the direction that matters: binder selection is per COMPILATION UNIT, so an
+            // app part-way through adopting namespaces has namespace-free files that reach the break
+            // while the app-level test says it cannot. Such a cycle returned the invented AL0133.
+            if (stripped.Length == 0 || !trees.Any(DeclaresNoNamespace))
+                return false;
+
+            // From here the marker IS this delta's to answer, so every exit below either repairs it
+            // or takes the whole module. Returning the diagnostic instead would ship an error a
+            // cold compile of the same tree does not produce — which is the whole defect.
+            //
+            // Exactly the objects the strip removed and this compile can describe again in the place
+            // it took them from: not the extensions (never stripped — see `packaged`), not the
+            // removals (they are meant to be gone), not an `entitlement` (no serialized form to
+            // strip or restore), and not an object this compile puts inside a NAMESPACE.
+            //
+            // The last one is what keeps a mixed app honest. WithObjectsFrom appends at the top
+            // level, which is where a namespace-free app's objects were; appending a namespaced
+            // object there would move it, and for a definition that holds namespaces BC re-parents
+            // the top-level arrays verbatim (`RadReferenceModuleSymbol.CreateNamespaceDefinition`),
+            // so the move would be visible to every namespaced file's binder as an object in the
+            // wrong namespace. Leaving it stripped is the safe half: if the marker was about that
+            // object it survives the pass and the whole module goes.
+            var replaceable = modified.Select(item => item.Key)
+                .Where(key => !key.IsExtension
+                    && AlRunner.Rad.ModuleDefinitionOps.HasSerializedForm(key.Kind))
+                .ToArray();
+
+            if (packagedOverride != null || replaceable.Length == 0)
+            {
+                FullCompileBecause(
+                    moduleName,
+                    "BC's namespace-free binder chose an isolated packaged symbol that cannot " +
+                    "see this app's supplied source after RAD stripped its changed by-name " +
+                    "target, and " + (packagedOverride != null
+                        ? "putting the changed objects' new surface back into the packaged symbols " +
+                          "did not repair it"
+                        : "this cycle changed no object whose surface could be put back — every " +
+                          "one of them was removed, or is an extension or an entitlement"));
+                return true;
+            }
+
+            NavSymRef.ModuleDefinition replaced;
+            try
+            {
+                var compiled = SymbolJsonWriter.BuildModuleDefinition(rad);
+                var atTopLevel = replaceable
+                    .Where(key => AlRunner.Rad.ModuleDefinitionOps.HoldsAtTopLevel(compiled, key))
+                    .ToArray();
+                if (atTopLevel.Length == 0)
+                    throw new InvalidOperationException(
+                        "every changed object this compile can describe again is inside a namespace, "
+                        + "and putting one back at the top level would move it");
+                replaceable = atTopLevel;
+                replaced = AlRunner.Rad.ModuleDefinitionOps.WithObjectsFrom(
+                    packaged, compiled, replaceable);
+                // Exactly one copy of each, or the next pass resolves by array order rather than
+                // by the edit — the same "went green on the stale copy" failure CountObjects
+                // exists to let the RAD suites assert against. A definition this compile did not
+                // produce (0) would leave the reference dangling; a second one (2) would make
+                // which surface answers a coin toss.
+                foreach (var key in replaceable)
+                {
+                    var copies = AlRunner.Rad.ModuleDefinitionOps.CountObjects(replaced, key);
+                    if (copies != 1)
+                        throw new InvalidOperationException(
+                            $"{key.Kind} '{ws.Object(key)?.Name ?? key.Name}' has {copies} " +
+                            "serialized copies after the replacement, not one");
+                }
+            }
+            catch (Exception ex)
+            {
+                FullCompileBecause(
+                    moduleName,
+                    "BC's namespace-free binder chose an isolated packaged symbol that cannot " +
+                    "see this app's supplied source after RAD stripped its changed by-name " +
+                    "target, and the changed objects' new surface could not be put back into " +
+                    $"the packaged symbols ({ex.GetType().Name}: {ex.Message.Split('\n')[0]})");
+                return true;
+            }
+
+            // Recorded as well as logged, and on the REBIND queue rather than the full-compile one,
+            // for the two reasons that queue exists: this is the narrow path working — one extra
+            // bind pass, not a cascade — and its cost has no visible cause, because the second pass
+            // re-emits exactly the objects the first one would have. Without a note, an app that
+            // declares no namespace pays double on every hub edit with nothing on the dashboard to
+            // attribute it to.
+            var reason =
+                $"BC's namespace-free binder chose the packaged copy of an untouched object " +
+                $"— that isolated copy cannot see this app's supplied source after RAD stripped " +
+                $"the changed target it names — retrying with the freshly " +
+                $"compiled surface of {replaceable.Length} changed object(s)";
+            Console.Error.WriteLine($"  [watch] {moduleName}: {reason}");
+            AlRunner.Rad.RadCycleNotes.Rebind(moduleName, reason);
+            repaired = DeltaCompile(
+                moduleName, dirs, ws, hashes, changedFiles, removedFiles, refLoader, specs,
+                appRootDir, replaced);
+            return true;
+        }
 
         // Ask for binding errors BEFORE code generation. BC's RAD emitter does not
         // survive them: a reference to an object this delta removed makes it throw out of
@@ -899,7 +1025,7 @@ public sealed partial class BcCompiler
             // Both compile clean cold. So the widened retry hangs off every diagnostic exit, not
             // just the emit's.
             if (TryRebindDamagedBystanders(out var repaired)) return repaired;
-            if (PackagedSurfaceWentUnresolvable()) return null;
+            if (TryReplaceStrippedSurface(out var replacedAtDeclaration)) return replacedAtDeclaration;
             return new RadEmitResult(
                 new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                 FullRebuild: false, NoChange: false);
@@ -936,7 +1062,7 @@ public sealed partial class BcCompiler
             if (diags.Count > 0)
             {
                 if (TryRebindDamagedBystanders(out var shortEmit)) return shortEmit;
-                if (PackagedSurfaceWentUnresolvable()) return null;
+                if (TryReplaceStrippedSurface(out var rebound)) return rebound;
                 return new RadEmitResult(
                     new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                     FullRebuild: false, NoChange: false);
@@ -954,7 +1080,7 @@ public sealed partial class BcCompiler
             // diagnostic out of `rad.Emit`, against source a cold compile of the same tree
             // accepts. Widen and retry ONCE before believing it.
             if (TryRebindDamagedBystanders(out var repaired)) return repaired;
-            if (PackagedSurfaceWentUnresolvable()) return null;
+            if (TryReplaceStrippedSurface(out var replacedAtEmit)) return replacedAtEmit;
             return new RadEmitResult(
                 new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                 FullRebuild: false, NoChange: false);
@@ -1463,6 +1589,39 @@ public sealed partial class BcCompiler
                     AlRunner.Rad.RadObjectKey.For(kind, 0, name), name, ns));
             }
         }
+    }
+
+    /// <summary>
+    /// Whether this file is one BC binds with its legacy, pre-namespace binder — which decides
+    /// which copy of the packaged surface the file's object references resolve to.
+    ///
+    /// <para><c>BinderFactory.VisitCompilationUnitInternal</c> picks
+    /// <c>LegacyInContainerBinder</c> exactly when <c>compilationUnit.NamespaceDeclaration</c> is
+    /// null, and <c>NamespaceContainerBinder</c> otherwise. The first resolves an object name
+    /// through the reference manager and lands on the packaged module symbol's own copy — the one
+    /// that cannot see this app's source; the second looks the name up in the merged namespace and
+    /// lands on the copy owned by the RAD module symbol, which can. So this predicate is the
+    /// precondition for the whole class of break <c>TryReplaceStrippedSurface</c> repairs, and it is
+    /// a property of the FILE, never of the app.</para>
+    ///
+    /// <para>BC's own condition has a second clause — <c>!IsFeatureEnabled(Feature.Namespaces)</c>,
+    /// which would send even a namespaced file down the legacy binder. It is not replicated because
+    /// it is not reachable here and is covered by measurement rather than by argument: with the
+    /// feature off, the namespaced control in RadByNameSelfSubtypeTests would take the legacy binder
+    /// and fail exactly as the namespace-free run used to.</para>
+    ///
+    /// <para>A tree whose root will not read as a compilation unit answers true. That is the
+    /// conservative side: it can only make a cycle that already produced the marker try the repair,
+    /// and the repair's own guards fail closed to a whole-module compile.</para>
+    /// </summary>
+    private static bool DeclaresNoNamespace(NavSyntax.SyntaxTree tree)
+    {
+        try
+        {
+            return tree.GetRoot() is not NavSyntax.CompilationUnitSyntax unit
+                || unit.NamespaceDeclaration == null;
+        }
+        catch { return true; }
     }
 
     private static string? FilePathOf(NavSyntax.SyntaxTree tree)

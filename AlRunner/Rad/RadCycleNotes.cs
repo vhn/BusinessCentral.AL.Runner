@@ -47,15 +47,15 @@ internal static class RadCycleNotes
     }
 
     /// <summary>
-    /// Record that <paramref name="moduleName"/> re-emitted objects it did not itself change,
-    /// because a SIBLING app in the bundle moved a callable surface this one's generated calls
-    /// bake the member ids of.
+    /// Record why a delta performed binding work that is invisible in its changed-file count:
+    /// either this app re-emitted callers because a sibling app moved a callable surface, or a
+    /// namespace-free file needed a second bind against freshly compiled packaged symbols.
     ///
     /// <para>Kept apart from <see cref="FullCompile"/> rather than sharing its queue, because the
     /// two say opposite things about the cycle. A full compile is the slow path and its note
-    /// explains a cost; a cross-app rebind is the NARROW path working correctly — one file per
-    /// caller instead of the whole module. Rendering it under a "full recompile" heading would
-    /// send a developer hunting a cascade that did not happen.</para>
+    /// explains a cost; a delta rebind is the NARROW path working correctly — selected caller
+    /// files or a second pass over the same changed files instead of the whole module. Rendering
+    /// it under a "full recompile" heading would claim a cascade that did not happen.</para>
     /// </summary>
     internal static void Rebind(string moduleName, string reason)
     {
@@ -74,7 +74,7 @@ internal static class RadCycleNotes
         return drained;
     }
 
-    /// <summary>Same, for the cross-app rebind notes recorded by <see cref="Rebind"/>.</summary>
+    /// <summary>Same, for the delta-rebind notes recorded by <see cref="Rebind"/>.</summary>
     internal static IReadOnlyList<string> DrainRebinds()
     {
         var drained = new List<string>();

@@ -42,10 +42,11 @@ public static class WatchDashboard
     /// a cycle that suddenly cost minutes looked identical to one that cost a second.
     /// </param>
     /// <param name="rebindNotes">
-    /// Why an app re-emitted objects its own source did not change — a sibling in the bundle
-    /// moved a callable surface whose member ids this app's generated calls bake. Same reason
-    /// for rendering as <paramref name="fullCompileNotes"/> and a separate panel for the
-    /// opposite one: this is the narrow path working, not the slow path.
+    /// Why a delta did binding work its changed-file count does not explain: a sibling app moved
+    /// a callable surface and this app re-emitted callers, or a namespace-free file needed a
+    /// second bind against freshly compiled packaged symbols. Same reason for rendering as
+    /// <paramref name="fullCompileNotes"/> and a separate panel for the opposite one: this is the
+    /// narrow path working, not the whole-module path.
     /// </param>
     public static IRenderable Build(
         IReadOnlyList<BucketResult> results,
@@ -94,10 +95,10 @@ public static class WatchDashboard
     }
 
     /// <summary>
-    /// The "this app recompiled and you did not touch it" panel. Blue rather than yellow, because
-    /// unlike a full recompile this is not a cost to explain away: the cycle stayed narrow and
-    /// re-emitted one file per caller. What it explains is why an app the developer never edited
-    /// appears in the cycle at all — without it, the correct behaviour looks like a cascade.
+    /// The "this delta performed an extra bind" panel. Blue rather than yellow because the cycle
+    /// stayed narrow: it either added specific caller files or repeated the same changed-file
+    /// bind with a repaired packaged surface. The note explains which one happened; neither is a
+    /// whole-module compile.
     /// </summary>
     private static IRenderable RebindNotes(IReadOnlyList<string> notes)
     {
@@ -105,7 +106,7 @@ public static class WatchDashboard
             Environment.NewLine,
             notes.Select(note => $"[blue]·[/] [grey]{Markup.Escape(note)}[/]"));
         return new Panel(new Markup(body))
-            .Header("[blue]cross-app rebind[/]")
+            .Header("[blue]delta rebind[/]")
             .Border(BoxBorder.Rounded)
             .BorderColor(Color.Blue)
             .Expand();

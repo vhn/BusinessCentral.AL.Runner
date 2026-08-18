@@ -782,10 +782,10 @@ var results = new List<BucketResult>();
 // the end of a cycle — draining the collector at paint time would show the notes once and then
 // blank them. Populated after the bundle loop restores the console streams.
 var fullCompileNotes = new List<string>();
-// …and why an app re-emitted objects its own source did not change, because a sibling
-// in the bundle moved a callable surface it binds to. Same lifetime and same reason as
-// the list above; a separate one because the dashboard renders them as separate panels
-// — a full recompile is a cost, a cross-app rebind is the narrow path working.
+// …and why a delta did binding work its changed-file count does not explain: selected callers
+// of a sibling app's moved surface, or a second pass over the same namespace-free files with a
+// repaired packaged surface. Same lifetime and same reason as the list above; a separate one
+// because the dashboard renders it as the narrow path working, not as a full recompile.
 var rebindNotes = new List<string>();
 
 // ── Layered source build pre-pass ─────────────────────────────────────────
