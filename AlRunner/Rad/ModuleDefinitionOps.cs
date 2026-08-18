@@ -124,6 +124,22 @@ public static class ModuleDefinitionOps
         return copy;
     }
 
+    /// <summary>
+    /// Whether <paramref name="module"/> declares any namespace at all.
+    ///
+    /// <para>This decides whether a delta can re-resolve a stripped object's name from the
+    /// supplied syntax. <c>RadReferenceModuleSymbol.BuildGlobalNamespace</c> re-parents the
+    /// packaged objects onto the RAD module symbol — whose symbol map merges the packaged
+    /// definition with the source namespaces — only when the packaged definition holds
+    /// namespaces; otherwise the packaged module symbol's own global namespace is kept, and
+    /// <c>ReferenceManager.GetObjectSymbolsByIdAcrossModules</c> asks that module and nothing
+    /// else. So an untouched object in a namespace-free app cannot name an object the delta
+    /// stripped. Namespaces arrived in AL 11, so answering false here is the common case.</para>
+    /// </summary>
+    public static bool DeclaresNamespaces(NavSymRef.ModuleDefinition module) =>
+        module.GetType().GetProperty("Namespaces")?.GetValue(module) is Array namespaces
+        && namespaces.Length > 0;
+
     private static Array ToTypedArray(Type elementType, IReadOnlyList<object> items)
     {
         var array = Array.CreateInstance(elementType, items.Count);

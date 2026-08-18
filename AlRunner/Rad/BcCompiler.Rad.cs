@@ -769,6 +769,54 @@ public sealed partial class BcCompiler
         // shadow the supplied syntax (especially when several changed objects call one
         // another). Added objects, by definition, have no baseline entry to strip.
         var diags = new List<string>();
+
+        // The one diagnostic that says the DELTA is wrong rather than the source. A serialized
+        // subtype BC cannot resolve becomes `MissingTypeSymbol.Instance`, and its display name is
+        // `__MissingTypeSymbol__`; only a REFERENCE symbol produces one, because only a reference
+        // symbol resolves its types out of a module definition — source binds against the
+        // declaration table and reports AL0185 / AL0247 / "does not exist" instead. So the marker
+        // in a diagnostic means an object this cycle did not touch lost the ability to name an
+        // object this cycle stripped, and the surrounding diagnostic is the delta's invention.
+        //
+        // WHY IT CANNOT BE WIDENED AWAY, unlike the four rules in DamagedBystanderFiles. Those
+        // sets are bounded — an object has the extensions and implementers it has. This one is
+        // `DirectUsersOf(everything stripped)`, and it does not converge: every bystander the
+        // widening pulls in is itself then stripped, which damages the next ring of bystanders
+        // that name IT. On npcore a single hub-codeunit edit enters that loop at 313 files and
+        // ends in `EMIT-ZERO — 0 sources emitted, 130 AL error(s)`.
+        //
+        // WHEN IT FIRES. `RadReferenceModuleSymbol.BuildGlobalNamespace` re-parents the packaged
+        // objects onto the RAD module symbol — whose symbol map merges the packaged definition
+        // with the source namespaces, so a stripped object is found as syntax — but only when the
+        // packaged module definition holds namespaces. An app that declares none keeps the
+        // packaged module symbol's own global namespace, and
+        // `ReferenceManager.GetObjectSymbolsByIdAcrossModules` asks that module first and last.
+        // Namespaces arrived in AL 11, so this is the majority of real AL: npcore declares none in
+        // any of its 7,053 files. Pinned both ways by RadByNameSelfSubtypeTests, which runs one
+        // fixture with and without its namespace declarations and gets opposite verdicts.
+        //
+        // Taking the whole module is a strict improvement on what this replaces, which was a
+        // COMPILE FAIL on a tree that builds clean — and it is named, because the unresolvable
+        // reference lives in a file the developer did not edit and cannot infer from the edit.
+        bool PackagedSurfaceWentUnresolvable()
+        {
+            if (!diags.Any(text => text.Contains("__MissingTypeSymbol__", StringComparison.Ordinal)))
+                return false;
+            // Name the namespace cause only when it IS the cause. The marker means "a reference
+            // symbol did not resolve", and a namespaced app can in principle reach that some other
+            // way — a dependency package whose own surface is broken, say. Blaming namespaces there
+            // would send someone to rewrite their app over an unrelated fault, so the reason
+            // degrades to what is actually known instead.
+            var because = AlRunner.Rad.ModuleDefinitionOps.DeclaresNamespaces(WorkspaceBaseline(ws))
+                ? "and this cycle cannot tell which reference, so it cannot rebind it"
+                : "because the app declares no namespace, which is what would have let the " +
+                  "packaged symbols re-resolve against the supplied syntax";
+            FullCompileBecause(
+                moduleName,
+                "an object this cycle did not touch could not resolve its own reference to one " +
+                $"this cycle changed, {because}");
+            return true;
+        }
         var model = new NavCA.ObjectChangeModelDefinition
         {
             Added = added.Select(ToChangeElement).ToArray(),
@@ -851,6 +899,7 @@ public sealed partial class BcCompiler
             // Both compile clean cold. So the widened retry hangs off every diagnostic exit, not
             // just the emit's.
             if (TryRebindDamagedBystanders(out var repaired)) return repaired;
+            if (PackagedSurfaceWentUnresolvable()) return null;
             return new RadEmitResult(
                 new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                 FullRebuild: false, NoChange: false);
@@ -887,6 +936,7 @@ public sealed partial class BcCompiler
             if (diags.Count > 0)
             {
                 if (TryRebindDamagedBystanders(out var shortEmit)) return shortEmit;
+                if (PackagedSurfaceWentUnresolvable()) return null;
                 return new RadEmitResult(
                     new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                     FullRebuild: false, NoChange: false);
@@ -904,6 +954,7 @@ public sealed partial class BcCompiler
             // diagnostic out of `rad.Emit`, against source a cold compile of the same tree
             // accepts. Widen and retry ONCE before believing it.
             if (TryRebindDamagedBystanders(out var repaired)) return repaired;
+            if (PackagedSurfaceWentUnresolvable()) return null;
             return new RadEmitResult(
                 new BcEmitOutput(Array.Empty<EmittedSource>(), diags, Array.Empty<string>()),
                 FullRebuild: false, NoChange: false);

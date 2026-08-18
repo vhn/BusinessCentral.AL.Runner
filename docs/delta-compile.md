@@ -843,14 +843,14 @@ corpus the whole-object rule did not make the tail case slow, it made it **not w
 **14 of 2,501** rebind-capable objects have ≥100 referrers. This is a tail optimisation. It
 happens to land on the hub codeunits a developer edits daily.
 
-**`NPR POS Sale` (the claimed 436 → 0) is unverified and currently unverifiable here.** Both
-binaries fail it identically — `EMIT-ZERO`, 7 × `AL0133: cannot convert from
+**`NPR POS Sale` (the claimed 436 → 0) is unverified, and the reason turned out to be a separate
+bug.** Both binaries failed it identically — `EMIT-ZERO`, 7 × `AL0133: cannot convert from
 'Codeunit "NPR POS Sale"' to '__MissingTypeSymbol__'` — at the seven sites where the codeunit
-passes *itself* into another codeunit's parameter. `POSSession` has no self-pass, which is why
-it is unaffected. Since both legs fail the same way this is pre-existing and unrelated to the
-member-level rule; it is the `TypeDefinition.Subtype` shape, whose RED tests are not written.
-Worth noting that the bystander retry does **not** fire on that AL0133 and no full-compile
-fallback line prints either — the cycle simply returns COMPILE FAIL in 0.3–0.4 s.
+passes *itself* into another codeunit's parameter. `POSSession` has no self-pass, which is why it
+is unaffected. Since both legs failed the same way it is unrelated to the member-level rule; it is
+[the namespace-free by-name break](#a-namespace-free-app-cannot-re-resolve-a-stripped-object-by-name),
+which now takes the whole module and says so instead of returning COMPILE FAIL in 0.3–0.4 s. The
+`436 → 0` figure is still unmeasured: a full compile is a correct answer, not a delta.
 
 #### Failing closed, in two different ways
 
@@ -1045,7 +1045,10 @@ interface the implementers it has — which is the whole difference between this
 `DirectUsersOf(every stripped object)`, the cascade a hub-codeunit edit on npcore sets off. It
 is also much narrower than "V's surface names X": a plain
 by-name pointer re-resolves fine, which is why the six clean property shapes and
-`TypeDefinition.Subtype` need no rule at all.
+`TypeDefinition.Subtype` need no rule at all — **in an app that declares a namespace**. Without
+one the re-resolution does not happen at all, and no widening can repair it; that case takes the
+whole module, see
+[below](#a-namespace-free-app-cannot-re-resolve-a-stripped-object-by-name).
 
 **Why the retry rather than computing it up front.** Every input is known before the strip, and
 widening there unconditionally does repair all eight shapes in one pass. It also widens every
@@ -1084,7 +1087,7 @@ Recursion terminates because a round can only ADD files: a bystander whose file 
 bystander the workspace cannot trace to a file on disk takes the whole module, named through
 `FullCompileBecause` like every other bail-out.
 
-#### `TypeDefinition.Subtype` does not reproduce
+#### `TypeDefinition.Subtype` does not reproduce — if the app declares a namespace
 
 Carried into this work as "the important one" — a method parameter's `Record "T"` serializes
 `T` as a bare string, counted at **13,610** occurrences on npcore, ~54× more common than
@@ -1092,8 +1095,71 @@ Carried into this work as "the important one" — a method parameter's `Record "
 whose name an untouched codeunit's `Record` parameter mentions is fine, because the stripped
 table is still supplied as syntax and the parameter's type re-resolves against it.
 
-That result is what disproved the wider thesis, and it deletes the claim that `Subtype` is the
-widest exposure. It is not exposure at all.
+That was read as deleting the claim that `Subtype` is the widest exposure — "it is not exposure at
+all". That conclusion was wrong, and the fixture is why: it declares a namespace, and so does
+every other fixture in the family. Remove the namespace and the identical shape breaks. See the
+next section.
+
+#### A namespace-free app cannot re-resolve a stripped object by name
+
+**The measurement.** `RadByNameSelfSubtypeTests` runs one fixture twice — as authored, and with
+`RadByName.Run(…, withoutNamespaces: true)` deleting every `namespace …;` line and nothing else.
+Same objects, same edit, opposite verdicts: with a namespace the cycle deltas to one object and
+matches a cold compile; without one it reports `AL0133: cannot convert from
+'Codeunit "Self Subtype Hub"' to '__MissingTypeSymbol__'` against a tree that compiles clean.
+`RadByNameSubtypeTests` carries the same pair over a `Record` parameter, so this is not specific
+to Codeunit subtypes, and neither the subtype's kind nor the self-reference is load-bearing —
+both were measured separately and both stay clean while a namespace is present.
+
+**Why.** `ReferenceSymbolHelper.ResolveApplicationObjectReference` resolves a serialized subtype
+through `ReferenceManager.GetObjectSymbolsByIdAcrossModules`, which asks **the symbol's own
+containing module** first. Which module that is comes from
+`RadReferenceModuleSymbol.BuildGlobalNamespace`, and it branches on whether the packaged module
+definition holds any namespaces:
+
+- **namespaces present** — the packaged objects are re-parented onto the RAD module symbol, whose
+  symbol map merges the packaged definition with the *source* namespaces. A stripped object is
+  found as syntax, and the bystander's reference resolves.
+- **none** — BC keeps the packaged module symbol's own global namespace verbatim, so the bystander
+  resolves against a module the delta just removed the referent from and gets
+  `MissingTypeSymbol.Instance`.
+
+Namespaces arrived in AL 11. The namespace-free shape is therefore the majority of real AL —
+npcore declares none in any of its **7,053** files, which is why editing `NPR POS Sale` failed on
+both binaries.
+
+**Why it takes the whole module rather than widening.** The four rules in `DamagedBystanderFiles`
+are all bounded — an object has the extensions and implementers it has. This set is
+`DirectUsersOf(everything stripped)`, and it does not converge: each bystander the widening pulls
+in is then itself stripped, damaging the next ring of bystanders that name *it*. On npcore a
+single hub-codeunit edit enters that loop at 313 files and ends in `EMIT-ZERO — 0 sources emitted,
+130 AL error(s)`.
+
+**How it is detected.** `__MissingTypeSymbol__` in a diagnostic is the signal, and it is a precise
+one: only a *reference* symbol can produce it, because only a reference symbol resolves its types
+out of a module definition — source binds against the declaration table and reports AL0185 /
+AL0247 / "does not exist" instead. So the marker means an object this cycle did not touch lost the
+ability to name an object this cycle stripped, and the surrounding diagnostic is the delta's own
+invention. `BcCompiler.Rad.cs`'s `PackagedSurfaceWentUnresolvable` checks for it at all three
+diagnostic exits, after the widened retry has had its chance, and returns the whole module with a
+`RadCycleNotes` reason. The reason matters more than usual here: the unresolvable reference is in a
+file the developer did not edit and cannot infer from the edit.
+
+**What was measured and rejected.** Two other repairs:
+
+| attempt | result |
+|---|---|
+| Inject a namespace entry into the packaged module definition, to flip BC onto the resolving branch | No effect — the `AL0133` is unchanged |
+| Stop stripping the changed objects from the packaged definition (BC's change model already shadows them for by-id lookups) | Repairs the namespace-free case and costs **18 failures across 7 suites** — the strip is load-bearing, exactly as its own comment claims |
+
+So the underlying limitation stands: **a namespace-free app gets no delta for any edit an
+untouched object's serialized surface names by name.** That is a correctness-preserving fallback,
+not a fix, and it is tracked as [#1944]. Two directions are untried there: compiling the changed
+objects to a symbol reference first and registering it as a reference module — which is what BC's
+own RAD flow's `radCompiledObjectsReferenceManager` is — or replacing rather than removing the
+changed objects in the packaged definition.
+
+[#1944]: https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1944
 
 #### Six by-name property shapes are clean, and are now pinned
 
@@ -1547,7 +1613,8 @@ different numbers.
 | `RadTableExtensionSelfReferenceTests` | A `tableextension` that reads its OWN fields through `Rec` still deltas — npcore's shape, which the 20-object fixture missed because both of its extension triggers touch a base-table field: adding a field, adding and reading one in the same edit, two extensions on one table seeing each other's new fields, removing a field (which must stop binding), and introducing a self-reference where there was none |
 | `RadRunnableCodeunitBindingTests` | A delta that strips a table also rebinds the codeunits whose `TableNo` names it, so an untouched `CodeunitVar.Run(Rec)` still binds — with no diagnostic to prompt it, which is why that one rule does not wait for one — and dropping `TableNo` for real still reports the AL0126 a cold compile reports |
 | `RadByNameTableExtTargetTests`, `RadByNameEnumExtTargetTests`, `RadByNameInterfaceCodeunitTests`, `RadByNameInterfaceEnumTests`, `RadByNameTableNoRenameTests` | One three-object triple each, asserting the delta reports exactly what a cold compile of the identical tree reports. Cold is `[]`, and each delta invented the diagnostic in the table above until the widened retry landed. The `TableNo` one additionally asserts the bystander is re-emitted, so a repair that merely avoided the diagnostic cannot pass |
-| `RadByNameSubtypeTests` | The same triple over a method parameter's `Record "T"` — a plain by-name pointer re-resolves against the supplied syntax, which is what disproved the wider damage thesis, and it must never widen |
+| `RadByNameSubtypeTests` | The same triple over a method parameter's `Record "T"` — a plain by-name pointer re-resolves against the supplied syntax, which is what disproved the wider damage thesis, and it must never widen. Plus the pair that bounds that result: strip the fixture's namespace declarations and the identical edit takes the whole module instead |
+| `RadByNameSelfSubtypeTests` | Why the by-name family only ever measured the resolving path: one fixture run with and without its `namespace …;` lines gives opposite verdicts, and the npcore shape it reproduces — a hub codeunit passing its own `_This` into an untouched codeunit's parameter — is what `NPR POS Sale` fails on. Also rules out the two other candidate causes (a Codeunit rather than Record subtype; the stripped object binding the damaged parameter itself) by measuring each with a namespace present |
 | `RadByNamePropertyShapesTests` | Six by-name property shapes survive the strip and are pinned as trip-wires (`SourceTable`, `CalcFormula`, `RunObject`, `LookupPageId`/`DrillDownPageId`, enum-value `Implementation`, `RoleCenter`); three do not (`pageextension` control, `reportextension` column, query `RelatedTable`) and are repaired by the widened retry. Every scenario asserts the exact modified/emitted lists. For the six that is exactly right and structurally safe — a clean shape raises no diagnostic, so no widening can reach it. For the three repaired ones those lists now INCLUDE the bystander, because a bystander rebound from source IS a delta participant; the original "no bystander" expectation encoded the premise that those shapes were clean, which measurement disproved |
 | `RadMemberSurfaceTests` | The member-level rule itself: an addition under a name new to the object rebinds nobody; an addition under a name already on it does; a removal and a fingerprint change both do; reordering procedures does not; adding a top-level global does not — asserted through the serialized surface, so the test proves the whole-object fingerprint *would* have moved and the delta still stayed at one object; and a widened caller re-emitted by the rule does not go on to widen *its* callers |
 | `RadSameAppOverloadTests`, `RadSameAppOverloadWatchTests` | The hazard the "additions are safe" rule must stop at: adding `Which(Integer)` beside `Which(Decimal)` leaves the existing member's id unmoved but moves which id the caller bakes, and the old `case` label survives — so an un-rebound caller answers with the previous overload and nothing throws. Asserted as the concrete runtime answer over a real `--watch` session, with the id contract under it pinned two ways: BC's `RequiresRuntimeOverloadDisambiguation` reads only the method it is asked about (Cecil over the linked assembly), and two full compiles show every other id unmoved |
