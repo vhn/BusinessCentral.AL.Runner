@@ -276,7 +276,7 @@ classifies the cycle:
 | An object of any kind was edited, added or removed | Re-emit exactly those objects with `Compilation.CreateForRad` and compile a C# overlay; a removal-only cycle produces no C# at all |
 | A modified **codeunit's** or **id-less object's** serialized surface moved, or an object was removed | Also re-emit the objects that directly reference it — one hop, not the transitive closure |
 | A table this cycle strips is named by an untouched codeunit's `TableNo` | Also re-emit that codeunit, under the table's new *and* previous name — see below |
-| A changed object declares a file resource the compiler must read (`AL0327`) | Normal full compile — see below |
+| A changed object declares a file resource the compiler must read | Delta — it is given the same `IFileSystem` as the full compile, so it resolves the path itself, or raises `AL0327` naming a genuinely absent file — see below |
 | An `entitlement` changed | Delta of it **plus the app's permission sets** — see below |
 | A changed file declares a key an untouched file still owns (a duplicate id or name) | Normal full compile, so the compiler reports the duplicate |
 | A changed file declares no AL object at all (a new empty file, a comment-only file) | Record the new hash and stop — no compiler runs |
@@ -812,10 +812,14 @@ what it offers is. Pinned in both directions by
 > reproduces the cascade exactly. Measured with the strip removed and the file system withheld
 > from the RAD compilation alone — both tests above fail, the body edit pulling in
 > `RAD Perf Unrelated A`. The CLI cannot hit that (`appGroup.SuiteDir` is always a real
-> directory), but `BcCompiler.EmitIncremental` is public and defaults it to `null`.
+> directory), but `BcCompiler.EmitIncremental` is public and defaults it to `null`, and
+> **`ReferenceSignature` does not carry the app root**, so a baseline committed with one and a
+> delta run without it would not invalidate — it would silently widen. Provenance is not part of
+> any binding contract, so dropping it is the cheaper side of that trade either way.
 >
 > Removing it is therefore a live option for whoever rewrites this fingerprint per-member
-> (W2) — with the evidence above, not as a guess.
+> (W2) — with the evidence above, not as a guess — but it should come with the app root in the
+> reference signature, not on its own.
 
 **2. Null versus empty.** The second instance cost a real app its watch loop. On NP Retail a
 body-only edit to `NPR Adyen Management` diverged on this, in a 36 KB serialized surface:

@@ -797,16 +797,20 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             edited.Commit(baseline.Workspace, assembly);
             baseline.AssertSettled(tempRoot);
 
-            // Negative: the same delta must still FAIL when the target genuinely is not there.
-            // Deleting the target table leaves the extension bound to nothing, and the answer
-            // has to be that diagnostic — not a clean cycle, and not the packaged definition
-            // quietly serving the old table.
+            // Negative: the same delta must still FAIL when the target genuinely is not there,
+            // and fail with THIS diagnostic. Deleting the target table leaves the extension
+            // bound to nothing, so the answer has to be the very AL0247 the positive half just
+            // proved absent — not a clean cycle, not the packaged definition quietly serving the
+            // old table, and not some other error that merely happens to name the table.
             File.Delete(RadFixture.SourceFile(tempRoot, "RadPerfHeader.Table.al"));
             var orphaned = baseline.Cycle(tempRoot, appRootDir: tempRoot);
-            Assert.NotEmpty(orphaned.Emit.Diagnostics);
+            var reported = string.Join(Environment.NewLine, orphaned.Emit.Diagnostics);
+            Assert.Contains("AL0247", reported);
             Assert.Contains(
-                "RAD Perf Header",
-                string.Join(Environment.NewLine, orphaned.Emit.Diagnostics));
+                "The target Table 'RAD Perf Header' for the extension object is not found",
+                reported);
+            Assert.False(orphaned.FullRebuild);
+            Assert.Empty(orphaned.Emit.Sources);
         }
         finally
         {

@@ -828,12 +828,16 @@ public sealed partial class BcCompiler
             .Where(d => d.Severity == NavDiag.DiagnosticSeverity.Error)
             .ToList();
 
-        // AL0327 "Missing file" — raised for a ControlAddIn resource path
-        // (Scripts/StartupScript/StyleSheets/Images) and for a report layout — used to be
-        // handed to a full compile from here, because the delta had no IFileSystem and so could
-        // not tell a resource that is present from one that is missing. It has one now, under
-        // the same guard the full compile uses, so it reports AL0327 itself: present resolves,
-        // absent is named. Pinned in both directions by
+        // AL0327 "Missing file" — every declaration BC resolves through the file system, which
+        // on 28.1 is a ControlAddIn resource path (Scripts/StartupScript/StyleSheets/Images) and
+        // an `analysisviews` DefinitionFile — used to be handed to a full compile from here,
+        // because the delta had no IFileSystem and so could not tell a resource that is present
+        // from one that is missing. It has one now, from the same AppFileSystem(appRootDir) the
+        // full compile uses and under the same guard, so it reports AL0327 itself: present
+        // resolves, absent is named. That symmetry is what makes the fallback pointless rather
+        // than merely unnecessary — with no app root NEITHER path has a file system, so the full
+        // compile it used to buy reached the identical diagnostic a whole module later. The list
+        // above is not load-bearing; the guard is. Pinned in both directions by
         // RadObjectDeltaTests.AControlAddInResourcePath_IsAnsweredByTheDelta_NotSilencedAndNotFailed.
         foreach (var d in declarationErrors)
             diags.Add($"{d.Location}: error {d.Id}: {d.GetMessage().Split('\n', 2)[0]}");

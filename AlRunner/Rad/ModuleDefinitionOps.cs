@@ -201,7 +201,7 @@ public static class ModuleDefinitionOps
     }
 
     /// <summary>Properties that say where a symbol was read from, not what it offers.</summary>
-    private static readonly string[] _provenanceProperties = System.Array.Empty<string>();
+    private static readonly string[] _provenanceProperties = ["ReferenceSourceFileName"];
 
     /// <summary>
     /// Reduce one serialized symbol to the form both producers agree on: no provenance, and no
