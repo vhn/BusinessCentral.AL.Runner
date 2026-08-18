@@ -108,9 +108,13 @@ Stays resident with dependencies + BC patches loaded once, and re-runs the bundl
 
 With a cold output cache, the first cycle performs a normal full compile and records a
 baseline. A cache HIT serves cycle 1 from the cached DLL *and* hydrates the baseline
-persisted beside it, so the first edit is a delta too — only an entry written before that
-baseline existed makes the first edit pay one full-bundle compile to establish every app's
-baseline. Later cycles hash the complete `.al` source tree and
+persisted beside it, so the first edit is a delta too — with two exceptions: an entry
+written before that baseline existed makes the first edit pay one full-bundle compile to
+establish every app's baseline, and an app that *another app in the bundle depends on*
+still pays a whole-module compile on the first edit after a one-shot run, because the
+one-shot published its symbols in a pre-pass whose reference set the watch path cannot
+reproduce (see [`docs/delta-compile.md`](docs/delta-compile.md)). Later cycles hash the
+complete `.al` source tree and
 recompile only the AL objects that actually changed — of any kind, including id-less ones
 such as a `controladdin`, and ones the save added or deleted — via BC's
 `Compilation.CreateForRad` plus a small C# overlay loaded beside the warm module. A save
