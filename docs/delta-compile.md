@@ -496,12 +496,14 @@ A successful warm cycle reports the changed-object delta and overlay explicitly:
 [watch] NP Retail Tests: unchanged — reusing the loaded module
 ```
 
-One edit costs one object, for every object kind and every file operation — with three named
+One edit costs one object, for every object kind and every file operation — with four named
 exceptions, all detailed under [scope and edge cases](#scope-and-edge-cases): a change to a
-**codeunit's or id-less object's** serialized surface also rebinds its direct users (one hop,
-not the transitive closure); a delta that strips a **table** also rebinds every codeunit whose
-`TableNo` names it; and an **entitlement** edit also binds the app's permission sets, because
-BC will not let one resolve a permission set from the packaged baseline.
+**codeunit's or id-less object's** callable surface also rebinds its direct users (one hop, not
+the transitive closure, and decided **member by member** — adding a procedure under a new name
+rebinds nobody); a delta that strips a **table** also rebinds every codeunit whose `TableNo`
+names it; an **entitlement** edit also binds the app's permission sets, because BC will not let
+one resolve a permission set from the packaged baseline; and a surface move in one app rebinds
+the **sibling apps** that call it, because their generated calls bake its member ids.
 
 | Edit | Delta | AL emit | Overlay | Cycle |
 |---|---|---:|---:|---:|
@@ -776,10 +778,65 @@ at all**.
 > does **not** catch this — it needs nothing from the packaged definition and stays green
 > either way; the probe has to be an extension object whose target is untouched.
 
+### The rebind is decided member by member, not by the whole object
+
+`CompareObjectSurface` decides whether a modified codeunit's or id-less object's surface moved,
+and therefore whether its direct users are rebound.
+
+For a **codeunit** it splits the canonicalised element in two: the **shell** — everything that
+is not `Methods` or `Variables` — compared wholesale, and `Methods` compared as a dictionary
+keyed on `(upper-cased Name, Id)`, each member fingerprinted as its own whole canonicalised
+element. It rebinds on a member **removed**, a member whose fingerprint **changed**, or a member
+**added under a name already on the object** (case-insensitive). It skips only additions under
+names new to the object. Every other kind keeps the whole-object compare, so an **interface
+stays all-or-nothing** — adding a method to one is breaking for every implementor.
+
+Three things about that rule are not arbitrary:
+
+**The shell is defined by subtraction, not by an allowlist.** `CodeunitDefinition` carries
+exactly `{Id, ImplementedInterfaces, Methods, Name, Properties, ReferenceSourceFileName,
+Variables}`, so removing two arrays yields the rest — and cannot go stale if Microsoft adds a
+property. A per-property list has already been incomplete twice in this file's history.
+
+**Top-level `Variables` is excluded, and that is a claim about AL, not about serialization.** AL
+cannot read another object's globals, so adding one cannot break a caller — yet under the
+whole-object compare it rebound every one of them. `MethodDefinition` also declares a
+`Variables` property, so the obvious worry is that member fingerprints then depend on method
+bodies; measured, neither producer populates it, so they do not.
+
+**"An addition is safe" stops at an existing name.** Adding `Which(Integer)` beside
+`Which(Decimal)` does not move the existing member's id — but it moves which id the *caller*
+bakes, while the old `case` label survives in the callee. The naive rule was implemented and
+measured: the cycle reported success, no diagnostic, no exception, and the test answered
+`BOUND-TO=DECIMAL` — a green watch cycle executing the overload the developer had just stopped
+calling.
+
+A consequence worth naming: because members are compared as a keyed set, **reordering
+procedures no longer rebinds anyone**.
+
+#### Failing closed, in two different ways
+
+The two failure modes are not the same and are not treated the same.
+
+If the object **cannot be located unambiguously** — absent, or serialized twice — the answer is
+"moved", for every kind, before the codeunit split. Falling back to the whole-object compare is
+*not* safe here: it answers with the *first* match, so a stale duplicate listed ahead of the
+re-emitted one compares equal to the baseline and reads "unchanged", leaving callers bound to
+the pre-edit shape.
+
+If the object is unique but its **member list cannot be keyed** — a member with no name, no
+integer id, or a duplicate `(Name, Id)` — it falls back to the whole-object compare, which *is*
+sound: the same single pair of elements, compared over strictly more than the member diff looks
+at. Answering "moved" unconditionally here was considered and rejected; on a hub codeunit it
+would rebind the entire caller set every cycle forever, which is the cascade this rule exists to
+remove.
+
+Either way the reason is returned and printed. Neither throws — unlike an unsupported AL
+surface, a correct answer exists.
+
 ### The fingerprint compares two different producers, so it canonicalises
 
-`ObjectSurfaceFingerprint` decides whether a modified codeunit's or id-less object's surface
-moved, and therefore whether its direct users are rebound. The two sides of that comparison are
+The comparison above is between two module definitions, and the two sides are
 built by **different code paths**. The committed baseline comes from
 `SerializableSymbolModelConverter.ConvertModuleToSerializableSymbolModel(Compilation)` and
 stays an object graph. The merged one is written by `CompilationUtilities.WriteSymbolReference`
@@ -817,9 +874,10 @@ what it offers is. Pinned in both directions by
 > delta run without it would not invalidate — it would silently widen. Provenance is not part of
 > any binding contract, so dropping it is the cheaper side of that trade either way.
 >
-> Removing it is therefore a live option for whoever rewrites this fingerprint per-member
-> (W2) — with the evidence above, not as a guess — but it should come with the app root in the
-> reference signature, not on its own.
+> Removing it is therefore still a live option — with the evidence above, not as a guess — but
+> it should come with the app root in the reference signature, not on its own. The per-member
+> rewrite above did not need it: provenance is object-level, so it never reaches a member
+> fingerprint.
 
 **2. Null versus empty.** The second instance cost a real app its watch loop. On NP Retail a
 body-only edit to `NPR Adyen Management` diverged on this, in a 36 KB serialized surface:
@@ -843,6 +901,33 @@ pinned: `ABodyEdit_StaysOneObject_WhenTheEditedCodeunitCarriesAnArgumentLessAttr
 edit stays one object) and `ChangingAnAttributesArguments_StillCountsAsASurfaceMove`
 (retargeting an `[EventSubscriber]` still rebinds its callers, so ignoring attribute
 *arguments* is not the fix).
+
+#### How far the divergence actually goes — surveyed, not inferred
+
+Both of the above were found by a failure. `RadProducerEquivalenceTests` asks the question
+directly instead, over a probe codeunit declaring fifteen methods across the shapes a member
+diff has to align on — no parameters, a `var` parameter, `Record` and `Codeunit` subtypes,
+generic returns, `[TryFunction]`, `[NonDebuggable]`, `[IntegrationEvent]`, `[EventSubscriber]`,
+`internal`, `local`, and an overloaded pair.
+
+The answer is narrower than the two incidents suggest. **One field differs, on two members** —
+`Attributes[0].Arguments`, `null` versus `[]`, on `[TryFunction]` and `[NonDebuggable]`, which is
+instance 2 above. Nothing in `Properties`, `ImplementedInterfaces`, `Variables`, the object's
+name or id differs; the same thirteen members appear in the same order with the same ids, with
+no member present on one side only and no duplicate `(Name, Id)`.
+
+Three consequences, each load-bearing for the member-level rule:
+
+- **It bites on exactly one path.** A *second* delta is byte-identical because both sides have
+  been round-tripped, and a `--watch` that starts from a cache HIT hydrates through
+  `RadBaselineSidecar`, which normalises both members identically. Only a cold-start `--watch`
+  that performs its own full compile in-session sees it — the path least likely to be exercised
+  while developing against it, and the one that broke NP Retail.
+- **Members must be keyed on `(Name, Id)`, never on name**, because overloads are distinguished
+  *only* by id: `Pick(Decimal)`=998637081, `Pick(Integer)`=998637083.
+- **`local` methods are absent from both producers**, attribute or not. So a `local`→`local` edit
+  is undiffable, and a `public`→`local` change reads as a member removal — which is the correct
+  answer, arrived at for an incidental reason.
 
 ### A delta damages surface a bystander holds only because the stripped object exists
 
@@ -1388,11 +1473,16 @@ different numbers.
 | `RadByNameTableExtTargetTests`, `RadByNameEnumExtTargetTests`, `RadByNameInterfaceCodeunitTests`, `RadByNameInterfaceEnumTests`, `RadByNameTableNoRenameTests` | One three-object triple each, asserting the delta reports exactly what a cold compile of the identical tree reports. Cold is `[]`, and each delta invented the diagnostic in the table above until the widened retry landed. The `TableNo` one additionally asserts the bystander is re-emitted, so a repair that merely avoided the diagnostic cannot pass |
 | `RadByNameSubtypeTests` | The same triple over a method parameter's `Record "T"` — a plain by-name pointer re-resolves against the supplied syntax, which is what disproved the wider damage thesis, and it must never widen |
 | `RadByNamePropertyShapesTests` | Six by-name property shapes survive the strip and are pinned as trip-wires (`SourceTable`, `CalcFormula`, `RunObject`, `LookupPageId`/`DrillDownPageId`, enum-value `Implementation`, `RoleCenter`); three do not (`pageextension` control, `reportextension` column, query `RelatedTable`) and are repaired by the widened retry. Every scenario asserts the exact modified/emitted lists. For the six that is exactly right and structurally safe — a clean shape raises no diagnostic, so no widening can reach it. For the three repaired ones those lists now INCLUDE the bystander, because a bystander rebound from source IS a delta participant; the original "no bystander" expectation encoded the premise that those shapes were clean, which measurement disproved |
+| `RadMemberSurfaceTests` | The member-level rule itself: an addition under a name new to the object rebinds nobody; an addition under a name already on it does; a removal and a fingerprint change both do; reordering procedures does not; adding a top-level global does not — asserted through the serialized surface, so the test proves the whole-object fingerprint *would* have moved and the delta still stayed at one object; and a widened caller re-emitted by the rule does not go on to widen *its* callers |
+| `RadSameAppOverloadTests`, `RadSameAppOverloadWatchTests` | The hazard the "additions are safe" rule must stop at: adding `Which(Integer)` beside `Which(Decimal)` leaves the existing member's id unmoved but moves which id the caller bakes, and the old `case` label survives — so an un-rebound caller answers with the previous overload and nothing throws. Asserted as the concrete runtime answer over a real `--watch` session, with the id contract under it pinned two ways: BC's `RequiresRuntimeOverloadDisambiguation` reads only the method it is asked about (Cecil over the linked assembly), and two full compiles show every other id unmoved |
+| `RadProducerEquivalenceTests` | That the two module-definition producers describe one surface member-for-member, over fifteen method shapes — and where they do not, exactly which field and both values. Includes the first delta after a full baseline, which is the only path the divergence appears on |
+| `RadCrossAppRebindGuardTests` | The four claims the cross-app broadcast rests on, each falsifiable: two dependents of one producer both rebind (a drained signal would starve the second); a producer whose C# is rejected publishes nothing *and* leaves its consumers' watermarks alone, so the next cycle still rebinds; a removal during a full rebuild still reaches its consumers; and a consumer that compiles before its producer picks the signal up next cycle instead of losing it |
+| `RadCrossAppBundleScopeTests` | Two workspaces sharing an identity under different bundle roots do not see each other's publishes — in all three shapes (per-key move, full rebuild, watermark), and in both directions |
 | `RadWorkspaceFileOfTests` | `FileOf` names the declaring file for every object the fixture declares, measured against an oracle read off the tree; returns null for a key the app never declared; and follows an object that moves to a different file across a commit |
 | `RadBulkSwitchDeltaTests` | A whole-version switch (8 modified + 2 added + 2 deleted, in one cycle) re-emits exactly those twelve and no more, in both directions, leaving the workspace settled |
 | `RadDeltaWatchTests` | Multi-app watch behaviour end to end: a warm reload still resolves a precompiled dependency's `tableextension` fields; a cross-app member-id move rebinds its caller in both its loud form (a retyped parameter, so the old id is gone) and its silent one (an added overload, so the old id survives and the caller would otherwise get the previous overload's answer); and the precision controls — a body-only edit leaves the caller `unchanged`, while a real surface move names its count and its producer and is asserted **not** to come from a full-rebuild broadcast |
 | `WatchTests` | Cycle 1 of a watch is served from the AL-output cache, and the first edit really runs (never a second HIT): delta'd when the entry carries a baseline — after a one-shot run, and after an earlier watch — and building one when it does not |
-| `RadBaselineSidecarTests` | A persisted baseline restores the compiler's symbol picture **byte-identically**, and a workspace hydrated from it deltas the first edit, rebinds the direct caller of a moved surface, classifies a deletion as a removal, and still rebuilds for a deleted `dotnet` package — plus the five ways hydration must fail closed (tree moved, file edited in place, symbols missing, unknown schema, app identity changed) |
+| `RadBaselineSidecarTests` | A persisted baseline restores the compiler's symbol picture **byte-identically**, and a workspace hydrated from it deltas the first edit, rebinds the direct caller of a moved surface, classifies a deletion as a removal, and still rebuilds for a deleted `dotnet` package — plus the ways hydration must fail closed (tree moved, file edited in place, symbols missing, unknown schema, app identity changed) — and, for schema 2, that a **genuine schema-1 envelope** (built by deleting the member, not by renumbering) is refused with a parked reason rather than silently read as having no cross-app edges, and that a schema-2 envelope round-trips those edges well enough for a hydrated workspace to rebind a sibling caller |
 | `WatchSourceTests` | The watch loop's own contract, deterministically: an edit made from inside `onArmed` is always seen (#1822's race); watchers arm exactly once; a burst below the quiet window releases only after it settles; a single save releases within one quiet window; and a watcher-buffer overflow is handled loudly rather than swallowed |
 | `WatchBurstSwitchTests` | The same quiescence claim against the real `--watch` process: a seven-file version switch produces exactly ONE cycle, against the settled tree, with the correct result — not a phantom failure mid-checkout followed by a second cycle |
 | `WatchStateResidencyTests` | One test re-run across three `--watch` cycles sees no state from any earlier one: no manual event binding (from a test-codeunit global *or* a `SingleInstance` one), no `SingleInstance` field value, no committed row. The AL fixture also proves it can observe each kind of state while it IS live, so a gutted runtime cannot pass by making it all unobservable |
