@@ -944,6 +944,14 @@ public sealed partial class BcCompiler
         // full semantic model. Their own unchanged surface does not pull in transitive
         // callers. Object removal likewise rebinds direct users so a dangling reference
         // becomes an AL diagnostic instead of silently executing an old loaded type.
+        //
+        // MEMBER-LEVEL for a codeunit, all-or-nothing for the rest — the whole rule, with the
+        // measurements behind it, is on ModuleDefinitionOps.CompareObjectSurface. The short
+        // version: a member no caller could have bound to cannot invalidate one, so a procedure
+        // added under a name new to the object is free, while a procedure added under a name
+        // the object already had is an OVERLOAD and rebinds — silently wrong otherwise, because
+        // the old id survives in the re-emitted callee and the un-rebound caller keeps
+        // dispatching it.
         var changedSurfaces = modified
             // Codeunits because generated calls bake Microsoft's member id; id-less objects
             // because they are binding contracts (an interface's method set, a control
@@ -953,16 +961,26 @@ public sealed partial class BcCompiler
             .Where(item =>
             {
                 var previous = ws.Object(item.Key);
-                var before = AlRunner.Rad.ModuleDefinitionOps.ObjectSurfaceFingerprint(
-                    WorkspaceBaseline(ws), item.Key);
-                var after = AlRunner.Rad.ModuleDefinitionOps.ObjectSurfaceFingerprint(
-                    mergedBaseline, item.Key);
-                return previous == null
+                // Identity first, and not part of the surface compare: an object whose name or
+                // namespace moved is a different thing to every caller that named it, whatever
+                // its members say.
+                if (previous == null
                     || !string.Equals(previous.Name, item.Name, StringComparison.Ordinal)
-                    || !string.Equals(previous.Namespace, item.Namespace, StringComparison.Ordinal)
-                    || before == null
-                    || after == null
-                    || !string.Equals(before, after, StringComparison.Ordinal);
+                    || !string.Equals(previous.Namespace, item.Namespace, StringComparison.Ordinal))
+                    return true;
+
+                var comparison = AlRunner.Rad.ModuleDefinitionOps.CompareObjectSurface(
+                    WorkspaceBaseline(ws), mergedBaseline, item.Key);
+                // A fallback nobody can see is the silent default .claude/rules/loud-failures.md
+                // forbids: the answer is still the conservative one, but the cycle says which
+                // object stopped being diffable, why, and what was done instead — the reason
+                // carries that last part, because the two fail-closed classes do different
+                // things (see CompareObjectSurface).
+                if (comparison.FailedClosedBecause is { } because)
+                    Console.Error.WriteLine(
+                        $"  [watch] {moduleName}: cannot diff {item.Key.Kind} '{item.Name}' " +
+                        $"member by member — {because}");
+                return comparison.Moved;
             })
             .Select(item => item.Key)
             .Concat(removed.Select(item => item.Key))
