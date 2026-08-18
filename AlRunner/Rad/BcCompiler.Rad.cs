@@ -976,6 +976,15 @@ public sealed partial class BcCompiler
                 // object stopped being diffable, why, and what was done instead — the reason
                 // carries that last part, because the two fail-closed classes do different
                 // things (see CompareObjectSurface).
+                //
+                // stderr only, like the same-app rebind line below it and unlike the cross-app
+                // one, which is also pushed to RadCycleNotes. That split is deliberate and is
+                // the cross-app note's own argument: it is recorded because its cause is in
+                // ANOTHER app, so the dashboard shows nothing to infer it from. This cause is in
+                // the app the developer just edited, and its consequence — that app's callers
+                // recompiling — is on screen. If this line ever starts appearing in practice it
+                // wants a dashboard channel of its own; today it marks a condition the RAD
+                // suites assert cannot arise.
                 if (comparison.FailedClosedBecause is { } because)
                     Console.Error.WriteLine(
                         $"  [watch] {moduleName}: cannot diff {item.Key.Kind} '{item.Name}' " +

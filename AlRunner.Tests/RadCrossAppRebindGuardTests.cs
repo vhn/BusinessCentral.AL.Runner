@@ -206,7 +206,15 @@ public sealed class RadCrossAppRebindGuardTests(BcEngineFixture engine)
             Assert.Empty(RadWorkspaceStore.PendingCrossAppRebinds(consumer));
             Assert.Equal(1, producer.Workspace.PublishGeneration);
 
-            // Move the callee's surface (a new member) AND make its generated C# unacceptable.
+            // Move the callee's surface AND make its generated C# unacceptable.
+            //
+            // The added member is an OVERLOAD of `Value`, not a procedure under a fresh name, and
+            // that is load-bearing setup rather than taste. `changedSurfaces` compares member by
+            // member (ModuleDefinitionOps.CompareObjectSurface): a member added under a name new
+            // to the object moves nothing a caller baked and correctly publishes NOTHING, which
+            // would leave this test asserting a lifecycle over an empty signal. An overload does
+            // move what the caller binds to. Line 239 is the guard on exactly that — it failed
+            // when this was `Extra()`.
             File.WriteAllText(
                 RadFixture.SourceFile(tempRoot, "RadPerfUnrelatedD.Codeunit.al"),
                 """
@@ -222,9 +230,9 @@ public sealed class RadCrossAppRebindGuardTests(BcEngineFixture engine)
                         exit(105);
                     end;
 
-                    procedure Extra(): Integer
+                    procedure Value(Seed: Integer): Integer
                     begin
-                        exit(1);
+                        exit(Seed);
                     end;
                 }
                 """);
@@ -251,7 +259,8 @@ public sealed class RadCrossAppRebindGuardTests(BcEngineFixture engine)
             RadWorkspaceStore.RecordConsumedGenerations(consumer);
             Assert.Equal(1, consumer.WatermarkFor(producer.Workspace.Identity));
 
-            // Repair the generated C# while KEEPING the surface move, and let it load.
+            // Repair the generated C# while KEEPING the surface move — the overload stays, for
+            // the reason given above.
             File.WriteAllText(
                 RadFixture.SourceFile(tempRoot, "RadPerfUnrelatedD.Codeunit.al"),
                 """
@@ -264,9 +273,9 @@ public sealed class RadCrossAppRebindGuardTests(BcEngineFixture engine)
                         exit(105);
                     end;
 
-                    procedure Extra(): Integer
+                    procedure Value(Seed: Integer): Integer
                     begin
-                        exit(1);
+                        exit(Seed);
                     end;
                 }
                 """);
