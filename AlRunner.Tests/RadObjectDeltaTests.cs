@@ -211,14 +211,35 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     }
 
     /// <summary>
-    /// Adding a procedure moves the callable surface too — generated calls bake
-    /// Microsoft's member ids, so the direct caller has to rebind. What must NOT happen is
-    /// the transitive caller (RAD Perf Unrelated A → Caller → Service) coming along:
-    /// that is the difference between a one-hop rebind and a whole-module rebuild on a
-    /// deep dependency graph.
+    /// Adding a procedure under a name the object did not already have rebinds NOBODY: the
+    /// object itself is re-emitted and its callers are not.
+    ///
+    /// <para><b>This assertion was reversed deliberately.</b> It used to expect
+    /// `["RAD Perf Caller", "RAD Perf Service"]`, on the reasoning that "generated calls bake
+    /// Microsoft's member ids, so an addition moves the callable surface". That reasoning was
+    /// too coarse, and this test was the measurement that recorded it. What it actually
+    /// recorded was the whole-object surface fingerprint's resolution limit — a serialized
+    /// codeunit that gained a method compares unequal, so every addition looked like a moved
+    /// surface — not a property of the ids.</para>
+    ///
+    /// <para>What the member-level diff established instead, measured on the compiler rather
+    /// than assumed (RadSameAppOverloadTests.AddingAnOverload_MovesNoOtherMemberId and
+    /// .RequiresRuntimeOverloadDisambiguation_ReadsOnlyTheMethodItIsAskedAbout): adding a
+    /// member moves no OTHER member's id, and `Added` is a name no call site ever mentioned, so
+    /// no baked id anywhere in the module changes. `RAD Perf Caller` was being recompiled to
+    /// arrive at byte-identical dispatch. On NP Retail the same edit on `NPR POS Session` cost
+    /// 313 objects and 22–54 s.</para>
+    ///
+    /// <para>The line this does NOT cross is the addition that joins an EXISTING name. That is
+    /// an overload, it moves what the caller binds to while leaving every id intact, and it
+    /// fails silently if skipped — RadSameAppOverloadTests.AddingAnOverload_RebindsTheSameAppCaller
+    /// and RadSameAppOverloadWatchTests hold that half, and
+    /// EditingACallableSurface_ReloadsTheChangedObjects_ButNotTheirTransitiveCaller
+    /// immediately above still pins that a retyped parameter rebinds the caller and stops
+    /// there.</para>
     /// </summary>
     [SkippableFact]
-    public void AddingAProcedure_RebindsDirectCallersOnly()
+    public void AddingAProcedureUnderANewName_RebindsNoCallerAtAll()
     {
         RunOverlayScenario(
             "procedure addition",
@@ -233,8 +254,8 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
 
                     procedure Coerce
                 """),
-            ["RAD Perf Caller", "RAD Perf Service"],
-            ["Codeunit71000", "Codeunit71001"]);
+            ["RAD Perf Service"],
+            ["Codeunit71000"]);
     }
 
     /// <summary>

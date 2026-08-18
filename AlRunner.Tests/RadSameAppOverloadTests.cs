@@ -46,13 +46,12 @@ public sealed class RadSameAppOverloadTests(BcEngineFixture engine)
     /// re-emitted, because the id it bakes has moved even though the callee's own members
     /// have not.
     ///
-    /// <para><b>Expected GREEN today.</b> The current gate is a whole-object surface
-    /// fingerprint (<c>ModuleDefinitionOps.ObjectSurfaceFingerprint</c>), and a serialized
-    /// codeunit that gained a method compares unequal for that reason alone — the same reason
-    /// a body-only edit compares equal and a body-only edit therefore does not rebind. So this
-    /// is a trip-wire, not a bug report: it fails the moment a member-level rule replaces that
-    /// fingerprint and treats "a member was added" as safe without asking whether the name was
-    /// already on the object.</para>
+    /// <para><b>The trip-wire on the member-level rule.</b> Under the whole-object fingerprint
+    /// this passed for a reason that had nothing to do with overloads — a serialized codeunit
+    /// that gained a method compared unequal, so EVERY addition rebound. It now passes for the
+    /// right reason: <c>ModuleDefinitionOps.CompareObjectSurface</c> sees a member added under
+    /// a name the object already had. It fails the moment that clause is dropped and "a member
+    /// was added" is treated as safe without asking whether the name was already there.</para>
     ///
     /// <para>Asserted as an exact set, so the opposite failure — a rule that rebinds
     /// everything and calls the hazard covered — is caught by
@@ -89,12 +88,13 @@ public sealed class RadSameAppOverloadTests(BcEngineFixture engine)
     /// id moved. The caller's baked ids are all still correct, so re-emitting it is pure cost.
     /// On NP Retail's `NPR POS Session` that cost is 313 objects for one added procedure.</para>
     ///
-    /// <para><b>Expected RED today, by construction.</b> The whole-object fingerprint cannot
-    /// tell this addition from the overload above — both change the serialized codeunit — so
-    /// today both rebind. That is the same measurement
-    /// RadObjectDeltaTests.AddingAProcedure_RebindsDirectCallersOnly records from the other
-    /// side, and the two are deliberately in conflict: whichever change makes this test green
-    /// must flip that one, and this comment is the record of why.</para>
+    /// <para><b>This was the member-level diff's acceptance test, and it was RED by
+    /// construction until that diff landed.</b> The whole-object fingerprint could not tell
+    /// this addition from the overload above — both change the serialized codeunit — so both
+    /// rebound. RadObjectDeltaTests recorded the same measurement from the other side and was
+    /// flipped by the same change, to
+    /// <c>AddingAProcedureUnderANewName_RebindsNoCallerAtAll</c>; its doc comment carries the
+    /// justification.</para>
     /// </summary>
     [SkippableFact]
     public void AddingAProcedureUnderANameNewToTheObject_DoesNotRebindTheCaller()
@@ -126,11 +126,12 @@ public sealed class RadSameAppOverloadTests(BcEngineFixture engine)
             Assert.True(
                 emitted.SequenceEqual(["RAD Ovl Lib"], StringComparer.Ordinal),
                 "a procedure added under a name NEW to the object still rebinds its caller — "
-                + $"re-emitted [{string.Join(", ", emitted)}]. Expected to fail until the "
-                + "whole-object surface fingerprint behind `changedSurfaces` (BcCompiler.Rad.cs) "
-                + "is replaced by a member-level diff: this is that change's acceptance test, and "
-                + "RadObjectDeltaTests.AddingAProcedure_RebindsDirectCallersOnly records the same "
-                + "measurement from the other side.");
+                + $"re-emitted [{string.Join(", ", emitted)}]. Nothing the caller baked can have "
+                + "moved: overload resolution never considered this name and no existing member's "
+                + "id changed. Look at the member-level rule behind `changedSurfaces` "
+                + "(ModuleDefinitionOps.CompareObjectSurface) — either its shell compare is "
+                + "picking up something that is not a binding contract, or an addition under a "
+                + "new name is being treated as one.");
         });
     }
 
