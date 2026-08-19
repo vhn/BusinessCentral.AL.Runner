@@ -531,9 +531,21 @@ public static partial class BcRuntime
         _alEnumCache.Clear();
         if (!preserveEmitCaptures)
         {
+            // Every id-keyed registry the AL emitter fills, with no exceptions. Page and
+            // XmlPort used to appear in NEITHER branch — not preserved, not cleared — which
+            // reads as harmless only while a live workspace is doing the bookkeeping:
+            // RadMetadataCapture.Drop removes both by id for an object the delta deleted.
+            // The path that has no workspace to ask is exactly this one. RadWorkspace.
+            // Invalidate clears the object map BEFORE the full compile runs, so the deletion
+            // sweep in RadEmitResult.Commit walks nothing and a deleted page's or xmlport's
+            // metadata XML survives the rebuild that was supposed to be the clean slate —
+            // RunnerFormInit and RunnerXmlMetadataLoader then answer for an object the source
+            // no longer declares.
             AlEnumMetadataRegistry.Clear();
             AlReportMetadataRegistry.Clear();
             AlReportLayoutRegistry.Clear();
+            AlPageMetadataRegistry.Clear();
+            AlXmlPortMetadataRegistry.Clear();
         }
         NavReportSync.ResetMetadataCache();
         // Sibling patch classes with their own bundle-derived state.
