@@ -85,6 +85,22 @@ public static class AlCallStackCapture
         return _captured;
     }
 
+    /// <summary>
+    /// The AL stack captured for <paramref name="exception"/> itself, or null — the strict
+    /// counterpart of <see cref="GetCaptured(Exception?)"/>, with no most-recent-capture
+    /// fallback.
+    ///
+    /// <para>The fallback is right for a failing test: the exception the runner reports may
+    /// have been wrapped or re-created on the way out, and the last capture is then still that
+    /// test's own stack. It is wrong for anything raised OUTSIDE a test — an install trigger,
+    /// company initialisation, a bundle-level hook. Those run when <c>_captured</c> still holds
+    /// whatever failed last, which in a <c>--watch</c> process can be a test from a previous
+    /// cycle. The caller then prints a confident, complete, entirely unrelated AL stack and
+    /// suppresses the real one. Callers outside a test must use this overload.</para>
+    /// </summary>
+    public static string? GetCapturedFor(Exception? exception)
+        => exception != null && _byException.TryGetValue(exception, out var s) ? s : null;
+
     public static string? CaptureCurrent()
     {
         try

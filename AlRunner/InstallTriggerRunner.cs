@@ -189,7 +189,16 @@ public static class InstallTriggerRunner
             Console.Error.WriteLine(
                 $"[install-trigger] {cu.Type.Name}.{name} ({cu.Type.Assembly.GetName().Name}) threw: " +
                 $"{tex.InnerException.GetType().Name}: {tex.InnerException.Message}");
-            var alStack = AlRunner.Infrastructure.AlCallStackCapture.GetCaptured(tex.InnerException);
+            // GetCapturedFor, not GetCaptured: the latter falls back to the most recent AL
+            // stack captured for ANY exception when this instance has none of its own. An
+            // install trigger runs outside a test, so a non-AL failure inside it (the
+            // NullReferenceException a null event-sender used to raise) had no capture — and
+            // the fallback handed back the stack of whatever test last failed, in a previous
+            // --watch CYCLE. That stack was then printed INSTEAD of the real .NET one, so the
+            // diagnostic named an unrelated test and buried the only frames that pointed at the
+            // actual defect. Print the .NET stack whenever this exception has no AL stack of
+            // its own; print both when it has.
+            var alStack = AlRunner.Infrastructure.AlCallStackCapture.GetCapturedFor(tex.InnerException);
             if (!string.IsNullOrEmpty(alStack))
                 Console.Error.WriteLine($"[install-trigger] AL stack:\n{alStack}");
             else

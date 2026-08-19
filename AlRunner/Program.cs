@@ -2100,6 +2100,19 @@ foreach (var bundle in bundles)
                 {
                     bundleErrors.Add($"<bundled>: EXEC-FAIL: {ex.Message.Split('\n')[0]}");
                 }
+                // Loud, because nothing downstream is: this app group contributed ZERO results,
+                // and whenever a SIBLING group produced any, the bucket still counts as "ran"
+                // and the summary's exec-fail counter stays 0 (Reporter classifies per bucket,
+                // and the bucket did run). An app's whole test set could therefore disappear
+                // from a run without a single line saying so — measured on the npcore witness,
+                // where an install-seed failure deleted all three of NP Retail's tests every
+                // warm --watch cycle and the only visible trace was the total dropping from
+                // 2317 to 2314. Naming the app and the cause here is what makes that a report
+                // instead of a subtraction.
+                Console.Error.WriteLine(
+                    $"{rel}: EXEC-FAIL in app group {asm.GetName().Name} — no tests ran for it: "
+                    + $"{ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+                if (ex.StackTrace is { } execSt) Console.Error.WriteLine(execSt);
                 tests = Array.Empty<TestResult>();
             }
             finally
