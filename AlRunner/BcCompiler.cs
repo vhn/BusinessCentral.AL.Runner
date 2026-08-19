@@ -1466,7 +1466,17 @@ public sealed partial class BcCompiler
 
         bool _timing = Environment.GetEnvironmentVariable("BCCOMPILER_TIMING") == "1";
         var _tw = System.Diagnostics.Stopwatch.StartNew();
-        void _mark(string p) { if (_timing) Console.Error.WriteLine($"[emit-timing] {p}: {_tw.ElapsedMilliseconds}ms"); _tw.Restart(); }
+        // Managed-heap size rides along with every mark: a cold compile of a real app is
+        // memory-bound before it is CPU-bound, so "which phase costs seconds" and "which phase
+        // is holding gigabytes" are two different questions and both need an answer per phase.
+        void _mark(string p)
+        {
+            if (_timing)
+                Console.Error.WriteLine(
+                    $"[emit-timing] {p}: {_tw.ElapsedMilliseconds}ms " +
+                    $"(heap {GC.GetTotalMemory(false) / (1024 * 1024)}MB)");
+            _tw.Restart();
+        }
 
         var trees = new NavSyntax.SyntaxTree[alFiles.Count];
         Parallel.For(0, alFiles.Count, i =>
@@ -1897,6 +1907,21 @@ public sealed partial class BcCompiler
     /// Only meaningful to the RAD delta path, which reads it immediately after the call.
     /// </summary>
     internal NavCA.Compilation? LastCompilation { get; private set; }
+
+    /// <summary>
+    /// Drop the reference to that compilation, once everything that reads it has.
+    ///
+    /// <para>A whole-module compilation of an npcore-scale app is one of the two largest live
+    /// object graphs the runner ever holds — every AL syntax tree plus every symbol bound off
+    /// them. The other is Roslyn's compilation of the C# that same emit produced, and the two
+    /// are consecutive, not concurrent: nothing downstream of the emit reads AL symbols. Left
+    /// reachable through this property, though, the first stays alive for the whole of the
+    /// second, doubling the peak on the phase that already sets it.</para>
+    ///
+    /// <para>Callers release explicitly rather than the field self-clearing on read, because
+    /// its two readers are in different modes and neither can know it is the last one.</para>
+    /// </summary>
+    internal void ReleaseLastCompilation() => LastCompilation = null;
 
     /// <summary>
     /// The reference signature the most recent <see cref="Emit"/> compiled under — everything a

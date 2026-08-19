@@ -1560,6 +1560,12 @@ foreach (var bundle in bundles)
         RadEmitResult? radResult = null;
         // True for every delta, including a zero-source removal.
         bool radOverlay = false;
+        // The delta baseline a one-shot / --server run will persist once its assembly has
+        // loaded, paired with the reference signature it was built under. Built BEFORE the
+        // Roslyn compile and held here as data, so BC's whole bound compilation can be dropped
+        // in between — see the release site below. The signature travels with it rather than
+        // being re-read at the persist site, so the two can never come from different emits.
+        (AlRunner.Rad.RadWorkspaceUpdate State, string Signature)? pendingBaseline = null;
         if (needCompile && cachedBytes != null)
         {
             // Replay the enum-registry sidecar BEFORE Assembly.Load. Test
@@ -1762,6 +1768,28 @@ foreach (var bundle in bundles)
                     Console.Error.WriteLine($"  {d}");
                 bundleErrors.Add($"<bundled>: EMIT-ZERO ({alDiagnostics.Count} AL error(s))");
             }
+
+            // ── Hand off from BC's compilation to Roslyn's ─────────────────────
+            // Everything downstream of here reads generated C#, never AL symbols, so BC's
+            // bound compilation — the 7,060 AL syntax trees plus every symbol bound off
+            // them — is dead weight from this point on. It used to stay reachable through
+            // BcCompiler.LastCompilation for the whole Roslyn compile, which is the single
+            // largest avoidable overlap in the pipeline: two whole-module compilations of
+            // the same app live at once, on a host whose peak footprint is already the
+            // binding constraint.
+            //
+            // A one-shot / --server run is the reason the snapshot is BUILT here rather
+            // than at the persist site: it reads the compilation, and it used to run after
+            // Assembly.Load. Building it now and writing it later keeps the invariant that
+            // made it late — a baseline whose C# was rejected, or which failed to load,
+            // must never become a cache entry — because only the WRITE was ever what that
+            // invariant guarded. --watch already has its baseline by now (FullCompile
+            // builds it as part of the emit), so it only needs the release.
+            if (radWs == null && radBaselinePath != null && radSymbolsPath != null
+                && sources.Count > 0)
+                pendingBaseline = BuildRadBaseline(emitter, allPaths, moduleName);
+            emitter.ReleaseLastCompilation();
+
             if (radNoChange && radWs is { Generations.Count: > 0 })
             {
                 // Nothing in this app's source tree moved. The assembly compiled for it
@@ -1960,7 +1988,8 @@ foreach (var bundle in bundles)
                     // baseline under B's cache key. A later watch would then hydrate a baseline
                     // describing a different app and delta against it.
                     if (cachedBytes == null)
-                        PersistRadBaseline(emitter, allPaths, moduleName, radBaselinePath, radSymbolsPath);
+                        PersistRadBaseline(
+                            pendingBaseline, moduleName, radBaselinePath, radSymbolsPath);
                 }
             }
             catch (Exception ex)
@@ -4965,30 +4994,22 @@ static (BcEmitOutput Output, RadEmitResult? Rad) RunEmit(
 }
 
 /// <summary>
-/// Persist the delta-readiness of a whole-module compile that has just loaded, for a mode with
-/// no RAD workspace of its own — one-shot and <c>--server</c>.
+/// Snapshot the delta-readiness of a whole-module compile for a mode with no RAD workspace of
+/// its own — one-shot and <c>--server</c>. Returns null when there is nothing to persist.
 ///
-/// <para>Both of those write the AL-output cache entry a later <c>--watch</c> will hit, and a HIT
-/// without a baseline beside it makes the developer's first edit a whole-module compile. Since
-/// switching between modes over one tree is the normal way people work — one-shot to see the
-/// suite, then watch to iterate, and back — the baseline has to be produced by whichever mode
-/// compiled, not only by watch.</para>
-///
-/// <para>Called AFTER <c>Assembly.Load</c> on purpose: a baseline whose generated C# was rejected,
-/// or which failed to load, must never become a cache entry. Best-effort throughout — a baseline
-/// that could not be built or written costs a later watch some speed and nothing else, so it
-/// reports and returns rather than failing the run.</para>
+/// <para>Called immediately after the emit, while BC's compilation is still alive and BEFORE the
+/// Roslyn compile, so the compilation can be released across it. The result is plain data —
+/// object keys, file hashes and a <c>ModuleDefinition</c> — and holds nothing back to the
+/// compilation it was read from. See <see cref="PersistRadBaseline"/> for why building and
+/// writing are two steps.</para>
 /// </summary>
-static void PersistRadBaseline(
+static (AlRunner.Rad.RadWorkspaceUpdate State, string Signature)? BuildRadBaseline(
     BcCompiler emitter,
     IReadOnlyList<string> allPaths,
-    string moduleName,
-    string? envelopePath,
-    string? symbolsPath)
+    string moduleName)
 {
-    if (envelopePath == null || symbolsPath == null) return;
-    if (emitter.LastCompilation is not { } compilation) return;
-    if (emitter.LastReferenceSignature is not { } signature) return;
+    if (emitter.LastCompilation is not { } compilation) return null;
+    if (emitter.LastReferenceSignature is not { } signature) return null;
     // One emitter serves every app group in a bundle, so refuse outright if its last emit was
     // some OTHER app's — persisting that under this app's cache key would hand a later watch a
     // baseline describing a different module. The caller is expected to have compiled this app;
@@ -4998,7 +5019,7 @@ static void PersistRadBaseline(
         Console.Error.WriteLine(
             $"  [cache] {moduleName}: no delta baseline persisted — the last compile was " +
             $"'{emitter.LastEmittedModuleName ?? "<none>"}', not this app");
-        return;
+        return null;
     }
 
     var hashes = AlRunner.Rad.RadWorkspace.HashSourceTree(
@@ -5009,10 +5030,37 @@ static void PersistRadBaseline(
         Console.Error.WriteLine(
             $"  [cache] {moduleName}: no delta baseline persisted ({failure}) — a later " +
             "--watch over this tree will build one on its first edit");
-        return;
+        return null;
     }
+    return (state, signature);
+}
+
+/// <summary>
+/// Write the baseline <see cref="BuildRadBaseline"/> snapshotted, for a mode with no RAD
+/// workspace of its own — one-shot and <c>--server</c>.
+///
+/// <para>Both of those write the AL-output cache entry a later <c>--watch</c> will hit, and a HIT
+/// without a baseline beside it makes the developer's first edit a whole-module compile. Since
+/// switching between modes over one tree is the normal way people work — one-shot to see the
+/// suite, then watch to iterate, and back — the baseline has to be produced by whichever mode
+/// compiled, not only by watch.</para>
+///
+/// <para>Called AFTER <c>Assembly.Load</c> on purpose: a baseline whose generated C# was rejected,
+/// or which failed to load, must never become a cache entry. That invariant governs the WRITE,
+/// which is why only the write stayed here when the build moved earlier. Best-effort throughout —
+/// a baseline that could not be built or written costs a later watch some speed and nothing else,
+/// so it reports and returns rather than failing the run.</para>
+/// </summary>
+static void PersistRadBaseline(
+    (AlRunner.Rad.RadWorkspaceUpdate State, string Signature)? baseline,
+    string moduleName,
+    string? envelopePath,
+    string? symbolsPath)
+{
+    if (envelopePath == null || symbolsPath == null) return;
+    if (baseline is not { } b) return;
     AlRunner.Rad.RadBaselineSidecar.TrySave(
-        moduleName, state, signature, envelopePath, symbolsPath);
+        moduleName, b.State, b.Signature, envelopePath, symbolsPath);
 }
 
 /// <summary>App ids that another app in the same bundle declares a dependency on.</summary>
