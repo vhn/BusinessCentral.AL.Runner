@@ -70,27 +70,6 @@ public static class AlObjectResolution
     }
 
     /// <summary>
-    /// Record <paramref name="asm"/> as a DELTA overlay. It declares only existing objects
-    /// whose bodies changed, so everything absent keeps its previous owner and nothing can
-    /// be tombstoned.
-    /// </summary>
-    public static void RegisterOverlay(Assembly asm)
-    {
-        var types = LoadTypes(asm);
-
-        lock (_sync)
-        {
-            foreach (var t in types)
-            {
-                if (!IsAlObjectTypeName(t.Name) || t.Namespace != "Microsoft.Dynamics.Nav.BusinessApplication")
-                    continue;
-                _owner[t.Name] = asm;
-                _tombstones.TryRemove(t.Name, out _);
-            }
-        }
-    }
-
-    /// <summary>
     /// Commit an object-granular generation. A deletion-only RAD cycle has no assembly;
     /// its removed names are still taken out of the workspace declaration set and
     /// tombstoned so an older loaded generation cannot resurrect them.

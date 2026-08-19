@@ -37,18 +37,6 @@ internal sealed class RadMetadataCapture : IDisposable
         lock (_registrations) _registrations.Add(registration);
     }
 
-    internal static void ApplyOrDefer(Action registration)
-    {
-        var capture = _current.Value;
-        if (capture == null)
-        {
-            registration();
-            return;
-        }
-
-        capture.Defer(registration);
-    }
-
     internal void Apply(RadWorkspace workspace, RadChangeSet changes)
     {
         // Clear the previous identity before replaying the capture — using the object map

@@ -197,19 +197,6 @@ public sealed partial class BcCompiler
         get { lock (_refSync) return _bundleCohort; }
     }
 
-    /// <summary>Set <see cref="BundleCohort"/> for the duration of a scope. For tests.</summary>
-    internal static IDisposable ScopeBundleCohort(AlRunner.Rad.RadAppCohort? cohort)
-    {
-        AlRunner.Rad.RadAppCohort? saved;
-        lock (_refSync) { saved = _bundleCohort; _bundleCohort = cohort; }
-        return new CohortScope(saved);
-    }
-
-    private sealed class CohortScope(AlRunner.Rad.RadAppCohort? saved) : IDisposable
-    {
-        public void Dispose() { lock (_refSync) { _bundleCohort = saved; } }
-    }
-
     /// <summary>
     /// Temporarily drop resolved deps whose .app carries no <c>SymbolReference.json</c> from
     /// the compile spec list, restoring the full set on dispose.

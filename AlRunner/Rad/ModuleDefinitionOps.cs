@@ -196,17 +196,6 @@ public static class ModuleDefinitionOps
     }
 
     /// <summary>
-    /// Serialized public symbol surface of one codeunit. SymbolReference definitions do
-    /// not contain procedure bodies, so this stays identical for a body-only edit and
-    /// changes for signatures, access, subtype, event metadata, and other binding-visible
-    /// changes. Only surface-stable edits are eligible for an overlay.
-    /// </summary>
-    public static string? CodeunitSurfaceFingerprint(NavSymRef.ModuleDefinition module, int id)
-    {
-        return ObjectSurfaceFingerprint(module, new RadObjectKey("Codeunit", id));
-    }
-
-    /// <summary>
     /// Serialized public symbol definition for one keyed AL object, canonicalised so that the
     /// two module definitions a delta compares — which are produced by DIFFERENT code paths —
     /// describe an unchanged surface identically.
