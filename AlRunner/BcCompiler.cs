@@ -1420,7 +1420,6 @@ public sealed partial class BcCompiler
             ? compilation.WithFileSystem(fileSystem)
             : compilation;
 
-    /// <summary>Compilation options shared by full and RAD emits.</summary>
     /// <summary>
     /// Whether to ask Microsoft's compiler to run its EMIT phase across threads.
     ///
@@ -1431,25 +1430,85 @@ public sealed partial class BcCompiler
     /// every one arrived on a single thread. On a 6-core host the emit window uses ~28% of the
     /// machine, so this is the one configured serialisation left in the largest phase.</para>
     ///
-    /// <para>Opt-in, because it changes two observable things and neither is worth taking on
-    /// trust: <c>AddApplicationObject</c> becomes genuinely concurrent (see
-    /// <c>CaptureOutputter</c>, written for it), and the order objects arrive in — hence the
-    /// order of syntax trees in the C# compilation, hence the emitted assembly's member
-    /// layout — stops being deterministic unless the captured sources are re-sorted.</para>
+    /// <para><b>Measured twice, with opposite answers. The current answer is that it WINS.</b></para>
+    ///
+    /// <para>2026-08-17, on a memory-starved host and before the runner shipped Server GC:
+    /// npcore's emit went 61.8/68.9 s off to <b>83.1 s</b> on, heap 3.8 GB to 8.1 GB. The reading
+    /// then was "the parallelism is real and the machine cannot spend it", and the flag was
+    /// shipped off.</para>
+    ///
+    /// <para>2026-08-19, re-measured on the npcore-v2-trial snapshot (7,339 <c>.al</c>) under
+    /// the now-shipped <c>ServerGarbageCollection</c>, one-shot <c>--no-cache</c>, arms
+    /// INTERLEAVED off/on/off/on after a discarded warmup, every leg gated on
+    /// <c>dep_emits=10</c> and 30 pass / 0 fail:</para>
+    ///
+    /// <list type="table">
+    /// <item><term>off</term><description>emit 108.9 / 108.9 / 102.7 s — heap 8.3 / 7.6 / 8.3 GB — wall 306 / 294 / 287 s</description></item>
+    /// <item><term>on</term><description>emit <b>71.0 / 48.3 s</b> — heap 8.3 / 5.7 GB — wall 278 / 172 s</description></item>
+    /// </list>
+    ///
+    /// <para>The arms do not overlap: the WORST on-leg beats the BEST off-leg by 1.45x on the
+    /// emit phase, median 1.8x, and the heap shows no penalty (the fastest on-leg was also the
+    /// lowest heap of all five). The off arm is reproducible to 1.06x across three runs, so the
+    /// separation is not BC's known 1.58x emit variance. Caveat: two on-samples against three
+    /// off-samples, and the on arm's own spread is 1.47x — the DIRECTION is solid, the
+    /// magnitude is not pinned.</para>
+    ///
+    /// <para><b>On by default since 2026-08-19</b> on the strength of that measurement.
+    /// <c>AL_RUNNER_BC_CONCURRENT_EMIT=0</c> turns it off — that is the escape hatch for a host
+    /// that struggles with the extra objects in flight, and it is also how
+    /// <c>.context/perf/concurrent-emit-ab.sh</c> drives its off arm, so keep it working.</para>
+    ///
+    /// <para>The one behavioural change it makes is handled: <c>AddApplicationObject</c> becomes
+    /// genuinely concurrent (see <c>CaptureOutputter</c>, written for it), so the order objects
+    /// arrive in — hence syntax-tree order, hence the emitted assembly's member layout — would
+    /// stop being deterministic. <c>EmitModule</c> re-sorts the captures on (Name, Code) for
+    /// exactly that reason, which is what keeps a cached AL-output DLL reproducible; see the
+    /// comment there for why Name alone was not enough.</para>
     /// </summary>
     private static bool ConcurrentEmitEnabled =>
-        Environment.GetEnvironmentVariable("AL_RUNNER_BC_CONCURRENT_EMIT") == "1";
+        Environment.GetEnvironmentVariable("AL_RUNNER_BC_CONCURRENT_EMIT") != "0";
+
+    /// <summary>
+    /// The emitted sources in a stable order, so a given source tree produces a byte-comparable
+    /// module however the emit threads happened to interleave.
+    ///
+    /// <para>Under concurrent emit the objects arrive in whatever order the threads finish, and
+    /// that order becomes the syntax-tree order of the C# compilation and therefore the member
+    /// layout of the emitted assembly. Ordering here is what makes two runs' cache entries and
+    /// two runs' <c>--dump-csharp</c> output comparable. Not applied under
+    /// <c>AL_RUNNER_BC_CONCURRENT_EMIT=0</c>: serial emit is already deterministic, and
+    /// Microsoft's own order is the more useful one to read when that is what you are
+    /// debugging.</para>
+    ///
+    /// <para><b>Name alone is not a total order</b>, and assuming it was is how this stayed
+    /// subtly nondeterministic after the sort was added. AL only requires an object name to be
+    /// unique per object TYPE, so a table and its page routinely share one — 439 such collisions
+    /// in npcore's Application app alone. <c>OrderBy</c> is a stable sort, so every tie group
+    /// kept its arrival order, which is exactly the nondeterminism being sorted away.
+    /// <c>Code</c> breaks the tie: two distinct AL objects cannot have identical generated C#,
+    /// and two captures equal in both fields are interchangeable by definition. The string
+    /// compare runs only within a tie group, so the cost is those 439, not all 6,956.</para>
+    /// </summary>
+    internal static IReadOnlyList<EmittedSource> OrderCapturesDeterministically(
+        IReadOnlyList<EmittedSource> captured) =>
+        captured
+            .OrderBy(s => s.Name, StringComparer.Ordinal)
+            .ThenBy(s => s.Code, StringComparer.Ordinal)
+            .ToList();
 
     /// <summary>
     /// <c>EmitOptions</c> for this run. <c>EmitOptions.Default</c> is the serial-emit default;
     /// the flag has to be set on the options the outputter is constructed with AND on the ones
     /// passed to <c>Compilation.Emit</c>, which is why both go through here.
-    /// </summary>
-    /// There is no <c>WithConcurrentEmit</c> — the property is get-only and the flag is a ctor
-    /// parameter — so the opt-in path constructs one. Every other parameter is left at the
+    ///
+    /// <para>There is no <c>WithConcurrentEmit</c> — the property is get-only and the flag is a
+    /// ctor parameter — so the opt-in path constructs one. Every other parameter is left at the
     /// ctor's declared default, which is what <c>EmitOptions.Default</c> is
     /// (<c>runtimeMetadataVersion: 130000</c>, no suffix, and skipStmtHit / nonDebuggableEmit /
-    /// emitAsync / emitInlineScope all false), so the two differ in this flag and nothing else.
+    /// emitAsync / emitInlineScope all false), so the two differ in this flag and nothing
+    /// else.</para>
+    /// </summary>
     private static NavCA.EmitOptions EmitOptionsForRun() =>
         ConcurrentEmitEnabled
             ? new NavCA.EmitOptions(concurrentEmit: true)
@@ -1991,15 +2050,9 @@ public sealed partial class BcCompiler
         // public contract with several other callers — stays as it is.
         LastCompilation = compilation;
 
-        // Under concurrent emit the objects arrive in whatever order the threads finish, and
-        // that order becomes the syntax-tree order of the C# compilation and therefore the
-        // member layout of the emitted assembly. Sorting restores a deterministic module for a
-        // given source tree, which is what makes two runs' cache entries and two runs'
-        // --dump-csharp output comparable. Left alone otherwise: serial emit is already
-        // deterministic, and Microsoft's own order is the more useful one to read.
-        var captured = outputter.Captured;
-        if (ConcurrentEmitEnabled)
-            captured = captured.OrderBy(s => s.Name, StringComparer.Ordinal).ToList();
+        var captured = ConcurrentEmitEnabled
+            ? OrderCapturesDeterministically(outputter.Captured)
+            : outputter.Captured;
 
         var emitOutput = new BcEmitOutput(captured, alDiags, excludedObjects);
 
