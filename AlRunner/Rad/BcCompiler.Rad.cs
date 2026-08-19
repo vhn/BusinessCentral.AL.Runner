@@ -1881,11 +1881,6 @@ public sealed partial class BcCompiler
     /// collects one set of targets for the file and fans it out to that file's sources at
     /// merge time. Self-edges are dropped there, exactly where the serial version dropped
     /// them.</para>
-    ///
-    /// <para><c>AL_RUNNER_RAD_GRAPH_PARALLEL=0</c> forces the original single-threaded walk.
-    /// The graph decides which callers a later delta rebinds, so a way to take Microsoft's
-    /// semantic-model concurrency out of the picture when diagnosing a wrong rebind is worth
-    /// the one branch.</para>
     /// </summary>
     private static RadReferenceGraph MapObjectReferences(NavCA.Compilation compilation)
     {
@@ -1934,16 +1929,12 @@ public sealed partial class BcCompiler
             }
         }
 
-        if (Environment.GetEnvironmentVariable("AL_RUNNER_RAD_GRAPH_PARALLEL") == "0")
-            for (int i = 0; i < groups.Count; i++) WalkGroup(i);
-        else
-            // Bounded to the core count on purpose: each in-flight group holds a semantic
-            // model and that file's bound bodies, so an unbounded pool would trade a
-            // memory-bound phase's wall time for a larger peak on the host that can least
-            // afford it.
-            Parallel.For(0, groups.Count,
-                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-                WalkGroup);
+        // Bounded to the core count on purpose: each in-flight group holds a semantic model
+        // and that file's bound bodies, so an unbounded pool would trade a memory-bound
+        // phase's wall time for a larger peak on the host that can least afford it.
+        Parallel.For(0, groups.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            WalkGroup);
 
         foreach (var (sources, same, cross) in walked)
         {

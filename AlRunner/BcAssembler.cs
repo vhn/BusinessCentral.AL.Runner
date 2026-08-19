@@ -124,9 +124,11 @@ public sealed class BcAssembler
         // them costs more than the optimizer saves. (It would also stamp
         // DebuggableAttribute.DisableOptimizations and slow the AL run.) Same shape as BC's own
         // nonDebuggableEmit. Release, unconditionally.
+        // concurrentBuild is Roslyn's own default; named here because the tree split above is
+        // sized for it — 6,957 sources exist as separate trees precisely so this can fan out.
         var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
             allowUnsafe: true,
-            concurrentBuild: Environment.GetEnvironmentVariable("AL_RUNNER_CSHARP_CONCURRENT") != "0",
+            concurrentBuild: true,
             checkOverflow: true,
             optimizationLevel: OptimizationLevel.Release);
 
