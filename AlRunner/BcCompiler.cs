@@ -1421,13 +1421,48 @@ public sealed partial class BcCompiler
             : compilation;
 
     /// <summary>Compilation options shared by full and RAD emits.</summary>
+    /// <summary>
+    /// Whether to ask Microsoft's compiler to run its EMIT phase across threads.
+    ///
+    /// <para>Its bind phase already fans out — <c>ConcurrentBuild</c> defaults to true and a
+    /// trace shows seven threads inside <c>MethodCompiler.CompileObject</c> — but
+    /// <c>ConcurrentEmit</c> defaults to <b>false</b> on both <c>CompilationOptions</c> and
+    /// <c>EmitOptions</c>, and a probe over npcore's 6,956 objects confirmed the consequence:
+    /// every one arrived on a single thread. On a 6-core host the emit window uses ~28% of the
+    /// machine, so this is the one configured serialisation left in the largest phase.</para>
+    ///
+    /// <para>Opt-in, because it changes two observable things and neither is worth taking on
+    /// trust: <c>AddApplicationObject</c> becomes genuinely concurrent (see
+    /// <c>CaptureOutputter</c>, written for it), and the order objects arrive in — hence the
+    /// order of syntax trees in the C# compilation, hence the emitted assembly's member
+    /// layout — stops being deterministic unless the captured sources are re-sorted.</para>
+    /// </summary>
+    private static bool ConcurrentEmitEnabled =>
+        Environment.GetEnvironmentVariable("AL_RUNNER_BC_CONCURRENT_EMIT") == "1";
+
+    /// <summary>
+    /// <c>EmitOptions</c> for this run. <c>EmitOptions.Default</c> is the serial-emit default;
+    /// the flag has to be set on the options the outputter is constructed with AND on the ones
+    /// passed to <c>Compilation.Emit</c>, which is why both go through here.
+    /// </summary>
+    /// There is no <c>WithConcurrentEmit</c> — the property is get-only and the flag is a ctor
+    /// parameter — so the opt-in path constructs one. Every other parameter is left at the
+    /// ctor's declared default, which is what <c>EmitOptions.Default</c> is
+    /// (<c>runtimeMetadataVersion: 130000</c>, no suffix, and skipStmtHit / nonDebuggableEmit /
+    /// emitAsync / emitInlineScope all false), so the two differ in this flag and nothing else.
+    private static NavCA.EmitOptions EmitOptionsForRun() =>
+        ConcurrentEmitEnabled
+            ? new NavCA.EmitOptions(concurrentEmit: true)
+            : NavCA.EmitOptions.Default;
+
     private static NavCA.CompilationOptions EmitCompilationOptions() =>
         new(
             continueBuildOnError: true,
             target: NavCA.CompilationTarget.OnPrem,
             generateOptions:
                 NavCA.CompilationGenerationOptions.Code |
-                NavCA.CompilationGenerationOptions.Navigation);
+                NavCA.CompilationGenerationOptions.Navigation,
+            concurrentEmit: ConcurrentEmitEnabled);
 
     /// <param name="appRootDir">
     /// The directory containing this app's own app.json — NOT <paramref name="alFolders"/>
@@ -1554,7 +1589,7 @@ public sealed partial class BcCompiler
             // EmitResult.Success=false because the internal Compile step caught
             // diagnostics rather than throwing. Capture the result so the diag
             // block can surface them — otherwise we have no signal at all.
-            emitResult = compilation.Emit(NavCA.EmitOptions.Default, outputter);
+            emitResult = compilation.Emit(EmitOptionsForRun(), outputter);
         }
         catch (Exception ex) { caught = ex; }
         _mark("compilation.Emit (bind + IL gen)");
@@ -1721,7 +1756,7 @@ public sealed partial class BcCompiler
                 var retryOutputter = new CaptureOutputter();
                 Exception? retryCaught = null;
                 Microsoft.Dynamics.Nav.CodeAnalysis.Emit.EmitResult? retryEmitResult = null;
-                try { retryEmitResult = retryCompilation.Emit(NavCA.EmitOptions.Default, retryOutputter); }
+                try { retryEmitResult = retryCompilation.Emit(EmitOptionsForRun(), retryOutputter); }
                 catch (Exception ex2) { retryCaught = ex2; }
 
                 outputter = retryOutputter;
@@ -1899,7 +1934,17 @@ public sealed partial class BcCompiler
         // public contract with several other callers — stays as it is.
         LastCompilation = compilation;
 
-        return new BcEmitOutput(outputter.Captured, alDiags, excludedObjects);
+        // Under concurrent emit the objects arrive in whatever order the threads finish, and
+        // that order becomes the syntax-tree order of the C# compilation and therefore the
+        // member layout of the emitted assembly. Sorting restores a deterministic module for a
+        // given source tree, which is what makes two runs' cache entries and two runs'
+        // --dump-csharp output comparable. Left alone otherwise: serial emit is already
+        // deterministic, and Microsoft's own order is the more useful one to read.
+        var captured = outputter.Captured;
+        if (ConcurrentEmitEnabled)
+            captured = captured.OrderBy(s => s.Name, StringComparer.Ordinal).ToList();
+
+        return new BcEmitOutput(captured, alDiags, excludedObjects);
     }
 
     /// <summary>
@@ -2321,23 +2366,49 @@ public sealed partial class BcCompiler
     /// </summary>
     private sealed class CaptureOutputter : NavEmit.CodeModuleOutputter
     {
-        public List<EmittedSource> Captured { get; } = new();
+        // Microsoft calls AddApplicationObject serially by default (ConcurrentEmit is False on
+        // both CompilationOptions and EmitOptions), and a probe over npcore's 6,956 objects
+        // confirmed it: maxInFlight=1, one thread throughout. ConcurrentEmit=1 turns that into
+        // a genuine fan-out, so everything this class touches per callback is written as if it
+        // already were concurrent — that is what makes the switch a measurement rather than a
+        // rewrite. The three registries it feeds are ConcurrentDictionary-backed already.
+        private readonly List<EmittedSource> _captured = new();
+        private int _addCalls;
+
+        // Which pending RAD generation this emit's registry writes belong to, bound HERE — on
+        // the thread that constructs the outputter, inside the capture's scope — rather than
+        // read from the AsyncLocal at callback time. Under concurrent emit the callback can
+        // arrive on a thread Microsoft created, and an AsyncLocal does not flow onto a raw
+        // thread: the ambient lookup would come back null and the write would be applied
+        // straight to the live runtime instead of being held until the generation is accepted.
+        // That failure is silent and only reachable under --watch, so it is designed out.
+        private readonly Rad.RadMetadataCapture? _capture = Rad.RadMetadataCapture.Current;
+
+        public IReadOnlyList<EmittedSource> Captured => _captured;
         public NavCA.IModuleSymbol? Module { get; private set; }
         public string? LastAddedName { get; private set; }
-        public int AddCalls { get; private set; }
+        public int AddCalls => Volatile.Read(ref _addCalls);
 
-        public CaptureOutputter() : base(NavCA.EmitOptions.Default) { }
+        public CaptureOutputter() : base(EmitOptionsForRun()) { }
 
         public override void InitializeModule(NavCA.IModuleSymbol moduleSymbol) => Module = moduleSymbol;
+
+        /// <summary>Defer a registry write to this emit's RAD generation, or apply it now when
+        /// there is no generation to hold it (one-shot, <c>--server</c>, dependency emits).</summary>
+        private void Capture(Action registration)
+        {
+            if (_capture != null) _capture.Defer(registration);
+            else registration();
+        }
 
         public override void AddApplicationObject(
             NavCA.IApplicationObjectTypeSymbol symbol,
             byte[] code, string metadata, string debugCode)
         {
-            AddCalls++;
+            Interlocked.Increment(ref _addCalls);
             LastAddedName = symbol.Name;
             var src = System.Text.Encoding.UTF8.GetString(code);
-            Captured.Add(new EmittedSource(symbol.Name, src));
+            lock (_captured) _captured.Add(new EmittedSource(symbol.Name, src));
 
             // Capture (id, name, options[], indexes[], captions[]) for AL enum types so
             // the runtime NCLEnumMetadata.Create(int) hook can return real
@@ -2373,14 +2444,14 @@ public sealed partial class BcCompiler
                 {
                     var extName = enumSym.Name;
                     var extTargetId = targetSym.Id;
-                    Rad.RadMetadataCapture.ApplyOrDefer(() => AlEnumMetadataRegistry.RegisterExtension(
+                    Capture(() => AlEnumMetadataRegistry.RegisterExtension(
                         extTargetId, extName, options, indexes, implementations, captions));
                 }
                 else
                 {
                     var enumId = enumSym.Id;
                     var enumName = enumSym.Name;
-                    Rad.RadMetadataCapture.ApplyOrDefer(() => AlEnumMetadataRegistry.Register(
+                    Capture(() => AlEnumMetadataRegistry.Register(
                         enumId, enumName, options, indexes, implementations, captions));
                 }
             }
@@ -2399,7 +2470,7 @@ public sealed partial class BcCompiler
                 // Read off the symbol NOW: the registry write may be deferred to the
                 // end of a RAD cycle, by which time this compilation is gone.
                 var layouts = ReadReportLayouts(reportSym, metadata);
-                Rad.RadMetadataCapture.ApplyOrDefer(() =>
+                Capture(() =>
                 {
                     AlReportMetadataRegistry.Register(reportId, metadata);
                     foreach (var layout in layouts) AlReportLayoutRegistry.Register(layout);
@@ -2414,7 +2485,7 @@ public sealed partial class BcCompiler
             if (symbol is NavCA.IPageTypeSymbol pageSym && !string.IsNullOrEmpty(metadata))
             {
                 var pageId = pageSym.Id;
-                Rad.RadMetadataCapture.ApplyOrDefer(() => AlPageMetadataRegistry.Register(pageId, metadata));
+                Capture(() => AlPageMetadataRegistry.Register(pageId, metadata));
             }
 
             // Same capture for xmlports. NCLMetaXmlPort.LoadMetadata() parses this XML into
@@ -2425,7 +2496,7 @@ public sealed partial class BcCompiler
             if (symbol is NavCA.IXmlPortTypeSymbol xmlPortSym && !string.IsNullOrEmpty(metadata))
             {
                 var xmlPortId = xmlPortSym.Id;
-                Rad.RadMetadataCapture.ApplyOrDefer(() => AlXmlPortMetadataRegistry.Register(xmlPortId, metadata));
+                Capture(() => AlXmlPortMetadataRegistry.Register(xmlPortId, metadata));
             }
 
             if (Environment.GetEnvironmentVariable("BCCOMPILER_TRACE") == "1")

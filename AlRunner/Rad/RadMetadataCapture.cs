@@ -20,6 +20,23 @@ internal sealed class RadMetadataCapture : IDisposable
 
     internal static RadMetadataCapture Begin() => new();
 
+    /// <summary>
+    /// The generation being prepared on this execution context, or null when there is none.
+    ///
+    /// <para>Exposed so a component that is entered on one thread but calls back on others —
+    /// Microsoft's emitter, under <c>ConcurrentEmit</c> — can bind the capture once, on the way
+    /// in. An <see cref="AsyncLocal{T}"/> does not flow onto a thread the runtime did not start
+    /// for us, so reading it at callback time would silently answer "no generation" and apply
+    /// the write to the live runtime instead of holding it.</para>
+    /// </summary>
+    internal static RadMetadataCapture? Current => _current.Value;
+
+    /// <summary>Hold a registry write until this generation is accepted.</summary>
+    internal void Defer(Action registration)
+    {
+        lock (_registrations) _registrations.Add(registration);
+    }
+
     internal static void ApplyOrDefer(Action registration)
     {
         var capture = _current.Value;
@@ -29,7 +46,7 @@ internal sealed class RadMetadataCapture : IDisposable
             return;
         }
 
-        lock (capture._registrations) capture._registrations.Add(registration);
+        capture.Defer(registration);
     }
 
     internal void Apply(RadWorkspace workspace, RadChangeSet changes)
