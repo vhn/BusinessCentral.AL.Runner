@@ -53,6 +53,22 @@ DEFAULT_ORDERER = Path(__file__).resolve().parent.parent / "AlRunner.Tests" / "C
 DEFAULT_THRESHOLD_MULTIPLE = 2
 
 
+def parse_trx_time(value):
+    """Parse a VSTest TRX timestamp on any Python >= 3.9.
+
+    `datetime.fromisoformat` only became liberal in 3.11. Before that it accepts a
+    fractional part of EXACTLY 3 or 6 digits and no `Z` suffix — while VSTest writes
+    .NET's round-trip format, which is seven digits, and emits `Z` for a UTC clock. So
+    this gate crashed on any locally-produced TRX (macOS ships 3.9) while CI's 3.12
+    parsed the identical file. Normalise both before handing it over; the report sums
+    whole seconds, so a discarded 100ns tick cannot matter."""
+    value = re.sub(r"([+-]\d{2}:\d{2}|Z)?$", lambda m: "+00:00" if m.group(0) == "Z" else m.group(0), value)
+    # Pad or truncate the fraction to exactly 6 digits rather than only trimming a long
+    # one: a 5-digit fraction is just as unparseable on 3.9 as an 8-digit one.
+    value = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), value, count=1)
+    return datetime.fromisoformat(value)
+
+
 def load_trx_per_collection_seconds(path):
     """Bare class name -> summed test duration (seconds) from a VSTest TRX file."""
     root = ET.parse(path).getroot()
@@ -67,7 +83,7 @@ def load_trx_per_collection_seconds(path):
         if not start or not end:
             continue
         cls = names.get(r.get("testId"), "?").rsplit(".", 1)[-1]
-        per_class[cls] += (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds()
+        per_class[cls] += (parse_trx_time(end) - parse_trx_time(start)).total_seconds()
     return dict(per_class)
 
 
