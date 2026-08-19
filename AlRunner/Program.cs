@@ -1044,6 +1044,12 @@ foreach (var bundle in bundles)
     List<string> bundleManifests;
     using (AlRunner.Infrastructure.PhaseLog.Stage("bundle-manifests"))
         bundleManifests = CollectBundleManifests(bucketRoot, bundleAbs);
+    // What this cycle is about to compile against, so the NEXT cycle can tell a manifest
+    // rewrite (a branch switch, a checkout, an autosave — byte-identical) from a manifest
+    // edit. Recorded here rather than inside PrepareBundleReload because this is the set the
+    // cycle actually resolves from, and it is already enumerated; asking the store to find
+    // the manifests itself would mean walking the tree for them once per cycle.
+    if (watchMode) AlRunner.Rad.RadWorkspaceStore.RecordManifestState(bundleManifests);
     // Everything below resolves package dirs and loads deps relative to a directory; when
     // the bundle is a parent of many apps there is no bucket root, so the bundle dir is it.
     var depRootDir = bucketRoot ?? bundleAbs;
@@ -4794,12 +4800,15 @@ static (BcEmitOutput Output, RadEmitResult? Rad) RunEmit(
 {
     if (ws == null) return (emitter.Emit(allPaths, moduleName, appRootDir), null);
 
-    // Keep the number of live generations bounded. A full compile replaces every old
-    // object at once; Program clears the generation list when that assembly loads.
-    const int maxOverlayChain = 12;
-    if (ws.Generations.Count >= maxOverlayChain)
-        ws.Invalidate($"the overlay chain reached {maxOverlayChain - 1} delta(s)");
-
+    // The overlay chain is deliberately UNBOUNDED. It used to reset at 12 generations,
+    // which made every 11th code-producing save a whole-module compile — minutes on a
+    // 7,000-object app, for a reason the developer could neither predict nor see, and for
+    // memory hygiene rather than correctness: AlObjectResolution resolves an object to its
+    // owning generation in O(1) and an overlay assembly is kilobytes. Growth is not free
+    // (per-cycle registration work scales with the chain), but paying it back with a full
+    // compile is the most expensive way to reclaim it. If a long session's overlays ever
+    // do need reclaiming, the answer is to compact the chain into one fresh generation on
+    // a memory threshold, not to rebuild the module on a counter.
     var result = emitter.EmitIncremental(allPaths, moduleName, ws, appRootDir);
     // "Nothing changed" is only actionable while there is a loaded module to reuse. If a
     // previous cycle compiled but failed to load, reporting no-change would drop the app

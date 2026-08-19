@@ -637,32 +637,56 @@ public sealed partial class BcCompiler
         // that replaces the `ws.Declares` scan this used to do:
         //
         //  * owned already → a modification, not an addition;
-        //  * owned by a file this cycle did not touch → a DUPLICATE declaration, and only the
-        //    compiler can say what that means. `ws.Declares` answered "does the module declare
-        //    this key", which is true either way, so a new object reusing an existing id or
-        //    name passed as a modification of the other file's object — that file's copy was
-        //    then stripped from the packaged baseline and the cycle reported either success or
-        //    an unrelated dangling-reference error. Measured against a cold compile of the same
-        //    tree: a duplicated `interface` name is four AL0197s cold and NO diagnostic at all
-        //    through the delta; a duplicated codeunit id is four AL0264s cold and one AL0185
-        //    through the delta. Hand the whole module over instead.
+        //  * owned by a file this cycle did not touch → a DUPLICATE declaration.
+        //
+        // `ws.Declares` answered "does the module declare this key", which is true either way,
+        // so a new object reusing an existing id or name passed as a modification of the other
+        // file's object — that file's copy was then stripped from the packaged baseline and the
+        // cycle reported either success or an unrelated dangling-reference error.
+        //
+        // A duplicate is REPORTED, not compiled around. The move that produces one is the most
+        // ordinary thing a developer does: copy an existing `.al` file to start a new object
+        // from it, intending to renumber and rename afterwards. Two objects sharing an id or a
+        // name is not a shape any AL compiler accepts, so there is no module to build either
+        // way — and handing the whole module over (what this used to do) charged a
+        // whole-module compile for a state whose only outcome is an error. Reporting it costs
+        // the parse of the changed files and nothing else, and leaves the workspace untouched,
+        // so the save that renumbers the copy deltas straight away.
+        //
+        // The AL code is chosen from the KIND of key, not guessed: an id-bearing kind collides
+        // on its id, which a cold compile reports as AL0264, and a name-keyed kind collides on
+        // its name, which a cold compile reports as AL0197. (Both measured against a cold
+        // compile of the same tree; the delta itself cannot produce them — the untouched
+        // declaration lives only in the packaged baseline, so the same trees yield NO
+        // diagnostic at all for a duplicated interface name and one misleading AL0185 for a
+        // duplicated codeunit id.)
         var touchedFiles = changedFiles.Concat(removedFiles).ToHashSet(StringComparer.Ordinal);
+        // Which of the touched files declares each key NOW, so a duplicate can name both ends.
+        var declaringFile = new Dictionary<AlRunner.Rad.RadObjectKey, string>();
+        foreach (var (file, objects) in objectsByFile)
+            foreach (var item in objects)
+                declaringFile.TryAdd(item.Key, file);
         var added = new List<AlRunner.Rad.RadObjectRef>();
         var modified = new List<AlRunner.Rad.RadObjectRef>();
+        var duplicates = new List<string>();
         foreach (var objRef in declaredNow.Values)
         {
             var owner = ws.FileOf(objRef.Key);
             if (owner != null && !touchedFiles.Contains(owner))
             {
-                FullCompileBecause(
-                    moduleName,
-                    $"{objRef.Key.Kind} '{objRef.Name}' is also declared by " +
-                    $"{Path.GetFileName(owner)}, which this cycle did not touch — only the " +
-                    "compiler can say which of the two is the duplicate");
-                return null;
+                duplicates.Add(DuplicateDeclarationDiagnostic(
+                    objRef, owner, declaringFile.GetValueOrDefault(objRef.Key)));
+                continue;
             }
             (owner != null ? modified : added).Add(objRef);
         }
+        if (duplicates.Count > 0)
+            return new RadEmitResult(
+                new BcEmitOutput(
+                    Array.Empty<EmittedSource>(),
+                    duplicates.Order(StringComparer.Ordinal).ToArray(),
+                    Array.Empty<string>()),
+                FullRebuild: false, NoChange: false);
 
         // Removed = objects the touched files used to declare and nothing declares now.
         // An object cannot escape to an untouched file: moving it edits its new home.
@@ -1552,6 +1576,36 @@ public sealed partial class BcCompiler
         symbol is NavCA.ISymbolWithId { Id: > 0 }
         || (AlRunner.Rad.RadObjectKey.IsIdlessKind(symbol.Kind.ToString())
             && !string.IsNullOrEmpty(symbol.Name));
+
+    /// <summary>
+    /// The diagnostic for a key two files declare: <paramref name="objRef"/> as the touched
+    /// file declares it now, and <paramref name="owner"/> as the file this cycle did not
+    /// touch that already declared it.
+    ///
+    /// <para>Formatted like every other emit diagnostic (<c>&lt;file&gt;: error &lt;code&gt;:
+    /// &lt;message&gt;</c>) so the CLI's existing EMIT-ZERO path prints it, the watch dashboard
+    /// shows it, and the cycle fails the way any other compile error fails. The code is
+    /// selected from the identity that actually collided — an id for an id-bearing kind
+    /// (AL0264), a name for a name-keyed one (AL0197) — which is what a cold compile of the
+    /// same tree reports.</para>
+    ///
+    /// <para>The message names the fix rather than the internals, because the state it
+    /// describes is nearly always a copied file mid-rename: both paths, and the two things
+    /// that have to become unique before it will compile.</para>
+    /// </summary>
+    private static string DuplicateDeclarationDiagnostic(
+        AlRunner.Rad.RadObjectRef objRef, string owner, string? declaredIn)
+    {
+        var kind = objRef.Key.Kind.ToLowerInvariant();
+        var identity = objRef.Key.IsIdless
+            ? $"'{objRef.Name}'"
+            : $"{objRef.Key.Id} '{objRef.Name}'";
+        var code = objRef.Key.IsIdless ? "AL0197" : "AL0264";
+        var subject = objRef.Key.IsIdless ? "name" : "id";
+        return $"{declaredIn ?? "<unknown file>"}: error {code}: {kind} {identity} is already " +
+               $"declared by {owner}. Two objects in one app cannot share an {subject} — give " +
+               "this one a unique id and name, or delete the copy.";
+    }
 
     /// <summary>
     /// The id-less objects Microsoft's symbol API does not report at all.

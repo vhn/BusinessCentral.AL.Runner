@@ -986,20 +986,22 @@ public class RadDeltaWatchTests
     /// macOS/APFS clones the source file, which touches the SOURCE inode's metadata — and
     /// FSEvents reports that as a change, so <c>FileSystemWatcher</c> raises <c>Changed</c> for
     /// every file of a tree that was only READ. Measured against the real runner: copying the
-    /// watched bundle with <c>File.Copy</c> starts a whole watch cycle (a full rebuild of every
-    /// app, since a byte-identical <c>app.json</c> counts as "not AL source" to
-    /// <c>RadWorkspaceStore.PrepareBundleReload</c>), while the same copy done with
-    /// <c>ReadAllBytes</c> or a <c>FileStream</c> raises nothing at all.
+    /// watched bundle with <c>File.Copy</c> starts a whole watch cycle, while the same copy done
+    /// with <c>ReadAllBytes</c> or a <c>FileStream</c> raises nothing at all.
     ///
     /// <para>That matters here because <see cref="ColdCompileAsync"/> copies the LIVE bundle
-    /// mid-test and its whole premise is that the watcher cannot observe it. With
-    /// <c>File.Copy</c> the spurious cycle lands between the cycle under test and the next
-    /// edit, so the next <c>WaitForMarkerAfter</c> returns the WRONG cycle and the assertions
-    /// are read against a segment that compiled the pre-edit tree.</para>
+    /// mid-test and its whole premise is that the watcher cannot observe it. The spurious cycle
+    /// lands between the cycle under test and the next edit, so the next
+    /// <c>WaitForMarkerAfter</c> returns the WRONG cycle and the assertions are read against a
+    /// segment that compiled the pre-edit tree.</para>
     ///
-    /// <para>The runner is not blameless — a read-only event costing every app in the bundle a
-    /// whole-module rebuild is a real defect — but it is a separate one from anything these
-    /// tests assert, and it is not what this helper should be measuring.</para>
+    /// <para>The runner's own half of that defect is fixed: the read-only event used to cost
+    /// every app in the bundle a whole-module rebuild, because a byte-identical <c>app.json</c>
+    /// counted as "not AL source" to <c>RadWorkspaceStore.PrepareBundleReload</c>, which now
+    /// compares manifest CONTENT (see
+    /// RadWatchNoUnnecessaryRebuildTests.Watch_RewritingAppJsonWithIdenticalBytes_KeepsTheModuleWarm_ButAnEditRebuildsIt).
+    /// The spurious cycle itself is not — an inode touch is still an event — so the stream copy
+    /// is still required for the ordering reason above.</para>
     /// </remarks>
     private static void CopyTree(string from, string to)
     {

@@ -625,6 +625,17 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     /// <para>Not specific to the newly keyable kinds — the codeunit row proves it — but
     /// load-bearing for them, because an entitlement has no module representation at all and
     /// this is the only place a duplicate one can be caught.</para>
+    ///
+    /// <para><b>The delta reports it rather than deferring to a full compile.</b> This used to
+    /// hand the whole module over on the argument that only the compiler can say which of the
+    /// two is the duplicate, and the assertion below was therefore an equality of full
+    /// diagnostic sets — trivially satisfied, since the fallback literally ran the cold
+    /// compile. The compiler's answer is always the same, so the whole-module compile bought a
+    /// diagnostic and nothing else, for the most ordinary way a developer starts a new object:
+    /// copying an existing <c>.al</c> file, intending to renumber and rename it afterwards.
+    /// What must still hold is the part that is about the developer: the same AL code a cold
+    /// build reports. What legitimately differs is arity — a cold build names both sides,
+    /// while the delta parsed only the changed one and says so, naming the other by path.</para>
     /// </summary>
     [SkippableTheory]
     [InlineData("DupCodeunit.Codeunit.al", """
@@ -658,12 +669,30 @@ public sealed class RadIdlessObjectTests(BcEngineFixture engine)
     {
         Run((compiler, workspace, tempRoot) =>
         {
-            File.WriteAllText(Path.Combine(tempRoot, "src", file), source);
+            var duplicatePath = Path.Combine(tempRoot, "src", file);
+            File.WriteAllText(duplicatePath, source);
 
             var delta = compiler.EmitIncremental([tempRoot], ModuleName, workspace);
             var cold = ColdCompile(tempRoot);
             Assert.NotEmpty(cold.Emit.Diagnostics);
-            Assert.Equal(DiagnosticCodes(cold.Emit.Diagnostics), DiagnosticCodes(delta.Emit.Diagnostics));
+
+            // The same AL code a cold build reports, from the file the developer just changed.
+            Assert.Equal(DiagnosticCodes(cold.Emit.Diagnostics).Distinct().ToArray(),
+                         DiagnosticCodes(delta.Emit.Diagnostics));
+            var reported = Assert.Single(delta.Emit.Diagnostics);
+            Assert.Contains(duplicatePath, reported, StringComparison.Ordinal);
+            // …and it names the other side, which is the thing a cold build makes the developer
+            // find for themselves.
+            Assert.Contains("is already declared by", reported, StringComparison.Ordinal);
+
+            // The behavioural claim: reported, not compiled around. Nothing was emitted, nothing
+            // is committable, and the workspace still holds the baseline it had — so the save
+            // that renumbers the copy is a delta, not a whole-module compile.
+            Assert.False(delta.FullRebuild);
+            Assert.False(delta.NoChange);
+            Assert.Empty(delta.Emit.Sources);
+            Assert.False(delta.CanCommit);
+            Assert.True(workspace.HasBaseline);
         });
     }
 
