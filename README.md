@@ -201,6 +201,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dev-loop) for provisioning them as a separ
 | `--out PATH` | Write classification JSON to PATH (default `v2-classification.json`). |
 | `--package-cache PATH` | Extra `.app`-package cache directory. Repeatable. |
 | `--cache PATH` | Cache compiled AL output keyed on source + dep set + runner mtime. |
+| `--no-cache` | Disable **every** on-disk cache for this run — AL output plus compiled-deps, workspace-deps, ncl-cecil, bc-symbols, app-manifests, r2r-chunks and install-baseline — not just al-out. `~/.cache/al-runner` is left untouched. Slow on purpose; use it to measure or reproduce a genuinely cold compile. `--cache DIR` and `--no-cache` are last-wins. |
 | `--isolation codeunit\|test\|disabled` | Test isolation mode. Default `codeunit`. |
 | `--watch` | Stay resident with warm dependencies; on `.al` or `app.json` changes, recompile only the AL objects that changed and run **in-process**. Debounces on quiescence (default 250ms of no further event, capped at 10s) so a bulk multi-file rewrite — a branch switch, a rebase, a formatter run — settles before a cycle starts, instead of firing mid-checkout. Tune with `AL_RUNNER_WATCH_QUIET_MS` / `AL_RUNNER_WATCH_MAX_WAIT_MS`. |
 | `--server` | Long-running JSON-RPC daemon over stdin/stdout (warm deps → ~19s→~4s/run). See [docs/server-mode.md](docs/server-mode.md). |
@@ -209,6 +210,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dev-loop) for provisioning them as a separ
 | `--verbose` | Show internal `[Component]` diagnostic logs. Equivalent to `AL_RUNNER_VERBOSE=1`. |
 | `--show-pass` | Include PASS lines in per-test output. Equivalent to `AL_RUNNER_SHOW_PASS=1`. |
 | `--precompile <input.app>` | Subcommand: compile one `.app` to a DLL via `--out`. |
+
+This table is a selection. **`al-runner --help` lists every flag** — including `--test`, `--bc-version`, `--define`, `--coverage`, `--expectations`, `--output-json`/`--output-junit` and the provisioning flags — and `al-runner --guide` is the operating manual.
 
 Environment variables: `AL_RUNNER_VERBOSE=1`, `AL_RUNNER_SHOW_PASS=1`, `AL_RUNNER_TRACE_NRE=1` (logs every first-chance NRE before AL `asserterror` swallows it).
 

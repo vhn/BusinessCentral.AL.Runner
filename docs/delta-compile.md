@@ -191,9 +191,13 @@ against fields declared in its own file. The exemption is a test on the **kind n
 (`IsExtension` is `Kind.EndsWith("Extension")`), which is why `pagecustomization` is stripped
 and `profileextension` is not.
 
-`CountObjects` exists for the tests: a *stale* copy of an object counts as one just as a
-fresh copy does, so a suite that only asserted "it is still there" would pass over a merged
-definition holding both.
+`CountObjects` answers how many serialized copies of a key a definition holds. A *stale* copy
+counts as one just as a fresh copy does, so a suite that only asserted "it is still there"
+would pass over a merged definition holding both — which is why the RAD suites assert the
+count directly. It is not test-only: the namespace-free surface replacement checks the same
+invariant in production (`BcCompiler.Rad.cs`, after `WithObjectsFrom`) and falls back to a full
+compile on anything but exactly one copy, because 0 leaves the reference dangling and 2 makes
+which surface answers depend on array order.
 
 `CompareObjectSurface`, the semantic reference graph, and the bounded derived-surface queries
 are the rebind inputs; all are described under [scope and edge cases](#scope-and-edge-cases).
@@ -462,16 +466,33 @@ every file* — so it scales with the **source tree**, not with the object count
 few files each is the cheapest possible shape for it.
 
 Measured on NP Retail (7,339 `.al` files across the bundle, 6,949 objects in the Application,
-BC 28.1, `--watch --no-cache`), the cold cycle grows from **1,125.9 s** without the snapshot to
+BC 28.1, `--watch --no-cache`), the cold cycle grew from **1,125.9 s** without the snapshot to
 **1,375.7 s** with it: **~250 s, or +22%** — not 0.6%. So quote the 25-app figure only for apps
 of that size; for anything larger, budget the cold overhead against the size of the source tree
-rather than as a fixed percentage. (Both legs were run when the emit phase still had a 120 s
-default deadline, so the without-snapshot leg needed `AL_RUNNER_EMIT_TIMEOUT_SEC=7200` to finish
-at all. That deadline and its env var are gone — the emit now always runs to completion and the
-caller cancels with Ctrl+C — so neither leg needs an override today.)
+rather than as a fixed percentage.
 
-The cold cycle is not what `--watch` optimises, but it is not *unchanged* either: that +22% is
-the price of delta-readiness, paid once per full compile, and it is what a warm cycle on the
+> **That +22% is stale in the direction of overstating the cost, and has not been
+> re-measured.** Both legs predate the change that lands squarely on it: the reference-graph
+> walk — 43–53 s of a cold npcore cycle on its own, and by far the largest of the five phases —
+> now fans out per file group (`MapObjectReferences`, `Parallel.For` bounded to the core count)
+> rather than walking one syntax tree at a time. Since that phase *is* substantially all of the
+> snapshot cost, treat "the snapshot is a real cold cost, and it scales with the source tree
+> rather than the object count" as the surviving claim, and the percentage as an upper bound
+> awaiting a re-run.
+>
+> The *seconds*, on the other hand, are more trustworthy now than when they were written. Both
+> legs ran through a benchmark harness that exported `DOTNET_gcServer=1` by hand, at a time when
+> `AlRunner.csproj` set no GC property — so they described a configuration no user actually got,
+> and understated real-world cold time by the 2–3× Server GC is worth on this corpus. The runner
+> ships `<ServerGarbageCollection>true</ServerGarbageCollection>` now, so that gap is closed.
+
+Both legs were also run when the emit phase still had a 120 s default deadline, so the
+without-snapshot leg needed `AL_RUNNER_EMIT_TIMEOUT_SEC=7200` to finish at all. That deadline
+and its env var are gone — the emit now always runs to completion and the caller cancels with
+Ctrl+C — so neither leg needs an override today.
+
+The cold cycle is not what `--watch` optimises, but it is not *unchanged* either: that overhead
+is the price of delta-readiness, paid once per full compile, and it is what a warm cycle on the
 same app buys back.
 
 ### Neither artifact gates a cache HIT
@@ -596,6 +617,11 @@ AL tests**, which is work the developer actually asked for.
 > which 649 s is the Application's AL emit" were taken at different times under different
 > flags. Each is reported as measured; none has been reconciled against the others. Treat the
 > order of magnitude as the claim, not the digits.
+>
+> **All of them predate two cold-path changes and none has been re-run since**: the parallel
+> reference-graph walk (see [What the snapshot costs](#what-the-snapshot-costs)) and the
+> parallel AL source-tree parse. Both cut cold time; neither was measured into this table. The
+> *warm* columns are unaffected — a delta cycle does not build a baseline snapshot.
 
 ### Where a warm cycle's time actually goes
 
@@ -607,7 +633,7 @@ edit to one codeunit, which moves five objects because four files call it):
 | Phase | Time |
 |---|---:|
 | Running the selected test codeunit (30 tests) | 11.0 s |
-| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | 7.9 s |
+| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | 7.9 s † |
 | **AL delta emit (`CreateForRad`)** | **2.4 s** |
 | `NP Retail Tests` establishing it has nothing to do | 2.9 s |
 | Register + publish symbols | 2.5 s |
@@ -624,11 +650,22 @@ The `AddSourceDir` row is the post-[#1903] figure and this branch carries that f
 direct probe of the phase on the same corpus measured **7.0–7.9 s** at one parse per file
 against **29.7 s** at eight.
 
-`AddSourceDir` is still the largest overhead in the cycle, and it is O(whole tree) by
-construction: the reload clears every parsed dictionary, so all of it is rebuilt to service an
-edit to one file. Making it O(changed files) needs file→parsed-entry provenance, which does not
-exist in `RecordPatches` today — the tableextension dictionaries are keyed by base-table name
-and accumulate, so one file's contribution cannot currently be retracted.
+> **† The `AddSourceDir` figure predates the parallel pre-parse and has not been re-measured.**
+> The parse is now batched at 256 files and built off the calling thread (`BeginPreParse`,
+> `PreParseParallelThreshold`); only the parse moved, so the eight extractors still run
+> serially over each batch in file order and find each tree already built via the primed memo.
+> Measured on the compile side just before that change (a comparable npcore tree, a different
+> run — do not subtract it from the 7.9 s above), the pass was **11.5 s wholly serial** against
+> **~1.1 s** for BC's own front end parsing the same file count with a `Parallel.For`. So this
+> row is now materially lower and is very likely no longer the largest overhead in the cycle.
+> Re-time it before planning anything around this table's ordering.
+
+`AddSourceDir` is still **O(whole tree)** by construction, faster constant or not: the reload
+clears every parsed dictionary, so all of it is rebuilt to service an edit to one file. Making
+it O(changed files) needs file→parsed-entry provenance, which does not exist in `RecordPatches`
+today — the tableextension dictionaries are keyed by base-table name and accumulate, so one
+file's contribution cannot currently be retracted. Parallelism lowered the constant; it did not
+change the complexity, and that is the part worth fixing.
 
 Two figures the instrumentation corrected: post-registration field-trigger wiring and record
 prewarm are **0.2 s**, not the ~12 s previously attributed to them; and `GetSharedReferences`
@@ -643,22 +680,24 @@ app per cycle.
 Everything in the table above is **per warm delta cycle** — per save — not per full compile.
 The `--watch` loop re-enters the same bundle body on every cycle: reset, resolve dependencies,
 re-register source dirs, build app groups, per app compile + load, then run. A full compile is
-a different *branch inside* that body, not a different body. So a row costing 7.9 s costs it on
-every save.
+a different *branch inside* that body, not a different body. So every row in that table is a
+cost paid on every save.
 
-Four items in that body are computed on every cycle and **used only on the first one**, or not
-at all. They are dead work on a warm cycle, in cost order:
+**Three** items in that body are computed on every cycle and **used only on the first one**, or
+not at all. They are dead work on a warm cycle, in cost order:
 
 | Item | Where | Cost | Why it is dead warm |
 |---|---|---|---|
-| `RecordPatches.AddSourceDirs` | `Program.cs`, `register-source-dirs` | 7.9 s | Not dead — genuinely needed, but O(whole tree) for a one-file edit. `ResetForReload` clears every parsed dictionary; making it proportional needs file→parsed-entry provenance that does not exist yet. |
 | `GetOrderedDepIds` | `Program.cs`, `ordered-dep-ids` | a full second `DependencyResolver` index | Its only consumer is `ComputeAlCacheKey`, behind the `radWs is null or { Generations.Count: 0 }` gate — false from cycle 2 on. `DependencyResolver.EnsureIndexed` is an *instance* field, so it re-walks every package-cache dir and re-reads every `.app`'s manifest out of its zip. |
 | `BcCompiler.BundleDeclaresQuery` | `Program.cs`, per app, `BundleDeclaresQuery` mark | O(whole tree) for an app with no query | Same gate, same story: it decides whether a **cache HIT** must also carry a query-symbols sidecar (without one, `NCLMetaQuery` is null and every query `Find` NREs inside `NavQuery.ValidateTablesNotVirtual`). It is not a judgement about queries mattering — an app that *has* one answers on the first file it reads and costs nothing. It is the app with **no** query that reads all 12.7 MB to prove a negative, and a warm cycle never consults the answer. |
 | The `PARTIAL-EMIT-DROP` guard | `Program.cs` | reads + regexes every `.al` file | Skipped for a delta overlay, so it lands only on full-rebuild cycles — i.e. it piles onto the cycles that are already the slowest. |
 
-None of these is fixed on this branch; they are recorded here because a cycle's own breakdown
-has to add up to the cycle, and until they were stage-timed the cost was not attributed to
-anything.
+`RecordPatches.AddSourceDirs` is deliberately **not** on that list, despite being one of the
+largest lines in the table above. Its cost is real work the cycle needs, not work the cycle
+wastes — O(whole tree) rather than dead — so it is treated in the previous section instead.
+
+None of the three is fixed; they are recorded here because a cycle's own breakdown has to add
+up to the cycle, and until they were stage-timed the cost was not attributed to anything.
 
 ### Per-cycle overhead scales with the overlay chain
 

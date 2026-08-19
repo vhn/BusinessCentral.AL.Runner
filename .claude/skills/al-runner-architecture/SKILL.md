@@ -89,9 +89,11 @@ When AL test code reaches a surface the runner cannot faithfully support, throw 
 
 ## CLI flags
 
-Defined in `AlRunner/Program.cs`. Current set: `--out`, `--package-cache` (repeatable), `--cache`, `--isolation {codeunit|test|disabled}`, `--per-suite`, `--bundled` (no-op alias), `--verbose`, `--show-pass`, `--precompile <input.app>` (subcommand). Environment: `AL_RUNNER_VERBOSE`, `AL_RUNNER_SHOW_PASS`, `AL_RUNNER_TRACE_NRE`.
+Defined in `AlRunner/Program.cs`. **`al-runner --help` is the authoritative list** — it is generated from the parser and `CliDocumentationTests` pins it against drift, so read it rather than trusting any inventory written here.
 
-No `--guide`, `--stubs`, `--coverage`, `--dap`, `extract-deps` — those were v1.
+The ones worth knowing before you read it: `--out`, `--package-cache` (repeatable), `--cache`, `--no-cache` (disables EVERY on-disk cache, not just al-out), `--isolation {codeunit|test|disabled}`, `--watch` (delta compilation — see `docs/delta-compile.md`), `--server` (JSON-RPC daemon — see `docs/server-mode.md`), `--test`, `--bc-version`, `--define`, `--coverage`, `--guide`, `--verbose`, `--show-pass`, `--precompile <input.app>` (subcommand). Environment: `AL_RUNNER_VERBOSE`, `AL_RUNNER_SHOW_PASS`, `AL_RUNNER_TRACE_NRE`, `AL_RUNNER_PHASE_LOG`, `AL_RUNNER_RAD=0` (bisect a suspected delta bug).
+
+No `--stubs`, `--dap`, `--extract-deps` — those were v1, and `--help` says so under its own "not implemented" heading.
 
 ## Cecil migration freeze
 
