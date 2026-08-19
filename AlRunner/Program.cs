@@ -197,9 +197,13 @@ string? alCacheDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
     ".cache", "al-runner", "al-out");
 // #1821: mirrors alCacheDir, but only ever set by an explicit --cache flag (never by
-// the default init above, never by --no-cache) — see the --cache parsing branch below
-// and AlRunner.Infrastructure.CacheRoots for what this drives.
+// the default init above) — see the --cache parsing branch below and
+// AlRunner.Infrastructure.CacheRoots for what this drives.
 string? cacheRootOverride = null;
+// --no-cache. Tracked as its own flag rather than inferred from `alCacheDir == null`
+// because the two are set by the same pair of arguments in either order and the LAST one
+// on the command line has to win for both.
+bool noCache = false;
 // --print-cache-key (issue #1851): a diagnostic/test-support mode. Reaches the SAME
 // ComputeAlCacheKey call, with the SAME arguments, that a real run would use for the
 // first app group it processes — then prints it and exits, before Emit+Compile even
@@ -278,13 +282,21 @@ for (int i = 0; i < args.Length; i++)
     if (args[i] == "--bundled") { bundledMode = true; continue; }
     if (args[i] == "--expectations" && i + 1 < args.Length) { expectationsDirArg = args[++i]; continue; }
     if (args[i] == "--count-baseline" && i + 1 < args.Length) { countBaselinePath = args[++i]; continue; }
-    // #1821: the SAME --cache value also becomes the isolation root for the four
-    // caches (compiled-deps/workspace-deps/ncl-cecil/bc-symbols) that used to ignore
-    // it — see AlRunner.Infrastructure.CacheRoots for why al-out itself is unaffected.
-    // --no-cache intentionally does NOT touch cacheRootOverride: it has only ever
-    // disabled the AL-output cache, and this issue doesn't expand that scope.
-    if (args[i] == "--cache" && i + 1 < args.Length) { alCacheDir = args[++i]; cacheRootOverride = alCacheDir; continue; }
-    if (args[i] == "--no-cache") { alCacheDir = null; continue; }
+    // #1821: the SAME --cache value also becomes the isolation root for the other
+    // caches (compiled-deps/workspace-deps/ncl-cecil/bc-symbols/app-manifests/
+    // r2r-chunks/install-baseline) that used to ignore it — see
+    // AlRunner.Infrastructure.CacheRoots for why al-out itself is unaffected.
+    // The two flags are last-wins against each other, exactly as they already were for
+    // alCacheDir alone: `--no-cache --cache <dir>` caches under <dir>, and
+    // `--cache <dir> --no-cache` caches nothing.
+    if (args[i] == "--cache" && i + 1 < args.Length)
+    {
+        alCacheDir = args[++i];
+        cacheRootOverride = alCacheDir;
+        noCache = false;
+        continue;
+    }
+    if (args[i] == "--no-cache") { alCacheDir = null; cacheRootOverride = null; noCache = true; continue; }
     if (args[i] == "--print-cache-key") { printCacheKeyOnly = true; continue; }
     if (args[i] == "--watch") { watchMode = true; continue; }
     if (args[i] == "--server") { continue; }  // handled above (serverMode); consume so it isn't "unknown"
@@ -554,9 +566,20 @@ catch (InvalidOperationException ex)
 
 if (alCacheDir != null) Directory.CreateDirectory(alCacheDir);
 // #1821: must run before the Cecil rewrite below (first ncl-cecil consumer) and well
-// before any DependencyLoader/BcAppSymbolCache/workspace-deps call — all four read
+// before any DependencyLoader/BcAppSymbolCache/workspace-deps call — they all read
 // CacheRoots.Resolve for their cache directory.
-AlRunner.Infrastructure.CacheRoots.SetOverride(cacheRootOverride);
+if (noCache)
+{
+    // --no-cache disables EVERY on-disk cache, not just al-out. It used to disable al-out
+    // alone, which made the flag actively misleading in the one case it exists for: a cold
+    // measurement or a cold reproduction still had compiled-deps, ncl-cecil, bc-symbols,
+    // app-manifests and r2r-chunks handed to it, and those are worth tens of seconds.
+    var throwaway = AlRunner.Infrastructure.CacheRoots.DisableForRun();
+    Console.Error.WriteLine(
+        $"  [cache] --no-cache: every on-disk cache redirected to {throwaway} for this run — " +
+        "nothing is reused from a previous run, and ~/.cache/al-runner is neither read nor written.");
+}
+else AlRunner.Infrastructure.CacheRoots.SetOverride(cacheRootOverride);
 Console.WriteLine(serverMode
     ? "al-runner — server mode (JSON-RPC over stdin/stdout)"
     : watchMode
@@ -3813,7 +3836,13 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("                          ~/.cache/al-runner/al-out. Compiled test DLLs are");
     w.WriteLine("                          re-used on subsequent runs if inputs are unchanged");
     w.WriteLine("                          (key = hash of .al sources, resolved deps, runner mtime).");
-    w.WriteLine("  --no-cache              Disable the AL-output cache for this run.");
+    w.WriteLine("  --no-cache              Disable EVERY on-disk cache for this run — AL output plus");
+    w.WriteLine("                          compiled-deps, workspace-deps, ncl-cecil, bc-symbols,");
+    w.WriteLine("                          app-manifests, r2r-chunks and install-baseline. Nothing is");
+    w.WriteLine("                          reused from an earlier run and ~/.cache/al-runner is left");
+    w.WriteLine("                          untouched; the run recomputes all of it, which is slow on");
+    w.WriteLine("                          purpose. Use it to measure or reproduce a genuinely cold");
+    w.WriteLine("                          compile. --cache DIR and --no-cache are last-wins.");
     w.WriteLine("  --print-cache-key       Diagnostic/test-support mode: compute the AL-output cache");
     w.WriteLine("                          key for the first app group of the first bundle exactly as");
     w.WriteLine("                          a real run would, print \"[cache] KEY key=<hash>\", and exit");
