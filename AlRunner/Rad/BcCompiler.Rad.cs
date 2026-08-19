@@ -399,7 +399,9 @@ public sealed partial class BcCompiler
         void Mark(string label)
         {
             if (timing)
-                Console.Error.WriteLine($"[baseline-timing] {moduleName}: {label}: {step.ElapsedMilliseconds}ms");
+                Console.Error.WriteLine(
+                    $"[baseline-timing] {moduleName}: {label}: {step.ElapsedMilliseconds}ms " +
+                    $"(heap {GC.GetTotalMemory(false) / (1024 * 1024)}MB)");
             step.Restart();
         }
 
@@ -1561,6 +1563,25 @@ public sealed partial class BcCompiler
     /// models. Stored only as object keys; no generated C# or syntax trees survive the
     /// baseline. A later callable-surface change uses the reverse one-hop relation to
     /// rebind direct callers without dragging in their transitive users.
+    ///
+    /// <para><b>Why the walk is parallel.</b> This is the single most expensive step of a
+    /// baseline — 43–53 s of a cold npcore cycle (11–13% of the whole run), against 4–700 ms
+    /// for the other four phases combined. Asking for a semantic model and calling
+    /// <c>GetSymbolInfo</c> on every node binds each file's method bodies, and the cost is
+    /// per file with no cross-file dependency: every group below reads an immutable
+    /// <see cref="NavCA.Compilation"/> and writes only its own accumulators, so the merge
+    /// into the two shared dictionaries happens once, afterwards, on one thread.</para>
+    ///
+    /// <para>Per group rather than per source object: every object declared in one file
+    /// receives the same target set (that is what the original nested loop did), so the walk
+    /// collects one set of targets for the file and fans it out to that file's sources at
+    /// merge time. Self-edges are dropped there, exactly where the serial version dropped
+    /// them.</para>
+    ///
+    /// <para><c>AL_RUNNER_RAD_GRAPH_PARALLEL=0</c> forces the original single-threaded walk.
+    /// The graph decides which callers a later delta rebinds, so a way to take Microsoft's
+    /// semantic-model concurrency out of the picture when diagnosing a wrong rebind is worth
+    /// the one branch.</para>
     /// </summary>
     private static RadReferenceGraph MapObjectReferences(NavCA.Compilation compilation)
     {
@@ -1572,11 +1593,18 @@ public sealed partial class BcCompiler
             _ => new HashSet<AlRunner.Rad.RadObjectKey>());
         var crossApp = new Dictionary<AlRunner.Rad.RadObjectKey, HashSet<AlRunner.Rad.RadAppObjectRef>>();
 
-        foreach (var group in declared
+        var groups = declared
             .Where(symbol => symbol.DeclaringSyntaxReference?.SyntaxTree != null)
-            .GroupBy(symbol => symbol.DeclaringSyntaxReference!.SyntaxTree))
+            .GroupBy(symbol => symbol.DeclaringSyntaxReference!.SyntaxTree)
+            .ToList();
+        var walked = new FileReferences[groups.Count];
+
+        void WalkGroup(int i)
         {
+            var group = groups[i];
             var sources = group.Select(ObjectKey).Distinct().ToArray();
+            var same = new HashSet<AlRunner.Rad.RadObjectKey>();
+            var cross = new HashSet<AlRunner.Rad.RadAppObjectRef>();
             var model = compilation.GetSemanticModel(group.Key);
             foreach (var node in group.Key.GetRoot().DescendantNodesAndSelf())
             {
@@ -1592,21 +1620,41 @@ public sealed partial class BcCompiler
                     // diagnostics still reject its compilation; graph capture is best effort.
                 }
             }
+            walked[i] = new FileReferences(sources, same, cross);
 
             void AddReference(NavCA.ISymbol? symbol)
             {
                 if (ReferenceTarget(symbol, ownAppId, cohort) is not { } target) return;
-                foreach (var source in sources)
+                if (target.App == null) same.Add(target.Key);
+                else cross.Add(new AlRunner.Rad.RadAppObjectRef(target.App, target.Key));
+            }
+        }
+
+        if (Environment.GetEnvironmentVariable("AL_RUNNER_RAD_GRAPH_PARALLEL") == "0")
+            for (int i = 0; i < groups.Count; i++) WalkGroup(i);
+        else
+            // Bounded to the core count on purpose: each in-flight group holds a semantic
+            // model and that file's bound bodies, so an unbounded pool would trade a
+            // memory-bound phase's wall time for a larger peak on the host that can least
+            // afford it.
+            Parallel.For(0, groups.Count,
+                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                WalkGroup);
+
+        foreach (var (sources, same, cross) in walked)
+        {
+            foreach (var source in sources)
+            {
+                if (same.Count > 0)
                 {
-                    if (target.App == null)
-                    {
-                        if (source != target.Key) sameApp[source].Add(target.Key);
-                        continue;
-                    }
-                    if (!crossApp.TryGetValue(source, out var targets))
-                        crossApp[source] = targets = new HashSet<AlRunner.Rad.RadAppObjectRef>();
-                    targets.Add(new AlRunner.Rad.RadAppObjectRef(target.App, target.Key));
+                    var targets = sameApp[source];
+                    foreach (var target in same)
+                        if (source != target) targets.Add(target);
                 }
+                if (cross.Count == 0) continue;
+                if (!crossApp.TryGetValue(source, out var appTargets))
+                    crossApp[source] = appTargets = new HashSet<AlRunner.Rad.RadAppObjectRef>();
+                appTargets.UnionWith(cross);
             }
         }
 
@@ -1616,6 +1664,17 @@ public sealed partial class BcCompiler
 
         return new RadReferenceGraph(sameApp, crossApp);
     }
+
+    /// <summary>
+    /// One file's contribution to the reference graph, before it is fanned out to the
+    /// objects that file declares. Kept per file rather than per object because the walk
+    /// cannot attribute a node to one of several co-declared objects, and the serial
+    /// version never did either — it added every target it saw to every source in the group.
+    /// </summary>
+    private readonly record struct FileReferences(
+        AlRunner.Rad.RadObjectKey[] Sources,
+        HashSet<AlRunner.Rad.RadObjectKey> SameApp,
+        HashSet<AlRunner.Rad.RadAppObjectRef> CrossApp);
 
     /// <summary>
     /// The one-hop reference relation a compile produces, split by whether the target is in
