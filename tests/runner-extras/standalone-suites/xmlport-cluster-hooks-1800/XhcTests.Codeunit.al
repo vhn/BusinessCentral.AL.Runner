@@ -205,4 +205,155 @@ codeunit 62182 "XHC Tests"
         if not Ok then
             Error('XHC Port.Import() reported failure against a correctly-set-up InStream source.');
     end;
+
+    // ── #1883 follow-up: static XMLPORT.EXPORT(id, stream, record) / XMLPORT.IMPORT(id,
+    // stream, record) — NOT covered by the #1800 investigation above (that was scoped to the
+    // instance methods). Also found orphaned (JmpHook disabled by default, hook never fired)
+    // with a "not-yet-implemented" throw stub that would have fired had the hook worked. BC's
+    // real, unpatched static Export/Import bodies were verified empirically to handle
+    // well-formed usage correctly, same conclusion and same shape as the #1800 cluster: there
+    // is nothing to redirect to, so the orphaned Hook(...) call sites and throw stubs
+    // (NavXmlPort_StaticExport/StaticImport in AlRunner/Patches/XmlPortPatches.cs) were
+    // deleted outright. The actual BC-behaviour claim ("does the static overload populate /
+    // export the given record correctly") is proven upstream in the corpus, not here — see
+    // bc-behavior-tests-go-upstream.md and xmlport/TestXmlPortObject.al's
+    // XmlPort_Export_StaticWithRecord_RespectsFilters /
+    // XmlPort_Import_StaticWithRecord_InsertsIntoGivenRecordVariable. These two tests are
+    // narrower regression guards, same framing as InstanceExportImportRoundTrip_RealBcBody_NoThrow
+    // above: a correctly-set-up static call completes without throwing, with no runner redirect
+    // installed on this surface. (NavXmlPortTableNode.ctor, the third #1883 orphan in this
+    // cluster, needs no separate test here — every XmlPort construction in this file, including
+    // InstanceConstruction_DoesNotThrow above, already goes through it since "XHC Port" is
+    // tableelement-bound.)
+    // Entry Nos 101/102 are deliberately disjoint from the other tests in this codeunit
+    // (which use Entry No. 1): "XHC Row" persists across test procedures in this suite (see
+    // the "legitimate duplicate-key failure" comment above InstanceExportImportRoundTrip_
+    // RealBcBody_NoThrow), so reusing 1 here would collide with whatever an earlier test in
+    // the same run left behind. Each test below deletes its own row at the end so it does
+    // not leak into whichever test runs after it.
+    [Test]
+    procedure StaticExport_WithRecordArg_RealBcBody_NoThrow()
+    var
+        Row_: Record "XHC Row";
+        TempBlob: Codeunit "Temp Blob";
+        DocumentOutStream: OutStream;
+        Ok: Boolean;
+    begin
+        if Row_.Get(101) then
+            Row_.Delete();
+        Row_.Init();
+        Row_."Entry No." := 101;
+        Row_.Name := 'First';
+        Row_.Insert();
+
+        TempBlob.CreateOutStream(DocumentOutStream);
+        Ok := XmlPort.Export(62181, DocumentOutStream, Row_);
+        if not Ok then
+            Error('Static XmlPort.Export(Integer, OutStream, Record) reported failure against a correctly-set-up OutStream destination.');
+
+        Row_.Delete();
+    end;
+
+    // Entry No. 103 is deliberately disjoint from every other Entry No. used elsewhere in
+    // this codeunit (1, 101) — "XHC Row" persists across test procedures in this suite (see
+    // the "legitimate duplicate-key failure" comment above InstanceExportImportRoundTrip_
+    // RealBcBody_NoThrow), so reusing an already-used key here would collide with whatever an
+    // earlier test in the same run left behind.
+    [Test]
+    procedure StaticImport_WithRecordArg_RealBcBody_NoThrow()
+    var
+        TargetRow: Record "XHC Row";
+        TempBlob: Codeunit "Temp Blob";
+        DocumentOutStream: OutStream;
+        DocumentInStream: InStream;
+        Ok: Boolean;
+    begin
+        // Hand-written payload matching "XHC Port"'s schema (root/Row/EntryNo/RowName) —
+        // sidesteps any uncertainty about what XmlPort.Export's own output shape is, since
+        // that is already covered by StaticExport_WithRecordArg_RealBcBody_NoThrow above.
+        TempBlob.CreateOutStream(DocumentOutStream);
+        DocumentOutStream.WriteText('<?xml version="1.0" encoding="utf-8"?><root><Row><EntryNo>103</EntryNo><RowName>First</RowName></Row></root>');
+        TempBlob.CreateInStream(DocumentInStream);
+
+        ClearLastError();
+        Ok := XmlPort.Import(62181, DocumentInStream, TargetRow);
+        if not Ok then
+            Error('Static XmlPort.Import(Integer, InStream, Record) reported failure. LastError=%1', GetLastErrorText());
+
+        // Verify via a fresh Get() rather than deleting TargetRow directly — see AL Runner#1946
+        // (filed while writing this test, resolved below in
+        // StaticImport_ThenUnrelatedFailedDelete_DoesNotWipeCommittedRow). Static
+        // XmlPort.Import(Integer, InStream, Record) never populates the GIVEN record
+        // variable's own fields -- confirmed against real BC (corpus PR
+        // StefanMaron/BusinessCentral.AL.Language.Tests#57,
+        // XmlPort_Import_StaticWithRecord_GivenVariableUnchangedWithoutExplicitGet, green on
+        // BC 27.5 and 28.3): the record argument only ever seeds SetTableView's row filter,
+        // never the reverse. A bare Delete() on the still-unpopulated TargetRow (key still at
+        // its Init() default) correctly throws "does not exist" on BOTH real BC and the
+        // runner -- that part of #1946's original reproducer was never a bug. Get()-then-read
+        // is simply the only way to read back a row a static Import(Record) call inserted.
+        if not TargetRow.Get(103) then
+            Error('Static XmlPort.Import(Integer, InStream, Record) reported success but Entry No. 103 was not actually inserted.');
+        if TargetRow.Name <> 'First' then
+            Error('Static XmlPort.Import(Integer, InStream, Record) inserted the wrong Name: %1', TargetRow.Name);
+        TargetRow.Delete();
+    end;
+
+    // The ACTUAL #1946 bug, isolated: a Delete() that legitimately fails (its own record
+    // variable's primary key is still at its Init() default, matching no row) must have NO
+    // side effect on the database -- but the runner's write-transaction rollback machinery
+    // (RecordPatches.TransactionSnapshot.cs) captured its "roll back to here" snapshot of
+    // this table BEFORE Import's own row-201 insert had happened (taken by Import's OWN
+    // internal Row_.Insert(), the first write since the last commit point), and NOTHING ever
+    // advanced that commit point past the insert -- so the later failed Delete()'s rollback
+    // (NavMethodScope.AssertError -> session.Rollback()) restored the table to its
+    // BEFORE-Import state, silently deleting the row Import had already, durably committed.
+    // Reproducible with no XmlPort involved at all: a plain Record.Insert() followed by an
+    // unrelated failing Record.Delete() shows the SAME wipe on an uncommitted plain write
+    // (matching real, INTENTIONAL BC behaviour -- see
+    // TestTriggerRollback.OnModify_Throws_ValueNotModified in the corpus) -- what made this
+    // one a genuine bug is that XmlPort.Import runs its own internal
+    // Session.BeginTransaction()/EndTransaction(commit: true) (decompiled, unmodified Ncl
+    // body), which real BC treats as a real, nested commit point that survives a later,
+    // unrelated rollback. The fix hooks
+    // SessionTransactionExtensions.EndTransaction/EndTransactionWorldAndTransaction (AL's
+    // compiler picks the WorldAndTransaction overload whenever the call's boolean result is
+    // captured into a variable, e.g. `Ok := XmlPort.Import(...)` -- the common, idiomatic
+    // shape, and the one that actually reaches this bug) to advance the runner's own commit
+    // point on every real `commit: true` completion, not just AL's own Commit() statement.
+    [Test]
+    procedure StaticImport_ThenUnrelatedFailedDelete_DoesNotWipeCommittedRow()
+    var
+        TargetRow: Record "XHC Row";
+        NeverTouched: Record "XHC Row";
+        TempBlob: Codeunit "Temp Blob";
+        DocumentOutStream: OutStream;
+        DocumentInStream: InStream;
+        Ok: Boolean;
+    begin
+        // Entry No. 201 is deliberately disjoint from every other Entry No. used elsewhere in
+        // this codeunit (1, 101, 103) -- see the "legitimate duplicate-key failure" comment
+        // above InstanceExportImportRoundTrip_RealBcBody_NoThrow.
+        TempBlob.CreateOutStream(DocumentOutStream);
+        DocumentOutStream.WriteText('<?xml version="1.0" encoding="utf-8"?><root><Row><EntryNo>201</EntryNo><RowName>Committed</RowName></Row></root>');
+        TempBlob.CreateInStream(DocumentInStream);
+
+        Ok := XmlPort.Import(62181, DocumentInStream, TargetRow);
+        if not Ok then
+            Error('Static XmlPort.Import(Integer, InStream, Record) reported failure ahead of the unrelated-delete assertion this test exists to prove.');
+
+        // NeverTouched is a completely separate, never-Get()'d record variable of the SAME
+        // table -- its own primary key is still at Init()'s default (0), so Delete() on it
+        // legitimately throws "does not exist". That failure itself is correct, expected BC
+        // behaviour (see the comment on StaticImport_WithRecordArg_RealBcBody_NoThrow above)
+        // -- the claim this test proves is narrower: that failure must not touch row 201.
+        asserterror NeverTouched.Delete();
+
+        if not TargetRow.Get(201) then
+            Error('The row XmlPort.Import(Integer, InStream, Record) committed did not survive an unrelated, legitimately-failing Delete() elsewhere.');
+        if TargetRow.Name <> 'Committed' then
+            Error('Row 201 survived the unrelated failed Delete() but with the wrong Name: %1', TargetRow.Name);
+
+        TargetRow.Delete();
+    end;
 }

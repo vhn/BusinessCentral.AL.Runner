@@ -465,8 +465,12 @@ public sealed partial class BcCompiler
         NavSymRef.ModuleDefinition? packagedOverride = null)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var parseOpts = ParseOptionsForCompile();
-        var compOpts = EmitCompilationOptions();
+        // Resolved and applied exactly as the full compile does (#1940/#1941/#1943). A delta
+        // that parsed without the manifest's preprocessorSymbols, or bound without its
+        // compilerFeatures, would answer differently from the compile it stands in for.
+        var (_, manifestInputs) = ResolveManifestInputs(appRootDir, dirs);
+        var parseOpts = EmitParseOptions(manifestInputs);
+        var compOpts = EmitCompilationOptions(manifestInputs);
         var appId = _currentAppId ?? DeterministicGuid(moduleName);
         var publisher = _currentPublisher ?? "AlRunner";
         var version = _currentVersion ?? new Version(1, 0, 0, 0);
@@ -1551,12 +1555,6 @@ public sealed partial class BcCompiler
             ? string.Join("; ", reasons)
             : "the compilation's reference surface changed";
     }
-
-    private NavCA.ParseOptions ParseOptionsForCompile() => new(
-        runtimeVersion: null!,
-        preprocessorSymbols: Enumerable.Range(1, 25).Select(n => $"CLEANSCHEMA{n}")
-            .Concat(_extraPreprocessorSymbols ?? []),
-        documentationMode: NavCA.DocumentationMode.None);
 
     /// <summary>
     /// Whether <see cref="AlRunner.Rad.RadObjectKey"/> can identify this object at all.

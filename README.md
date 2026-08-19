@@ -235,6 +235,42 @@ Out of scope by design: SMTP, HTTP egress to external services, file I/O against
 | `2` | Runner limitations only |
 | `3` | AL compilation error |
 
+## Knowledge graph (optional)
+
+This repo — the C# runner and AL sources alike — can be indexed into a queryable knowledge
+graph: communities, most-connected types, import cycles. Built with
+[graphify](https://github.com/safishamsi/graphify).
+
+**Install the AL-aware fork**, not the upstream package:
+
+```bash
+uv tool install --upgrade "git+https://github.com/ChristianHovenbitzer/graphify-al.git@al-support"
+```
+
+The fork adds `.al` to the file detector and an AL extractor. Upstream graphify has no AL
+support, and it does not fail on `.al` files — it skips them silently, so a graph built with it
+looks complete while containing none of the AL in this repo. Upstream is enough if you only ever
+index the C# under `AlRunner/`, but anyone working on this project reaches AL sooner or later.
+Install the fork once and the question does not come up.
+
+Then, from the repo root:
+
+```bash
+graphify AlRunner              # index the C# runner
+graphify tests/runner-extras   # or an AL tree (needs the fork)
+graphify query "<question>"    # ask it something
+graphify AlRunner --update     # refresh after changes
+```
+
+Output lands in `graphify-out/` (`graph.html`, `graph.json`, `GRAPH_REPORT.md`). It is gitignored
+— it is derived, several MB, and goes stale quickly.
+
+`AlRunner/` is code-only, so extraction is deterministic AST work and costs no LLM tokens.
+
+One limit worth knowing before trusting it: the graph is static. A `Hook(...)` registration that
+never fires and one that does look the same in it. For that question use `AL_RUNNER_HOOK_AUDIT=1`,
+which measures at runtime.
+
 ## Reporting Gaps
 
 If AL code fails to run and the reason is not in [`docs/limitations.md`](docs/limitations.md) or [`docs/scope.md`](docs/scope.md), that is a **runner gap**. Open an issue with `.github/ISSUE_TEMPLATE/runner-gap.md`. Silent workarounds are forbidden (`.claude/rules/file-issues-for-gaps.md`).

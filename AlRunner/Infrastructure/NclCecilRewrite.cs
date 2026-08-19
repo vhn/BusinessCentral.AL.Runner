@@ -1688,6 +1688,56 @@ public static class NclCecilRewrite
             Console.Error.WriteLine("[Cecil] Rewrote SessionTransactionExtensions.Rollback → row-store rollback");
         }
 
+        // 8g. SessionTransactionExtensions.EndTransaction / EndTransactionWorldAndTransaction —
+        //     see RecordPatches.NoteTransactionEnd.
+        //
+        //     AL Runner#1946: BC's own APIs wrap their internal work in an explicit nested
+        //     transaction (decompiled, unmodified Ncl body of the static overload of
+        //     NavXmlPort.Import — the one the corpus proved this against:
+        //     Session.BeginTransaction(); ...; finally { Session.EndTransaction(commit); } for
+        //     DataError.ThrowError, or Session.BeginTransactionWorldAndTransaction(); ...;
+        //     finally { Session.EndTransactionWorldAndTransaction(commit); } for
+        //     DataError.TrapError — AL's compiler picks TrapError whenever the call's boolean
+        //     result is captured into a variable, e.g. `Ok := XmlPort.Import(...)`, which is
+        //     the common, idiomatic AL shape and the one that actually reaches this bug).
+        //     A real commit there is exactly as durable, from AL's point of view, as an
+        //     explicit Commit() statement — but only MarkCommitPoint's two existing call sites
+        //     (AL's own Commit() and the per-test isolation boundary) ever advanced the
+        //     rollback baseline, so a LATER, unrelated asserterror in the caller rolled all the
+        //     way back to test-method start, wiping out rows a nested BC API had already
+        //     committed. Reproducible with no XmlPort involved at all — see
+        //     RecordPatches.NoteTransactionEnd's doc comment.
+        //
+        //     Prepend, not replace: the original bodies (SessionTransactionManager.EndTransaction
+        //     / EndTransactionWorldAndTransaction) already run safely today (every passing
+        //     XmlPort Export/Import test goes through one of them), so this only adds the
+        //     missing commit-point bookkeeping alongside them.
+        {
+            var sessTxType2 = asm.MainModule.Types
+                .FirstOrDefault(t => t.FullName == "Microsoft.Dynamics.Nav.Runtime.SessionTransactionExtensions")
+                ?? throw new InvalidOperationException(
+                    "[Cecil] SessionTransactionExtensions type not found — Ncl shape changed; do not commit");
+
+            var noteTransactionEndHelper = typeof(AlRunner.Patches.RecordPatches).GetMethod(
+                nameof(AlRunner.Patches.RecordPatches.NoteTransactionEnd),
+                BindingFlags.Public | BindingFlags.Static)
+                ?? throw new InvalidOperationException(
+                    "[Cecil] RecordPatches.NoteTransactionEnd not found");
+
+            foreach (var methodName in new[] { "EndTransaction", "EndTransactionWorldAndTransaction" })
+            {
+                var endTransactionMethod = sessTxType2.Methods
+                    .FirstOrDefault(m => m.Name == methodName && m.IsStatic
+                                         && m.Parameters.Count == 2 && m.HasBody
+                                         && m.Parameters[1].ParameterType.FullName == "System.Boolean")
+                    ?? throw new InvalidOperationException(
+                        $"[Cecil] SessionTransactionExtensions.{methodName}(NavSession, bool) not found — Ncl shape changed; do not commit");
+
+                PrependStaticCall(asm.MainModule, endTransactionMethod, noteTransactionEndHelper, argSlots: 2);
+            }
+        }
+
+
         // 9b. TreeHandler.get_Session — see BcRuntime.TreeHandler_get_Session.
         //     The real body is `=> session`, a readonly field set in the ctor from
         //     `parentHandler.session ?? (hostObject as NavSession)`. The runner's root tree
@@ -4124,10 +4174,35 @@ public static class NclCecilRewrite
             // rollback snapshot hangs off this same note, so leaving them out meant a
             // DeleteAll before the first single-row write was never captured and therefore
             // never rolled back.
+            //
+            // DeleteAllAsync/ModifyAllAsync (no "AL" prefix) — NOT ALDeleteAllAsync/
+            // ALModifyAllAsync — deliberately (AlRunner#1791). The single-row forms
+            // (ALInsert/ALModify/ALDelete/ALRename) all fire their prepend correctly via
+            // either overload because BC's own sync entry point (e.g. `ALInsert(bool)`)
+            // itself calls the "AL"-prefixed async sibling (`ALInsertAsync(...)`), so
+            // hooking the async name catches both call surfaces. The bulk forms break that
+            // pattern: decompiling the shipped Ncl.dll shows `ALDeleteAll(bool)` — what AL's
+            // compiler actually binds `Record.DeleteAll(RunTrigger)` to, confirmed by
+            // decompiling this project's own AL-compiled test output — calls the PROTECTED
+            // `DeleteAllAsync(bool)` directly, bypassing `ALDeleteAllAsync` entirely (same
+            // for `ALModifyAll` → `ModifyAllAsync`). Hooking `ALDeleteAllAsync` therefore
+            // never fired for any DeleteAll()/ModifyAll() statement the AL compiler emits —
+            // confirmed by decompiling this project's OWN compiled test corpus: zero
+            // `.ALDeleteAllAsync(`/`.ALModifyAllAsync(` call sites anywhere in it, only
+            // `.ALDeleteAll(` (125 occurrences). Most visibly this left
+            // IsInWriteTransaction() silently reading false after a DeleteAll() that matched
+            // zero rows (AlRunner#1791's reproduction), but the miss is unconditional — the
+            // hooked method is simply never reached, whether or not the call matches any
+            // rows. `DeleteAllAsync`/`ModifyAllAsync` are each a single, non-overloaded,
+            // protected `virtual` method that every entry surface (0-arg/1-arg, sync/async)
+            // funnels through exactly once, so hooking them fires exactly once per AL
+            // DeleteAll()/ModifyAll() statement regardless of which surface form the AL
+            // compiler chose — no double-count risk from a forwarding overload also being
+            // in this list.
             var writeEntries = new[]
             {
                 "ALInsertAsync", "ALModifyAsync", "ALDeleteAsync", "ALRenameAsync",
-                "ALDeleteAllAsync", "ALModifyAllAsync",
+                "DeleteAllAsync", "ModifyAllAsync",
             };
             int bumped = 0;
             foreach (var m in navRecord.Methods.Where(
@@ -6666,6 +6741,18 @@ public static class NclCecilRewrite
             ReplaceBodyWithHelper(nclMod,
                 ByParams(Rt + "NCLMetaTable", "GetFieldByNo", "Int32", "Int32"),
                 H(recordPatches, "NCLMetaTable_GetFieldByNoExt"));
+
+            // ── NavRecord TestField navigation-action guards (#1938) ──────────────
+            // See NavRecordTestFieldNavigationPatches.cs for the full mechanism. Both
+            // GetPageToOpen and TryAddTestFieldAction can independently throw
+            // NavMetadataNotFoundException for a Base App page the runner never loaded,
+            // hijacking the real TestField error the caller was about to throw — guard both.
+            ReplaceBodyWithHelper(nclMod,
+                ByParams(Rt + "NavRecord", "GetPageToOpen", "NCLMetaTable"),
+                H(recordPatches, "NavRecord_GetPageToOpen"));
+            ReplaceBodyWithHelper(nclMod,
+                ByParams(Rt + "NavRecord", "TryAddTestFieldAction", "NCLMetaField"),
+                H(recordPatches, "NavRecord_TryAddTestFieldAction"));
 
             // ── NavSession getters / DataAccessSource (RecordWritePatches.cs:84-104,482) ──
             ReplaceBodyWithHelper(nclMod,

@@ -1509,7 +1509,11 @@ foreach (var bundle in bundles)
         // pre-edit DLL over it.
         if (needCompile && alCacheDir != null && radWs is null or { Generations.Count: 0 })
         {
-            cacheKey = ComputeAlCacheKey(allPaths, moduleName, ordered: orderedDepIds);
+            // orderedDepIds is hoisted (computed once per cycle, above) rather than resolved
+            // here; appRootDir is main's — the key has to move when the manifest's
+            // compiler inputs do, or a features/preprocessorSymbols edit serves the pre-edit DLL.
+            cacheKey = ComputeAlCacheKey(
+                allPaths, moduleName, ordered: orderedDepIds, appRootDir: appGroup.SuiteDir);
             cachePath = Path.Combine(alCacheDir, cacheKey + ".dll");
             sidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.EnumRegistrySuffix);
             querySidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.QuerySymbolsSuffix);
@@ -1638,6 +1642,19 @@ foreach (var bundle in bundles)
             // already applies — see BcCompiler.ScopeSymbolBearingDepsOnly.
             using var bundleDepScope = BcCompiler.ScopeSymbolBearingDepsOnly();
             AppMark("pre-emit setup");
+            // The delta path is RunEmit -> BcCompiler.EmitIncremental, against the resident
+            // RadWorkspace. #1962 landed a second, narrower incremental path on main
+            // (BcCompiler.TryEmitIncremental, still present and still directly tested) whose
+            // hook was here; it is deliberately NOT wired, because the two cannot both own the
+            // baseline and this one is a strict superset of it. TryEmitIncremental falls back to
+            // a whole-module compile for an added/removed/renamed file, an id-less object kind,
+            // a file declaring anything other than exactly one object, a changed object
+            // identity, and every first cycle of a new process (its baseline is per-instance and
+            // in-memory); the workspace deltas all of those, persists its baseline through the
+            // AL-output cache so a cache HIT arrives delta-ready, and rebinds cross-app callers
+            // instead of rebuilding them. RadWorkspace.ReferenceSignature covers what
+            // TryEmitIncremental's two fingerprints covered — resolved dependency specs,
+            // preprocessor symbols, app identity.
             var emitTask = Task.Run(() => RunEmit(emitter, allPaths, moduleName, radWs, appGroup.SuiteDir));
             try
             {
@@ -3324,7 +3341,7 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
             if (reusedAsm == null && alCacheDir != null)
             {
                 cacheKey = ComputeAlCacheKey(allPaths, moduleName,
-                    ordered: GetOrderedDepIds(bucketRoot, effectivePkgDirs));
+                    ordered: GetOrderedDepIds(bucketRoot, effectivePkgDirs), appRootDir: bucketRoot);
                 cachePath = Path.Combine(alCacheDir, cacheKey + ".dll");
                 sidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.EnumRegistrySuffix);
                 querySidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.QuerySymbolsSuffix);
@@ -5725,7 +5742,8 @@ static List<string> CollectSuitePaths(string suite, string? bucketRoot = null)
 static string ComputeAlCacheKey(
     IReadOnlyList<string> alFolders,
     string moduleName,
-    IReadOnlyList<string> ordered)
+    IReadOnlyList<string> ordered,
+    string? appRootDir = null)
 {
     using var sha = System.Security.Cryptography.SHA256.Create();
     using var ms = new MemoryStream();
@@ -5769,7 +5787,15 @@ static string ComputeAlCacheKey(
     //        explicit version line all 8 legs would collide on one cache entry and a leg
     //        could load AL output compiled against another BC version's symbols). v9
     //        entries carried neither and must not be served under the new key shape.
-    WriteLine("schema:v10");
+    //    v11: added a manifest fragment (preprocessorSymbols/features/contextSensitiveHelpUrl
+    //        read from the app's own app.json — see BcCompiler.ReadManifestCompilerInputs).
+    //        #1943: before this, editing app.json changed neither the AL source bytes nor
+    //        the CLI --define set, so the key was IDENTICAL before and after — a cache HIT
+    //        would silently serve the DLL compiled under the OLD manifest values (wrong #if
+    //        branch, missing NoImplicitWith, stale contextSensitiveHelpUrl) forever, until
+    //        something else in the key happened to change. v10 entries never hashed the
+    //        manifest at all and must not be served under the new key shape.
+    WriteLine("schema:v11");
 
     // 1. Runner assembly fingerprint (content hash, not mtime — see v10 note above) +
     //    the selected BC version, so any rewriter/polyfill/patch change in the runner,
@@ -5785,6 +5811,13 @@ static string ComputeAlCacheKey(
     //    compiled first served the other. Written unconditionally so the line always frames
     //    the key (existing entries hash differently once and rebuild).
     WriteLine($"defines:{string.Join(",", AlRunner.BcCompiler.GetExtraPreprocessorSymbols())}");
+
+    // 3. The app's OWN manifest properties that feed ParseOptions/CompilationOptions —
+    //    preprocessorSymbols, features, contextSensitiveHelpUrl (#1943; see v11 note
+    //    above). appRootDir is the directory holding app.json — the same one Emit()
+    //    itself reads from (BcCompiler.ReadManifestCompilerInputs) — so an edit to any of
+    //    these three properties changes this line and forces a MISS.
+    WriteLine($"manifest:{AlRunner.BcCompiler.ReadManifestCacheKeyFragment(appRootDir)}");
 
     foreach (var d in ordered) WriteLine($"dep:{d}");
 

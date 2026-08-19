@@ -117,6 +117,19 @@ constructs a workspace.
 | `Program.cs` (watch loop) | Drains the paths, decides warm-reload eligibility, wires cache HIT → hydrate |
 | `WatchDashboard.cs` | Renders full-recompile and delta-rebind panels above the test tree |
 
+**`BcCompiler.Incremental.cs` is not part of this and is not wired.** It holds a second,
+narrower incremental compile (`TryEmitIncremental`, #1902/#1962) that arrived independently on
+`main`: a per-`BcCompiler`-instance, in-memory baseline that deltas a content edit to a
+single-object, id-bearing file whose identity has not moved, and falls back to a whole-module
+compile for everything else — an added, removed or renamed file, an id-less kind, a file
+declaring anything other than exactly one object, a changed id or name, and the first cycle of
+every new process. The workspace above deltas all of those, persists its baseline through the
+AL-output cache so a HIT arrives delta-ready, and rebinds cross-app callers instead of
+rebuilding them; the two cannot both own the baseline, so `Program.cs` calls `RunEmit` and
+never `TryEmitIncremental`. The file and `BcCompilerIncrementalTests` are kept so the choice
+stays reversible and the code stays exercised — but a change to *how `--watch` deltas* belongs
+in `Rad/`, not there.
+
 ### `Rad/RadWorkspace.cs` — the baseline, and what may be committed to it
 
 One `RadWorkspace` per app, keyed in `RadWorkspaceStore` by module name + `AppId`, living for
