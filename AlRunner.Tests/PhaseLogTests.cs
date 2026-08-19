@@ -424,4 +424,31 @@ public sealed class PhaseLogTests : IDisposable
         var rss = PhaseLog.PeakRssBytes();
         Assert.True(rss > 8 * 1024 * 1024, $"peak RSS looks stubbed: {rss} bytes");
     }
+
+    /// <summary>
+    /// The figure must be in BYTES on every platform, and the floor above cannot tell:
+    /// a kilobyte value read as bytes clears 8 MB just as easily. Each platform source
+    /// carries a different unit — Linux's VmHWM and Windows' PeakWorkingSet64 are
+    /// kilobytes and bytes respectively, and Darwin's ru_maxrss is bytes (unlike Linux's
+    /// getrusage, where the same field is kilobytes) — so a 1024x error is the live
+    /// hazard here, not a stub. Anchoring against this process's own working set catches
+    /// it in either direction: 1024x too large fails the ceiling, 1024x too small fails
+    /// the floor. Darwin adds a second failure mode with the same tell — ru_maxrss read at
+    /// the wrong struct offset lands in a timeval and reports a wall-clock second count.
+    /// </summary>
+    [Fact]
+    public void PeakRssBytes_IsInBytes_NotKilobytes()
+    {
+        var peak = PhaseLog.PeakRssBytes();
+        using var self = System.Diagnostics.Process.GetCurrentProcess();
+        var live = self.WorkingSet64;
+        Assert.True(live > 8 * 1024 * 1024, $"working set implausible for a test host: {live} bytes");
+
+        // A high-water mark is >= the current set by definition; halve the bound so a
+        // sampling skew between the two reads cannot fail an otherwise correct value.
+        Assert.True(peak >= live / 2,
+            $"peak RSS {peak} is below half the live working set {live} — units too small by ~1024x?");
+        Assert.True(peak <= live * 8,
+            $"peak RSS {peak} is more than 8x the live working set {live} — units too large by ~1024x?");
+    }
 }
