@@ -1376,9 +1376,32 @@ foreach (var bundle in bundles)
         // Ordered dep ids feed every app's cache key but depend only on the bucket root
         // and the package caches — both loop-invariant. Resolving them inside the loop
         // re-scanned the package caches once per app.
-        IReadOnlyList<string> orderedDepIds;
-        using (AlRunner.Infrastructure.PhaseLog.Stage("ordered-dep-ids"))
-            orderedDepIds = GetOrderedDepIds(bucketRoot, packageCacheDirs, bundleAbs);
+        //
+        // Lazy because once per cycle is still once too many on a warm --watch cycle. The only
+        // consumer is ComputeAlCacheKey, behind the `radWs is null or { Generations.Count: 0 }`
+        // gate below — false from cycle 2 on, because by then this app owns a loaded generation
+        // and a cache entry must never resurrect the pre-edit DLL over it. So every warm cycle
+        // paid for a full second DependencyResolver index it then discarded:
+        // `EnsureIndexed` is an INSTANCE field, so a fresh resolver re-walks every
+        // package-cache dir and re-reads every .app's manifest out of its zip, with nothing
+        // carried over from the previous cycle.
+        //
+        // Deliberately not memoised across cycles instead: the resolved closure is exactly what
+        // a cache key must move with, and a --watch session outlives .alpackages changing under
+        // it. Skipping the work when nothing reads it is safe; reusing a stale answer when
+        // something does is not.
+        //
+        // AppStage, not Stage: deferring moved the work from before the app loop to inside
+        // whichever app group first opens the cache gate, and PhaseLog's two arithmetic rules say
+        // a BUNDLE stage must not overlap an app group — that time is already counted in the app
+        // row, so counting it again on the bundle row would inflate the #1828 stage sum and eat
+        // into the report's "unattributed" honesty line. Charging it to the app that actually
+        // pays it keeps the decomposition true, and the Lazy means no other app is charged twice.
+        var orderedDepIds = new Lazy<IReadOnlyList<string>>(() =>
+        {
+            using (AlRunner.Infrastructure.PhaseLog.AppStage("ordered-dep-ids"))
+                return GetOrderedDepIds(bucketRoot, packageCacheDirs, bundleAbs);
+        });
 
         int agIdx = 0;
         foreach (var appGroup in appGroups)
@@ -1485,8 +1508,19 @@ foreach (var bundle in bundles)
         // MetaQuery design is built from the compilation's SymbolReference, which only
         // emit produces. Serving a HIT without it leaves NCLMetaQuery null and every
         // query Find NREs inside BC's NavQuery.ValidateTablesNotVirtual.
-        bool bundleDeclaresQuery = BcCompiler.BundleDeclaresQuery(allPaths);
-        AppMark("BundleDeclaresQuery");
+        //
+        // Answered inside the cache gate below rather than here, because the question is only
+        // ever asked ABOUT a cache entry — "does a HIT for this bundle also need the
+        // query-symbols sidecar?" — and a warm --watch cycle never consults a cache entry at
+        // all. It is not a judgement about whether queries matter: an app that HAS a query
+        // answers on the first file it reads and costs nothing. It is the app with NO query
+        // that reads every .al file in the tree to prove a negative (12.7 MB on npcore), which
+        // is the overwhelmingly common case and was paid on every cycle.
+        //
+        // The second reader (the sidecar-replay block) is reachable only when cachedBytes was
+        // set, and cachedBytes is assigned nowhere but inside that gate — so it always observes
+        // the assigned value, never this initialiser.
+        bool bundleDeclaresQuery = false;
 
         // ── RAD delta workspace (--watch) ──────────────────────────────────
         // Held across cycles per app identity: per-file content hashes, the compiler's
@@ -1509,11 +1543,13 @@ foreach (var bundle in bundles)
         // pre-edit DLL over it.
         if (needCompile && alCacheDir != null && radWs is null or { Generations.Count: 0 })
         {
-            // orderedDepIds is hoisted (computed once per cycle, above) rather than resolved
-            // here; appRootDir is main's — the key has to move when the manifest's
+            bundleDeclaresQuery = BcCompiler.BundleDeclaresQuery(allPaths);
+            AppMark("BundleDeclaresQuery");
+            // orderedDepIds is hoisted (resolved at most once per cycle, above) rather than
+            // resolved here; appRootDir is main's — the key has to move when the manifest's
             // compiler inputs do, or a features/preprocessorSymbols edit serves the pre-edit DLL.
             cacheKey = ComputeAlCacheKey(
-                allPaths, moduleName, ordered: orderedDepIds, appRootDir: appGroup.SuiteDir);
+                allPaths, moduleName, ordered: orderedDepIds.Value, appRootDir: appGroup.SuiteDir);
             cachePath = Path.Combine(alCacheDir, cacheKey + ".dll");
             sidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.EnumRegistrySuffix);
             querySidecarPath = Path.Combine(alCacheDir, cacheKey + AlRunner.Infrastructure.AlCacheSidecars.QuerySymbolsSuffix);
@@ -3337,9 +3373,16 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
             // feeds the emitted assembly name, module identity, the protocol's responses and the
             // phase log. Tracked separately rather than done here.
             // See AlCacheSidecars: a query bundle without its query-symbols sidecar must MISS.
-            bool bundleDeclaresQuery = BcCompiler.BundleDeclaresQuery(allPaths);
+            //
+            // Inside the gate for the same reason as the CLI path: both readers are below, the
+            // question only means anything about a cache entry, and answering it costs a read of
+            // every .al file in the bundle whenever the app declares no query. Here the skipped
+            // case is a repeat request whose module is already loaded (`reusedAsm != null`) or a
+            // run with the cache off — neither of which can consult an entry.
+            bool bundleDeclaresQuery = false;
             if (reusedAsm == null && alCacheDir != null)
             {
+                bundleDeclaresQuery = BcCompiler.BundleDeclaresQuery(allPaths);
                 cacheKey = ComputeAlCacheKey(allPaths, moduleName,
                     ordered: GetOrderedDepIds(bucketRoot, effectivePkgDirs), appRootDir: bucketRoot);
                 cachePath = Path.Combine(alCacheDir, cacheKey + ".dll");

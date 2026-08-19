@@ -686,11 +686,15 @@ cost paid on every save.
 **Three** items in that body are computed on every cycle and **used only on the first one**, or
 not at all. They are dead work on a warm cycle, in cost order:
 
-| Item | Where | Cost | Why it is dead warm |
-|---|---|---|---|
-| `GetOrderedDepIds` | `Program.cs`, `ordered-dep-ids` | a full second `DependencyResolver` index | Its only consumer is `ComputeAlCacheKey`, behind the `radWs is null or { Generations.Count: 0 }` gate — false from cycle 2 on. `DependencyResolver.EnsureIndexed` is an *instance* field, so it re-walks every package-cache dir and re-reads every `.app`'s manifest out of its zip. |
-| `BcCompiler.BundleDeclaresQuery` | `Program.cs`, per app, `BundleDeclaresQuery` mark | O(whole tree) for an app with no query | Same gate, same story: it decides whether a **cache HIT** must also carry a query-symbols sidecar (without one, `NCLMetaQuery` is null and every query `Find` NREs inside `NavQuery.ValidateTablesNotVirtual`). It is not a judgement about queries mattering — an app that *has* one answers on the first file it reads and costs nothing. It is the app with **no** query that reads all 12.7 MB to prove a negative, and a warm cycle never consults the answer. |
-| The `PARTIAL-EMIT-DROP` guard | `Program.cs` | reads + regexes every `.al` file | Skipped for a delta overlay, so it lands only on full-rebuild cycles — i.e. it piles onto the cycles that are already the slowest. |
+| Item | Where | Cost | Why it is dead warm | Status |
+|---|---|---|---|---|
+| `GetOrderedDepIds` | `Program.cs`, `ordered-dep-ids` | a full second `DependencyResolver` index | Its only consumer is `ComputeAlCacheKey`, behind the `radWs is null or { Generations.Count: 0 }` gate — false from cycle 2 on. `DependencyResolver.EnsureIndexed` is an *instance* field, so it re-walks every package-cache dir and re-reads every `.app`'s manifest out of its zip. | **Fixed** — now a `Lazy`, resolved only when that gate opens. Deferring moved the work inside an app group, so its phase-log stage became an `AppStage`: a bundle stage overlapping an app group would double-count against the #1828 sum. |
+| `BcCompiler.BundleDeclaresQuery` | `Program.cs`, per app, `BundleDeclaresQuery` mark | O(whole tree) for an app with no query | Same gate, same story: it decides whether a **cache HIT** must also carry a query-symbols sidecar (without one, `NCLMetaQuery` is null and every query `Find` NREs inside `NavQuery.ValidateTablesNotVirtual`). It is not a judgement about queries mattering — an app that *has* one answers on the first file it reads and costs nothing. It is the app with **no** query that reads all 12.7 MB to prove a negative, and a warm cycle never consults the answer. | **Fixed** — computed inside the gate. Its second reader (the sidecar-replay block) is lexically outside the gate but reachable only via `cachedBytes != null`, which is assigned nowhere else, so it still observes the computed value. The `--server` twin got the same treatment behind `reusedAsm == null && alCacheDir != null`. |
+| The `PARTIAL-EMIT-DROP` guard | `Program.cs` | reads + regexes every `.al` file | Skipped for a delta overlay, so it lands only on full-rebuild cycles — i.e. it piles onto the cycles that are already the slowest. | Open |
+
+Both fixes are pinned by `AlRunner.Tests/AlCacheGateDeadWorkTests.cs`, which spawns the real
+runner over a query-declaring fixture and asserts each probe **present** with `--cache` (on both
+a MISS and a HIT) and **absent** with `--no-cache`.
 
 `RecordPatches.AddSourceDirs` is deliberately **not** on that list, despite being one of the
 largest lines in the table above. Its cost is real work the cycle needs, not work the cycle
