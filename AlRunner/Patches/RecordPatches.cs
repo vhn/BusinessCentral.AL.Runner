@@ -133,6 +133,8 @@ public static partial class RecordPatches
         _parsedObjectDecls.Clear();
         _parsedObjectCaptions.Clear();
         _metaFormCache.Clear();
+        // Must go with _metaFormCache, never without it — see ResetRealPageMetadataForReload.
+        ResetRealPageMetadataForReload();
         _metaReportCache.Clear();
         _metaQueryCache.Clear();
         _metaXmlPortCache.Clear();

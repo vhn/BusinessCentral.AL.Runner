@@ -464,6 +464,12 @@ public sealed class PhaseLogIntegrationTests : IDisposable
                          // AlRunner.Tests.InstallSeedDepCompanyCacheTests — plus a distinct
                          // "install-seed-run-own-install-triggers" mark for the bundle's own
                          // (always fresh, never cached) Install triggers.
+                         // "install-seed-arm-event-dispatch" arms the subscriber registry ahead
+                         // of the Install triggers below it — deleting it puts the runner back
+                         // to dispatching an install-time integration event to nobody on a cold
+                         // cycle and to its subscribers on every warm one (see TestExecutor.Run
+                         // and AlRunner.Tests.WatchInstallDiscoveryTests).
+                         "install-seed-arm-event-dispatch",
                          "install-seed-reset-per-test", "install-seed-reset-for-new-bundle",
                          "install-seed-set-test-assembly", "install-seed-dep-company-baseline",
                          "install-seed-run-own-install-triggers", "install-seed-capture-baseline",
