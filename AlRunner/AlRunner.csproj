@@ -3,9 +3,16 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <!-- BC 28.1 is a .NET 8 product (Server.runtimeconfig.json tfm=net8.0); the runner
-         targets net8.0 so it runs BC on its real runtime. net9/net10 were dropped:
-         net10's BCL drift (BitArray m_array→_array, etc.) breaks BC's UnsafeAccessor/
-         precode assumptions, and net9 can't satisfy BC's System.Text.Json 10 bind. -->
+         targets net8.0 so it runs BC on its real runtime. net9 is out because it can't
+         satisfy BC's System.Text.Json 10 bind.
+
+         net10 is out on COST, not capability: measured on net10 it builds against BC 28.1,
+         runs the engine, and compiles the corpus to an identical 2,492-test pass/fail set —
+         but a cold compile is 1.66x slower, and the cause is the runtime's GC heap sizing,
+         not Roslyn. (An earlier note here blamed net10 BCL drift — BitArray m_array→_array
+         breaking BC's UnsafeAccessor/precode assumptions. That did not reproduce; do not
+         reinstate it, or the next reader concludes the migration is blocked by a defect
+         that isn't there.) -->
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -196,7 +203,11 @@
 
   <!-- Common packages on every TFM -->
   <ItemGroup>
-    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+    <!-- 5.6.0 is the newest Roslyn that still ships a lib/net8.0 build; 5.9.0 dropped it and
+         carries only net10.0 + netstandard2.0, and binding the netstandard2.0 build on net8
+         would be a downgrade, not an upgrade. Revisit when the runner's TFM moves (which is
+         gated on BC shipping a .NET 10 service tier — see the TargetFramework comment). -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
     <!-- Cross-platform terminal UI for the watch-mode live dashboard. MIT-licensed,
          renders correctly on Windows/macOS/Linux and degrades to plain text on

@@ -32,6 +32,27 @@ public sealed class BcAssembler
     // Run the full compile pass on a thread with 64 MB stack to avoid SIGSEGV.
     private const int CompileStackSize = 64 * 1024 * 1024;
 
+    /// <summary>
+    /// Parse options for BC-generated C#. <c>CSharpParseOptions.Default</c> carries
+    /// <c>DocumentationMode.Parse</c>, which makes the lexer build structured XML-doc trivia for
+    /// every <c>///</c> comment. BC's emitter does not produce any, and nothing downstream reads
+    /// doc comments, so the work and the trivia nodes it would allocate are pure overhead across
+    /// ~7,000 generated files.
+    /// </summary>
+    /// <remarks>
+    /// The language version is pinned rather than left at <c>LanguageVersion.Default</c>, which
+    /// resolves to whatever the referenced Roslyn's newest major happens to be — so a routine
+    /// package bump silently changes the language BC's generated C# is parsed as. That is not
+    /// hypothetical: 4.14 resolved Default to C# 13 and 5.6 resolves it to C# 14, and C# 14 made
+    /// <c>field</c> a contextual keyword inside property accessor bodies, which is exactly the
+    /// kind of identifier an AL-to-C# emitter produces. Pinned at the version the corpus has
+    /// actually been compiled under; raising it is a deliberate change that needs a corpus run.
+    /// </remarks>
+    private static readonly CSharpParseOptions GeneratedParseOptions =
+        CSharpParseOptions.Default
+            .WithDocumentationMode(DocumentationMode.None)
+            .WithLanguageVersion(LanguageVersion.CSharp14);
+
     public CompileResult Compile(string assemblyName, IEnumerable<EmittedSource> sources)
     {
         CompileResult? result = null;
@@ -50,19 +71,59 @@ public sealed class BcAssembler
 
     private CompileResult CompileCore(string assemblyName, IEnumerable<EmittedSource> sources)
     {
+        // Same switch and same [emit-timing] channel BcCompiler.Emit uses, because the two
+        // halves of a cold compile are only comparable when they are measured the same way.
+        // The Roslyn half used to be one opaque number; these split it into parse / references
+        // / bind+IL so a change can be attributed to the pass it actually touched.
+        bool timing = Environment.GetEnvironmentVariable("BCCOMPILER_TIMING") == "1";
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        void Mark(string phase)
+        {
+            if (timing)
+                Console.Error.WriteLine(
+                    $"[emit-timing] {assemblyName}: {phase}: {stopwatch.ElapsedMilliseconds}ms " +
+                    $"(heap {GC.GetTotalMemory(false) / (1024 * 1024)}MB)");
+            stopwatch.Restart();
+        }
+
         var sourceList = sources.ToList();
         if (Environment.GetEnvironmentVariable("DUMP_CS") == "1")
             foreach (var s in sourceList)
                 File.WriteAllText(Path.Combine(Path.GetTempPath(), $"gen_{s.Name}.cs"), s.Code);
-        var trees = sourceList
-            .Select(s => CSharpSyntaxTree.ParseText(
-                ApplyPolyfillRedirects(s.Code), path: s.Name + ".cs"))
-            .ToList();
+        // Parsing is per file with no cross-file dependency, and on a whole-module compile
+        // there are thousands of them — 165 MB of generated C# for npcore's Application app.
+        // The redirect pass is a pure function of one file's text, so both run per source.
+        //
+        // ONE TREE PER AL OBJECT IS DELIBERATE — do not consolidate. It looks wasteful, and a
+        // standalone benchmark over synthetic code agrees: a fixed 15 MB of generated C# split
+        // 6,000 ways emitted in 13.5 s against 5.1 s split 12 ways, because Roslyn carries a
+        // per-syntax-tree cost that dominates when the trees are tiny. On the real corpus the
+        // result inverts — merging npcore's 6,957 sources into 110 trees of ~1.5 MB took
+        // bind + IL from 41 s to 66 s and added ~1 GB of peak footprint. At BC's ~24 KB per
+        // object the per-tree cost is already noise, and what the split actually buys is
+        // parallelism: both this parse and Roslyn's own concurrent method-body compilation fan
+        // out per tree, so 110 units of work leave most of the machine idle where 6,957 do not.
+        var parsed = new Microsoft.CodeAnalysis.SyntaxTree[sourceList.Count];
+        Parallel.For(0, sourceList.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            i => parsed[i] = CSharpSyntaxTree.ParseText(
+                ApplyPolyfillRedirects(sourceList[i].Code), GeneratedParseOptions,
+                path: sourceList[i].Name + ".cs"));
+        var trees = new List<Microsoft.CodeAnalysis.SyntaxTree>(parsed);
         // Inject helpers for runtime-API mismatches between alc-emit and the
         // service-tier DLLs. PolyfillRedirects above route callers here.
-        trees.Add(CSharpSyntaxTree.ParseText(PolyfillSource, path: "_polyfill.cs"));
-        var refs = ReferencePaths().Select(p => MetadataReference.CreateFromFile(p)).ToList();
+        trees.Add(CSharpSyntaxTree.ParseText(PolyfillSource, GeneratedParseOptions, path: "_polyfill.cs"));
+        Mark($"Roslyn parse {trees.Count} sources");
+        var refs = SharedMetadataReferences(ReferencePaths());
+        Mark($"metadata references ({refs.Count})");
 
+        // OptimizationLevel.Debug looks like a way to skip Roslyn's IL optimizer on a module
+        // this size. Measured on npcore and it is a pessimisation in both dimensions —
+        // bind + IL 41.0 s → 52.3 s and a 58 MB assembly → 60 MB — because Debug emits the
+        // sequence points, nops and extra locals the optimizer would have removed, and writing
+        // them costs more than the optimizer saves. (It would also stamp
+        // DebuggableAttribute.DisableOptimizations and slow the AL run.) Same shape as BC's own
+        // nonDebuggableEmit. Release, unconditionally.
         var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
             allowUnsafe: true,
             concurrentBuild: Environment.GetEnvironmentVariable("AL_RUNNER_CSHARP_CONCURRENT") != "0",
@@ -90,6 +151,7 @@ public sealed class BcAssembler
             if (rewritten == null) break;   // not a ByRef gap — report the real errors
             trees = rewritten.ToList();
         }
+        Mark($"Roslyn bind + IL gen → {(bytes?.Length ?? 0) / (1024 * 1024)}MB assembly");
         if (bytes == null)
             return new CompileResult(null, errors);
         if (Environment.GetEnvironmentVariable("AL_RUNNER_DUMP_BC_ASM") == "1")
@@ -103,6 +165,49 @@ public sealed class BcAssembler
             catch { /* best-effort */ }
         }
         return new CompileResult(bytes, Array.Empty<string>());
+    }
+
+    /// <summary>
+    /// One <see cref="MetadataReference"/> per (path, last-write, length), shared by every
+    /// compile in the process.
+    ///
+    /// <para><c>MetadataReference.CreateFromFile</c> reads and indexes the whole PE metadata of
+    /// the file it is given, and the reference list here is ~80 unchanging assemblies — every BC
+    /// service-tier DLL plus the .NET shared framework. Recreating them per app group meant a
+    /// bundle of N apps paid that N times, and a <c>--watch</c> session paid it again on every
+    /// cycle for files that cannot have moved. Roslyn is explicitly designed for these to be
+    /// shared: a <see cref="MetadataReference"/> is immutable and its underlying metadata is
+    /// reference-counted, so caching also means one copy of that metadata in memory instead of
+    /// one per live compilation.</para>
+    ///
+    /// <para>Keyed on the file's identity AND its stamp, never the path alone: a
+    /// <c>--bc-version</c> switch or a rebuilt <c>al-runner.dll</c> (which is itself in the
+    /// list) points the same path at different bytes, and serving the old metadata for it would
+    /// compile AL against a version that is no longer on disk.</para>
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        (string Path, long Ticks, long Length), MetadataReference> _metadataReferenceCache = new();
+
+    private static List<MetadataReference> SharedMetadataReferences(IEnumerable<string> paths)
+    {
+        var refs = new List<MetadataReference>();
+        foreach (var path in paths)
+        {
+            (string, long, long) key;
+            try
+            {
+                var info = new FileInfo(path);
+                key = (path, info.LastWriteTimeUtc.Ticks, info.Length);
+            }
+            catch (IOException)
+            {
+                // Unreadable stamp — take the uncached path rather than key on a guess.
+                refs.Add(MetadataReference.CreateFromFile(path));
+                continue;
+            }
+            refs.Add(_metadataReferenceCache.GetOrAdd(key, static k => MetadataReference.CreateFromFile(k.Path)));
+        }
+        return refs;
     }
 
     private IEnumerable<string> ReferencePaths()
@@ -254,11 +359,106 @@ public sealed class BcAssembler
         ("ALSystemString.ALStrPos(",       "global::AlRunnerShim.NavRuntimeHelpersShim.ALStrPos("),
     };
 
+    /// <summary>
+    /// How many full walks of one file's text <see cref="ApplyPolyfillRedirects"/> performed on
+    /// THIS thread. A COUNT, never a duration — the same discipline
+    /// <c>RecordPatches.ParseObjectTextCallCount</c> established: the redirect pass is a pure
+    /// per-file function run over every generated source of every compile (~6,950 sources,
+    /// 165 MB of C# for npcore's Application app), so "how many times is each file walked" is
+    /// the cost, and it is the part a test can pin without measuring a clock.
+    ///
+    /// <para>Per-thread on purpose. The pass runs inside <c>CompileCore</c>'s
+    /// <c>Parallel.For</c>, and a process-wide counter would let a compile running in another
+    /// test collection perturb the reading.</para>
+    /// </summary>
+    internal static int PolyfillRedirectPassCount => _polyfillRedirectPassCount;
+
+    [ThreadStatic] private static int _polyfillRedirectPassCount;
+
+    /// <summary>Test seam for <see cref="ApplyPolyfillRedirects"/>, which is private because
+    /// nothing outside the compile pipeline may apply it.</summary>
+    internal static string ApplyPolyfillRedirectsForTests(string code) => ApplyPolyfillRedirects(code);
+
+    /// <summary>Test seam: the redirect table itself, so the structural properties the
+    /// single-pass rewrite's equivalence rests on can be asserted against the real entries
+    /// rather than a copy that drifts.</summary>
+    internal static IReadOnlyList<(string From, string To)> PolyfillRedirectsForTests => _polyfillRedirects;
+
+    // Scan anchor: the distinct first characters of every redirect key ({'N', 'A'} today).
+    // IndexOfAny over a SearchValues<char> is vectorised, so finding the candidate positions
+    // costs one SIMD walk of the file however many redirects the table holds.
+    private static readonly System.Buffers.SearchValues<char> _polyfillAnchors =
+        System.Buffers.SearchValues.Create(
+            _polyfillRedirects.Select(r => r.from[0]).Distinct().ToArray());
+
+    // Candidates per anchor character, longest key first. The ordering only matters if a key
+    // is ever a prefix of another — which NoRedirectKeyIsASubstringOfAnotherKey forbids, so
+    // today at most one entry can match at a given position and longest-first is simply the
+    // definition that stays well-behaved if that guard is ever relaxed deliberately.
+    private static readonly Dictionary<char, (string From, string To)[]> _polyfillByAnchor =
+        _polyfillRedirects
+            .GroupBy(r => r.from[0])
+            .ToDictionary(g => g.Key,
+                g => g.OrderByDescending(r => r.from.Length).Select(r => (r.from, r.to)).ToArray());
+
+    /// <summary>
+    /// Rewrites BC-emitted C# so calls to service-tier members the skeleton runtime cannot
+    /// serve land on the shim instead. One left-to-right walk of the file.
+    ///
+    /// <para>It used to be one <c>string.Replace</c> per entry: 35 walks of every generated
+    /// source, plus a fresh copy of the whole file for each entry that actually matched.
+    /// <c>CompileCore</c> runs this per source inside its <c>Parallel.For</c> — ~6,950 sources
+    /// and 165 MB of generated C# for npcore's Application app — so the sweeps and the Gen0
+    /// churn both scaled with the size of the redirect table rather than with the file.</para>
+    ///
+    /// <para>Byte-identical to the sequential form, and <c>BcAssemblerPolyfillRedirectTests</c>
+    /// proves it two ways: differentially against the naive algorithm over inputs built from
+    /// every entry in the table, and structurally, by pinning the four properties that make
+    /// "leftmost match wins, one pass" and "redirect 1 everywhere, then redirect 2 everywhere"
+    /// the same function — no key inside another key, no key inside a replacement, no key able
+    /// to span either seam of a replacement, and no two keys able to overlap. Add a redirect
+    /// that breaks one of those and that test fails, which is the point: the two algorithms
+    /// only agree because the table has that shape, and nothing else enforces it.</para>
+    /// </summary>
     private static string ApplyPolyfillRedirects(string code)
     {
-        foreach (var (from, to) in _polyfillRedirects)
-            code = code.Replace(from, to);
-        return code;
+        _polyfillRedirectPassCount++;
+        var span = code.AsSpan();
+        System.Text.StringBuilder? sb = null;
+        // Two cursors: `copied` is how far the output has been filled from the input, `search`
+        // is where the next anchor scan starts. They only diverge over a run of anchor
+        // characters that turned out not to begin a redirect, which must still be copied.
+        int copied = 0, search = 0;
+        while (search < span.Length)
+        {
+            var offset = span[search..].IndexOfAny(_polyfillAnchors);
+            if (offset < 0) break;
+            var at = search + offset;
+
+            string? replacement = null;
+            int matchedLength = 0;
+            foreach (var (from, to) in _polyfillByAnchor[span[at]])
+            {
+                if (!span[at..].StartsWith(from.AsSpan(), StringComparison.Ordinal)) continue;
+                replacement = to;
+                matchedLength = from.Length;
+                break;
+            }
+            if (replacement == null) { search = at + 1; continue; }
+
+            sb ??= new System.Text.StringBuilder(code.Length + 256);
+            sb.Append(span[copied..at]);
+            sb.Append(replacement);
+            // Resume AFTER the replacement, never inside it — the one-pass counterpart of the
+            // sequential form's "a later sweep may not rewrite what an earlier one emitted",
+            // which the structural guards above are what make safe.
+            copied = search = at + matchedLength;
+        }
+        // Nothing matched: return the original instance. Most generated sources touch none of
+        // these members, and that case must not cost a copy of the file.
+        if (sb == null) return code;
+        sb.Append(span[copied..]);
+        return sb.ToString();
     }
 
     private const string PolyfillSource = @"
