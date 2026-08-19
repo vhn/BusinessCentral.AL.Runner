@@ -135,11 +135,26 @@ public sealed class CollectionCostOrderer : ITestCollectionOrderer
             // BcCompiler.Emit() call with no package cache wired (see the file header).
             // Measured 81.7s in CI.
             ["ManifestFeaturesSubprocessTests"] = 81,
+            // The five --watch/RAD delta collections below arrived with the delta-compile
+            // work and went unmeasured — RadDeltaWatchTests at 79s tripped the #1887 guard,
+            // and the other four sit above the 20s line this table lists from. Each spawns
+            // real runner subprocesses that compile an AL fixture and then edit it in place,
+            // so the cost is several cold compiles per test, not per collection.
+            //
+            // These five numbers are from a local 4-way run (max of two, rounded down), not
+            // from CI, because that is where the guard fired. Local and CI disagree
+            // materially on the same class — ServerCancelTests reads 285s in CI and 87s here,
+            // InstallBaselineDiskCacheTests 125s in CI and 192s here — so treat these as
+            // provisional and re-measure from a CI trx with scripts/trx-occupancy.py. Any of
+            // the five is a better dispatch weight than the 30s fallback that ranked them
+            // below two dozen lighter collections.
+            ["RadDeltaWatchTests"] = 79,
             ["TestPageDrillDownDispatchTests"] = 75,
             // #1870: one test, spawning a real runner subprocess against an AL fixture
             // (BC engine cold-start + AL emit/compile once). Measured 63.9s in CI.
             ["TestPageBooleanRecBoundDispatchTests"] = 63,
             ["ServerTestIsolationTests"] = 69,
+            ["WatchTests"] = 55,
             ["ServerStreamingTests"] = 50,
             ["ExpectationManifestWiringTests"] = 47,
             ["LayeredCacheTests"] = 46,
@@ -148,11 +163,14 @@ public sealed class CollectionCostOrderer : ITestCollectionOrderer
             ["SourceDepCacheEnumMetadataTests"] = 41,
             ["DefineFlagIntegrationTests"] = 41,
             ["SuiteEnumerationTests"] = 36,
+            ["RadWatchNoUnnecessaryRebuildTests"] = 34,
             ["EmitExclusionLoudnessTests"] = 33,
             ["BundleSuiteErrorLoudnessTests"] = 32,
             ["BcVersionFloorSkipTests"] = 32,
             ["OutputFormatTests"] = 31,
+            ["RadWatchTwentyObjectTests"] = 29,
             ["CrossBundleModuleIdentityDedupTests"] = 23,
+            ["ServerCrossAppStaleGenerationTests"] = 23,
             ["SourceDepSymbolsWithoutPackageCacheTests"] = 23,
             ["TestTimeoutFlagTests"] = 21,
         };
