@@ -69,7 +69,11 @@ public sealed class RecordPatchesParseOnceTests : IDisposable
         BcCompiler.SetExtraPreprocessorSymbols(Array.Empty<string>());
     }
 
-    public void Dispose() => BcCompiler.SetExtraPreprocessorSymbols(Array.Empty<string>());
+    public void Dispose()
+    {
+        BcCompiler.SetExtraPreprocessorSymbols(Array.Empty<string>());
+        RecordPatches.FailParseForTests = null;
+    }
 
     private static void InvokeTryParse(string methodName, string text)
     {
@@ -152,6 +156,68 @@ public sealed class RecordPatchesParseOnceTests : IDisposable
         Assert.True(ParsedTables.ContainsKey(tableIdB));
         Assert.Equal("Parse Once A", ParsedTables[tableIdA].TableName);
         Assert.Equal("Parse Once B", ParsedTables[tableIdB].TableName);
+    }
+
+    // ── Mechanism: a file the parser cannot handle costs ONE attempt, not nine ───────────
+
+    // Why the failure is injected rather than written as bad AL: BC's parser is error-tolerant.
+    // Probed against 28.1's Microsoft.Dynamics.Nav.CodeAnalysis — free-form garbage, an
+    // unterminated brace, an unterminated string literal, a stray `#endif`, embedded NUL and
+    // lone-surrogate characters, and 20,000-deep parenthesis/`begin` nesting each returned a
+    // tree with diagnostics; not one threw. The only input that does fail (50,000-deep
+    // statement nesting) overflows the stack and aborts the process, which no catch block sees.
+    // So the ONLY way to hold the failed-parse path to its invariant is to inject the failure —
+    // see RecordPatches.FailParseForTests. What can still reach it in production is an
+    // OutOfMemoryException on a pathological file, or a future BC parser that does throw.
+
+    [Fact]
+    public void EightExtractors_OnTextWhoseParseThrows_AttemptTheParseOnce_NotEight()
+    {
+        var text = TableSource(61901, "Parse Once Throwing");
+        RecordPatches.FailParseForTests = t => ReferenceEquals(t, text);
+
+        var before = RecordPatches.ParseObjectTextCallCount;
+
+        InvokeTryParse("TryParseTableFile", text);
+        InvokeTryParse("TryParseTableExtensionFile", text);
+        InvokeTryParse("TryParsePageFile", text);
+        InvokeTryParse("TryParseReportFile", text);
+        InvokeTryParse("TryParseQueryFile", text);
+        InvokeTryParse("TryParseXmlPortFile", text);
+        InvokeTryParse("TryParseObjectDeclFile", text);
+        InvokeTryParse("TryParseObjectCaptionFile", text);
+
+        var after = RecordPatches.ParseObjectTextCallCount;
+
+        // The failed parse is the (text, symbols) pair's real answer, so it must be memoized
+        // like any other. Clearing the memo on the way out instead — which is what the catch
+        // used to do — made every one of the remaining seven extractors re-parse and re-throw,
+        // reading 8 here: #1903's "N files cost N tree builds" invariant, inverted for exactly
+        // the file class least able to afford it.
+        Assert.Equal(1, after - before);
+    }
+
+    [Fact]
+    public void AfterAThrowingParse_ADifferentTextIsStillParsedFresh()
+    {
+        const int tableId = 61902;
+        var doomed = TableSource(61903, "Parse Once Doomed");
+        var good = TableSource(tableId, "Parse Once After Doomed");
+        RecordPatches.FailParseForTests = t => ReferenceEquals(t, doomed);
+
+        var before = RecordPatches.ParseObjectTextCallCount;
+        InvokeTryParse("TryParseTableFile", doomed);
+        InvokeTryParse("TryParseTableFile", good);
+        var after = RecordPatches.ParseObjectTextCallCount;
+
+        // The negative memo entry must be keyed on ITS OWN text like any other — one attempt
+        // for the doomed text, one real parse for the next file. An implementation that
+        // remembered "the last parse failed" without remembering WHICH text it failed for
+        // would serve the empty answer to `good` too, and every table after a single
+        // unparseable file would silently vanish.
+        Assert.Equal(2, after - before);
+        Assert.True(ParsedTables.ContainsKey(tableId), $"table {tableId} was not parsed at all");
+        Assert.Equal("Parse Once After Doomed", ParsedTables[tableId].TableName);
     }
 
     // ── Correctness: the memo must not regress #1900 ────────────────────────────────────

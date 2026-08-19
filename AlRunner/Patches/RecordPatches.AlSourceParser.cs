@@ -206,13 +206,19 @@ public static partial class RecordPatches
     private static IReadOnlyList<NavCA.SyntaxNode> _lastParsedObjects = Array.Empty<NavCA.SyntaxNode>();
 
     /// <summary>
-    /// Number of times <see cref="ParseAlObjects"/> has actually built a syntax tree (a real
+    /// Number of times a syntax tree has actually been built (a real
     /// <c>SyntaxTree.ParseObjectText</c> call), as opposed to serving the single-slot memo
     /// above. #1903's proving test asserts THIS — a count, never a duration — to pin that N
     /// files registered through the eight extractors costs N tree builds, not 8N. Mirrors
     /// the discipline <see cref="PopulateNclMetadataCacheCallCount"/> established for #1833.
+    ///
+    /// <para>Interlocked because <see cref="PreParseAlFiles"/> builds trees on several threads:
+    /// the count is the assertion the invariant rests on, so a lost increment would show up as
+    /// a test that passes for the wrong reason.</para>
     /// </summary>
-    internal static int ParseObjectTextCallCount { get; private set; }
+    internal static int ParseObjectTextCallCount => System.Threading.Volatile.Read(ref _parseObjectTextCallCount);
+
+    private static int _parseObjectTextCallCount;
 
     /// <summary>
     /// Parses every AL object in <paramref name="text"/> with BC's own parser and returns the
@@ -239,12 +245,7 @@ public static partial class RecordPatches
 
         try
         {
-            ParseObjectTextCallCount++;
-            var tree = NavSyntax.SyntaxTree.ParseObjectText(
-                text, path: "", encoding: null!, AlParseOptions, default);
-            IReadOnlyList<NavCA.SyntaxNode> objects = tree.GetRoot() is NavSyntax.CompilationUnitSyntax root
-                ? root.ChildNodes().ToList()
-                : Array.Empty<NavCA.SyntaxNode>();
+            var objects = ParseAlObjectsUncached(text);
             _lastParsedText = text;
             _lastParsedSymbols = symbols;
             _lastParsedObjects = objects;
@@ -254,14 +255,126 @@ public static partial class RecordPatches
         {
             // A malformed input is not a runner gap — the AL simply is not parseable, and the
             // caller's contract is "extract what you can". Callers that need a table and do
-            // not get one already report that themselves ("AL source not parsed"). Don't let
-            // a failed parse poison the memo as if it were this (text, symbols) pair's real
-            // answer — clear the slot so the NEXT call (for unrelated input) can't accidentally
-            // key-match leftover state from before the exception.
-            _lastParsedText = null;
-            _lastParsedSymbols = null;
+            // not get one already report that themselves ("AL source not parsed").
+            //
+            // The empty result is MEMOIZED, not discarded. `[]` is this (text, symbols) pair's
+            // real answer — the parse is a pure function of the pair, so a throw for it is as
+            // stable a fact as a tree would have been, and re-attempting cannot produce a
+            // different one. Clearing the slot instead (what this used to do) meant each of the
+            // eight extractors re-parsed the same doomed text and cleared it again for the next:
+            // one file cost eight failed parses rather than one, silently undoing #1903's
+            // "N files cost N tree builds, not 8N" invariant for exactly the files least able
+            // to afford it.
+            _lastParsedText = text;
+            _lastParsedSymbols = symbols;
+            _lastParsedObjects = [];
             return [];
         }
+    }
+
+    /// <summary>
+    /// The parse itself, with no memo around it — the shared body of the cached
+    /// <see cref="ParseAlObjects"/> and of <see cref="PreParseAlFiles"/>, which builds trees on
+    /// many threads at once and cannot touch the single-slot memo while doing so.
+    /// </summary>
+    private static IReadOnlyList<NavCA.SyntaxNode> ParseAlObjectsUncached(string text)
+    {
+        System.Threading.Interlocked.Increment(ref _parseObjectTextCallCount);
+        if (FailParseForTests?.Invoke(text) == true)
+            throw new InvalidOperationException("FailParseForTests: injected parse failure");
+        var tree = NavSyntax.SyntaxTree.ParseObjectText(
+            text, path: "", encoding: null!, AlParseOptions, default);
+        return tree.GetRoot() is NavSyntax.CompilationUnitSyntax root
+            ? root.ChildNodes().ToList()
+            : Array.Empty<NavCA.SyntaxNode>();
+    }
+
+    /// <summary>
+    /// Test seam: when non-null, <see cref="ParseAlObjectsUncached"/> throws for any text this
+    /// predicate accepts, so the failed-parse path can be driven deterministically.
+    ///
+    /// <para>It exists because that path cannot be reached any other way. BC's AL parser is
+    /// error-tolerant by design: measured against 28.1's
+    /// <c>Microsoft.Dynamics.Nav.CodeAnalysis</c>, free-form garbage, an unterminated brace,
+    /// an unterminated string literal, a stray <c>#endif</c>, embedded NUL and lone-surrogate
+    /// characters, and 20,000-deep parenthesis/<c>begin</c> nesting all return a tree carrying
+    /// diagnostics — none of them throws. The one input that does "fail" (50,000-deep
+    /// statement nesting) overflows the stack and aborts the process, which no <c>catch</c>
+    /// ever sees.</para>
+    ///
+    /// <para>So no <c>.al</c> file can currently take the catch in <see cref="ParseAlObjects"/>.
+    /// The path still has to be right for what CAN escape — an <c>OutOfMemoryException</c> on a
+    /// pathological file, or a future BC parser that does throw — because getting it wrong
+    /// costs eight failed re-parses per affected file instead of one.</para>
+    /// </summary>
+    internal static Func<string, bool>? FailParseForTests;
+
+    /// <summary>
+    /// Read and parse a batch of <c>.al</c> files concurrently, returning each file's text
+    /// paired with its parsed objects <b>in the order given</b>.
+    ///
+    /// <para><b>Why.</b> Registering a source tree is one of the runner's few remaining wholly
+    /// serial passes and, on a real app, the largest: 11.5 s for npcore's 7,364 files, which
+    /// three times the memory headroom did not move by even 4% — it is CPU-bound, in the AL
+    /// parser. BC's own compile front end parses the same files with a <c>Parallel.For</c> and
+    /// takes ~1.1 s for 7,060 of them, which is the size of what is being left on the table.</para>
+    ///
+    /// <para><b>Why batched rather than whole-tree.</b> Holding every file's text and syntax
+    /// tree at once would trade this phase's wall time for a peak-memory spike of roughly a
+    /// gigabyte on the corpus that needs it least — the same corpus whose cold compile is
+    /// memory-bound. A batch is parsed, consumed and dropped before the next is read, so the
+    /// extra live set is bounded by the batch, not by the tree.</para>
+    ///
+    /// <para><b>Why it does not disturb ordering or the memo.</b> The parse is a pure function
+    /// of (text, preprocessor symbols) — no shared state, which is exactly why it parallelises.
+    /// The eight extractors still run serially, over the batch, in file order, so every
+    /// last-writer-wins and de-dup rule they encode sees the same sequence it always has; the
+    /// caller simply primes the memo with the already-built tree so those eight calls hit it
+    /// instead of re-parsing. A file whose parse threw is returned with an EMPTY object list —
+    /// the memo is primed with that, so the eight extractors read the same "no objects" answer
+    /// the serial path would have reached, without eight more doomed parses.</para>
+    /// </summary>
+    internal static (string Text, IReadOnlyList<NavCA.SyntaxNode>? Objects)[] PreParseAlFiles(
+        IReadOnlyList<string> files)
+    {
+        var parsed = new (string Text, IReadOnlyList<NavCA.SyntaxNode>? Objects)[files.Count];
+        Parallel.For(0, files.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            i =>
+            {
+                // The read is deliberately NOT guarded: a source file that cannot be read is
+                // not "extract what you can", it is a broken registration, and the serial loop
+                // this replaces let it out too. Parallel.For wraps it in an AggregateException
+                // on the way, which is a change of shape and not of loudness.
+                var text = File.ReadAllText(files[i]);
+                if (string.IsNullOrWhiteSpace(text)) { parsed[i] = (text, null); return; }
+                // The parse is guarded, matching ParseAlObjects: unparseable AL yields no
+                // objects and the caller extracts nothing from that file.
+                //
+                // A THROW STILL COUNTS AS PARSED — the empty list, not null. The parse is a
+                // pure function of (text, symbols), so "it threw" is this file's answer and
+                // the serial pass re-attempting it could only reach the same one. Reporting
+                // null instead left the memo unprimed, and the eight extractors then each
+                // re-parsed and re-threw: nine attempts for one file. Null is now reserved for
+                // "not attempted" (the blank-file branch above), which ParseAlObjects
+                // short-circuits before it ever reaches the memo.
+                try { parsed[i] = (text, ParseAlObjectsUncached(text)); }
+                catch { parsed[i] = (text, Array.Empty<NavCA.SyntaxNode>()); }
+            });
+        return parsed;
+    }
+
+    /// <summary>
+    /// Seed the single-slot memo with a tree built elsewhere, so the eight extractors called
+    /// straight after for the same text hit it instead of re-parsing. Keyed exactly as
+    /// <see cref="ParseAlObjects"/> keys it, because a memo entry that answers for the wrong
+    /// <c>--define</c> set is the defect #1900 already cost a cycle.
+    /// </summary>
+    private static void PrimeParseMemo(string text, IReadOnlyList<NavCA.SyntaxNode> objects)
+    {
+        _lastParsedText = text;
+        _lastParsedSymbols = AlRunner.BcCompiler.GetExtraPreprocessorSymbols().ToArray();
+        _lastParsedObjects = objects;
     }
 
     /// <summary>

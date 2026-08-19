@@ -1716,17 +1716,29 @@ foreach (var bundle in bundles)
             // mismatch (see BcCompiler.DeltaCompile).
             if (sources.Count > 0 && alDiagnostics.Count == 0 && !radOverlay)
             {
-                var declaredObjects = allPaths
+                // Deliberately still a read-and-scan of the source tree rather than a count off
+                // the compilation BC just bound: this census is the cross-check ON that
+                // compilation, and re-deriving it from the same symbol API whose output is
+                // under suspicion would make the guard agree with itself. What DID change is
+                // that the scan no longer runs one file at a time — it is a pure per-file
+                // function over ~200 MB of AL text on the happy path of every whole-module
+                // compile, so it fans out. Same files, same regex, same predicate.
+                var censusFiles = allPaths
                     .Where(File.Exists)
                     .Concat(allPaths.Where(Directory.Exists)
                         .SelectMany(d => Directory.EnumerateFiles(d, "*.al", SearchOption.AllDirectories)))
                     .Distinct()
-                    .SelectMany(f => System.Text.RegularExpressions.Regex.Matches(
-                        File.ReadAllText(f),
-                        @"^(table|codeunit|page|report|query|enum|xmlport|tableextension|pageextension|permissionset)\s+\d+\s+""?([^""\r\n]+?)""?\s*$",
-                        System.Text.RegularExpressions.RegexOptions.Multiline))
-                    .Select(m => m.Groups[2].Value.Trim())
                     .ToList();
+                var perFile = new List<string>[censusFiles.Count];
+                Parallel.For(0, censusFiles.Count,
+                    new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                    i => perFile[i] = System.Text.RegularExpressions.Regex.Matches(
+                            File.ReadAllText(censusFiles[i]),
+                            @"^(table|codeunit|page|report|query|enum|xmlport|tableextension|pageextension|permissionset)\s+\d+\s+""?([^""\r\n]+?)""?\s*$",
+                            System.Text.RegularExpressions.RegexOptions.Multiline)
+                        .Select(m => m.Groups[2].Value.Trim())
+                        .ToList());
+                var declaredObjects = perFile.SelectMany(names => names).ToList();
                 if (declaredObjects.Count > sources.Count)
                 {
                     var emittedNames = sources.Select(s => s.Name).ToList();
