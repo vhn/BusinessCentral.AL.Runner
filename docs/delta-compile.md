@@ -932,19 +932,58 @@ Both warm cycles are then allowed to finish their test run:
 | cycle | Application app | tests | pass | fail |
 |---|---|---|---|---|
 | 1 — cold | baseline built, 6,949 objects | 2317 | 432 | 1885 |
-| 2 — control (no Application delta) | unchanged | 2314 | 415 | 1899 |
-| 3 — repair (1-object delta) | delta +0 ~1 -0 | 2314 | 415 | 1899 |
+| 2 — control (no Application delta) | unchanged | 2317 | 432 | 1885 |
+| 3 — repair (1-object delta) | delta +0 ~1 -0 | 2317 | 432 | 1885 |
 
-Cycles 2 and 3 agree on the **whole 2,314-entry PASS/FAIL set**, not merely the totals — `diff` of
-the two sorted sets is empty. Since ~80% of npcore's tests fail on missing seed data by design, the
-count alone would not have been evidence. The cold→warm drift (432 → 415) belongs to the control,
-i.e. to warm cycling itself, not to the delta: the control performs no Application compile at all
-and still shows it. The same is true of the two `[install-trigger] … threw NullReferenceException`
-lines each warm cycle logs — 0 in the cold cycle, 2 in the control, 2 in the repair cycle. Both are
-pre-existing warm-cycle behaviour on this corpus and neither is this change's; they are recorded here
-so the next person measuring does not attribute them to it. **That is causal isolation, not a fix:**
-the 432→415 drift and the two warm-cycle install-trigger exceptions remain separate warm-reload
-behaviour for follow-up work.
+All three cycles agree on the **whole 2,317-entry PASS/FAIL set**, not merely the totals — `diff` of
+the sorted sets is empty in both directions. Since ~80% of npcore's tests fail on missing seed data
+by design, the count alone would not have been evidence.
+
+##### What that table used to say, and why
+
+Rows 2 and 3 previously read `2314 | 415 | 1899`: three tests **disappeared** from every warm cycle
+and seventeen flipped pass→fail, deterministically, on a bundle the control never recompiled. That
+was recorded here as pre-existing warm-cycle behaviour, isolated from the delta work but unexplained.
+It is now fixed, and it was three separate defects — none of them in the delta path:
+
+1. **Event dispatch was armed too late.** `TestExecutor` seeded each publisher's static
+   `γeventScope` inside its per-test-codeunit loop, i.e. after the install-seed block. A
+   `Subtype=Install` codeunit raising an integration event (npcore's 6014448 opens with
+   `POSSalesWorkflow.OnDiscoverPOSSalesWorkflows()`) therefore dispatched to **nobody** on a cold
+   run. The field is a static on the emitted `<Event>_Scope` type and outlives a watch cycle, so
+   cycle 2's install trigger *did* dispatch — the same unedited bundle running different code cold
+   and warm. Arming now happens before the first Install trigger.
+
+2. **A table publisher's `IncludeSender` argument was passed as `null`.** The dispatcher recognised
+   a sender only by its CLR type being a `NavCodeunitHandle`; a table-declared
+   `[IntegrationEvent(true, …)]` emits it as `INavRecordHandle`, which fell through to the
+   scope-field lookup that an `IncludeSender` sender has no field for. npcore's subscribers open
+   with `Sender.DiscoverPOSSalesWorkflow(…)`, so once (1) let the event fire, it raised a bare
+   `NullReferenceException` out of `TestExecutor.Run` — taking the **whole owning app group** with
+   it. Those were the three vanished tests: NP Retail declares exactly one test codeunit, 6014508,
+   with exactly three `[Test]` methods.
+
+3. **Page metadata was marked loaded for an object that had been discarded.**
+   `RecordPatches.ResetForReload` empties `_metaFormCache` but kept `_pagesWithRealMetadata`, whose
+   entries describe *those* now-discarded `NCLMetaForm` instances. The next cycle built a fresh
+   control-less skeleton, short-circuited it as "already loaded", and BC dereferenced a page
+   definition that was never parsed. `TestPage` catches that and falls back to record-only access,
+   so `OnOpenPage` silently never runs — which is why all seventeen flipped tests are page-opening
+   tests, nine of them reporting `NullReferenceException at
+   NCLMetaForm.GetFrozenPageDefinitionWithExtensionWithoutMergedMultiLanguage()` (zero in the cold
+   cycle) and the rest reporting whatever their page trigger should have done, e.g. "Discount not
+   created".
+
+Two diagnostics had been hiding it, and are fixed alongside: `DispatchCore` rethrew a subscriber's
+exception with a bare `throw`, resetting the stack trace to itself, and `InstallTriggerRunner`
+printed `AlCallStackCapture.GetCaptured(ex)`'s **most-recent-capture fallback** — an AL stack from a
+test in a *previous cycle* — instead of the real .NET one. Separately, an app group that throws
+contributes zero results while the bucket still counts as `ran` with `exec-fail: 0`, so an app's
+whole test set could leave a run with nothing printed; `Program.cs` now names it on stderr.
+
+The regression is pinned by `AlRunner.Tests.WatchInstallDiscoveryTests`, which reproduces all of the
+above on a six-file fixture in about eight seconds — the npcore witness is the corroboration, not
+the guard.
 
 #### Failing closed, in two different ways
 
