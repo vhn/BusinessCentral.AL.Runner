@@ -4241,9 +4241,9 @@ static List<string> RunLayeredPrePass(List<string> bundles, List<string> package
             .SelectMany(d => Directory.EnumerateFiles(d, "*.app", SearchOption.AllDirectories))
             .FirstOrDefault(f =>
             {
-                var m = AppLoader.ReadManifest(f);
-                return m != null && m.AppId == implId.AppId
-                    && AppLoader.HasSymbolReference(f);
+                // One read answers both halves of the question — see AppLoader.ReadPackageMeta.
+                var (m, hasSymbolReference) = AppLoader.ReadPackageMeta(f);
+                return m != null && m.AppId == implId.AppId && hasSymbolReference;
             });
         if (prebuilt != null)
         {

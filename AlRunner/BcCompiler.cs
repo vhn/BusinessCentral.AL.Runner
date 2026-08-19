@@ -226,11 +226,11 @@ public sealed partial class BcCompiler
     ///
     /// The "does this .app carry a SymbolReference.json" question goes through
     /// <see cref="ReadAppMeta"/>, the same per-file (path + length + last-write-ticks) cache
-    /// DeduplicateAppPackageDirs uses. Calling <see cref="AppLoader.HasSymbolReference"/>
-    /// directly re-read and unzipped every resolved dep's WHOLE package on each scope entry,
-    /// and a bundled run enters this scope once per app group: measured 20.1 s across the 38
-    /// scope entries of a cold tests/runner-extras bundle (#1832). The cache invalidates on
-    /// an in-place rewrite, so a synthetic .app re-packaged mid-run is still re-read.
+    /// DeduplicateAppPackageDirs uses. Before that cache existed this re-read and unzipped every
+    /// resolved dep's WHOLE package on each scope entry, and a bundled run enters this scope once
+    /// per app group: measured 20.1 s across the 38 scope entries of a cold tests/runner-extras
+    /// bundle (#1832). The cache invalidates on an in-place rewrite, so a synthetic .app
+    /// re-packaged mid-run is still re-read.
     /// </summary>
     public static IDisposable ScopeSymbolBearingDepsOnly()
     {
@@ -705,28 +705,43 @@ public sealed partial class BcCompiler
     internal readonly record struct PackageScanEntry(
         string Path, Guid AppId, string Publisher, string Name, Version Version);
 
-    // Per-file cache of the two zip reads DeduplicateAppPackageDirs performs on every .app
-    // it scans (ReadManifest + HasSymbolReference). Both re-read the WHOLE package from
-    // disk and unzip it — for a 113-package, 138 MB platform-apps dir that is ~1–2.5 s per
-    // scan, and the scan runs on EVERY GetSharedReferences call (it has to: its output is
-    // what the loader signature is computed from). Keyed by path + length + last-write
-    // ticks, so a package rewritten in place (InProcessAppPackager's synthetic .apps, a
-    // --watch rebuild) invalidates its own entry.
+    // Per-file cache of the package read DeduplicateAppPackageDirs performs on every .app it
+    // scans. For a 113-package, 138 MB platform-apps dir that read is ~1–2.5 s per scan, and the
+    // scan runs on EVERY GetSharedReferences call (it has to: its output is what the loader
+    // signature is computed from). Keyed by path + length + last-write ticks, so a package
+    // rewritten in place (InProcessAppPackager's synthetic .apps, a --watch rebuild)
+    // invalidates its own entry.
+    //
+    // AppLoader.ReadPackageMeta keeps the same key across processes in its on-disk index; this
+    // is the in-process layer in front of it, and the one ResetSharedReferencesForTests clears
+    // so a test can force the scan to re-read.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<
         string, (long Length, long Ticks, AppManifest? Manifest, bool HasSymbolReference)> _appMetaCache = new();
+
+    /// <summary>
+    /// Test seam: invoked once per candidate package inside <c>DeduplicateAppPackageDirs</c>'
+    /// metadata scan, on the thread doing that package's read.
+    ///
+    /// <para>It exists because "these reads overlap" is not otherwise observable, and the only
+    /// alternative — timing the scan — is the kind of assertion that goes red on a loaded CI
+    /// box for reasons that have nothing to do with the code. A probe that rendezvouses lets
+    /// the test state the claim directly: two package reads were in flight at the same moment.
+    /// A serial scan can never satisfy that, whatever the machine is doing.</para>
+    /// </summary>
+    internal static Action? PackageScanProbeForTests;
 
     private static (AppManifest? Manifest, bool HasSymbolReference) ReadAppMeta(FileInfo fi)
     {
         var path = fi.FullName;
         long len, ticks;
         try { len = fi.Length; ticks = fi.LastWriteTimeUtc.Ticks; }
-        catch { return (AppLoader.ReadManifest(path), AppLoader.HasSymbolReference(path)); }
+        catch { return AppLoader.ReadPackageMeta(path); }
 
         if (_appMetaCache.TryGetValue(path, out var hit) && hit.Length == len && hit.Ticks == ticks)
             return (hit.Manifest, hit.HasSymbolReference);
 
-        var meta = (AppLoader.ReadManifest(path), AppLoader.HasSymbolReference(path));
-        _appMetaCache[path] = (len, ticks, meta.Item1, meta.Item2);
+        var meta = AppLoader.ReadPackageMeta(path);
+        _appMetaCache[path] = (len, ticks, meta.Manifest, meta.HasSymbolReference);
         return meta;
     }
 
@@ -810,54 +825,91 @@ public sealed partial class BcCompiler
         var picked = new List<string>();
         inventory = new List<PackageScanEntry>();
         var changed = false;
+
+        // Enumerating the dirs is a stat walk and stays serial; it is also what defines scan
+        // order, which every rule below depends on. The `.ToList()` stays INSIDE the try for
+        // the same reason it always was: a dir that throws part-way through enumeration
+        // contributes nothing at all, rather than a truncated prefix.
+        var candidates = new List<FileInfo>();
         foreach (var dir in packageDirs)
         {
-            IEnumerable<FileInfo> apps;
+            List<FileInfo> apps;
             try { apps = new DirectoryInfo(dir).EnumerateFiles("*.app", SearchOption.AllDirectories).ToList(); }
             catch { continue; }
-            foreach (var appInfo in apps)
+            candidates.AddRange(apps);
+        }
+
+        // READING each package's metadata is the expensive half, and GetSharedReferences has to
+        // run the whole scan every time because its output is what the loader signature is
+        // computed from: ~1–2.5 s for a 113-package, 138 MB platform-apps dir on the first call.
+        // Those reads are independent, so they fan out into a per-index array; the DECISIONS
+        // below do not and stay serial, because `seen`/`picked`/`inventory` encode first-
+        // occurrence-in-scan-order rules. Same shape as the branch's other three fixes: parallel
+        // read, serial merge, identical sequence downstream.
+        //
+        // One read per package, not one per question: ReadAppMeta needs two facts about each
+        // .app, and AppLoader.ReadPackageMeta answers both off a single streamed open (see
+        // AppLoaderPackageMetaTests). Until it did, HasSymbolReference pulled the WHOLE package
+        // into a byte[] to check for one entry name, so N workers held N package-sized buffers
+        // and the degree had to be capped at 8 to bound that on a memory-bound cold compile.
+        //
+        // Measured per read of Microsoft_Base Application (93 MB): 439 MB allocated before,
+        // 45 MB after. What is left is the nested .app an R2R package must buffer to be read at
+        // all — a flat package costs a 64 KB FileStream buffer. So the bound is ProcessorCount:
+        // still a bound, both because that residue is real and because a Parallel.For left
+        // unbounded keeps injecting threads while workers sit in blocking I/O.
+        var scanned = new (AppManifest? Manifest, bool HasSymbolReference)[candidates.Count];
+        Parallel.For(0, candidates.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            i =>
             {
-                var app = appInfo.FullName;
-                var (m, hasSymbolReference) = ReadAppMeta(appInfo);
-                if (m == null) continue;
-                if (excludeAppId != null && m.AppId == excludeAppId.Value) { changed = true; continue; }
-                if (!seen.Add((m.AppId, m.Version.ToString()))) { changed = true; continue; }
-                // Drop packages carrying no SymbolReference.json. The native .app scanner
-                // cannot serve them — it reports AL1023 "package file is not valid" — and the
-                // error is attributed to the COMPILATION, not to the package, so a single such
-                // file fails every compile that scans its directory even when nothing
-                // references it. That is a bundle-wide blast radius from one unrelated suite's
-                // fixture.
-                //
-                // Removing them loses nothing: a symbol-less .app is either a synthetic
-                // source-dependency package (its symbols reach the compiler through the
-                // *.symbols.json JSON loader chain below, which is the intended route) or a
-                // fixture that exists purely for DependencyResolver's identity lookup, which
-                // reads manifests directly and never goes through this scan set.
-                //
-                // ScopeSymbolBearingDepsOnly applies the same rule to the RESOLVED DEP list;
-                // this is its counterpart for the directory scan. Both are needed — the two
-                // paths reach the compiler independently, and BC 27 is far stricter than BC 28
-                // about a malformed package, so a gap here shows up as a version-specific
-                // failure that looks like a runner capability gap and is not one.
-                if (!hasSymbolReference) { changed = true; continue; }
-                // Normalise to an absolute path BEFORE it is ever used as a symlink target.
-                // `dir` (and therefore `app`) may be a caller-supplied RELATIVE path (e.g. a
-                // relative --package-cache argument, exactly as in issue #1652's repro:
-                // `--package-cache app/.alpackages`). File.CreateSymbolicLink below treats its
-                // target argument LITERALLY — a relative target is resolved by the OS relative
-                // to the SYMLINK's own directory (the temp stage dir under
-                // al-runner-pkgdedup/<hash>/), not relative to this process's CWD. Staging a
-                // relative target therefore produces a DANGLING symlink: BC's native package
-                // reader then reports the (perfectly valid) package as `AL1023 ... is not
-                // valid`, the resulting declaration errors cascade into Compilation.Emit, and
-                // the emitter crashes on unbound types — the EMIT-ZERO failure this dedup path
-                // is supposed to prevent, not cause. Resolving to an absolute path here makes
-                // every downstream symlink target valid regardless of CWD.
-                var full = Path.GetFullPath(app);
-                picked.Add(full);
-                inventory.Add(new PackageScanEntry(full, m.AppId, m.Publisher, m.Name, m.Version));
-            }
+                PackageScanProbeForTests?.Invoke();
+                scanned[i] = ReadAppMeta(candidates[i]);
+            });
+
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            var appInfo = candidates[i];
+            var app = appInfo.FullName;
+            var (m, hasSymbolReference) = scanned[i];
+            if (m == null) continue;
+            if (excludeAppId != null && m.AppId == excludeAppId.Value) { changed = true; continue; }
+            if (!seen.Add((m.AppId, m.Version.ToString()))) { changed = true; continue; }
+            // Drop packages carrying no SymbolReference.json. The native .app scanner
+            // cannot serve them — it reports AL1023 "package file is not valid" — and the
+            // error is attributed to the COMPILATION, not to the package, so a single such
+            // file fails every compile that scans its directory even when nothing
+            // references it. That is a bundle-wide blast radius from one unrelated suite's
+            // fixture.
+            //
+            // Removing them loses nothing: a symbol-less .app is either a synthetic
+            // source-dependency package (its symbols reach the compiler through the
+            // *.symbols.json JSON loader chain below, which is the intended route) or a
+            // fixture that exists purely for DependencyResolver's identity lookup, which
+            // reads manifests directly and never goes through this scan set.
+            //
+            // ScopeSymbolBearingDepsOnly applies the same rule to the RESOLVED DEP list;
+            // this is its counterpart for the directory scan. Both are needed — the two
+            // paths reach the compiler independently, and BC 27 is far stricter than BC 28
+            // about a malformed package, so a gap here shows up as a version-specific
+            // failure that looks like a runner capability gap and is not one.
+            if (!hasSymbolReference) { changed = true; continue; }
+            // Normalise to an absolute path BEFORE it is ever used as a symlink target.
+            // `dir` (and therefore `app`) may be a caller-supplied RELATIVE path (e.g. a
+            // relative --package-cache argument, exactly as in issue #1652's repro:
+            // `--package-cache app/.alpackages`). File.CreateSymbolicLink below treats its
+            // target argument LITERALLY — a relative target is resolved by the OS relative
+            // to the SYMLINK's own directory (the temp stage dir under
+            // al-runner-pkgdedup/<hash>/), not relative to this process's CWD. Staging a
+            // relative target therefore produces a DANGLING symlink: BC's native package
+            // reader then reports the (perfectly valid) package as `AL1023 ... is not
+            // valid`, the resulting declaration errors cascade into Compilation.Emit, and
+            // the emitter crashes on unbound types — the EMIT-ZERO failure this dedup path
+            // is supposed to prevent, not cause. Resolving to an absolute path here makes
+            // every downstream symlink target valid regardless of CWD.
+            var full = Path.GetFullPath(app);
+            picked.Add(full);
+            inventory.Add(new PackageScanEntry(full, m.AppId, m.Publisher, m.Name, m.Version));
         }
         if (!changed) return packageDirs; // common case — leave the hot path untouched
 

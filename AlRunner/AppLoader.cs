@@ -43,18 +43,25 @@ public sealed record AppManifest(
 
 public static class AppLoader
 {
-    // Process-wide memo for ReadManifest, keyed by (full path, length, mtime) — cheap to
-    // compute (a single FileInfo stat, never touches file content) so a repeat ReadManifest
-    // call for the SAME file within this process is a dictionary lookup, not a re-parse.
-    // Measured: this method is called ~113 times across ProvisioningCheck.CheckPlatformApps,
-    // DependencyResolver.EnsureIndexed/Resolve and BcCompiler for the SAME package caches,
-    // often for the SAME files more than once per process — see AppLoaderManifestCacheTests.
-    private static readonly ConcurrentDictionary<string, AppManifest?> _manifestMemo = new(StringComparer.Ordinal);
+    // Process-wide memo for the package-metadata read, keyed by (full path, length, mtime) —
+    // cheap to compute (a single FileInfo stat, never touches file content) so a repeat
+    // ReadManifest / HasSymbolReference call for the SAME file within this process is a
+    // dictionary lookup, not a re-read. Measured: ReadManifest alone is called ~113 times
+    // across ProvisioningCheck.CheckPlatformApps, DependencyResolver.EnsureIndexed/Resolve and
+    // BcCompiler for the SAME package caches, often for the SAME files more than once per
+    // process — see AppLoaderManifestCacheTests.
+    //
+    // The entry holds BOTH facts a caller can want about a package, because one open of its zip
+    // answers both (see ReadPackageMeta): asking the two questions separately used to read the
+    // file twice, which for the 113-package / 138MB platform-apps dir the .app metadata scan
+    // walks was 226 reads per scan — see AppLoaderPackageMetaTests.
+    private static readonly ConcurrentDictionary<string, (AppManifest? Manifest, bool HasSymbolReference)>
+        _manifestMemo = new(StringComparer.Ordinal);
 
     /// <summary>Test-only: clears the in-process memo so a test can simulate a fresh process.</summary>
     internal static void ResetManifestMemoForTests() => _manifestMemo.Clear();
 
-    // Test-only: counts genuine ReadManifestUncached invocations (i.e. BOTH the memo AND
+    // Test-only: counts genuine ReadPackageMetaUncached invocations (i.e. BOTH the memo AND
     // the disk index missed) per full .app path — mirrors BcAppSymbolCache
     // .ParseInvocationCountByPath so a test can assert a given ReadManifest call was
     // served from a cache rather than a re-parse that happens to produce equal content.
@@ -91,7 +98,24 @@ public static class AppLoader
     /// a correctness hazard, only a cache miss (see AppLoaderManifestCacheTests
     /// .ReadManifest_TouchedMtime_IsReparsedNotServedStale).
     /// </summary>
-    public static AppManifest? ReadManifest(string appPath)
+    public static AppManifest? ReadManifest(string appPath) => ReadPackageMeta(appPath).Manifest;
+
+    /// <summary>
+    /// Reads BOTH facts a caller can want about a package — its identity
+    /// (<see cref="ReadManifest"/>) and whether it carries a <c>SymbolReference.json</c>
+    /// (<see cref="HasSymbolReference"/>) — from ONE open of its zip, and caches them together.
+    ///
+    /// <para>Use this wherever both are needed. The two questions look independent but are
+    /// answered by the same central directory, and for the R2R packages Microsoft ships (System
+    /// Application, Base Application) by the same buffered nested <c>.app</c> — so asking them
+    /// separately reads the package twice for nothing. BcCompiler's <c>DeduplicateAppPackageDirs</c>
+    /// asks both about every candidate on every <c>GetSharedReferences</c> call, over a dir its
+    /// own comment sizes at 113 packages / 138MB.</para>
+    ///
+    /// <para>Both entry points share this method's two-level cache, so calling them separately
+    /// still costs one read — just one lookup more.</para>
+    /// </summary>
+    internal static (AppManifest? Manifest, bool HasSymbolReference) ReadPackageMeta(string appPath)
     {
         string fullPath;
         long length;
@@ -100,7 +124,7 @@ public static class AppLoader
         {
             fullPath = Path.GetFullPath(appPath);
             var fi = new FileInfo(fullPath);
-            if (!fi.Exists) return null;
+            if (!fi.Exists) return (null, false);
             length = fi.Length;
             mtimeTicks = fi.LastWriteTimeUtc.Ticks;
         }
@@ -108,8 +132,8 @@ public static class AppLoader
         {
             // Can't even stat the path (invalid chars, permission error, ...) — fall back
             // to a plain uncached read so behaviour matches the pre-cache contract exactly
-            // (any failure here returns null, never throws).
-            return ReadManifestUncached(appPath);
+            // (any failure here returns null/false, never throws).
+            return ReadPackageMetaUncached(appPath);
         }
 
         var memoKey = $"{fullPath}|{length}|{mtimeTicks}";
@@ -120,30 +144,30 @@ public static class AppLoader
         if (indexed != null)
         {
             PerfTrace.Log($"app-manifests HIT {Path.GetFileName(fullPath)}");
-            _manifestMemo[memoKey] = indexed;
-            return indexed;
+            _manifestMemo[memoKey] = indexed.Value;
+            return indexed.Value;
         }
 
         _manifestParseInvocationCountByPath.AddOrUpdate(fullPath, 1, static (_, c) => c + 1);
-        var parsed = ReadManifestUncached(fullPath);
+        var parsed = ReadPackageMetaUncached(fullPath);
         PerfTrace.Log($"app-manifests MISS {Path.GetFileName(fullPath)}");
         _manifestMemo[memoKey] = parsed;
-        if (parsed != null)
+        if (parsed.Manifest != null)
             TryWriteManifestIndex(memoKey, parsed);
         return parsed;
     }
 
-    /// <summary>The actual parse, with no caching — streams the .app straight off disk via
+    /// <summary>The actual read, with no caching — streams the .app straight off disk via
     /// <see cref="OpenAppZip"/> rather than reading the whole file into memory first (the
     /// dominant cost this cache exists to avoid on a cold/uncached call).</summary>
-    private static AppManifest? ReadManifestUncached(string appPath)
+    private static (AppManifest? Manifest, bool HasSymbolReference) ReadPackageMetaUncached(string appPath)
     {
         try
         {
             using var zip = OpenAppZip(appPath);
-            return ReadManifestFromZip(zip);
+            return ReadPackageMetaFromZip(zip);
         }
-        catch { return null; }
+        catch { return (null, false); }
     }
 
     // ── on-disk manifest index (issue #perf-B) ─────────────────────────────────
@@ -154,17 +178,17 @@ public static class AppLoader
         return Path.Combine(CacheRoots.Resolve("app-manifests"), hash + ".json");
     }
 
-    private static AppManifest? TryReadManifestIndex(string memoKey)
+    private static (AppManifest? Manifest, bool HasSymbolReference)? TryReadManifestIndex(string memoKey)
     {
         var path = ManifestIndexPath(memoKey);
         if (!File.Exists(path)) return null;
         try
         {
             var payload = JsonSerializer.Deserialize<ManifestCachePayload>(File.ReadAllText(path));
-            var manifest = payload == null ? null : FromPayload(payload);
-            if (manifest == null)
+            var meta = payload == null ? null : FromPayload(payload);
+            if (meta == null)
                 PerfTrace.Log($"app-manifests index entry unusable {Path.GetFileName(path)}: payload malformed — reparsing");
-            return manifest;
+            return meta;
         }
         catch (Exception ex)
         {
@@ -175,13 +199,14 @@ public static class AppLoader
         }
     }
 
-    private static void TryWriteManifestIndex(string memoKey, AppManifest manifest)
+    private static void TryWriteManifestIndex(
+        string memoKey, (AppManifest? Manifest, bool HasSymbolReference) meta)
     {
         try
         {
             var path = ManifestIndexPath(memoKey);
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            var payload = ToPayload(manifest);
+            var payload = ToPayload(meta);
             // Atomic (temp file + rename) — 4 CI processes can race a write to the SAME
             // key for the SAME shared package cache; a torn write must never be visible.
             AlCacheWriter.AtomicPublish(path, tmp => File.WriteAllText(tmp, JsonSerializer.Serialize(payload)));
@@ -195,22 +220,38 @@ public static class AppLoader
     // JSON-serializable mirror of AppManifest/DependencyRef — Version/Guid round-trip as
     // strings (System.Text.Json has no default converter for System.Version, and keeping
     // Guid as text sidesteps ever depending on that assumption changing).
+    //
+    // HasSymbolReference is NULLABLE for one reason: entries written before it existed omit the
+    // property, and System.Text.Json fills an absent constructor argument with default(T). For a
+    // plain `bool` that default is `false` — the answer that makes BcCompiler's scan DROP the
+    // package as unserveable, producing AL1023 against the compilation on a package nothing
+    // referenced, and only on machines carrying a warm cache from an older build. Nullable makes
+    // "the entry never recorded this" a distinct state that FromPayload rejects, so the flag is
+    // recomputed instead of guessed (AppLoaderPackageMetaTests
+    // .LegacyIndexEntry_WithoutTheFlag_IsRecomputed_NotReadAsFalse).
     private sealed record ManifestCachePayload(
         string Publisher, string Name, string Version, string AppId,
         List<DependencyCachePayload> Dependencies,
-        string? Application, string? Platform);
+        string? Application, string? Platform,
+        bool? HasSymbolReference);
 
     private sealed record DependencyCachePayload(
         string AppId, string Name, string Publisher, string Version, bool Optional);
 
-    private static ManifestCachePayload ToPayload(AppManifest m) => new(
-        m.Publisher, m.Name, m.Version.ToString(), m.AppId.ToString("D"),
-        m.Dependencies.Select(d => new DependencyCachePayload(
-            d.AppId.ToString("D"), d.Name, d.Publisher, d.Version.ToString(), d.Optional)).ToList(),
-        m.Application?.ToString(), m.Platform?.ToString());
-
-    private static AppManifest? FromPayload(ManifestCachePayload p)
+    private static ManifestCachePayload ToPayload((AppManifest? Manifest, bool HasSymbolReference) meta)
     {
+        var m = meta.Manifest!;
+        return new(
+            m.Publisher, m.Name, m.Version.ToString(), m.AppId.ToString("D"),
+            m.Dependencies.Select(d => new DependencyCachePayload(
+                d.AppId.ToString("D"), d.Name, d.Publisher, d.Version.ToString(), d.Optional)).ToList(),
+            m.Application?.ToString(), m.Platform?.ToString(),
+            meta.HasSymbolReference);
+    }
+
+    private static (AppManifest? Manifest, bool HasSymbolReference)? FromPayload(ManifestCachePayload p)
+    {
+        if (p.HasSymbolReference == null) return null;
         if (!Guid.TryParse(p.AppId, out var appId)) return null;
         if (!Version.TryParse(p.Version, out var version)) return null;
         var deps = new List<DependencyRef>(p.Dependencies.Count);
@@ -222,7 +263,8 @@ public static class AppLoader
         }
         Version? appVer = p.Application != null && Version.TryParse(p.Application, out var av) ? av : null;
         Version? platVer = p.Platform != null && Version.TryParse(p.Platform, out var pv) ? pv : null;
-        return new AppManifest(p.Publisher, p.Name, version, appId, deps, appVer, platVer);
+        return (new AppManifest(p.Publisher, p.Name, version, appId, deps, appVer, platVer),
+                p.HasSymbolReference.Value);
     }
 
     /// <summary>
@@ -232,60 +274,64 @@ public static class AppLoader
     /// symbols.json needed), and merges tableextensions/etc. correctly. A synthetic
     /// source-only .app emitted by InProcessAppPackager returns false here.
     /// Returns false on any read/format error.
+    ///
+    /// <para>Answered off the same cached read as <see cref="ReadManifest"/> — see
+    /// <see cref="ReadPackageMeta"/>. This used to be a <c>File.ReadAllBytes</c> of the WHOLE
+    /// package (98MB for Base Application) to check for one entry NAME, which is why the .app
+    /// metadata scan that calls it once per candidate had to cap its own concurrency.</para>
     /// </summary>
-    public static bool HasSymbolReference(string appPath)
-    {
-        try
-        {
-            var bytes = File.ReadAllBytes(appPath);
-            using var zip = OpenZipFromNavx(bytes);
-            if (zip.Entries.Any(e => e.FullName.Equals("SymbolReference.json", StringComparison.OrdinalIgnoreCase)))
-                return true;
-            // R2R nested case: the inner .app carries the SymbolReference.json.
-            var nested = zip.Entries.FirstOrDefault(e =>
-                e.FullName.EndsWith(".app", StringComparison.OrdinalIgnoreCase) && !e.FullName.Contains('/'));
-            if (nested == null) return false;
-            using var ns = nested.Open();
-            using var nms = new MemoryStream();
-            ns.CopyTo(nms);
-            using var innerZip = OpenZipFromNavx(nms.ToArray());
-            return innerZip.Entries.Any(e => e.FullName.Equals("SymbolReference.json", StringComparison.OrdinalIgnoreCase));
-        }
-        catch { return false; }
-    }
+    public static bool HasSymbolReference(string appPath) => ReadPackageMeta(appPath).HasSymbolReference;
 
     /// <summary>
     /// Byte[]-backed entry point — used to recurse into a nested R2R .app once its (small,
-    /// unavoidably-buffered — see <see cref="ReadManifestFromZip"/>) bytes are already in
+    /// unavoidably-buffered — see <see cref="ReadPackageMetaFromZip"/>) bytes are already in
     /// hand. Not used for the outer .app anymore; that path goes through
     /// <see cref="OpenAppZip"/> so it never reads the whole (potentially 100+MB) file.
     /// </summary>
-    private static AppManifest? ReadManifestFromBytes(byte[] bytes)
+    private static (AppManifest? Manifest, bool HasSymbolReference) ReadPackageMetaFromBytes(
+        byte[] bytes, int count)
     {
         try
         {
-            using var zip = OpenZipFromNavx(bytes);
-            return ReadManifestFromZip(zip);
+            using var zip = OpenZipFromNavx(bytes, count);
+            return ReadPackageMetaFromZip(zip);
         }
-        catch { return null; }
+        catch { return (null, false); }
     }
 
     /// <summary>
-    /// Core manifest lookup shared by the streamed (<see cref="OpenAppZip"/>, outer .app)
-    /// and byte[]-backed (<see cref="ReadManifestFromBytes"/>, nested .app) entry points —
+    /// Core package lookup shared by the streamed (<see cref="OpenAppZip"/>, outer .app)
+    /// and byte[]-backed (<see cref="ReadPackageMetaFromBytes"/>, nested .app) entry points —
     /// only the ZipArchive's backing stream differs between callers.
+    ///
+    /// <para>Both facts come off the one central directory this already has in hand, and the
+    /// nested .app is buffered at most once — only when the outer zip left a fact unanswered.</para>
     /// </summary>
-    private static AppManifest? ReadManifestFromZip(ZipArchive zip)
+    private static (AppManifest? Manifest, bool HasSymbolReference) ReadPackageMetaFromZip(ZipArchive zip)
     {
+        AppManifest? manifest = null;
         var entry = zip.Entries.FirstOrDefault(e =>
             string.Equals(e.FullName, "NavxManifest.xml", StringComparison.OrdinalIgnoreCase));
         if (entry != null)
         {
-            using var s = entry.Open();
-            return ParseManifestXml(s);
+            // A manifest that will not parse must not cost the symbol-reference answer as well:
+            // the two facts were read independently before this became one pass, and BC's native
+            // scanner can perfectly well serve a package whose NavxManifest.xml we failed to
+            // understand. Answering `false` here would drop it from the scan instead.
+            try
+            {
+                using var s = entry.Open();
+                manifest = ParseManifestXml(s);
+            }
+            catch { manifest = null; }
         }
 
-        // R2R outer .app — recurse into the nested .app. Unlike the outer zip (read
+        var hasSymbolReference = zip.Entries.Any(e =>
+            string.Equals(e.FullName, "SymbolReference.json", StringComparison.OrdinalIgnoreCase));
+        if (manifest != null && hasSymbolReference) return (manifest, true);
+
+        // R2R outer .app — recurse into the nested .app for whatever is still unanswered
+        // (the manifest, the flag, or both). Unlike the outer zip (read
         // straight off disk, central-directory-only, via OpenAppZip), a zip ENTRY's
         // Open() stream is forward-only/compressed, and ZipArchive needs its central
         // directory readable from the end of a seekable stream — so the nested .app's
@@ -295,11 +341,32 @@ public static class AppLoader
         // far smaller than the whole package — e.g. nowhere near Base Application's ~98MB.
         var nested = zip.Entries.FirstOrDefault(e =>
             e.FullName.EndsWith(".app", StringComparison.OrdinalIgnoreCase) && !e.FullName.Contains('/'));
-        if (nested == null) return null;
-        using var nestedStream = nested.Open();
-        using var nms = new MemoryStream();
-        nestedStream.CopyTo(nms);
-        return ReadManifestFromBytes(nms.ToArray());
+        if (nested == null) return (manifest, hasSymbolReference);
+
+        // Pre-sized from the central directory's uncompressed length, and handed on WITHOUT a
+        // trailing ToArray() copy. Base Application's nested .app is ~57MB, and letting a
+        // MemoryStream double its way up to that and then copying it out again allocated ~3x
+        // that per read (measured 172MB for one metadata read of a 93MB package). The scan now
+        // runs ProcessorCount of these concurrently, so it is the per-worker figure that matters.
+        //
+        // The pre-size is CLAMPED because nested.Length is a claim the package makes about
+        // itself, not a measurement: a corrupt or hostile central directory can declare 2GB for
+        // an entry holding a few bytes, and honouring that would turn a package the old
+        // growth-doubling read coped with into an OutOfMemoryException. Past the clamp the
+        // MemoryStream simply grows as it always did, so a genuinely larger nested .app still
+        // reads — it just forfeits the pre-size. nms.Length, not the claim, is what is handed on.
+        const int nestedPreSizeCeiling = 256 * 1024 * 1024;
+        byte[] nestedBytes;
+        int nestedCount;
+        using (var nestedStream = nested.Open())
+        using (var nms = new MemoryStream(capacity: (int)Math.Clamp(nested.Length, 0, nestedPreSizeCeiling)))
+        {
+            nestedStream.CopyTo(nms);
+            nestedBytes = nms.GetBuffer();
+            nestedCount = (int)nms.Length;
+        }
+        var inner = ReadPackageMetaFromBytes(nestedBytes, nestedCount);
+        return (manifest ?? inner.Manifest, hasSymbolReference || inner.HasSymbolReference);
     }
 
     /// <summary>Parses a NavxManifest.xml stream into an <see cref="AppManifest"/>. Pure XML
@@ -411,6 +478,7 @@ public static class AppLoader
             && e.FullName.EndsWith(".al", StringComparison.OrdinalIgnoreCase));
         try
         {
+            CountPackageOpen(appPath);
             var bytes = File.ReadAllBytes(appPath);
             using var zip = OpenZipFromNavx(bytes);
             if (AnyAl(zip)) return true;
@@ -618,6 +686,7 @@ public static class AppLoader
     /// </summary>
     public static IReadOnlyList<(string Name, string Source)> ExtractAl(string appPath)
     {
+        CountPackageOpen(appPath);
         var bytes = File.ReadAllBytes(appPath);
         var direct = ReadAlFromNavx(bytes);
         if (direct.Count > 0) return direct;
@@ -647,6 +716,7 @@ public static class AppLoader
     /// </summary>
     public static IReadOnlyList<(string FileName, byte[] Bytes)> ExtractReportLayouts(string appPath)
     {
+        CountPackageOpen(appPath);
         var bytes = File.ReadAllBytes(appPath);
         var direct = ReadLayoutsFromNavx(bytes);
         if (direct.Count > 0) return direct;
@@ -690,6 +760,26 @@ public static class AppLoader
 
     // ── internals ────────────────────────────────────────────────────────────
 
+    // Test-only: how many times this process has opened a given .app's OWN file to read its
+    // bytes — counted at every entry point in this class that does so, whether it streams
+    // (OpenAppZip) or still slurps (HasAlSource, ExtractAl, ExtractReportLayouts). That makes it
+    // the thing that tells "one open answered every question asked about the package" apart from
+    // "several opens that happened to agree" — the distinction the .app metadata scan is built
+    // on, and one that no assertion about the returned VALUES can make.
+    private static readonly ConcurrentDictionary<string, int> _packageOpenCountByPath =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static void CountPackageOpen(string appPath)
+    {
+        string full;
+        try { full = Path.GetFullPath(appPath); }
+        catch { return; }
+        _packageOpenCountByPath.AddOrUpdate(full, 1, static (_, c) => c + 1);
+    }
+
+    internal static int PackageOpenCountForTests(string appPath)
+        => _packageOpenCountByPath.TryGetValue(Path.GetFullPath(appPath), out var c) ? c : 0;
+
     /// <summary>
     /// Opens the given .app's outer ZIP straight off disk via a <see cref="FileStream"/>,
     /// WITHOUT reading the whole file into memory first (issue #perf-B — was
@@ -704,6 +794,7 @@ public static class AppLoader
     /// </summary>
     private static ZipArchive OpenAppZip(string appPath)
     {
+        CountPackageOpen(appPath);
         var fs = new FileStream(appPath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 65536, useAsync: false);
         try
         {
@@ -795,16 +886,23 @@ public static class AppLoader
         }
     }
 
-    private static ZipArchive OpenZipFromNavx(byte[] bytes)
+    private static ZipArchive OpenZipFromNavx(byte[] bytes) => OpenZipFromNavx(bytes, bytes.Length);
+
+    /// <summary>As <see cref="OpenZipFromNavx(byte[])"/>, but for a buffer whose USED length is
+    /// <paramref name="count"/> rather than its whole capacity — lets a caller hand over a
+    /// MemoryStream's own buffer instead of a right-sized copy of it.</summary>
+    private static ZipArchive OpenZipFromNavx(byte[] bytes, int count)
     {
-        var offset = NavxZipOffset(bytes);
-        var ms = new MemoryStream(bytes, offset, bytes.Length - offset, writable: false);
+        var offset = NavxZipOffset(bytes, count);
+        var ms = new MemoryStream(bytes, offset, count - offset, writable: false);
         return new ZipArchive(ms, ZipArchiveMode.Read);
     }
 
-    private static int NavxZipOffset(byte[] bytes)
+    private static int NavxZipOffset(byte[] bytes) => NavxZipOffset(bytes, bytes.Length);
+
+    private static int NavxZipOffset(byte[] bytes, int count)
     {
-        if (bytes.Length >= 8
+        if (count >= 8
             && bytes[0] == (byte)'N' && bytes[1] == (byte)'A'
             && bytes[2] == (byte)'V' && bytes[3] == (byte)'X')
             return (int)BitConverter.ToUInt32(bytes, 4);
