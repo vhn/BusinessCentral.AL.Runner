@@ -46,6 +46,7 @@
 // AL_RUNNER_PHASE_LOG is read once into a static. Unset, `Install` registers no
 // exit hook and every Note*/Begin*/End* entry point returns on a null check before
 // allocating or reading a clock. Production pays a predictable-branch per call site.
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
@@ -529,9 +530,9 @@ public static class PhaseLog
 
     /// <summary>
     /// This process's resident-set high-water mark in bytes. Linux reads VmHWM from
-    /// /proc/self/status — the kernel's own high-water mark, which .NET's
-    /// PeakWorkingSet64 does not surface on Unix. Falls back to the framework
-    /// property elsewhere.
+    /// /proc/self/status and macOS reads getrusage's ru_maxrss — both are the kernel's
+    /// own high-water mark, which .NET's PeakWorkingSet64 does not surface on Unix.
+    /// Falls back to the framework property elsewhere.
     /// </summary>
     public static long PeakRssBytes()
     {
@@ -546,6 +547,12 @@ public static class PhaseLog
                     if (long.TryParse(kb, out var v)) return v * 1024;
                 }
             }
+            // PeakWorkingSet64 is not implemented on macOS — it returns 0, which reads
+            // as "this run used no memory" rather than as a missing measurement. Darwin's
+            // getrusage carries the same high-water mark the Linux branch above reads.
+            if (OperatingSystem.IsMacOS() && getrusage(RusageSelf, out var usage) == 0 && usage.MaxRss > 0)
+                return usage.MaxRss;
+
             using var self = System.Diagnostics.Process.GetCurrentProcess();
             return self.PeakWorkingSet64;
         }
@@ -554,6 +561,24 @@ public static class PhaseLog
             return 0;
         }
     }
+
+    private const int RusageSelf = 0;
+
+    /// <summary>
+    /// Darwin's <c>struct rusage</c>. The declared Size is what keeps the kernel's write
+    /// in bounds — getrusage writes the whole struct, not just the field being read: two
+    /// 16-byte <c>struct timeval</c>s (8-byte tv_sec + 4-byte tv_usec + 4 bytes padding
+    /// on both Darwin ABIs) followed by 14 longs, so 144 bytes. Only ru_maxrss is read.
+    /// </summary>
+    [StructLayout(LayoutKind.Explicit, Size = 144)]
+    private struct DarwinRUsage
+    {
+        /// <summary>ru_maxrss. Already BYTES on Darwin, unlike Linux's kilobytes.</summary>
+        [FieldOffset(32)] public long MaxRss;
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int getrusage(int who, out DarwinRUsage usage);
 
     /// <summary>
     /// Appends one complete record under an exclusive open, so concurrent writers in
