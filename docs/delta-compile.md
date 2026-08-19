@@ -625,6 +625,50 @@ app per cycle.
 
 [#1903]: https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1903
 
+### What "per cycle" means, and what a cycle does that it does not need
+
+Everything in the table above is **per warm delta cycle** — per save — not per full compile.
+The `--watch` loop re-enters the same bundle body on every cycle: reset, resolve dependencies,
+re-register source dirs, build app groups, per app compile + load, then run. A full compile is
+a different *branch inside* that body, not a different body. So a row costing 7.9 s costs it on
+every save.
+
+Four items in that body are computed on every cycle and **used only on the first one**, or not
+at all. They are dead work on a warm cycle, in cost order:
+
+| Item | Where | Cost | Why it is dead warm |
+|---|---|---|---|
+| `RecordPatches.AddSourceDirs` | `Program.cs`, `register-source-dirs` | 7.9 s | Not dead — genuinely needed, but O(whole tree) for a one-file edit. `ResetForReload` clears every parsed dictionary; making it proportional needs file→parsed-entry provenance that does not exist yet. |
+| `GetOrderedDepIds` | `Program.cs`, `ordered-dep-ids` | a full second `DependencyResolver` index | Its only consumer is `ComputeAlCacheKey`, behind the `radWs is null or { Generations.Count: 0 }` gate — false from cycle 2 on. `DependencyResolver.EnsureIndexed` is an *instance* field, so it re-walks every package-cache dir and re-reads every `.app`'s manifest out of its zip. |
+| `BcCompiler.BundleDeclaresQuery` | `Program.cs`, per app, `BundleDeclaresQuery` mark | O(whole tree) for an app with no query | Same gate, same story: it decides whether a **cache HIT** must also carry a query-symbols sidecar (without one, `NCLMetaQuery` is null and every query `Find` NREs inside `NavQuery.ValidateTablesNotVirtual`). It is not a judgement about queries mattering — an app that *has* one answers on the first file it reads and costs nothing. It is the app with **no** query that reads all 12.7 MB to prove a negative, and a warm cycle never consults the answer. |
+| The `PARTIAL-EMIT-DROP` guard | `Program.cs` | reads + regexes every `.al` file | Skipped for a delta overlay, so it lands only on full-rebuild cycles — i.e. it piles onto the cycles that are already the slowest. |
+
+None of these is fixed on this branch; they are recorded here because a cycle's own breakdown
+has to add up to the cycle, and until they were stage-timed the cost was not attributed to
+anything.
+
+### Per-cycle overhead scales with the overlay chain
+
+The load loop iterates `appAssemblies` — every generation in `RadWorkspace.Generations` — and
+the run loop iterates the same set again, so `BcRuntime.SetTestAssembly` runs roughly
+**2 × generations × apps** times per cycle. Past its `_currentTestAssembly` guard (which never
+hits across differing generations) each call re-runs:
+
+- `HookXmlPortInitializeComponents` — `asm.GetTypes()` over the assembly plus a
+  JmpHook/`mprotect` per XmlPort. `JmpHook.Apply` has no already-applied guard.
+- `RecordPatches.FixupEnumFieldOptionMetadataAll` — walks the **whole** `_metaTableCache` and
+  regexes every field's `TypeName`, with **no done-guard**. `WireFieldTriggerHandlersAll`
+  directly above it has exactly such a guard (`_fieldTriggersWiredTables`), added because the
+  unguarded version cost 81 s of a 111 s run on `tests/runner-extras`; this one never got the
+  same treatment.
+
+So a `--watch` benchmark has to report a **series** of cycles, never one: overhead climbs as
+the chain lengthens. It used to climb for 11 saves and then reset with a whole-module compile
+(see [What still forces a full compile](#what-still-forces-a-full-compile)); with the cap
+removed it simply climbs, which is the right trade — an overlay is kilobytes and resolution is
+O(1) — but the two unguarded walks above are what make it climb at all, and neither is fixed
+on this branch.
+
 ### The developer loop it is meant to serve
 
 The same corpus, driven through a scripted session that alternates application and test
@@ -747,7 +791,7 @@ and the two guard tests beside it.
 
 ### What still forces a full compile
 
-Every AL **object** kind is keyable. Two cases remain:
+Every AL **object** kind is keyable. Inside one app, **one** case remains:
 
 - **A `dotnet` package declaration.** Not an AL object: it changes what every object in the
   module can bind to, and a RAD object compilation carries no package declaration trees —
@@ -755,15 +799,60 @@ Every AL **object** kind is keyable. Two cases remain:
   in both directions. Declaring one is read off the changed file's syntax; **deleting** one can
   only come from the workspace's per-file record, since there is no file left to parse. Pinned
   both ways by `RadObjectDeltaTests.AFileDeclaringADotNetPackage_StillForcesAFullCompile`.
-- **A duplicate declaration** — a changed file claiming a key an untouched file still owns.
-  `ws.FileOf` answers *which file* owns a key, which is the question that distinguishes a
-  modification from a duplicate; `ws.Declares` only answered "does the module declare this
-  key", which is true either way, so the new object was classified as a *modification* of the
-  other file's object and the cycle reported success on a tree that does not compile. Measured
-  against a cold compile: a duplicated `interface` name is four AL0197s cold and **no
-  diagnostic at all** through the delta; a duplicated codeunit id is four AL0264s cold and one
-  unrelated AL0185. Only the compiler can say what a duplicate means, so it gets the whole
-  module.
+
+Two further triggers live above the app, in the reload decision rather than in the delta:
+
+- **A manifest edit.** `app.json` feeds the reference signature (dependencies, identity,
+  preprocessor symbols), so `RadWorkspace.ArmFor` invalidates when one moves — and
+  `RadWorkspaceStore.PrepareBundleReload` refuses to keep the bundle's emit captures warm,
+  because the full compile that follows has no object map left to sweep stale metadata with.
+  It compares manifest **content**, not the fact of a write: a branch switch, a checkout, an
+  editor autosave and (on macOS/APFS) even reading the tree with `File.Copy` all rewrite
+  `app.json` byte-identically, and every one of those used to cost the whole bundle a
+  whole-module compile with nothing edited. Both directions are pinned by
+  `RadWatchNoUnnecessaryRebuildTests.Watch_RewritingAppJsonWithIdenticalBytes_KeepsTheModuleWarm_ButAnEditRebuildsIt`.
+- **A bundle that cannot be kept warm at all** — more than one bundle in the run, an app with
+  no baseline yet, or `.al` source no warm app in the bundle owns. Each names itself in the
+  `full rebuild —` line.
+
+**A duplicate declaration is not on this list any more: it is an error.** A changed file
+claiming a key an untouched file still owns used to get the whole module, on the argument that
+"only the compiler can say which of the two is the duplicate". The compiler's answer is always
+the same — two objects in one app cannot share an id or a name — so the whole-module compile
+bought a diagnostic and nothing else, for the most ordinary thing a developer does: copy an
+existing `.al` file to start a new object from it, intending to renumber and rename afterwards.
+The cycle now reports it, at the cost of parsing the changed file, and leaves the workspace
+untouched so the save that renumbers the copy deltas straight away. The AL code comes from the
+identity that collided — `AL0264` for an id, `AL0197` for a name — matching what a cold compile
+of the same tree reports; the delta cannot produce those itself, because the other declaration
+lives only in the packaged baseline (measured: a duplicated `interface` name is four AL0197s
+cold and **no diagnostic at all** through the delta; a duplicated codeunit id is four AL0264s
+cold and one unrelated AL0185). `ws.FileOf` is what makes this answerable at all: it says
+*which file* owns a key, where `ws.Declares` only said "does the module declare this key" —
+true either way, so the copy used to be classified as a *modification* of the original and the
+cycle reported success on a tree that does not compile.
+
+Pinned end to end by
+`RadWatchNoUnnecessaryRebuildTests.Watch_CopyingAnAlFile_ReportsTheDuplicate_ThenDeltasOnceRenumbered`
+(copy the file → error, no rebuild; renumber + rename → `delta +1 ~0 -0`), and per kind by
+`RadIdlessObjectTests.AChangedFileClaimingAKeyAnUntouchedFileOwns_DoesNotPassAsAModification`
+over a codeunit, an interface and an entitlement — which compares the delta's AL code against a
+cold compile of the same tree rather than against an expectation written here. Arity is where
+the two legitimately differ: a cold build names both sides, the delta parsed only the changed
+one and names the other by path.
+
+**What is no longer a trigger: the overlay chain.** `Program.RunEmit` used to invalidate the
+workspace once it held 12 generations, so **every 11th code-producing save rebuilt the whole
+module** — minutes on npcore, for memory hygiene rather than correctness, at a moment no
+developer could predict. `AlObjectResolution` resolves an object to its owning generation in
+O(1) and an overlay assembly is kilobytes, so the chain is now unbounded; if a long session's
+overlays ever do need reclaiming, the answer is to compact them into one fresh generation on a
+memory threshold, not to rebuild the module on a counter. Growth is not free — see
+[Per-cycle overhead scales with the overlay chain](#per-cycle-overhead-scales-with-the-overlay-chain)
+— but paying it back with a full compile is the most expensive way to reclaim it.
+`RadWatchNoUnnecessaryRebuildTests.Watch_FourteenSuccessiveDeltas_NeverRebuildTheModule` drives
+two saves past the old cap and asserts both that every cycle stayed a delta and that the suite
+still passes with a 15-generation chain loaded.
 
 Adding a future kind is a line in `RadObjectKey.IsIdlessKind` (plus `IdlessKindOf` if the
 symbol API omits it, plus a `ModuleDefinitionOps` array entry if one exists) and a fixture
