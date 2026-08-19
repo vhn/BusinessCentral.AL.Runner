@@ -633,7 +633,7 @@ edit to one codeunit, which moves five objects because four files call it):
 | Phase | Time |
 |---|---:|
 | Running the selected test codeunit (30 tests) | 11.0 s |
-| `RecordPatches.AddSourceDir` — re-reads and re-parses every `.al` file in both apps | 7.9 s † |
+| `RecordPatches.AddSourceDir` — **was** re-read + re-parse of every `.al` file in both apps | 7.9 s † |
 | **AL delta emit (`CreateForRad`)** | **2.4 s** |
 | `NP Retail Tests` establishing it has nothing to do | 2.9 s |
 | Register + publish symbols | 2.5 s |
@@ -650,22 +650,49 @@ The `AddSourceDir` row is the post-[#1903] figure and this branch carries that f
 direct probe of the phase on the same corpus measured **7.0–7.9 s** at one parse per file
 against **29.7 s** at eight.
 
-> **† The `AddSourceDir` figure predates the parallel pre-parse and has not been re-measured.**
-> The parse is now batched at 256 files and built off the calling thread (`BeginPreParse`,
-> `PreParseParallelThreshold`); only the parse moved, so the eight extractors still run
-> serially over each batch in file order and find each tree already built via the primed memo.
-> Measured on the compile side just before that change (a comparable npcore tree, a different
-> run — do not subtract it from the 7.9 s above), the pass was **11.5 s wholly serial** against
-> **~1.1 s** for BC's own front end parsing the same file count with a `Parallel.For`. So this
-> row is now materially lower and is very likely no longer the largest overhead in the cycle.
-> Re-time it before planning anything around this table's ordering.
+> **† The 7.9 s is the pre-fix figure and is kept only as the "before" of the row below.** It
+> also predates both the parallel pre-parse and Server GC. Re-measured on the same 7,339-file
+> corpus after those landed, the stage was **1.40–2.85 s (median 1.76 s) of a 6.0 s median warm
+> cycle** — still the single largest line item at 29%, and still 5–10× the AL delta emit
+> (0.14–0.79 s) it exists to serve. Source: `.context/perf/w4-servergc/phase.jsonl`, cycles 4–9.
 
-`AddSourceDir` is still **O(whole tree)** by construction, faster constant or not: the reload
-clears every parsed dictionary, so all of it is rebuilt to service an edit to one file. Making
-it O(changed files) needs file→parsed-entry provenance, which does not exist in `RecordPatches`
-today — the tableextension dictionaries are keyed by base-table name and accumulate, so one
-file's contribution cannot currently be retracted. Parallelism lowered the constant; it did not
-change the complexity, and that is the part worth fixing.
+### `AddSourceDirs` is now O(files that moved)
+
+**Fixed.** The stage no longer re-derives the whole tree. Each file's extraction results are
+memoized on `(path, content hash, preprocessor symbols)` and **replayed** into the
+freshly-cleared dictionaries in enumeration order; only files whose bytes moved are read and
+parsed again. See `AlRunner/Patches/RecordPatches.SourceFileExtracts.cs`.
+
+Measured A/B, same machine, same corpus, direct probe of the stage — cold pass then three warm
+cycles, each preceded by the `ResetForReload` a `--watch` cycle performs:
+
+| | cold | warm 1 | warm 2 | warm 3 |
+|---|---:|---:|---:|---:|
+| before | 11.6 s (7,339 parses) | 7.12 s (7,339) | 7.20 s (7,339) | 6.06 s (7,339) |
+| after | 10.3 s (7,339 parses) | **0.15 s (0)** | **0.14 s (0)** | **0.12 s (0)** |
+
+The warm cost left is the parallel content hash of the tree, which *replaces* the serial read
+the stage used to do rather than adding to it. (The probe runs in the xunit test host, i.e.
+under Workstation GC, so its absolute "before" figures line up with the `w3-deltas` series
+rather than the Server-GC `w4` ones. The "after" path does no parsing at all, so it is
+essentially GC-insensitive: against the Server-GC median of 1.76 s the stage drops to ~0.14 s,
+about 29% off the whole warm cycle.)
+
+Why this was previously recorded as blocked, and what changed: making it proportional does need
+file→parsed-entry provenance, and the tableextension dictionaries accumulate by base-table name
+so one file's contribution cannot be **retracted**. That rules out keeping the dictionaries
+across cycles and patching the changed files — `_extensionIdsByBaseTable` is an *ordered*
+accumulate that drives record-trigger dispatch, and an object deleted from an edited file would
+linger. It does not rule out **replay**: clearing exactly as before and rebuilding from the memo
+in the same order reproduces the accumulate identically, and a file that vanished is simply
+never replayed. Nothing is subtracted, so nothing needs to be.
+
+Pinned by `AlRunner.Tests/RecordPatchesIncrementalReparseTests.cs`, which asserts on
+`ParseObjectTextCallCount` (a count, never a duration) *and* on the resulting parsed state, so
+an implementation that skipped the stage outright would fail. Three mutation checks confirm the
+suite discriminates: publishing the memo's own field list instead of a copy, keying on content
+without the preprocessor symbols, and keeping a parsed dictionary across the reload are each
+caught by a specific test.
 
 Two figures the instrumentation corrected: post-registration field-trigger wiring and record
 prewarm are **0.2 s**, not the ~12 s previously attributed to them; and `GetSharedReferences`
@@ -696,9 +723,10 @@ Both fixes are pinned by `AlRunner.Tests/AlCacheGateDeadWorkTests.cs`, which spa
 runner over a query-declaring fixture and asserts each probe **present** with `--cache` (on both
 a MISS and a HIT) and **absent** with `--no-cache`.
 
-`RecordPatches.AddSourceDirs` is deliberately **not** on that list, despite being one of the
-largest lines in the table above. Its cost is real work the cycle needs, not work the cycle
-wastes — O(whole tree) rather than dead — so it is treated in the previous section instead.
+`RecordPatches.AddSourceDirs` is deliberately **not** on that list, despite having been the
+largest line in the table above. Its cost was real work the cycle needs, not work the cycle
+wastes — O(whole tree) rather than dead — so it is treated in the previous section, where it is
+now O(files that moved).
 
 None of the three is fixed; they are recorded here because a cycle's own breakdown has to add
 up to the cycle, and until they were stage-timed the cost was not attributed to anything.

@@ -151,42 +151,9 @@ public static partial class RecordPatches
     public static void AddSourceDir(string dir) => AddSourceDirs(new[] { dir });
 
     /// <summary>
-    /// Runs all eight source extractors (table, tableextension, page, report, query,
-    /// xmlport, object-decl, object-caption) over ONE already-read file's text (#1903).
-    /// <para>
-    /// Before this, <see cref="AddSourceDirs"/>' per-file loop called all eight directly —
-    /// each extractor is a thin foreach over <c>ParseAlObjects(text)</c>, which built its
-    /// OWN full AL syntax tree from the same text. A source tree of N files therefore cost
-    /// 8N parses of eight IDENTICAL trees, measured on a 7,339-file real-world corpus as
-    /// ~59,000 parses / 29.7s per pass instead of 7,339 parses. <see cref="ParseAlObjects"/>
-    /// now memoizes its most-recently-built tree keyed on (text, active preprocessor
-    /// symbols) — see the comment there — so calling the eight extractors back-to-back on
-    /// the SAME text, as both callers below do, costs one real parse plus seven cache hits.
-    /// </para>
-    /// <para>
-    /// The (text, symbols) key is deliberate, not an oversight: #1900 was caused by a
-    /// parser that stopped seeing <c>--define</c> symbols because a field FROZE at
-    /// type-init before <c>BcCompiler.SetExtraPreprocessorSymbols</c> ran. A cache keyed on
-    /// text alone would reintroduce that bug silently — two calls for the same text under
-    /// different <c>--define</c> sets are a genuinely different parse, not a cache hit.
-    /// </para>
-    /// </summary>
-    private static void ParseSourceFileIntoAllExtractors(string text)
-    {
-        TryParseTableFile(text);
-        TryParseTableExtensionFile(text);
-        TryParsePageFile(text);
-        TryParseReportFile(text);
-        TryParseQueryFile(text);
-        TryParseXmlPortFile(text);
-        TryParseObjectDeclFile(text);
-        TryParseObjectCaptionFile(text);
-    }
-
-    /// <summary>
     /// The Register()-time equivalent of <see cref="AddSourceDirs"/>' per-file loop: one
     /// pass over every registered source dir, reading each file's text exactly once and
-    /// running all eight extractors on it via <see cref="ParseSourceFileIntoAllExtractors"/>
+    /// running all eight extractors on it via <c>ExtractSourceFile</c>
     /// (#1903). This replaced seven independent sweeps (one per extractor kind), each of
     /// which re-walked every source dir and re-read every file from disk on its own — 7
     /// directory walks + 7 file reads + (with the old un-memoized parser) 8 tree builds per
@@ -196,7 +163,7 @@ public static partial class RecordPatches
     {
         foreach (var dir in _sourceDirs)
             ParseSourceFilesIntoAllExtractors(
-                Directory.GetFiles(dir, "*.al", SearchOption.AllDirectories));
+                dir, Directory.GetFiles(dir, "*.al", SearchOption.AllDirectories));
     }
 
     /// <summary>
@@ -205,33 +172,6 @@ public static partial class RecordPatches
     /// once are bounded — see the pre-parse note in RecordPatches.AlSourceParser.cs.
     /// </summary>
     private const int SourceFileBatchSize = 256;
-
-    /// <summary>
-    /// Run all eight extractors over <paramref name="files"/>, a batch at a time: read the batch,
-    /// build its syntax trees (in parallel, above a threshold), then run the extractors over the
-    /// results one file at a time in the order given.
-    ///
-    /// <para>The extractors stay SERIAL and in order deliberately. They write into shared
-    /// dictionaries, two of which accumulate — <c>_parsedExtensionFields</c> by base-table name,
-    /// and <c>_extensionIdsByBaseTable</c>, whose lists are in AL declaration order because that
-    /// is the order BC registers tableextensions and the record-trigger pipeline preserves it. The
-    /// parse is the part that is pure, and the part that costs seconds.</para>
-    /// </summary>
-    private static void ParseSourceFilesIntoAllExtractors(IReadOnlyList<string> files)
-    {
-        for (int start = 0; start < files.Count; start += SourceFileBatchSize)
-        {
-            var batch = files.Skip(start).Take(SourceFileBatchSize).ToArray();
-            var texts = new string[batch.Length];
-            // Serial, so a file that cannot be read throws exactly the exception it always threw
-            // rather than an AggregateException from the parallel phase.
-            for (int i = 0; i < batch.Length; i++) texts[i] = File.ReadAllText(batch[i]);
-
-            using (BeginPreParse(texts))
-                foreach (var text in texts)
-                    ParseSourceFileIntoAllExtractors(text);
-        }
-    }
 
     /// <summary>
     /// Register N source dirs and populate the NCLMetadata cache ONCE for the whole
@@ -279,11 +219,12 @@ public static partial class RecordPatches
             // The NCLMetadata cache is populated once below, after every dir in this batch
             // has been parsed — see the batching rationale on the doc comment above. Every
             // .al file's text is read ONCE and handed to all eight extractors together
-            // (#1903) — see ParseSourceFileIntoAllExtractors.
+            // (#1903) — see RecordPatches.SourceFileExtracts.cs, which also skips the
+            // derivation entirely for a file whose bytes have not moved since the last pass.
             if (_registered)
             {
                 ParseSourceFilesIntoAllExtractors(
-                    Directory.GetFiles(dir, "*.al", SearchOption.AllDirectories));
+                    dir, Directory.GetFiles(dir, "*.al", SearchOption.AllDirectories));
                 parsedAny = true;
             }
         }

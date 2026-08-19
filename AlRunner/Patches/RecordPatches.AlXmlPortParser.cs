@@ -15,14 +15,24 @@ public static partial class RecordPatches
     // — that shared loop calls TryParseXmlPortFile alongside the other seven extractors, one
     // file read per file, instead of this file doing its own separate directory walk.
 
-    private static void TryParseXmlPortFile(string text)
+    private static void TryParseXmlPortFile(string text) => ApplyXmlPorts(ExtractXmlPorts(text));
+
+    /// <summary>The pure half — see <see cref="ExtractTables"/>.</summary>
+    private static List<ParsedXmlPort> ExtractXmlPorts(string text)
     {
+        var result = new List<ParsedXmlPort>();
         foreach (var obj in ParseAlObjects(text))
         {
             if (obj is not NavSyntax.XmlPortSyntax x) continue;
             if (ObjectIdOf(x) is not int id) continue;
-            _parsedXmlPorts[id] = new ParsedXmlPort(id, IdentText(x.Name));
+            result.Add(new ParsedXmlPort(id, IdentText(x.Name)));
         }
+        return result;
+    }
+
+    private static void ApplyXmlPorts(IReadOnlyList<ParsedXmlPort> xmlPorts)
+    {
+        foreach (var xmlPort in xmlPorts) _parsedXmlPorts[xmlPort.Id] = xmlPort;
     }
 }
 

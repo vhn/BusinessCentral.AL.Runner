@@ -31,6 +31,17 @@ public static partial class RecordPatches
 
     private static void TryParsePageFile(string text)
     {
+        var (pages, pageExtensions) = ExtractPages(text);
+        ApplyPages(pages, pageExtensions);
+    }
+
+    /// <summary>The pure half — see <see cref="RecordPatches"/>.ExtractTables. Pages and
+    /// pageextensions come back as two lists because they land in two dictionaries; each is in
+    /// the declaration order of its own pass, exactly as before.</summary>
+    private static (List<ParsedPage> Pages, List<ParsedPage> PageExtensions) ExtractPages(string text)
+    {
+        var pages = new List<ParsedPage>();
+        var pageExtensions = new List<ParsedPage>();
         var objects = ParseAlObjects(text);
 
         // Pages and pageextensions go into SEPARATE dictionaries, mirroring
@@ -48,7 +59,7 @@ public static partial class RecordPatches
             var props = p.PropertyList;
             var (fieldMap, controls) = ParsePageControls(id, p.Layout);
             var pageTypeText = Unquote(PropValue(props, "PageType")?.ToString()?.Trim() ?? "");
-            _parsedPages[id] = new ParsedPage(id, IdentText(p.Name), IsExtension: false,
+            pages.Add(new ParsedPage(id, IdentText(p.Name), IsExtension: false,
                 // Absent SourceTable is the empty string, not null — callers distinguish
                 // "declares none" from "never parsed" via IsPageParsed.
                 SourceTableName: Unquote(PropValue(props, "SourceTable")?.ToString()?.Trim() ?? ""),
@@ -73,7 +84,7 @@ public static partial class RecordPatches
                 // none", which Page Metadata reports as CardPageID = 0 (a real, meaningful
                 // value: Base App "Page Management".GetDefaultCardPageID reads it to decide
                 // whether a table has a card page at all).
-                CardPageName: PageRefText(PropValue(props, "CardPageId")));
+                CardPageName: PageRefText(PropValue(props, "CardPageId"))));
         }
 
         foreach (var obj in objects)
@@ -88,13 +99,22 @@ public static partial class RecordPatches
             // GetPageControlFieldMap merges them into the BASE page's map, which is where a
             // TestPage looks.
             var (extFieldMap, extControls) = ParsePageControls(id, pe.Layout);
-            _parsedPageExtensions[id] = new ParsedPage(id, IdentText(pe.Name), IsExtension: true,
+            pageExtensions.Add(new ParsedPage(id, IdentText(pe.Name), IsExtension: true,
                 SourceTableName: string.Empty,
                 ControlIdToFieldName: extFieldMap,
                 InsertAllowed: !PropIs(pe.PropertyList, "InsertAllowed", "false"),
                 BaseName: Unquote(pe.BaseObject?.ToString()?.Trim() ?? ""),
-                Controls: extControls);
+                Controls: extControls));
         }
+
+        return (pages, pageExtensions);
+    }
+
+    private static void ApplyPages(
+        IReadOnlyList<ParsedPage> pages, IReadOnlyList<ParsedPage> pageExtensions)
+    {
+        foreach (var page in pages) _parsedPages[page.Id] = page;
+        foreach (var extension in pageExtensions) _parsedPageExtensions[extension.Id] = extension;
     }
 
     /// <summary>

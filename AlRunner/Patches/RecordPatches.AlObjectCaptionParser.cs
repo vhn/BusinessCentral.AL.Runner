@@ -68,8 +68,13 @@ public static partial class RecordPatches
     // extractors, one file read per file, instead of this file doing its own separate
     // directory walk.
 
-    private static void TryParseObjectCaptionFile(string text)
+    private static void TryParseObjectCaptionFile(string text) =>
+        ApplyObjectCaptions(ExtractObjectCaptions(text));
+
+    /// <summary>The pure half — see <see cref="RecordPatches"/>.ExtractTables.</summary>
+    private static List<ParsedAlObjectCaption> ExtractObjectCaptions(string text)
     {
+        var result = new List<ParsedAlObjectCaption>();
         foreach (var obj in ParseAlObjects(text))
         {
             if (AlObjectKindName(obj) is not string kind) continue;
@@ -83,8 +88,15 @@ public static partial class RecordPatches
             // that node's property list, not this one, so the old brace-depth gate is now
             // structural rather than arithmetic.
             var props = (obj as NavSyntax.ObjectSyntax)?.PropertyList;
-            _parsedObjectCaptions[(kind, id)] = PropertyTextFrom(PropValue(props, "Caption"));
+            result.Add(new ParsedAlObjectCaption(kind, id, PropertyTextFrom(PropValue(props, "Caption"))));
         }
+        return result;
+    }
+
+    private static void ApplyObjectCaptions(IReadOnlyList<ParsedAlObjectCaption> captions)
+    {
+        foreach (var caption in captions)
+            _parsedObjectCaptions[(caption.Kind, caption.Id)] = caption.Caption;
     }
 
     /// <summary>

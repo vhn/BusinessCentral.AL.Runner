@@ -44,8 +44,13 @@ public static partial class RecordPatches
     // — that shared loop calls TryParseObjectDeclFile alongside the other seven extractors,
     // one file read per file, instead of this file doing its own separate directory walk.
 
-    private static void TryParseObjectDeclFile(string text)
+    private static void TryParseObjectDeclFile(string text) =>
+        ApplyObjectDecls(ExtractObjectDecls(text));
+
+    /// <summary>The pure half — see <see cref="RecordPatches"/>.ExtractTables.</summary>
+    private static List<ParsedAlObjectDecl> ExtractObjectDecls(string text)
     {
+        var result = new List<ParsedAlObjectDecl>();
         foreach (var obj in ParseAlObjects(text))
         {
             // Kind comes from the node type, so the old worry about `enum` matching the
@@ -54,8 +59,14 @@ public static partial class RecordPatches
             if (!ObjectDeclKinds.Contains(kind)) continue;
             if (ObjectIdOf(obj) is not int id) continue;
             var name = IdentText((obj as NavSyntax.ObjectSyntax)?.Name);
-            _parsedObjectDecls[(kind, id)] = new ParsedAlObjectDecl(kind, id, name);
+            result.Add(new ParsedAlObjectDecl(kind, id, name));
         }
+        return result;
+    }
+
+    private static void ApplyObjectDecls(IReadOnlyList<ParsedAlObjectDecl> decls)
+    {
+        foreach (var decl in decls) _parsedObjectDecls[(decl.Kind, decl.Id)] = decl;
     }
 
     /// <summary>Snapshot of every non-table/page/report/query/xmlport AL object declaration parsed from source.</summary>

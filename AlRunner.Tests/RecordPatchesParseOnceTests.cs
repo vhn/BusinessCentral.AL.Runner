@@ -11,7 +11,7 @@
 //
 // The fix: ParseAlObjects now memoizes the single most-recently-built tree, keyed on
 // (text, active preprocessor symbols). All eight TryParse*File extractors funnel through it
-// on the SAME file text back-to-back (RecordPatches.ParseSourceFileIntoAllExtractors is the
+// on the SAME file text back-to-back (RecordPatches.ExtractSourceFile is the
 // shared per-file call site both AddSourceDirs and Register() route every file through), so
 // the second through eighth calls for a given file are cache hits.
 //
@@ -111,7 +111,7 @@ public sealed class RecordPatchesParseOnceTests : IDisposable
         var before = RecordPatches.ParseObjectTextCallCount;
 
         // Exactly the eight extractors AddSourceDirs / Register run over one file's text, in
-        // the same order RecordPatches.ParseSourceFileIntoAllExtractors calls them.
+        // the same order RecordPatches.ExtractSourceFile calls them.
         InvokeTryParse("TryParseTableFile", text);
         InvokeTryParse("TryParseTableExtensionFile", text);
         InvokeTryParse("TryParsePageFile", text);

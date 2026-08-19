@@ -195,7 +195,7 @@ public static partial class RecordPatches
     // exact (text, active preprocessor symbols) pair that produced it. #1903: the eight
     // TryParse*File extractors (table, tableextension, page, report, query, xmlport,
     // object-decl, object-caption) each call ParseAlObjects on the SAME file text
-    // back-to-back — RecordPatches.ParseSourceFileIntoAllExtractors is the shared call
+    // back-to-back — RecordPatches.ExtractSourceFile is the shared call
     // site both AddSourceDirs and Register() route every file through — so remembering
     // only the LAST parse turns 8 identical tree builds per file into 1 real build plus 7
     // cache hits, with no change to AlParseOptions, to any TryParse*File signature, or to
@@ -622,8 +622,17 @@ public static partial class RecordPatches
         return parts;
     }
 
-    private static void TryParseTableFile(string text)
+    private static void TryParseTableFile(string text) => ApplyTables(ExtractTables(text));
+
+    /// <summary>
+    /// The pure half: every <c>table</c> declared in <paramref name="text"/>, in declaration
+    /// order. Reads nothing but the syntax tree, so the result is a function of
+    /// (text, preprocessor symbols) alone — which is what lets a warm reload replay it from a
+    /// per-file memo instead of re-deriving it. See RecordPatches.SourceFileExtracts.cs.
+    /// </summary>
+    private static List<ParsedTable> ExtractTables(string text)
     {
+        var result = new List<ParsedTable>();
         foreach (var obj in ParseAlObjects(text))
         {
             if (obj is not NavSyntax.TableSyntax table) continue;
@@ -679,13 +688,30 @@ public static partial class RecordPatches
             // this table in compile order is not in the page inventory yet.
             var lookupPage = PageRefText(PropValue(table.PropertyList, "LookupPageId"));
             var drillDownPage = PageRefText(PropValue(table.PropertyList, "DrillDownPageId"));
-            _parsedTables[tableId] = new ParsedTable(tableId, tableName, fields, pkFieldIds,
-                secondaryKeys, isTableTypeTemporary, dataPerCompany, lookupPage, drillDownPage);
+            result.Add(new ParsedTable(tableId, tableName, fields, pkFieldIds,
+                secondaryKeys, isTableTypeTemporary, dataPerCompany, lookupPage, drillDownPage));
         }
+        return result;
     }
 
-    private static void TryParseTableExtensionFile(string text)
+    private static void ApplyTables(IReadOnlyList<ParsedTable> tables)
     {
+        foreach (var table in tables) _parsedTables[table.TableId] = table;
+    }
+
+    private static void TryParseTableExtensionFile(string text) =>
+        ApplyTableExtensions(ExtractTableExtensions(text));
+
+    /// <summary>
+    /// The pure half — see <see cref="ExtractTables"/>. Every <c>tableextension</c> in
+    /// <paramref name="text"/> with the fields it declares, in declaration order. All of the
+    /// merge logic (dedup, metatable eviction, the ordered extension-id registry) is
+    /// <see cref="ApplyTableExtensions"/>'s, because all of it reads or writes state outside
+    /// this file.
+    /// </summary>
+    private static List<ParsedTableExtension> ExtractTableExtensions(string text)
+    {
+        var result = new List<ParsedTableExtension>();
         foreach (var obj in ParseAlObjects(text))
         {
             if (obj is not NavSyntax.TableExtensionSyntax ext) continue;
@@ -704,6 +730,20 @@ public static partial class RecordPatches
                     if (ParseFieldSyntax(f) is { } pf)
                         fields.Add(pf);
 
+            result.Add(new ParsedTableExtension(extId, extName, baseName, fields));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The stateful half of the tableextension parse: merges each extension's fields into the
+    /// base table's accumulated list, evicts a base metatable built before them, and records
+    /// the extension object id.
+    /// </summary>
+    private static void ApplyTableExtensions(IReadOnlyList<ParsedTableExtension> extensions)
+    {
+        foreach (var (extId, extName, baseName, fields) in extensions)
+        {
             Console.Error.WriteLine($"[TableExt] parsed extension {extId} '{extName}' extends '{baseName}' with {fields.Count} fields");
 
             var key = baseName.ToLowerInvariant();
@@ -717,8 +757,18 @@ public static partial class RecordPatches
             // positional field-count arithmetic, which crashes deep inside
             // NCLMetaTable.SetSystemFields() with a bare NullReferenceException — surfaced
             // to the caller as the misleading "no NCLMetaTable ... (AL source not parsed)".
+            //
+            // COPIED, never published directly. The list under this key is appended to IN
+            // PLACE — by the next tableextension over the same base table (the `else` arm
+            // below) and by EnsureBcSymbolExtensionIndex's precompiled merge in
+            // RecordPatches.BcAppFallback.cs. `fields` belongs to a ParsedTableExtension that
+            // a per-file memo hands back on every later warm cycle, so publishing it would
+            // let those appends accumulate INTO the memo: by the third cycle the same field
+            // id is present several times, and a duplicated NCLMetaField corrupts
+            // NCLMetaTable.AssignFromMetaTable's positional field-count arithmetic exactly as
+            // described above.
             if (!_parsedExtensionFields.TryGetValue(key, out var existing))
-                _parsedExtensionFields[key] = fields;
+                _parsedExtensionFields[key] = new List<ParsedField>(fields);
             else
             {
                 var existingIds = new HashSet<int>(existing.Select(f => f.FieldId));
@@ -749,6 +799,19 @@ public static partial class RecordPatches
                 extIds.Add(extId);
         }
     }
+
+    /// <summary>
+    /// The tableextension fields accumulated for <paramref name="baseTableName"/> so far, as
+    /// <see cref="ApplyTableExtensions"/> and EnsureBcSymbolExtensionIndex have merged them.
+    /// <para>Read-only view of the accumulate itself, deliberately: the merged NCLMetaTable is
+    /// the other way to observe this, but BC's skeleton metadata cache is NOT cleared by a
+    /// reload (see <see cref="BcRuntime.ResetForNewBundleReload"/>), so it can still answer for
+    /// a field the source has since dropped. This is the state the source parse actually
+    /// owns.</para>
+    /// </summary>
+    internal static IReadOnlyList<ParsedField> ExtensionFieldsForBaseTable(string baseTableName) =>
+        _parsedExtensionFields.TryGetValue(baseTableName.ToLowerInvariant(), out var fields)
+            ? fields : Array.Empty<ParsedField>();
 
     /// <summary>
     /// Drop any cached NCLMetaTable built for <paramref name="baseTableName"/> before its

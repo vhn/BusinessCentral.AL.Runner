@@ -26,13 +26,24 @@ public static partial class RecordPatches
 
     private static void TryParseReportFile(string text)
     {
+        var (reports, reportExtensions) = ExtractReports(text);
+        ApplyReports(reports, reportExtensions);
+    }
+
+    /// <summary>The pure half — see <see cref="RecordPatches"/>.ExtractTables. Reports and
+    /// reportextensions come back separately because they land in separate dictionaries (they
+    /// have separate AL id namespaces); each keeps its declaration order.</summary>
+    private static (List<ParsedReport> Reports, List<ParsedReport> ReportExtensions) ExtractReports(string text)
+    {
+        var reports = new List<ParsedReport>();
+        var reportExtensions = new List<ParsedReport>();
         foreach (var obj in ParseAlObjects(text))
         {
             switch (obj)
             {
                 case NavSyntax.ReportSyntax r when ObjectIdOf(r) is int id:
                     var props = r.PropertyList;
-                    _parsedReports[id] = new ParsedReport(id, IdentText(r.Name), IsExtension: false,
+                    reports.Add(new ParsedReport(id, IdentText(r.Name), IsExtension: false,
                         // AL's default for ProcessingOnly is false. Reading it off the report's
                         // own property list also removes an old asymmetry: the regex scanned the
                         // whole body, unlike every other property here, which was depth-scoped.
@@ -46,7 +57,7 @@ public static partial class RecordPatches
                             PropertyTextFrom(PropValue(props, "UseRequestPage")), "false",
                             StringComparison.OrdinalIgnoreCase),
                         DataItems = ParseReportDataItems(r.DataSet),
-                    };
+                    });
                     break;
 
                 // reportextension has its OWN id namespace, separate from `report`.
@@ -57,11 +68,20 @@ public static partial class RecordPatches
                 // which silently turned suite 100-report-preview's report 50001
                 // (ProcessingOnly=true) into a layout-bound report → OOS at run.
                 case NavSyntax.ReportExtensionSyntax rx when ObjectIdOf(rx) is int extId:
-                    _parsedReportExtensions[extId] = new ParsedReport(
-                        extId, IdentText(rx.Name), IsExtension: true, ProcessingOnly: false);
+                    reportExtensions.Add(new ParsedReport(
+                        extId, IdentText(rx.Name), IsExtension: true, ProcessingOnly: false));
                     break;
             }
         }
+
+        return (reports, reportExtensions);
+    }
+
+    private static void ApplyReports(
+        IReadOnlyList<ParsedReport> reports, IReadOnlyList<ParsedReport> reportExtensions)
+    {
+        foreach (var report in reports) _parsedReports[report.Id] = report;
+        foreach (var extension in reportExtensions) _parsedReportExtensions[extension.Id] = extension;
     }
 
     /// <summary>
