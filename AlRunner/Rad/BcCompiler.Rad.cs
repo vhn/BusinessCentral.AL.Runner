@@ -1881,6 +1881,24 @@ public sealed partial class BcCompiler
     /// collects one set of targets for the file and fans it out to that file's sources at
     /// merge time. Self-edges are dropped there, exactly where the serial version dropped
     /// them.</para>
+    ///
+    /// <para><b>Why the node loop no longer swallows.</b> It used to catch every exception per
+    /// node, on the stated grounds that "a malformed/incomplete node has no useful dependency
+    /// edge". Measured against BC 28.1, that case does not exist: a clean two-codeunit compile
+    /// and six malformed shapes — truncated body, unclosed object, unknown type, garbage
+    /// tokens, bad expressions, an empty file, 26 diagnostics between them — put 168 nodes
+    /// through <c>GetSymbolInfo</c> and got 168 answers, never a throw. So the catch absorbed
+    /// no real case and covered exactly one class of fault: whatever this walk's own
+    /// concurrency introduces. A dropped edge is invisible (an object with no edges and an
+    /// object whose edges were lost look identical) and surfaces cycles later as a caller that
+    /// should have rebound and did not — stale code reported green.</para>
+    ///
+    /// <para>Both callers already fail safe, so propagating is strictly better than dropping:
+    /// <see cref="TryBuildBaselineSnapshot"/> catches, names the exception in its
+    /// <c>failure</c> string and returns null — no baseline, so the next cycle compiles in full
+    /// — and the <see cref="DeltaCompile"/> caller is inside <see cref="EmitIncremental"/>'s
+    /// try, which reports through <c>FullCompileBecause</c> and falls back to a full compile
+    /// this cycle. Both cost speed, neither costs correctness.</para>
     /// </summary>
     private static RadReferenceGraph MapObjectReferences(NavCA.Compilation compilation)
     {
@@ -1907,17 +1925,10 @@ public sealed partial class BcCompiler
             var model = compilation.GetSemanticModel(group.Key);
             foreach (var node in group.Key.GetRoot().DescendantNodesAndSelf())
             {
-                try
-                {
-                    var info = model.GetSymbolInfo(node);
-                    AddReference(info.Symbol);
-                    foreach (var candidate in info.CandidateSymbols) AddReference(candidate);
-                }
-                catch
-                {
-                    // A malformed/incomplete node has no useful dependency edge. AL
-                    // diagnostics still reject its compilation; graph capture is best effort.
-                }
+                GraphWalkProbeForTests?.Invoke();
+                var info = model.GetSymbolInfo(node);
+                AddReference(info.Symbol);
+                foreach (var candidate in info.CandidateSymbols) AddReference(candidate);
             }
             walked[i] = new FileReferences(sources, same, cross);
 
@@ -1929,12 +1940,26 @@ public sealed partial class BcCompiler
             }
         }
 
-        // Bounded to the core count on purpose: each in-flight group holds a semantic model
-        // and that file's bound bodies, so an unbounded pool would trade a memory-bound
-        // phase's wall time for a larger peak on the host that can least afford it.
-        Parallel.For(0, groups.Count,
-            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-            WalkGroup);
+        try
+        {
+            // Bounded to the core count on purpose: each in-flight group holds a semantic model
+            // and that file's bound bodies, so an unbounded pool would trade a memory-bound
+            // phase's wall time for a larger peak on the host that can least afford it.
+            Parallel.For(0, groups.Count,
+                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                WalkGroup);
+        }
+        catch (AggregateException ex) when (ex.InnerExceptions.Count > 0)
+        {
+            // Rethrow the fault itself, not Parallel.For's wrapper. Both callers format
+            // `<TypeName>: <first line>` into the line a developer reads, and
+            // "AggregateException: One or more errors occurred" names the loop instead of the
+            // bug — which is the difference between a diagnosable report and a shrug. The
+            // first inner exception is the fault; the rest are the same fault on other groups,
+            // since every group runs the same body over an immutable compilation.
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                .Capture(ex.InnerExceptions[0]).Throw();
+        }
 
         foreach (var (sources, same, cross) in walked)
         {
@@ -1959,6 +1984,23 @@ public sealed partial class BcCompiler
 
         return new RadReferenceGraph(sameApp, crossApp);
     }
+
+    /// <summary>
+    /// Test seam: invoked for every node of every file the walk visits, on the thread walking
+    /// that file — that is, exactly where the per-node <c>catch</c> used to sit.
+    ///
+    /// <para>It exists because BC does not throw here on its own, so "an exception in the walk
+    /// is no longer swallowed" is not observable from any AL input. The measurement is in
+    /// <see cref="MapObjectReferences"/>'s remarks: 168 nodes across a clean compile and six
+    /// malformed shapes, 168 answers, no throw. Injecting the fault is the only way to state
+    /// the claim, and the claim is worth stating — the behaviour it pins is that a fault
+    /// degrades the cycle to a full compile instead of committing a graph with edges missing.</para>
+    ///
+    /// <para>A null check per node is the whole cost, against a <c>GetSymbolInfo</c> call that
+    /// binds method bodies. Same seam shape and same rationale as
+    /// <c>BcCompiler.PackageScanProbeForTests</c>.</para>
+    /// </summary>
+    internal static Action? GraphWalkProbeForTests;
 
     /// <summary>
     /// One file's contribution to the reference graph, before it is fanned out to the
