@@ -422,10 +422,10 @@ Measured on NP Retail (7,339 `.al` files across the bundle, 6,949 objects in the
 BC 28.1, `--watch --no-cache`), the cold cycle grows from **1,125.9 s** without the snapshot to
 **1,375.7 s** with it: **~250 s, or +22%** — not 0.6%. So quote the 25-app figure only for apps
 of that size; for anything larger, budget the cold overhead against the size of the source tree
-rather than as a fixed percentage. (The without-snapshot leg needs
-`AL_RUNNER_EMIT_TIMEOUT_SEC=7200` to finish at all — the default 120 s emit timeout aborts an
-app this size. A cycle that has a RAD workspace waits indefinitely instead, which is why the
-with-snapshot leg needs no override.)
+rather than as a fixed percentage. (Both legs were run when the emit phase still had a 120 s
+default deadline, so the without-snapshot leg needed `AL_RUNNER_EMIT_TIMEOUT_SEC=7200` to finish
+at all. That deadline and its env var are gone — the emit now always runs to completion and the
+caller cancels with Ctrl+C — so neither leg needs an override today.)
 
 The cold cycle is not what `--watch` optimises, but it is not *unchanged* either: that +22% is
 the price of delta-readiness, paid once per full compile, and it is what a warm cycle on the

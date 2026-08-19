@@ -1602,12 +1602,6 @@ foreach (var bundle in bundles)
             var et = System.Diagnostics.Stopwatch.StartNew();
             IReadOnlyList<EmittedSource> sources = Array.Empty<EmittedSource>();
             IReadOnlyList<string> alDiagnostics = Array.Empty<string>();
-            // Emit-phase timeout: default 120 s, override via AL_RUNNER_EMIT_TIMEOUT_SEC.
-            // A RAD emit mutates its resident workspace, so it must finish before the
-            // cycle can continue; abandoning its task would let a late RecordCompile race
-            // the next edit. Cold npcore also legitimately takes longer than 120 seconds.
-            int emitTimeoutSec = int.TryParse(
-                Environment.GetEnvironmentVariable("AL_RUNNER_EMIT_TIMEOUT_SEC"), out var ts) ? ts : 120;
             // Containment: keep a symbol-less .app in ONE suite's .alpackages from failing
             // every OTHER suite in the bundle. BC's native .app scanner reports AL1023
             // ("package file is not valid") for a package with no SymbolReference.json and
@@ -1627,18 +1621,18 @@ foreach (var bundle in bundles)
             var emitTask = Task.Run(() => RunEmit(emitter, allPaths, moduleName, radWs, appGroup.SuiteDir));
             try
             {
-                var emitWait = radWs == null
-                    ? TimeSpan.FromSeconds(emitTimeoutSec)
-                    : System.Threading.Timeout.InfiniteTimeSpan;
-                if (!emitTask.Wait(emitWait))
-                {
-                    Console.Error.WriteLine(
-                        $"<bundled>: EMIT-TIMEOUT after {emitTimeoutSec}s on {allPaths.Count} AL paths");
-                    Console.Error.WriteLine(
-                        "Hint: increase AL_RUNNER_EMIT_TIMEOUT_SEC or quarantine the offending suite via a tests/expectations/ entry.");
-                    bundleErrors.Add($"<bundled>: EMIT-TIMEOUT after {emitTimeoutSec}s");
-                }
-                else
+                // No deadline. How long an emit takes is a function of the app's size and the
+                // host's speed, and the runner can predict neither: npcore's Application group
+                // emits in 89 s on an idle machine and 333 s on a loaded one, so any fixed
+                // budget either aborts a legitimate compile or is too loose to catch a real
+                // hang. Cancelling is the caller's decision (Ctrl+C).
+                //
+                // Abandoning the wait was never safe either, which is the second reason there
+                // is no timeout to restore: nothing cancelled the emit, so a "timed-out" task
+                // kept running — holding its bound compilation alive on its own stack while the
+                // next app group parsed, and re-pinning that heap through a late
+                // `LastCompilation = compilation` after ReleaseLastCompilation had freed it.
+                emitTask.Wait();
                 {
                     var (emitOutput, result) = emitTask.Result;
                     radResult = result;
@@ -3951,7 +3945,6 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("                               ~/.cache/al-runner/ncl-cecil/<key>.dll if present).");
     w.WriteLine("  AL_RUNNER_HOOK_TRACE=1       Trace every JmpHook fire to");
     w.WriteLine("                               /tmp/al-runner-hook-trace.log.");
-    w.WriteLine("  AL_RUNNER_EMIT_TIMEOUT_SEC=N Override the 120 s default emit-phase timeout.");
     w.WriteLine("  AL_RUNNER_PHASE_LOG=PATH     Append one JSONL cost record per app group, per");
     w.WriteLine("                               bundle and per process to PATH (emit/compile/run");
     w.WriteLine("                               ms, deps, cache HIT/MISS, start + wall clock,");

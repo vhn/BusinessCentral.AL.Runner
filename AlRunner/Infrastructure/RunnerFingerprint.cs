@@ -122,7 +122,7 @@ internal static class RunnerFingerprint
     /// rewrite is an ncl-cecil bug, not something an al-out HIT could mask.</description></item>
     /// <item><description><b>Environment variables</b>: audited every
     /// <c>Environment.GetEnvironmentVariable</c> read reachable from the emit/compile path
-    /// (<c>AL_RUNNER_EMIT_TIMEOUT_SEC</c>, <c>BCCOMPILER_TIMING</c>/<c>_DIAG</c>/
+    /// (<c>BCCOMPILER_TIMING</c>/<c>_DIAG</c>/
     /// <c>_TRACE</c>/<c>_DUMP_CS</c>). All are diagnostics, timing output or a debug
     /// dump-to-disk side effect — none alter what bytes <c>compilation.Emit</c> produces.
     /// None found that qualify. (This list also covered <c>AL_RUNNER_ENABLE_R2R</c> and
