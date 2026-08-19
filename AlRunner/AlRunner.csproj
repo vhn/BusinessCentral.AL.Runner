@@ -44,6 +44,34 @@
          improved (156.0s -> 133.7s) with an unchanged fail-set.
          Regression cover: AlRunner.Tests/StartupJitModeTests. -->
 
+    <!-- Server GC. A cold AL compile allocates at a few hundred MB/s and retains most of
+         it — the Application module's emit produces 165 MB of C# that becomes ~330 MB of
+         UTF-16, and every copy stays reachable until Roslyn finishes, so the workload is
+         GC-throughput-bound. One Workstation GC heap cannot keep up.
+
+         Measured on the NP Retail corpus (7,053 AL files / 6,949 objects, one-shot cold,
+         6-core/12 GB), identical binary, the ONLY difference being DOTNET_gcServer:
+
+                                        Workstation   Server
+           BC AL emit (compilation.Emit)    837.7s     331.3s   2.53x
+           Roslyn bind + IL gen -> 58 MB    293.9s     103.8s   2.83x
+           whole emit+compile+load         1173.6s     483.0s   2.43x
+           run wall clock                  1283.1s     611.5s   2.10x
+           peak process RSS                  2.86GB    2.39GB
+
+         Faster AND smaller resident — Server GC's larger managed heap mark does not
+         translate into a larger footprint here, because the Workstation run spends the
+         difference thrashing. RecordPatches.AddSourceDir, a phase GC flavour should not
+         move, read 17.0s vs 16.2s across the two, which is the control that says the legs
+         are comparable.
+
+         This was measurable for a year only because every benchmark harness in the repo
+         exported DOTNET_gcServer=1 by hand; nothing shipped it, so no user ever got it.
+         Concurrent (background) GC stays at its default (on) — untested here, and the
+         allocation profile is throughput-bound rather than pause-bound.
+         Regression cover: AlRunner.Tests/ServerGcConfigTests. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+
     <!-- dotnet tool packaging -->
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>al-runner</ToolCommandName>
