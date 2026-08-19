@@ -3,7 +3,7 @@
 // Plan Task 11 in `.context/plans/2026-08-16-delta-compile-correctness.md` (section W4,
 // "by-name references"). The sibling shape, Task 10, is the same bug on a CODEUNIT's
 // `ImplementedInterfaces`; this file is the ENUM half, which the plan calls out as its own
-// task because `BcCompiler.Rad.cs:754-776`'s `changedSurfaces` gate treats the two kinds
+// task because `BcCompiler.DeltaCompile`'s `changedSurfaces` gate treats the two kinds
 // differently — see the class doc below.
 
 using AlRunner.Rad;
@@ -18,7 +18,7 @@ namespace AlRunner.Tests;
 ///
 /// <para><b>The mechanism.</b> <c>BcCompiler.DeltaCompile</c> strips every MODIFIED,
 /// non-extension object from the packaged <c>ModuleDefinition</c> so the newly supplied
-/// source binds in its place (<c>BcCompiler.Rad.cs:620-624</c>) — an <c>interface</c>
+/// source binds in its place (<c>ModuleDefinitionOps.WithoutObjects</c>) — an <c>interface</c>
 /// included, since <c>RadObjectKey.IsExtension</c> only exempts kinds whose name ends in
 /// "Extension". Which OTHER objects get pulled back into the same delta on the stripped
 /// object's behalf is decided by <c>changedSurfaces</c> (<c>:754-776</c>), and that gate
@@ -63,7 +63,7 @@ namespace AlRunner.Tests;
 /// requirement is "at least three" objects on three sides of the delta, not "exactly three" —
 /// a fourth bystander that is itself untouched does not weaken the proof.</para>
 ///
-/// <para><b>Why this is a method-body diagnostic.</b> <c>BcCompiler.Rad.cs:646</c> asks only
+/// <para><b>Why this is a method-body diagnostic.</b> <c>BcCompiler.DeltaCompile</c> asks only
 /// <c>GetDeclarationDiagnostics()</c> before code generation. A broken by-name
 /// <c>ImplementedInterfaces</c> reference does not surface there — it surfaces once the
 /// emitter actually generates the interface dispatch for <c>C := K;</c>, which happens
@@ -134,7 +134,7 @@ public sealed class RadByNameInterfaceEnumTests(BcEngineFixture engine)
         {
             // X: a cosmetic edit. It changes the file's bytes, so BcCompiler.DeltaCompile
             // classifies "ByName Enum Contract" as `modified` and strips it from the packaged
-            // baseline (BcCompiler.Rad.cs:620-624) — without changing the interface's method
+            // baseline (ModuleDefinitionOps.WithoutObjects) — without changing the interface's method
             // set at all, so nothing about what V or the implementer codeunit satisfy actually
             // moves. That is what keeps the cold compile of the edited tree clean (assertion 2
             // below): this is not a real widening or narrowing of the contract, just enough of

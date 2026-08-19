@@ -7,11 +7,11 @@ namespace AlRunner.Tests;
 /// RAD delta compilation must rebind a <c>tableextension</c>'s <c>TargetObject</c> by-name
 /// reference when the table it names is stripped from the packaged baseline. It currently does
 /// not: the trigger that decides which OTHER, untouched objects get pulled into a delta
-/// (<c>changedSurfaces</c>, <c>BcCompiler.Rad.cs:754-776</c>) only admits codeunits and id-less
+/// (<c>changedSurfaces</c>, in <c>BcCompiler.DeltaCompile</c>) only admits codeunits and id-less
 /// kinds whose serialized surface fingerprint moved. A modified table is never a member of that
 /// set, so an untouched tableextension whose serialized surface names it is never rebound —
 /// even though the table itself, being a table and not an extension, WAS just stripped out of
-/// the packaged module definition at <c>BcCompiler.Rad.cs:620-624</c>.
+/// the packaged module definition by <c>ModuleDefinitionOps.WithoutObjects</c>.
 ///
 /// <para><b>Why this needs three objects, not two.</b> The damage is only observable through a
 /// bystander that reads the broken representation, which is why every fixture in this family
@@ -84,7 +84,7 @@ public sealed class RadByNameTableExtTargetTests(BcEngineFixture engine)
             {
                 // X: add a field. X is a table, not an extension, so RadObjectKey.IsExtension
                 // is false and this modification strips X from the packaged baseline
-                // (BcCompiler.Rad.cs:620-624). X's own symbol still compiles fine from the
+                // (ModuleDefinitionOps.WithoutObjects). X's own symbol still compiles fine from the
                 // freshly supplied source — the damage lands on V, which names X BY NAME.
                 RadByName.Replace(
                     RadByName.SourceFile(tempRoot, "ExtTargetBase.Table.al"),

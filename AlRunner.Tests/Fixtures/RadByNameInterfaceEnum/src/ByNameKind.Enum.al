@@ -3,7 +3,7 @@
 // this enum's own serialized surface (`ImplementedInterfaces`) — the by-name reference
 // the delta path fails to re-validate when the interface is edited without this enum
 // being edited too, because a modified Enum never enters `changedSurfaces`
-// (BcCompiler.Rad.cs:754-776).
+// (in BcCompiler.DeltaCompile).
 enum 72041 "ByName Kind" implements "ByName Enum Contract"
 {
     Extensible = false;

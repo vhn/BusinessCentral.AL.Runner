@@ -5,10 +5,11 @@
 // the packaged `ModuleDefinition` so the supplied syntax binds instead of the stale
 // serialized copy (BcCompiler.Rad.cs, `ModuleDefinitionOps.WithoutObjects`) — with one
 // deliberate exception: an EXTENSION object is never stripped, because what it contributes
-// is only visible on its target (`BcCompiler.Rad.cs:610-624`).
+// is only visible on its target (`ModuleDefinitionOps.WithoutObjects`, exempting
+// `RadObjectKey.IsExtension`).
 //
 // Which OTHER objects get pulled into the cycle and re-emitted from source is decided by
-// `changedSurfaces` (`BcCompiler.Rad.cs:754-776`), and that filter admits only codeunits and
+// `changedSurfaces` in `BcCompiler.DeltaCompile`, and that filter admits only codeunits and
 // the id-less kinds. A modified Enum never enters it, so an enumextension whose serialized
 // `TargetObject` names that enum is never rebound — it keeps resolving the enum's merged
 // surface against a packaged module whose copy of the enum this same cycle just removed.
@@ -31,8 +32,8 @@ namespace AlRunner.Tests;
 /// <list type="bullet">
 ///   <item><b>X</b> — <c>enum 72080 "EnumExt Base"</c>. Edited (a value is added), therefore
 ///     in the delta's `modified` set, therefore STRIPPED from the packaged baseline
-///     (`BcCompiler.Rad.cs:620-624` strips every modified object that is not itself an
-///     extension). Being a plain enum — not a codeunit, not an id-less kind — it is also
+///     (`ModuleDefinitionOps.WithoutObjects` strips every modified object that is not itself
+///     an extension). Being a plain enum — not a codeunit, not an id-less kind — it is also
 ///     invisible to `changedSurfaces`, so nothing downstream is told its surface moved.</item>
 ///   <item><b>V</b> — <c>enumextension 72081 "EnumExt Ext" extends "EnumExt Base"</c>.
 ///     UNTOUCHED, so it is never compiled from source in this cycle and is always resolved
@@ -51,7 +52,7 @@ namespace AlRunner.Tests;
 /// wrong. All three, or it is not evidence.</para>
 ///
 /// <para>This is a METHOD-BODY diagnostic: <c>BcCompiler.DeltaCompile</c> asks only
-/// <c>GetDeclarationDiagnostics()</c> before codegen (`BcCompiler.Rad.cs:646`), so an
+/// <c>GetDeclarationDiagnostics()</c> before codegen, so an
 /// enum-value access that fails to bind inside W's body reaches the runner through
 /// <c>rad.Emit(...)</c> (`:682-687`).</para>
 /// </summary>

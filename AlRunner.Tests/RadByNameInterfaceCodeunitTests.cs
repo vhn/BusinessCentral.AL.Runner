@@ -8,12 +8,13 @@
 // serialized surface names a stripped object BY NAME, such as its `ImplementedInterfaces`.
 //
 // Unlike a Table/Page/Enum/Report/Query — never admitted to `changedSurfaces` at all,
-// because that filter accepts only codeunits and id-less kinds (BcCompiler.Rad.cs:754-776)
+// because that filter accepts only codeunits and id-less kinds (`changedSurfaces`, in
+// `BcCompiler.DeltaCompile`)
 // — an `interface` IS an id-less kind, so in principle it IS eligible for `changedSurfaces`.
 // That eligibility makes no difference here: `changedSurfaces` is computed only after
 // `rad.Emit(...)` has already returned with zero diagnostics — it sits past the
 // `if (diags.Count > 0) return …;` gate immediately after the emit call
-// (BcCompiler.Rad.cs:714-717). This shape's damage is a hard, blocking METHOD-BODY
+// in `BcCompiler.DeltaCompile`. This shape's damage is a hard, blocking METHOD-BODY
 // diagnostic on that very first emit attempt: the consumer's codeunit-to-interface
 // assignment fails to bind before the delta ever reaches the widening logic that only runs
 // once a compile has already succeeded. Widening `changedSurfaces` (or the reference graph
@@ -41,7 +42,7 @@ namespace AlRunner.Tests;
 /// <list type="bullet">
 ///   <item><b>X</b> — <c>interface "ByName Contract"</c>. Edited (a second method is added),
 ///     therefore in the delta's `modified` set, therefore STRIPPED from the packaged
-///     baseline (`BcCompiler.Rad.cs:620-624` strips every modified object that is not itself
+///     baseline (`ModuleDefinitionOps.WithoutObjects` strips every modified object that is not itself
 ///     an extension).</item>
 ///   <item><b>V</b> — <c>codeunit 72021 "ByName Impl" implements "ByName Contract"</c>.
 ///     UNTOUCHED, so it is never compiled from source in this cycle and is always resolved
@@ -59,7 +60,7 @@ namespace AlRunner.Tests;
 /// that has quietly gone wrong. All three, or it is not evidence.</para>
 ///
 /// <para>This is a METHOD-BODY diagnostic: <c>BcCompiler.DeltaCompile</c> asks only
-/// <c>GetDeclarationDiagnostics()</c> before codegen (`BcCompiler.Rad.cs:646`), and V's own
+/// <c>GetDeclarationDiagnostics()</c> before codegen, and V's own
 /// declaration is never re-checked at all in this delta — it is not part of the supplied
 /// syntax trees. It is W's <c>C := I;</c> assignment that fails to bind inside W's freshly
 /// compiled body, reaching the runner through <c>rad.Emit(...)</c> (`:682-687`).</para>

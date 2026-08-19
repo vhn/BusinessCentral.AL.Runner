@@ -1,10 +1,11 @@
-// RadByNameTableNoRenameTests — pins the TableNo-bystander rule (BcCompiler.Rad.cs:799-824)
+// RadByNameTableNoRenameTests — pins the TableNo-bystander rule
+// (`ModuleDefinitionOps.CodeunitsWithTableNo`, driven from `BcCompiler.DeltaCompile`)
 // against the one shape no fixture has ever exercised: a table RENAME, not a modification or
 // a removal.
 //
 // The rule: every delta collects, for each table it strips from the packaged baseline, BOTH
-// the object's current name and its committed (pre-edit) one — see `strippedTableNames` at
-// BcCompiler.Rad.cs:815-819 — because a RENAMED table keeps its `RadObjectKey` (an id'd
+// the object's current name and its committed (pre-edit) one — see `StrippedTableNames` in
+// `BcCompiler.Rad.cs` — because a RENAMED table keeps its `RadObjectKey` (an id'd
 // object's key is (Kind, Id), never its name), so it arrives in `modified`, not as a
 // remove-then-add. `item.Name` (parsed from the edited source) reports the NEW name;
 // `ws.Object(item.Key)` (the committed baseline) still reports the OLD one.
