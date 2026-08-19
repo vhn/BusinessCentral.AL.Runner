@@ -542,6 +542,241 @@ public class RadDeltaWatchTests
     }
 
     /// <summary>
+    /// The path a developer actually takes to <c>--watch</c>: run the suite once, then start
+    /// watching the same tree. The one-shot run is what writes the cache entry the watch hits —
+    /// and it has <b>no <c>RadWorkspace</c> at all</b>, because the store is only enabled under
+    /// <c>--watch</c>. So every cross-app edge in the envelope it leaves behind can only have
+    /// come from the app graph (<c>RadAppCohort</c>, built in <c>Program.cs</c> before the app
+    /// loop); a cohort derived from live workspaces would write an envelope with zero of them,
+    /// the first watch would hydrate nothing, and the developer's first edit would be exactly as
+    /// stale as before the cross-app work existed — with a schema bump and nothing to show for
+    /// it.
+    ///
+    /// <para>Two claims, and only the second one is worth having. The envelope carries edges
+    /// into the sibling app and none into the precompiled dependencies — that is the cheap half,
+    /// and on its own it proves only that a file on disk has the right shape. The half that
+    /// matters is that a watch process which never compiled these apps rebinds
+    /// <c>Delta Bridge</c> on the FIRST edit, purely out of what it hydrated, and answers what a
+    /// cold compile of the identical tree answers.</para>
+    ///
+    /// <para>The oracle is that cold run, not "some error". The edit retypes
+    /// <c>Delta Lib Scale.Scaled</c>'s parameter, which moves its member id while leaving
+    /// <c>Delta Bridge</c>'s source valid (an Integer argument widens to a Decimal parameter) —
+    /// so Bridge never enters <c>changedFiles</c> and only a hydrated cross-app edge can say it
+    /// must be re-emitted.</para>
+    ///
+    /// <para><b>What this measured that is not about cross-app edges at all:</b> the PRODUCER's
+    /// hydration does not survive the first edit, because a one-shot run and a watch run do not
+    /// compute the same reference signature for an app that is a dependency target. The
+    /// assertion below names it in full. It is asserted rather than worked around so that it
+    /// cannot be mistaken for intended behaviour, and so that fixing it fails this test rather
+    /// than passing it silently.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task OneShotSidecar_ThenWatch_HydratesCrossAppEdges_AndRebindsTheSiblingCaller()
+    {
+        TestArtifacts.SkipIfMissing();
+
+        var root = Path.Combine(
+            Path.GetTempPath(), "al-runner-rad-oneshot-xapp", Guid.NewGuid().ToString("N"));
+        var bundle = Path.Combine(root, "bundle");
+        var cache = Path.Combine(root, "cache");
+        CopyTree(FixtureSrc, bundle);
+        Directory.CreateDirectory(cache);
+        var scaleSource = Path.Combine(bundle, "Lib", "src", "DeltaLibScale.Codeunit.al");
+
+        // ── phase 1: the one-shot run that writes the cache entry ─────────────────────
+        var oneShot = await RunOnceAsync($" \"{bundle}\" --cache \"{cache}\"");
+        Assert.Contains("PASS  Codeunit60941.ScaledIsEightyFour", oneShot);
+        Assert.DoesNotContain("FAIL  Codeunit", oneShot);
+        Assert.Contains("[cache] MISS", oneShot);
+
+        // Delta Lib's workspace identity is its app.json id — RadWorkspaceStore.IdentityOf's
+        // first case. Spelled out rather than read back from the envelope, so a writer that
+        // stored some other string could not satisfy the assertion by agreeing with itself.
+        const string libIdentity = "7c4f6c1e9a2b4f0d8f3a1b2c3d4e5f60";
+
+        var bridgeEnvelope = ReadEnvelope(cache, "Delta Bridge");
+        Assert.Equal(2, bridgeEnvelope["schema"]!.GetValue<int>());
+        var edges = bridgeEnvelope["crossAppReferences"]!.AsArray();
+        Assert.NotEmpty(edges);
+        // Codeunit 60961 "Delta Bridge" calls Codeunit 60922 "Delta Lib Scale" — the exact
+        // edge the rebind below has to travel.
+        var callsFromBridgeCodeunit = edges
+            .Where(edge => Kind(edge!["from"]!) == "Codeunit" && Id(edge["from"]!) == 60961)
+            .SelectMany(edge => edge!["to"]!.AsArray())
+            .ToList();
+        Assert.Contains(
+            callsFromBridgeCodeunit,
+            target => target!["app"]!.GetValue<string>() == libIdentity
+                && Kind(target["key"]!) == "Codeunit" && Id(target["key"]!) == 60922);
+        // …and nothing points OUT of the bundle. Every AL object also binds against the
+        // platform's precompiled symbols; retaining those edges would cost a multiple of the
+        // envelope for targets that can never change between two watch cycles. Delta Bridge
+        // depends on exactly one sibling, so every cross-app target must name it.
+        foreach (var edge in edges)
+            foreach (var target in edge!["to"]!.AsArray())
+                Assert.Equal(libIdentity, target!["app"]!.GetValue<string>());
+
+        // ── phase 2: a fresh watch process over the same tree and the same cache ──────
+        var lines = new List<string>();
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg
+                + $" \"{bundle}\" --watch --cache \"{cache}\"",
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+        using var p = Process.Start(psi)!;
+        void Pump(StreamReader r) => Task.Run(async () =>
+        {
+            string? l;
+            while ((l = await r.ReadLineAsync()) != null) lock (lines) lines.Add(l);
+        });
+        Pump(p.StandardOutput);
+        Pump(p.StandardError);
+
+        async Task<int> WaitForMarkerAfter(int fromIndex, TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (DateTime.UtcNow < deadline)
+            {
+                lock (lines)
+                    for (int i = fromIndex; i < lines.Count; i++)
+                        if (lines[i].Contains("[watch] waiting for AL source")) return i;
+                await Task.Delay(200);
+            }
+            string dump; lock (lines) dump = string.Join("\n", lines.TakeLast(40));
+            throw new TimeoutException($"watch marker not seen.\n--- last output ---\n{dump}");
+        }
+
+        string Segment(int from, int to)
+        {
+            lock (lines) return string.Join("\n", lines.GetRange(from, Math.Max(0, to - from)));
+        }
+
+        try
+        {
+            // Cycle 1: nothing compiles at all — the module arrives out of the cache and the
+            // delta state arrives out of the sidecar beside it.
+            int m1 = await WaitForMarkerAfter(0, TimeSpan.FromSeconds(240));
+            var cycle1 = Segment(0, m1);
+            Assert.Contains("PASS  Codeunit60941.ScaledIsEightyFour", cycle1);
+            Assert.DoesNotContain("FAIL  Codeunit", cycle1);
+            Assert.Contains("[cache] rad baseline hydrated for Delta Bridge", cycle1);
+            Assert.Contains("[cache] rad baseline hydrated for Delta Lib", cycle1);
+            Assert.DoesNotContain("[watch] Delta Bridge: baseline built", cycle1);
+            Assert.DoesNotContain("[watch] Delta Lib: baseline built", cycle1);
+
+            // The id-moving edit, in the app the watch process has never compiled.
+            var scale = await File.ReadAllTextAsync(scaleSource);
+            var retyped = scale
+                .Replace("procedure Scaled(Factor: Integer): Integer",
+                         "procedure Scaled(Factor: Decimal): Integer")
+                .Replace("exit(42 * Factor);", "exit(21 * Factor);");
+            Assert.NotEqual(scale, retyped);
+            await File.WriteAllTextAsync(scaleSource, retyped);
+
+            int m2 = await WaitForMarkerAfter(m1 + 1, TimeSpan.FromSeconds(240));
+            var cycle2 = Segment(m1 + 1, m2);
+
+            // The subject of the test: the consumer deltas off a baseline it never compiled,
+            // and is re-emitted although its own source did not move — which can only have come
+            // from the cross-app edges the one-shot envelope carried.
+            Assert.DoesNotContain("[watch] Delta Bridge: baseline built", cycle2);
+            Assert.DoesNotContain("[watch] Delta Bridge: unchanged", cycle2);
+            Assert.Contains("[watch] Delta Bridge: rebinding ", cycle2);
+            Assert.Contains(" that call Delta Lib", cycle2);
+            Assert.Contains("[watch] Delta Bridge: delta ", cycle2);
+
+            // MEASURED SIDE-FINDING, asserted so it cannot quietly change: the PRODUCER's own
+            // hydration does not survive this cycle. A one-shot run publishes each
+            // dependency-target app's symbols in a pre-pass (Program.cs, `EmitSiblingSymbols` —
+            // skipped under RAD), so by the time Delta Lib itself compiles, the sibling-symbols
+            // directory already holds Delta BRIDGE's symbols and they enter Delta Lib's resolved
+            // reference set. The signature persisted for Delta Lib therefore carries a
+            // `ref|…|Delta Bridge|…` line that the watch path — which publishes incrementally
+            // and never puts a dependent's symbols in front of its dependency — cannot
+            // reproduce, so ArmFor invalidates on the first edit.
+            //
+            // Consequence: for an app that is a dependency TARGET, one-shot-then-watch still
+            // pays a whole-module compile on the first edit, which is the exact cost the sidecar
+            // exists to remove. It is a defect in the signature, not in the cross-app work, and
+            // it is why the rebind below reads `which rebuilt in full` rather than naming one
+            // moved key. When the signature is made mode-independent, this becomes
+            // `Delta Lib: delta +0 ~1 -0` and the rebind message loses its suffix — update both
+            // lines together.
+            Assert.Contains(
+                "[watch] Delta Lib: full rebuild — the resolved dependency set changed (1 → 0)",
+                cycle2);
+
+            // Whichever of the two the producer broadcast, the consumer only hears it because
+            // its hydrated graph names the producer at all: PendingCrossAppRebinds returns
+            // immediately for a workspace with no cross-app producers, which is precisely what a
+            // schema-1 envelope, or a cohort derived from live workspaces, would have restored.
+            var cold = await ColdCompileAsync(bundle);
+            Assert.Contains("Delta Lib Scaled returned 42, expected 84", cold);
+            Assert.Contains("Delta Lib Scaled returned 42, expected 84", cycle2);
+            Assert.DoesNotContain("does not have a member with that ID", cycle2);
+        }
+        finally
+        {
+            try { p.Kill(true); } catch { }
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// The <c>&lt;key&gt;.rad-baseline.json</c> one app group left in <paramref name="cacheDir"/>.
+    /// Found by the module name it records rather than by the cache key, because the key is a
+    /// hash of the runner binary and the tree and reproducing it here would be a second
+    /// implementation of <c>ComputeAlCacheKey</c> for the test to be wrong in.
+    /// </summary>
+    private static System.Text.Json.Nodes.JsonObject ReadEnvelope(string cacheDir, string module)
+    {
+        var envelopes = Directory
+            .EnumerateFiles(cacheDir, "*" + AlCacheSidecars.RadBaselineSuffix)
+            .Select(path => System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!.AsObject())
+            .ToList();
+        Assert.NotEmpty(envelopes);
+        var found = envelopes
+            .Where(envelope => envelope["module"]!.GetValue<string>() == module)
+            .ToList();
+        Assert.True(
+            found.Count == 1,
+            $"expected exactly one envelope for '{module}', found {found.Count} among "
+            + string.Join(", ", envelopes.Select(e => e["module"]!.GetValue<string>())));
+        return found[0];
+    }
+
+    // The envelope's writer omits members left at their default (JsonIgnoreCondition
+    // .WhenWritingDefault), so an id-less key carries no `id` at all and a bare `["id"]!` would
+    // NRE on the first interface or permission-set edge in the array.
+    private static string Kind(System.Text.Json.Nodes.JsonNode key) =>
+        key["kind"]?.GetValue<string>() ?? string.Empty;
+
+    private static int Id(System.Text.Json.Nodes.JsonNode key) =>
+        key["id"]?.GetValue<int>() ?? 0;
+
+    /// <summary>Run the real runner to completion and return everything it printed.</summary>
+    private static async Task<string> RunOnceAsync(string arguments)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = TestBuildConfig.RunArgs(ProjectPath) + TestBuildConfig.BcVersionArg + arguments,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+        using var run = Process.Start(psi)!;
+        var stdout = run.StandardOutput.ReadToEndAsync();
+        var stderr = run.StandardError.ReadToEndAsync();
+        await run.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(240));
+        return (await stdout) + (await stderr);
+    }
+
+    /// <summary>
     /// Compile and run a copy of <paramref name="tree"/> from scratch — no watch, no cache,
     /// no baseline. Whatever a cold build says about the tree is what the delta has to say
     /// about it. Copied first so the live watcher cannot observe the run.
@@ -751,20 +986,22 @@ public class RadDeltaWatchTests
     /// macOS/APFS clones the source file, which touches the SOURCE inode's metadata — and
     /// FSEvents reports that as a change, so <c>FileSystemWatcher</c> raises <c>Changed</c> for
     /// every file of a tree that was only READ. Measured against the real runner: copying the
-    /// watched bundle with <c>File.Copy</c> starts a whole watch cycle (a full rebuild of every
-    /// app, since a byte-identical <c>app.json</c> counts as "not AL source" to
-    /// <c>RadWorkspaceStore.PrepareBundleReload</c>), while the same copy done with
-    /// <c>ReadAllBytes</c> or a <c>FileStream</c> raises nothing at all.
+    /// watched bundle with <c>File.Copy</c> starts a whole watch cycle, while the same copy done
+    /// with <c>ReadAllBytes</c> or a <c>FileStream</c> raises nothing at all.
     ///
     /// <para>That matters here because <see cref="ColdCompileAsync"/> copies the LIVE bundle
-    /// mid-test and its whole premise is that the watcher cannot observe it. With
-    /// <c>File.Copy</c> the spurious cycle lands between the cycle under test and the next
-    /// edit, so the next <c>WaitForMarkerAfter</c> returns the WRONG cycle and the assertions
-    /// are read against a segment that compiled the pre-edit tree.</para>
+    /// mid-test and its whole premise is that the watcher cannot observe it. The spurious cycle
+    /// lands between the cycle under test and the next edit, so the next
+    /// <c>WaitForMarkerAfter</c> returns the WRONG cycle and the assertions are read against a
+    /// segment that compiled the pre-edit tree.</para>
     ///
-    /// <para>The runner is not blameless — a read-only event costing every app in the bundle a
-    /// whole-module rebuild is a real defect — but it is a separate one from anything these
-    /// tests assert, and it is not what this helper should be measuring.</para>
+    /// <para>The runner's own half of that defect is fixed: the read-only event used to cost
+    /// every app in the bundle a whole-module rebuild, because a byte-identical <c>app.json</c>
+    /// counted as "not AL source" to <c>RadWorkspaceStore.PrepareBundleReload</c>, which now
+    /// compares manifest CONTENT (see
+    /// RadWatchNoUnnecessaryRebuildTests.Watch_RewritingAppJsonWithIdenticalBytes_KeepsTheModuleWarm_ButAnEditRebuildsIt).
+    /// The spurious cycle itself is not — an inode touch is still an event — so the stream copy
+    /// is still required for the ordering reason above.</para>
     /// </remarks>
     private static void CopyTree(string from, string to)
     {

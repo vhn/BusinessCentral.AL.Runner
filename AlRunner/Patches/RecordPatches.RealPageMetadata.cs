@@ -38,6 +38,42 @@ public static partial class RecordPatches
     private static readonly object _realPageMetadataLock = new();
 
     /// <summary>
+    /// Forget which pages have been loaded (or have failed to load), because the NCLMetaForm
+    /// instances those answers were about are gone.
+    ///
+    /// <para>Both sets are keyed on page id but are statements about ONE
+    /// <c>NCLMetaForm</c> instance: "this object's metadataLoaded flag has been cleared and
+    /// LoadMetadata() has run on it". <see cref="ResetForReload"/> empties
+    /// <c>_metaFormCache</c>, so the next <see cref="EnsureRealPageMetadata"/> builds a BRAND
+    /// NEW skeleton — with <c>metadataLoaded</c> force-set to true and no control tree — and
+    /// the stale "already loaded" entry then short-circuits the load for it. The caller
+    /// receives a skeleton it is told is fully loaded, and BC dereferences the page
+    /// definition that was never parsed — <c>NullReferenceException</c> out of
+    /// <c>NCLMetaForm.GetFrozenPageDefinitionWithExtensionWithoutMergedMultiLanguage()</c>.</para>
+    ///
+    /// <para>Which is a silent wrong answer, not a crash the developer sees: TryCreate
+    /// catches it and TestPage falls back to record-only access, so the page's OnOpenPage
+    /// never runs. On the npcore corpus that turned seventeen passing tests into failures on
+    /// every warm <c>--watch</c> cycle — nine reporting the raw NRE and the rest reporting
+    /// whatever their page trigger was supposed to have done ("Discount not created", "Cross
+    /// Reference not registered"), which points at the AL rather than at the runner. Cold runs
+    /// were unaffected because nothing had populated these sets yet, so the same bundle
+    /// answered differently on cycle 1 and cycle 2. See WatchInstallDiscoveryTests.</para>
+    ///
+    /// <para>The failure set is cleared for the same reason in the other direction: a page
+    /// that could not load against the previous generation must get a fresh attempt against
+    /// this one, or an edit that fixes it can never be observed to have fixed it.</para>
+    /// </summary>
+    private static void ResetRealPageMetadataForReload()
+    {
+        lock (_realPageMetadataLock)
+        {
+            _pagesWithRealMetadata.Clear();
+            _pagesRealMetadataFailed.Clear();
+        }
+    }
+
+    /// <summary>
     /// Ensure <paramref name="pageId"/>'s NCLMetaForm carries its real, parsed page
     /// definition, and return it. Returns null when the runner has no emit-captured
     /// metadata XML for the page (a precompiled dependency's page) or when the load

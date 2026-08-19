@@ -287,6 +287,28 @@ public sealed class TestExecutor
             || ReferenceEquals(assembly, appGenerations[0]))
         {
         var seedSw = System.Diagnostics.Stopwatch.StartNew();
+        // Arm event dispatch BEFORE the first Install trigger runs, not only inside the
+        // per-test-codeunit loop below.
+        //
+        // An Install trigger raising an integration event is AL's normal way for an app to let
+        // other apps contribute setup rows (npcore's codeunit 6014448 opens with
+        // `POSSalesWorkflow.OnDiscoverPOSSalesWorkflows()`). Injection used to happen only at
+        // the top of the loop below — strictly AFTER this whole seeding block — so on a cold
+        // run those events found the publisher's static γeventScope still null, took BC's
+        // `if (γeventScope == null) return` early exit, and dispatched to nobody. The install
+        // trigger completed and quietly seeded nothing.
+        //
+        // What turned that flat gap into a --watch divergence: γeventScope is a STATIC on the
+        // publisher's emitted <Event>_Scope type, and .NET statics outlive a watch cycle. Once
+        // cycle 1's test loop seeded it, cycle 2's Install trigger DID dispatch — so the same
+        // unedited bundle ran different code cold and warm, which is what made a warm cycle
+        // report a different test set from the cold one. Arming here removes the asymmetry by
+        // making the cold cycle behave the way every later cycle already did.
+        //
+        // Idempotent (see InjectAllUsingStoredLookup) and a no-op until PopulateNclMetadataCache
+        // has installed the publisher lookup, so this cannot run ahead of its own inputs.
+        using (AlRunner.Infrastructure.PhaseLog.AppStage("install-seed-arm-event-dispatch"))
+            AlRunner.Patches.EventSubscriberPatches.InjectAllUsingStoredLookup();
         // A TestExecutor instance is reused across bundles. Discard the preceding bundle's
         // final test mutations before creating this bundle's committed installation baseline.
         //

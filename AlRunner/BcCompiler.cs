@@ -1410,14 +1410,27 @@ public sealed partial class BcCompiler
     }
 
     /// <summary>
-    /// Anchor a compilation's file access at the app root so ControlAddIn resource paths
-    /// (<c>Scripts</c>, <c>StartupScript</c>, <c>StyleSheets</c>, <c>Images</c>) resolve —
-    /// see <see cref="Emit"/>'s <c>appRootDir</c> parameter and #1899. A null or missing
-    /// root leaves the compilation untouched, exactly as the inline sites below do.
+    /// The file access a compilation over this app needs, anchored at the app root so
+    /// ControlAddIn resource paths (<c>Scripts</c>, <c>StartupScript</c>, <c>StyleSheets</c>,
+    /// <c>Images</c>) resolve — see <see cref="Emit"/>'s <c>appRootDir</c> parameter and #1899.
+    /// Null for a caller with no known root, which is how every site here declines.
+    ///
+    /// <para>The delta path constructs its RAD compilation with the result of this same call
+    /// (<c>BcCompiler.Rad.cs</c>), so a resource question one path can answer is never a
+    /// question the other cannot. Keeping the guard in one place is what makes that true.</para>
+    /// </summary>
+    internal static NavCA.IFileSystem? AppFileSystem(string? appRootDir) =>
+        appRootDir != null && Directory.Exists(appRootDir)
+            ? new NavCA.RelativeFileSystem(appRootDir)
+            : null;
+
+    /// <summary>
+    /// <see cref="AppFileSystem"/> applied to an already-built compilation. A null or missing
+    /// root leaves it untouched, exactly as the inline sites below do.
     /// </summary>
     private static NavCA.Compilation WithAppFileSystem(NavCA.Compilation compilation, string? appRootDir) =>
-        appRootDir != null && Directory.Exists(appRootDir)
-            ? compilation.WithFileSystem(new NavCA.RelativeFileSystem(appRootDir))
+        AppFileSystem(appRootDir) is { } fileSystem
+            ? compilation.WithFileSystem(fileSystem)
             : compilation;
 
     /// <summary>Compilation options shared by full and RAD emits.</summary>
@@ -1549,9 +1562,10 @@ public sealed partial class BcCompiler
         // as alFolders). Without an IFileSystem, BC's compiler cannot resolve ANY
         // ControlAddIn resource path (Scripts/StartupScript/StyleSheets/Images) and raises
         // AL0327 "Missing file" for every declaration, even when the file exists exactly
-        // where declared. RelativeFileSystem is a public BC API — no new dependency.
-        if (appRootDir != null && Directory.Exists(appRootDir))
-            compilation = compilation.WithFileSystem(new NavCA.RelativeFileSystem(appRootDir));
+        // where declared. RelativeFileSystem is a public BC API — no new dependency. Routed
+        // through the shared helper, not an inline guard: the RAD delta drops its AL0327 to this
+        // compile's answer, which is only sound while the two decide identically.
+        compilation = WithAppFileSystem(compilation, appRootDir);
 
         // Suite-local .alpackages (rare in v2's corpus today, but cheap to honour).
         var bundleAlpackages = dirs
@@ -1744,8 +1758,7 @@ public sealed partial class BcCompiler
                 // #1899: same file system as the primary compile above — without it, a
                 // retry after excluding an unrelated broken object would still raise AL0327
                 // for a perfectly-resolvable ControlAddIn resource and could exclude it too.
-                if (appRootDir != null && Directory.Exists(appRootDir))
-                    retryCompilation = retryCompilation.WithFileSystem(new NavCA.RelativeFileSystem(appRootDir));
+                retryCompilation = WithAppFileSystem(retryCompilation, appRootDir);
                 if (refLoader != null)
                 {
                     retryCompilation = retryCompilation.WithReferenceLoader(refLoader);

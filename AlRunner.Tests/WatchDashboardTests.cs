@@ -14,12 +14,14 @@ namespace AlRunner.Tests;
 public class WatchDashboardTests
 {
     private static string Render(IReadOnlyList<BucketResult> results, WatchStatus status,
-        DateTime ts, TimeSpan dur, IReadOnlyList<string>? fullCompileNotes = null)
+        DateTime ts, TimeSpan dur, IReadOnlyList<string>? fullCompileNotes = null,
+        IReadOnlyList<string>? rebindNotes = null)
     {
         var console = new TestConsole();
         // Wide enough that the table columns aren't truncated away in the test.
         console.Profile.Width = 120;
-        console.Write(WatchDashboard.Build(results, "my-bundle", status, ts, dur, fullCompileNotes));
+        console.Write(WatchDashboard.Build(
+            results, "my-bundle", status, ts, dur, fullCompileNotes, rebindNotes));
         return console.Output;
     }
 
@@ -220,5 +222,54 @@ public class WatchDashboardTests
             Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2)));
         Assert.DoesNotContain("full recompile",
             Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2), []));
+    }
+
+    /// <summary>
+    /// The same argument for extra binding work that a delta's changed-file count does not expose:
+    /// either an app re-emits callers of a sibling app's moved surface, or a namespace-free file
+    /// repeats its bind against a repaired packaged surface. Those decisions are made deep in the
+    /// compile path and announced on stderr — which the bundle loop redirects to
+    /// <c>TextWriter.Null</c> while it runs. Without this panel the work has no visible cause.
+    ///
+    /// <para>A SEPARATE panel, not an extra line in the full-recompile one, because the two say
+    /// opposite things about the cycle. A full compile is the slow path and the note explains a
+    /// cost; a delta rebind is the narrow path working correctly, and mislabelling it "full
+    /// recompile" would claim a cascade that did not happen.</para>
+    /// </summary>
+    [Fact]
+    public void Render_RebindNotes_ShowTheProducerAndTheCount_InTheirOwnPanel()
+    {
+        var results = new List<BucketResult>
+        {
+            Bucket(new TestResult("A", "One", TestOutcome.Pass, null, null, TimeSpan.FromMilliseconds(5)))
+        };
+
+        var output = Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2),
+            fullCompileNotes: null,
+            rebindNotes: ["NP Retail Test: 3 that call NP Retail"]);
+
+        Assert.Contains("delta rebind", output);
+        Assert.Contains("NP Retail Test", output);
+        Assert.Contains("3 that call NP Retail", output);
+        // Not the slow path, and must not be reported as it.
+        Assert.DoesNotContain("full recompile", output);
+    }
+
+    /// <summary>
+    /// And absent on a cycle that needed neither caller widening nor a repaired second bind. A
+    /// panel that is always present stops carrying information.
+    /// </summary>
+    [Fact]
+    public void Render_NoRebindNotes_OmitsThePanelEntirely()
+    {
+        var results = new List<BucketResult>
+        {
+            Bucket(new TestResult("A", "One", TestOutcome.Pass, null, null, TimeSpan.FromMilliseconds(5)))
+        };
+
+        Assert.DoesNotContain("delta rebind",
+            Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2)));
+        Assert.DoesNotContain("delta rebind",
+            Render(results, WatchStatus.Idle, DateTime.Now, TimeSpan.FromSeconds(2), [], []));
     }
 }

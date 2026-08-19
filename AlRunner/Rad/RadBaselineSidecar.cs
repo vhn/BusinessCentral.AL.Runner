@@ -74,8 +74,39 @@ public static class RadBaselineSidecar
     /// cosmetic: <c>System.Text.Json</c> ignores members it does not find, so a schema-2 reader
     /// handed a schema-1 envelope would deserialize it happily and get ZERO cross-app edges —
     /// a hydrated workspace that silently rebinds no sibling caller, which is the exact bug
-    /// those edges exist to fix. Refusing the older envelope costs one full compile and states
-    /// its reason; accepting it would cost correctness and state nothing.</para>
+    /// those edges exist to fix. Accepting it would cost correctness and state nothing.</para>
+    ///
+    /// <para><b>What the refusal costs — measured, not assumed.</b> Two separate questions, and
+    /// the second one has a much larger answer than "one full compile per app, once".</para>
+    ///
+    /// <para><i>How often it fires: through an ordinary upgrade, never.</i> The envelope lives at
+    /// <c>&lt;cacheDir&gt;/&lt;cacheKey&gt;.rad-baseline.json</c>, and <c>ComputeAlCacheKey</c>'s
+    /// second line is <c>runner:&lt;sha256 of al-runner.dll&gt;</c>
+    /// (<c>RunnerFingerprint.WriteKeyLines</c>). Changing this constant changes that DLL, so the
+    /// runner that reads schema 2 computes a DIFFERENT key from the one that wrote schema 1 and
+    /// never opens the old envelope — the <c>.dll</c> beside it MISSes too, and the full compile
+    /// that follows writes a fresh schema-2 pair. The refusal below is therefore a guard for a
+    /// cache directory that is shared or hand-modified, not an upgrade path, and the bump's cost
+    /// on an upgrade is zero over what the binary change already costs.</para>
+    ///
+    /// <para><i>What it costs when it does fire: a whole-bundle compile, once per watch session,
+    /// indefinitely.</i> Measured on the three-app <c>DeltaTwoApp</c> fixture by rewriting one
+    /// app's envelope as a genuine schema 1 and starting <c>--watch</c>:</para>
+    /// <code>
+    /// [watch] Delta Lib: full rebuild — 1 app(s) in the bundle have no baseline
+    /// [watch] Delta Lib Tests: full rebuild — 1 app(s) in the bundle have no baseline
+    /// [watch] Delta Bridge: full compile — the cached module's delta baseline could not be
+    ///         used (its envelope is schema 1, not 2), so this compile establishes a new one
+    /// </code>
+    /// <para>Not one app: <c>RadWorkspaceStore.PrepareBundleReload</c> refuses warm metadata for
+    /// the whole bundle while ANY app in it lacks a baseline, and invalidates every workspace —
+    /// so one refused envelope turned a 2-object delta into all 9 objects of the bundle. And it
+    /// does not heal: the write site is guarded on the sidecar paths, which
+    /// <c>Program.cs</c> only assigns while <c>radWs is null or { Generations.Count: 0 }</c>. A
+    /// cache HIT loads a generation on the spot, so on the cycle that pays the full compile
+    /// those paths are null and <c>TrySave</c> never runs — the schema-1 envelope is still on
+    /// disk afterwards, and the next watch session over the same tree pays the same bundle-wide
+    /// compile again.</para>
     /// </summary>
     internal const int Schema = 2;
 

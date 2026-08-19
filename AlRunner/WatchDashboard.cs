@@ -41,13 +41,21 @@ public static class WatchDashboard
     /// it runs, so the <c>[watch]</c> log lines that carry these reasons never reach this screen:
     /// a cycle that suddenly cost minutes looked identical to one that cost a second.
     /// </param>
+    /// <param name="rebindNotes">
+    /// Why a delta did binding work its changed-file count does not explain: a sibling app moved
+    /// a callable surface and this app re-emitted callers, or a namespace-free file needed a
+    /// second bind against freshly compiled packaged symbols. Same reason for rendering as
+    /// <paramref name="fullCompileNotes"/> and a separate panel for the opposite one: this is the
+    /// narrow path working, not the whole-module path.
+    /// </param>
     public static IRenderable Build(
         IReadOnlyList<BucketResult> results,
         string bundleName,
         WatchStatus status,
         DateTime lastRun,
         TimeSpan lastDuration,
-        IReadOnlyList<string>? fullCompileNotes = null)
+        IReadOnlyList<string>? fullCompileNotes = null,
+        IReadOnlyList<string>? rebindNotes = null)
     {
         var rows = new List<IRenderable>
         {
@@ -57,6 +65,11 @@ public static class WatchDashboard
         if (fullCompileNotes is { Count: > 0 })
         {
             rows.Add(FullCompileNotes(fullCompileNotes));
+            rows.Add(new Text(string.Empty));
+        }
+        if (rebindNotes is { Count: > 0 })
+        {
+            rows.Add(RebindNotes(rebindNotes));
             rows.Add(new Text(string.Empty));
         }
         rows.Add(BuildTree(results));
@@ -78,6 +91,24 @@ public static class WatchDashboard
             .Header("[yellow]full recompile[/]")
             .Border(BoxBorder.Rounded)
             .BorderColor(Color.Yellow)
+            .Expand();
+    }
+
+    /// <summary>
+    /// The "this delta performed an extra bind" panel. Blue rather than yellow because the cycle
+    /// stayed narrow: it either added specific caller files or repeated the same changed-file
+    /// bind with a repaired packaged surface. The note explains which one happened; neither is a
+    /// whole-module compile.
+    /// </summary>
+    private static IRenderable RebindNotes(IReadOnlyList<string> notes)
+    {
+        var body = string.Join(
+            Environment.NewLine,
+            notes.Select(note => $"[blue]·[/] [grey]{Markup.Escape(note)}[/]"));
+        return new Panel(new Markup(body))
+            .Header("[blue]delta rebind[/]")
+            .Border(BoxBorder.Rounded)
+            .BorderColor(Color.Blue)
             .Expand();
     }
 

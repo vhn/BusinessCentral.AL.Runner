@@ -807,6 +807,11 @@ var results = new List<BucketResult>();
 // the end of a cycle — draining the collector at paint time would show the notes once and then
 // blank them. Populated after the bundle loop restores the console streams.
 var fullCompileNotes = new List<string>();
+// …and why a delta did binding work its changed-file count does not explain: selected callers
+// of a sibling app's moved surface, or a second pass over the same namespace-free files with a
+// repaired packaged surface. Same lifetime and same reason as the list above; a separate one
+// because the dashboard renders it as the narrow path working, not as a full recompile.
+var rebindNotes = new List<string>();
 
 // ── Layered source build pre-pass ─────────────────────────────────────────
 // When multiple bundles are passed and one depends on another (by AppId or
@@ -915,7 +920,8 @@ List<string> RenderDashboardLines(WatchStatus status, DateTime ts, TimeSpan dur)
         Out = new Spectre.Console.AnsiConsoleOutput(sw),
     });
     rec.Profile.Width = width;
-    rec.Write(WatchDashboard.Build(results, watchBundleName, status, ts, dur, fullCompileNotes));
+    rec.Write(WatchDashboard.Build(
+        results, watchBundleName, status, ts, dur, fullCompileNotes, rebindNotes));
     return sw.ToString().Replace("\r\n", "\n").TrimEnd('\n').Split('\n').ToList();
 }
 
@@ -983,7 +989,9 @@ if (sourceWatch != null)
         cycleChangedPaths.Add(changedPath);
 results.Clear();
 fullCompileNotes.Clear();
-AlRunner.Rad.RadCycleNotes.Drain();   // discard anything left over from the previous cycle
+rebindNotes.Clear();
+AlRunner.Rad.RadCycleNotes.Drain();          // discard anything left over from the previous cycle
+AlRunner.Rad.RadCycleNotes.DrainRebinds();
 // Clean loading (#5): the interactive dashboard owns the whole screen, but the
 // run-cycle body emits diagnostic Console.WriteLine noise ("[bundle] resolved N
 // dep(s)", "loaded N assembl(ies)", "[i/N] … suites", …) that would scroll over
@@ -1061,6 +1069,12 @@ foreach (var bundle in bundles)
     List<string> bundleManifests;
     using (AlRunner.Infrastructure.PhaseLog.Stage("bundle-manifests"))
         bundleManifests = CollectBundleManifests(bucketRoot, bundleAbs);
+    // What this cycle is about to compile against, so the NEXT cycle can tell a manifest
+    // rewrite (a branch switch, a checkout, an autosave — byte-identical) from a manifest
+    // edit. Recorded here rather than inside PrepareBundleReload because this is the set the
+    // cycle actually resolves from, and it is already enumerated; asking the store to find
+    // the manifests itself would mean walking the tree for them once per cycle.
+    if (watchMode) AlRunner.Rad.RadWorkspaceStore.RecordManifestState(bundleManifests);
     // Everything below resolves package dirs and loads deps relative to a directory; when
     // the bundle is a parent of many apps there is no bucket root, so the bundle dir is it.
     var depRootDir = bucketRoot ?? bundleAbs;
@@ -2152,6 +2166,19 @@ foreach (var bundle in bundles)
                 {
                     bundleErrors.Add($"<bundled>: EXEC-FAIL: {ex.Message.Split('\n')[0]}");
                 }
+                // Loud, because nothing downstream is: this app group contributed ZERO results,
+                // and whenever a SIBLING group produced any, the bucket still counts as "ran"
+                // and the summary's exec-fail counter stays 0 (Reporter classifies per bucket,
+                // and the bucket did run). An app's whole test set could therefore disappear
+                // from a run without a single line saying so — measured on the npcore witness,
+                // where an install-seed failure deleted all three of NP Retail's tests every
+                // warm --watch cycle and the only visible trace was the total dropping from
+                // 2317 to 2314. Naming the app and the cause here is what makes that a report
+                // instead of a subtraction.
+                Console.Error.WriteLine(
+                    $"{rel}: EXEC-FAIL in app group {asm.GetName().Name} — no tests ran for it: "
+                    + $"{ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+                if (ex.StackTrace is { } execSt) Console.Error.WriteLine(execSt);
                 tests = Array.Empty<TestResult>();
             }
             finally
@@ -2296,6 +2323,7 @@ if (stdoutSilenced)
 // Collected here rather than logged: the `[watch]` lines carrying these reasons were written to
 // the stderr just restored above, i.e. to TextWriter.Null. See RadCycleNotes.
 fullCompileNotes.AddRange(AlRunner.Rad.RadCycleNotes.Drain());
+rebindNotes.AddRange(AlRunner.Rad.RadCycleNotes.DrainRebinds());
 
 if (!watchMode)
     break;   // normal mode: one pass, fall through to the summary below
@@ -4973,12 +5001,15 @@ static (BcEmitOutput Output, RadEmitResult? Rad) RunEmit(
 {
     if (ws == null) return (emitter.Emit(allPaths, moduleName, appRootDir), null);
 
-    // Keep the number of live generations bounded. A full compile replaces every old
-    // object at once; Program clears the generation list when that assembly loads.
-    const int maxOverlayChain = 12;
-    if (ws.Generations.Count >= maxOverlayChain)
-        ws.Invalidate($"the overlay chain reached {maxOverlayChain - 1} delta(s)");
-
+    // The overlay chain is deliberately UNBOUNDED. It used to reset at 12 generations,
+    // which made every 11th code-producing save a whole-module compile — minutes on a
+    // 7,000-object app, for a reason the developer could neither predict nor see, and for
+    // memory hygiene rather than correctness: AlObjectResolution resolves an object to its
+    // owning generation in O(1) and an overlay assembly is kilobytes. Growth is not free
+    // (per-cycle registration work scales with the chain), but paying it back with a full
+    // compile is the most expensive way to reclaim it. If a long session's overlays ever
+    // do need reclaiming, the answer is to compact the chain into one fresh generation on
+    // a memory threshold, not to rebuild the module on a counter.
     var result = emitter.EmitIncremental(allPaths, moduleName, ws, appRootDir);
     // "Nothing changed" is only actionable while there is a loaded module to reuse. If a
     // previous cycle compiled but failed to load, reporting no-change would drop the app

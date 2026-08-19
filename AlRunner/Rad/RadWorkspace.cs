@@ -732,13 +732,13 @@ public static class RadWorkspaceStore
         // Two different blockers, kept apart because they read as different problems and the
         // first one is almost always `app.json`.
         var inBundle = changedPaths.Where(path => IsWithin(path, root)).ToList();
-        var notAlSource = Names(inBundle.Where(path =>
-            !string.Equals(Path.GetExtension(path), ".al", StringComparison.OrdinalIgnoreCase)));
+        var movedManifests = Names(ChangedManifests(inBundle));
         var unownedAl = Names(inBundle.Where(path =>
             string.Equals(Path.GetExtension(path), ".al", StringComparison.OrdinalIgnoreCase)
             && !workspaces.Any(ws => IsWithin(path, ws.SourceRoot))));
-        if (notAlSource.Count > 0)
-            blockers.Add($"{List(notAlSource)} changed — not AL source, so warm metadata cannot be kept");
+        if (movedManifests.Count > 0)
+            blockers.Add($"{List(movedManifests)} changed — a manifest edit moves what the whole "
+                + "module binds against, so warm metadata cannot be kept");
         if (unownedAl.Count > 0)
             blockers.Add($"{List(unownedAl)} changed — AL source that no warm app in this bundle owns");
 
@@ -757,6 +757,107 @@ public static class RadWorkspaceStore
         static string List(List<string> names) =>
             string.Join(", ", names.Take(3))
             + (names.Count > 3 ? $" (+{names.Count - 3} more)" : string.Empty);
+    }
+
+    /// <summary>
+    /// Content hash per <c>app.json</c>, as of the last cycle that compiled against it — so a
+    /// manifest WRITE can be told apart from a manifest CHANGE. Written by
+    /// <see cref="RecordManifestState"/> and read by <see cref="PrepareBundleReload"/>, both on
+    /// the single cycle thread.
+    /// </summary>
+    private static readonly Dictionary<string, string> _manifestHashes = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Seed the recorded content of manifests this store has never seen, so the first cycle of
+    /// a session gives later ones something to compare against. Called with the exact set the
+    /// cycle resolved its dependencies from — an O(apps) list of small files the cycle has
+    /// already enumerated, never a tree walk.
+    ///
+    /// <para>Seed-only, deliberately. A manifest a cycle actually examined was recorded by
+    /// <see cref="ChangedManifests"/> from the very bytes it compared; overwriting that here
+    /// from a second read later in the same cycle is exactly the window in which a write could
+    /// land and be recorded as "already compiled against" — while the compile that follows binds
+    /// to it, <see cref="ArmFor"/> invalidates, and the full rebuild runs with emit captures it
+    /// was told it could keep and no object map left to sweep them with.</para>
+    /// </summary>
+    public static void RecordManifestState(IEnumerable<string> manifestPaths)
+    {
+        foreach (var path in manifestPaths)
+        {
+            var full = Path.GetFullPath(path);
+            if (!_manifestHashes.ContainsKey(full)) _manifestHashes[full] = HashManifest(full);
+        }
+    }
+
+    /// <summary>
+    /// The manifests among <paramref name="inBundle"/> whose CONTENT moved since the last cycle.
+    ///
+    /// <para>Two things this deliberately does NOT do. It does not treat a non-<c>.al</c> path
+    /// as a blocker on the strength of its extension: the only non-AL file a watch session can
+    /// see is <c>app.json</c> (<c>WatchSource.ArmSourceWatch</c> filters the watcher to
+    /// <c>*.al</c> and <c>app.json</c> and re-checks each event), and nothing else a source tree
+    /// contains changes what the compiler binds against. And it does not treat a WRITE to
+    /// <c>app.json</c> as a change: a branch switch, a checkout, an editor autosave or a
+    /// formatter rewrites the file byte-identically, and every one of those used to cost a
+    /// whole-module compile of the whole bundle — the most expensive cycle there is, bought with
+    /// no edit at all.</para>
+    ///
+    /// <para>Content is the right question because content is what the OTHER half of this reads:
+    /// <see cref="ArmFor"/> invalidates when the reference signature (dependencies, identity,
+    /// preprocessor symbols) moves, and a manifest is the only thing in the tree that feeds it.
+    /// An identical manifest therefore cannot make a warm app rebuild. The converse does not
+    /// hold exactly — a changed <c>description</c> moves no signature — and that direction is
+    /// deliberately left conservative: this decides whether emit captures may survive a rebuild
+    /// that has no object map to sweep with, so an unnecessary refresh costs a cycle while a
+    /// missed one leaves stale metadata behind.</para>
+    ///
+    /// <para>A manifest with no recorded content is reported as changed. That is the honest
+    /// answer rather than a guess — it means no cycle has compiled against it, which is either
+    /// the first cycle of the session (already blocked, and for a better reason) or an app
+    /// appearing in the bundle mid-session.</para>
+    /// </summary>
+    private static List<string> ChangedManifests(IReadOnlyList<string> inBundle)
+    {
+        var moved = new List<string>();
+        foreach (var path in inBundle)
+        {
+            if (!string.Equals(Path.GetFileName(path), "app.json", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var full = Path.GetFullPath(path);
+            var hash = HashManifest(full);
+            // Recorded from the SAME read the decision is made from — see RecordManifestState
+            // for the window that re-reading later in the cycle would open.
+            var seen = _manifestHashes.TryGetValue(full, out var previous);
+            _manifestHashes[full] = hash;
+            if (!seen || !string.Equals(previous, hash, StringComparison.Ordinal)) moved.Add(full);
+        }
+        return moved;
+    }
+
+    /// <summary>
+    /// A manifest's content hash, or a sentinel for one that is absent or unreadable — both of
+    /// which are states a compile reacts to, so they must be distinguishable from each other
+    /// and from any real content.
+    /// </summary>
+    private static string HashManifest(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return "<absent>";
+            using var sha = SHA256.Create();
+            return Convert.ToHexString(sha.ComputeHash(File.ReadAllBytes(path)));
+        }
+        catch (IOException)
+        {
+            // Mid-write, by a checkout or an editor. Unreadable is not "unchanged": returning a
+            // fresh sentinel each time would thrash, so this reads as one distinct state that
+            // differs from any real content and settles as soon as the file is readable again.
+            return "<unreadable>";
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return "<unreadable>";
+        }
     }
 
     private static bool IsWithin(string path, string root)

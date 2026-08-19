@@ -1,0 +1,13 @@
+{
+  "id": "9b2e7d15-4c60-4a3f-8e91-5d70c3f8a214",
+  "name": "Watch Discovery Tests",
+  "publisher": "AlRunner Tests",
+  "version": "1.0.0.0",
+  "runtime": "14.0",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [{ "from": 60995, "to": 60999 }],
+  "dependencies": [
+    { "id": "3f6a1c84-5d21-4b7e-9c03-8a4d2e6f1b90", "publisher": "AlRunner Tests", "name": "Watch Discovery Lib", "version": "1.0.0.0" }
+  ]
+}

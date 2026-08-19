@@ -133,6 +133,8 @@ public static partial class RecordPatches
         _parsedObjectDecls.Clear();
         _parsedObjectCaptions.Clear();
         _metaFormCache.Clear();
+        // Must go with _metaFormCache, never without it — see ResetRealPageMetadataForReload.
+        ResetRealPageMetadataForReload();
         _metaReportCache.Clear();
         _metaQueryCache.Clear();
         _metaXmlPortCache.Clear();
@@ -182,42 +184,6 @@ public static partial class RecordPatches
     }
 
     /// <summary>
-    /// How many files one <see cref="ParseAlFilesIntoAllExtractors"/> batch reads and parses
-    /// before the extractors consume it. Bounds the extra live set that batch's syntax trees
-    /// represent — the reason the pass is batched at all (see <c>PreParseAlFiles</c>) — while
-    /// still being wide enough to keep every core busy through the parse.
-    /// </summary>
-    private const int SourceParseBatchSize = 256;
-
-    /// <summary>
-    /// Read, parse and extract a list of <c>.al</c> files: the parse runs concurrently a batch
-    /// at a time, the eight extractors then run serially over that batch in file order.
-    /// <para>
-    /// The split is what makes this the same work in less time rather than different work: the
-    /// AL parse is a pure function of the text and dominates the pass, while the extractors
-    /// mutate shared per-bundle dictionaries whose de-dup and last-writer-wins rules are
-    /// order-sensitive. So only the first half moves off the calling thread, and the second
-    /// half sees the identical sequence of files it always did — it just finds each tree
-    /// already built (<c>PrimeParseMemo</c>) instead of building it.
-    /// </para>
-    /// </summary>
-    private static void ParseAlFilesIntoAllExtractors(IReadOnlyList<string> files)
-    {
-        for (int start = 0; start < files.Count; start += SourceParseBatchSize)
-        {
-            var batch = new List<string>(Math.Min(SourceParseBatchSize, files.Count - start));
-            for (int i = start; i < files.Count && i < start + SourceParseBatchSize; i++)
-                batch.Add(files[i]);
-
-            foreach (var (text, objects) in PreParseAlFiles(batch))
-            {
-                if (objects != null) PrimeParseMemo(text, objects);
-                ParseSourceFileIntoAllExtractors(text);
-            }
-        }
-    }
-
-    /// <summary>
     /// The Register()-time equivalent of <see cref="AddSourceDirs"/>' per-file loop: one
     /// pass over every registered source dir, reading each file's text exactly once and
     /// running all eight extractors on it via <see cref="ParseSourceFileIntoAllExtractors"/>
@@ -229,7 +195,42 @@ public static partial class RecordPatches
     private static void ParseAllRegisteredSourceFiles()
     {
         foreach (var dir in _sourceDirs)
-            ParseAlFilesIntoAllExtractors(Directory.GetFiles(dir, "*.al", SearchOption.AllDirectories));
+            ParseSourceFilesIntoAllExtractors(
+                Directory.GetFiles(dir, "*.al", SearchOption.AllDirectories));
+    }
+
+    /// <summary>
+    /// Number of files whose trees are built together before the extractors walk them. Big enough
+    /// that the parallel parse has something to divide, small enough that the trees it holds at
+    /// once are bounded — see the pre-parse note in RecordPatches.AlSourceParser.cs.
+    /// </summary>
+    private const int SourceFileBatchSize = 256;
+
+    /// <summary>
+    /// Run all eight extractors over <paramref name="files"/>, a batch at a time: read the batch,
+    /// build its syntax trees (in parallel, above a threshold), then run the extractors over the
+    /// results one file at a time in the order given.
+    ///
+    /// <para>The extractors stay SERIAL and in order deliberately. They write into shared
+    /// dictionaries, two of which accumulate — <c>_parsedExtensionFields</c> by base-table name,
+    /// and <c>_extensionIdsByBaseTable</c>, whose lists are in AL declaration order because that
+    /// is the order BC registers tableextensions and the record-trigger pipeline preserves it. The
+    /// parse is the part that is pure, and the part that costs seconds.</para>
+    /// </summary>
+    private static void ParseSourceFilesIntoAllExtractors(IReadOnlyList<string> files)
+    {
+        for (int start = 0; start < files.Count; start += SourceFileBatchSize)
+        {
+            var batch = files.Skip(start).Take(SourceFileBatchSize).ToArray();
+            var texts = new string[batch.Length];
+            // Serial, so a file that cannot be read throws exactly the exception it always threw
+            // rather than an AggregateException from the parallel phase.
+            for (int i = 0; i < batch.Length; i++) texts[i] = File.ReadAllText(batch[i]);
+
+            using (BeginPreParse(texts))
+                foreach (var text in texts)
+                    ParseSourceFileIntoAllExtractors(text);
+        }
     }
 
     /// <summary>
@@ -281,7 +282,7 @@ public static partial class RecordPatches
             // (#1903) — see ParseSourceFileIntoAllExtractors.
             if (_registered)
             {
-                ParseAlFilesIntoAllExtractors(
+                ParseSourceFilesIntoAllExtractors(
                     Directory.GetFiles(dir, "*.al", SearchOption.AllDirectories));
                 parsedAny = true;
             }

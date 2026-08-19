@@ -199,7 +199,16 @@ public static partial class BcRuntime
                     Console.Error.WriteLine(
                         $"[DispatchThrow] {declName}.{eventMethodName} subscriber threw: "
                         + $"{(tie.InnerException ?? tie).GetType().Name}: {(tie.InnerException ?? tie).Message}");
-                throw tie.InnerException ?? tie;
+                // Capture().Throw(), for the reason already spelled out on the catch in
+                // CodeunitEventDispatch_OnRunEventAsync — which this line contradicted: a bare
+                // `throw inner` RESETS the exception's stack trace to here. Measured
+                // consequence, not a style point: the npcore install-trigger failure reported
+                // itself as "NullReferenceException at DispatchCore line 202", and every frame
+                // naming WHICH subscriber threw and where inside it was discarded one frame
+                // below where it was raised.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                    .Capture(tie.InnerException ?? tie).Throw();
+                throw; // unreachable
             }
         }
     }
@@ -377,6 +386,44 @@ public static partial class BcRuntime
         return false;
     }
 
+    /// <summary>
+    /// Is this the sender parameter of an <c>IncludeSender=true</c> event whose publisher is
+    /// NOT a codeunit — a table, page, report, query or xmlport that declared the
+    /// <c>[IntegrationEvent(true, …)]</c> in its own code?
+    ///
+    /// <para><see cref="IsSenderParameter"/> recognises a sender by its CLR type being a
+    /// <c>NavCodeunitHandle</c> (or a bundle's typed <c>Codeunit&lt;N&gt;</c> subclass), which
+    /// is what AL emits when the publisher is a codeunit. A TABLE publisher emits the same
+    /// parameter as <c>INavRecordHandle</c> — an interface, so that method's <c>BaseType</c>
+    /// walk terminates immediately and answers false. The parameter then fell through to the
+    /// scope-field lookup, and an <c>IncludeSender</c> sender has no scope field (the event
+    /// declares no parameters at all — the sender is the publishing instance), so the
+    /// subscriber was invoked with <c>null</c>.</para>
+    ///
+    /// <para>That is the silent-fake shape <c>.claude/rules/loud-failures.md</c> forbids, and
+    /// here it did not even stay silent: npcore's
+    /// <c>"NPR POS Sales Workflow".OnDiscoverPOSSalesWorkflows</c> subscribers open with
+    /// <c>Sender.DiscoverPOSSalesWorkflow(…)</c>, so a null sender surfaced as a bare
+    /// <c>NullReferenceException</c> out of AL code with no indication of which argument was
+    /// missing.</para>
+    ///
+    /// <para><b>Why passing the publisher object is faithful, not a guess.</b> BC's contract
+    /// for <c>IncludeSender</c> is that the subscriber receives the publishing instance
+    /// itself, and the emitted publisher IS the handle type the subscriber asks for —
+    /// <c>Record&lt;N&gt;</c> implements <c>INavRecordHandle</c> directly (measured on the
+    /// emitted assembly: <c>INavRecordHandle</c> is in <c>Record60990</c>'s interface list, and
+    /// <c>IsInstanceOfType</c> answers true). The assignability test below is what keeps this
+    /// honest: if the publisher does not satisfy the parameter, this is not the sender and the
+    /// scope-field path is left to answer.</para>
+    ///
+    /// <para>The caller applies this only after the scope-field lookup came back empty, and
+    /// that order is load-bearing: a leading parameter that DOES match a scope field is a
+    /// declared event argument which happens to be record-typed, and its value must keep
+    /// coming from the scope rather than from the publisher.</para>
+    /// </summary>
+    private static bool IsNonCodeunitSenderParameter(ParameterInfo p, int paramIndex, object publisher)
+        => paramIndex == 0 && p.ParameterType.IsInstanceOfType(publisher);
+
     private static Type? _tNavCodeunitHandle;
     private static ConstructorInfo? _ciNavCodeunitHandleByIdInt;
     private static ConstructorInfo? _ciNavCodeunitHandleByInstance;
@@ -449,9 +496,14 @@ public static partial class BcRuntime
             }
             var fld = scopeType.GetField(p.Name!,
                 BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
-            args[i] = CoerceArg(fld?.GetValue(publisherScope), p.ParameterType);
-            if (Environment.GetEnvironmentVariable("ALRUNNER_DISPATCH_TRACE") == "1"
-                && subscriberMethod.Name.Contains("CustomDocumentMerger", StringComparison.OrdinalIgnoreCase))
+            // No scope field, and the publisher object itself satisfies this leading parameter:
+            // it IS the sender. See IsNonCodeunitSenderParameter for why that is a distinct
+            // case from the NavCodeunitHandle branch above and why passing the publisher is the
+            // faithful answer rather than a guess.
+            args[i] = fld == null && IsNonCodeunitSenderParameter(p, i, treeObj)
+                ? treeObj
+                : CoerceArg(fld?.GetValue(publisherScope), p.ParameterType);
+            if (Environment.GetEnvironmentVariable("ALRUNNER_DISPATCH_TRACE") == "1")
             {
                 string repr;
                 try { repr = args[i]?.ToString() ?? "null"; } catch { repr = "<unreadable>"; }

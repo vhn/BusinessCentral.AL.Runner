@@ -6,11 +6,13 @@
 // else in the app is still resolved FROM that packaged module — including objects whose
 // serialized surface refers to a stripped object BY NAME.
 //
-// Which other objects get pulled into the cycle and re-emitted from source is decided by
-// `changedSurfaces`, and that filter admits only codeunits and the id-less kinds. A
-// modified Table / Page / Enum / Report / Query never enters it, so nothing that names one
-// of those by name is ever rebound — it keeps resolving against a module the delta just
-// removed the referent from.
+// The reference graph DOES record the by-name edge from the untouched object to the changed
+// one. That is only dependency discovery, not by itself a reason to re-emit the owner: direct
+// callers are widened when a callable contract they already bound to moved. The table-field
+// addition below moves no such contract. On the namespaced path the serialized subtype resolves
+// through the supplied source. On the namespace-free path BC's different binder chooses the
+// plain packaged copy instead, so the delta repairs that copy with the changed object's fresh
+// surface and binds the same changed files once more.
 
 using AlRunner.Rad;
 using Xunit;
@@ -27,13 +29,21 @@ namespace AlRunner.Tests;
 /// <b>13,610</b> occurrences — so it is the one that decides whether a real app can trust a
 /// watch cycle at all.</para>
 ///
+/// <para><b>The first clean result below holds because this fixture declares a namespace.</b> For
+/// a long time that was read as "a by-name subtype is not exposure at all". Remove the namespace
+/// and the identical shape used to break: <c>BinderFactory.VisitCompilationUnitInternal</c>
+/// selects <c>LegacyInContainerBinder</c>, whose by-name lookup prefers the plain packaged copy
+/// that cannot see this app's supplied source. The second test measures the repaired path, and
+/// <see cref="RadByNameSelfSubtypeTests"/> carries the mechanism and the npcore witness.</para>
+///
 /// <para><b>Why the fixture is a triple, not a pair.</b> The damage needs three distinct
 /// roles, and a two-object fixture goes green while proving nothing because it never asks
 /// the damaged representation a question:</para>
 /// <list type="bullet">
 ///   <item><b>X</b> — <c>table 72000 "Subtype Target"</c>. Edited, therefore in the delta's
-///     `modified` set, therefore STRIPPED from the packaged baseline. Being a table, it is
-///     also invisible to `changedSurfaces`.</item>
+///     `modified` set, therefore STRIPPED from the packaged baseline. A field addition does not
+///     invalidate a caller's baked codeunit-member binding, so it triggers no direct-caller
+///     widening.</item>
 ///   <item><b>V</b> — <c>codeunit 72001 "Subtype Bystander"</c>. UNTOUCHED, so it is never
 ///     compiled from source in this cycle and is resolved from the packaged baseline
 ///     instead — and its serialized surface NAMES X.</item>
@@ -86,8 +96,8 @@ public sealed class RadByNameSubtypeTests(BcEngineFixture engine)
             "RadByNameSubtype", ModuleName, AppId, EmittedObjectCount,
             (compiler, workspace, tempRoot) =>
             {
-                // X: additive field. A table is never admitted by `changedSurfaces`, so this
-                // edit strips the table from the packaged baseline and rebinds nothing.
+                // X: additive field. It strips the table from the packaged baseline but moves
+                // no callable contract a direct caller was compiled against.
                 RadByName.Replace(
                     RadByName.SourceFile(tempRoot, "SubtypeTarget.Table.al"),
                     "        field(2; Amount; Decimal) { DataClassification = CustomerContent; }",
@@ -128,5 +138,58 @@ public sealed class RadByNameSubtypeTests(BcEngineFixture engine)
                 Assert.Contains("Subtype Target", emitted);
                 Assert.Contains("Subtype Caller", emitted);
             });
+    }
+
+    /// <summary>
+    /// The same edit on the same three objects with every `namespace …;` declaration removed, which
+    /// is what the test above would have measured had this fixture been written the way most real
+    /// AL is written. A `Record "T"` parameter was NOT immune: the untouched bystander resolved it
+    /// against a packaged module symbol the delta had removed the table from, and the caller's
+    /// argument stopped matching with the same <c>'__MissingTypeSymbol__'</c> a Codeunit subtype
+    /// produces.
+    ///
+    /// <para>It resolves now, and this is the second object KIND to say so — a Table here against a
+    /// Codeunit in <see cref="RadByNameSelfSubtypeTests"/>, so the repair is not keyed to the kind
+    /// that happened to be measured first. Same oracle, and now the same verdict as the namespaced
+    /// run above: a delta over exactly the two edited objects.</para>
+    /// </summary>
+    [SkippableFact]
+    public void WithoutANamespace_TheSameEdit_StillDeltasToTheEditedObjects()
+    {
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
+
+        RadByName.Run(
+            "RadByNameSubtype", ModuleName, AppId, EmittedObjectCount,
+            (compiler, workspace, tempRoot) =>
+            {
+                RadByName.Replace(
+                    RadByName.SourceFile(tempRoot, "SubtypeTarget.Table.al"),
+                    "        field(2; Amount; Decimal) { DataClassification = CustomerContent; }",
+                    "        field(2; Amount; Decimal) { DataClassification = CustomerContent; }\n"
+                    + "        field(3; Quantity; Decimal) { DataClassification = CustomerContent; }");
+                RadByName.Replace(
+                    RadByName.SourceFile(tempRoot, "SubtypeCaller.Codeunit.al"),
+                    "Take(Target) + 1", "Take(Target) + 2");
+
+                var cold = RadByName.ColdCompile(tempRoot, ModuleName);
+                Assert.True(cold.Emit.Diagnostics.Count == 0,
+                    "the edited tree does not compile from scratch, so the fixture — not the "
+                    + "delta path — is what this run measured:" + Environment.NewLine
+                    + string.Join(Environment.NewLine, cold.Emit.Diagnostics));
+
+                var delta = compiler.EmitIncremental([tempRoot], ModuleName, workspace);
+
+                RadByName.AssertMatchesColdCompile(delta, tempRoot, ModuleName);
+                Assert.False(delta.FullRebuild,
+                    "editing a table and one caller rebuilt the whole module instead of deltaing");
+
+                // Containment, for the same reason the namespaced control uses it: rebinding the
+                // bystander from source would be a legitimate third object, and pinning the exact
+                // set would fail a correct implementation.
+                var emitted = delta.Emit.Sources.Select(source => source.Name).ToArray();
+                Assert.Contains("Subtype Target", emitted);
+                Assert.Contains("Subtype Caller", emitted);
+            },
+            withoutNamespaces: true);
     }
 }

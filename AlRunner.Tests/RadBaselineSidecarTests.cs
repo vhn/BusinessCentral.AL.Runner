@@ -61,6 +61,29 @@ public sealed class RadBaselineSidecarTests(BcEngineFixture engine)
         return fresh;
     }
 
+    /// <summary>
+    /// The reason the envelope's schema is checked at all, made concrete: <c>System.Text.Json</c>
+    /// ignores members it does not find, so a schema-2 reader handed a schema-1 envelope
+    /// deserializes it happily. What it gets is not an error — it is a workspace whose
+    /// <c>crossAppReferences</c> map is EMPTY, which is exactly the shape of an app that calls
+    /// no sibling. It would then delta every edit without ever rebinding a cross-app caller, and
+    /// nothing in the run would say so.
+    ///
+    /// <para>Written by DELETING the member rather than renumbering a schema-2 envelope, because
+    /// those are not the same document: a renumbered one still carries
+    /// <c>"crossAppReferences":[]</c>, so a reader that had silently accepted it would be
+    /// indistinguishable from one that read a real empty list. A schema-1 envelope never had the
+    /// member at all, and that absence is the whole hazard.</para>
+    /// </summary>
+    private static void RewriteAsGenuineSchemaOne(string envelopePath)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(envelopePath))!.AsObject();
+        Assert.True(node.Remove("crossAppReferences"), "the schema-2 writer must emit the member");
+        node["schema"] = 1;
+        File.WriteAllText(envelopePath, node.ToJsonString());
+        Assert.DoesNotContain("crossAppReferences", File.ReadAllText(envelopePath), StringComparison.Ordinal);
+    }
+
     // ── the premise: a serialized baseline is the same baseline ────────────────────────
 
     /// <summary>
@@ -512,6 +535,150 @@ public sealed class RadBaselineSidecarTests(BcEngineFixture engine)
 
             Assert.False(hydrated);
             Assert.False(fresh.HasBaseline);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The rejection the schema bump exists for, and the one the 999 test above does NOT make.
+    /// A schema of 999 could only ever come from a runner that does not exist; a schema of 1 is
+    /// the envelope every runner before this change wrote, and it is the one a schema-2 reader
+    /// would accept without complaint — <c>System.Text.Json</c> leaves an absent member at its
+    /// default, so the reader gets zero cross-app edges and a workspace that will silently
+    /// rebind no sibling caller. That is the bug those edges exist to fix, restored by the cache.
+    ///
+    /// <para>Refusal is only half of what <c>.claude/rules/loud-failures.md</c> asks for: the
+    /// reason has to survive to the compile that pays for it. The full compile happens on the
+    /// developer's NEXT edit, a cycle later, so a reason that were only written to stderr here
+    /// would be gone by then — hence the assertion on the parked reason and on the note the
+    /// following cycle actually reports.</para>
+    /// </summary>
+    [SkippableFact]
+    public void Hydration_IsRejected_WhenTheEnvelopeIsAGenuineSchemaOne_WithNoCrossAppMember()
+    {
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            var baseline = RadFixture.Seed(tempRoot);
+            Assert.True(RadBaselineSidecar.TrySave(
+                baseline.Workspace, EnvelopePath(tempRoot), SymbolsPath(tempRoot)));
+
+            RewriteAsGenuineSchemaOne(EnvelopePath(tempRoot));
+
+            var fresh = HydrateLikeACacheHit(
+                tempRoot, baseline.Types["Codeunit71000"].Assembly, out var hydrated);
+
+            Assert.False(hydrated);
+            Assert.False(fresh.HasBaseline);
+            Assert.Empty(fresh.AllObjects());
+            Assert.Empty(fresh.CrossAppProducers());
+            // Named, not merely refused — and naming the version, so "schema 1" and "schema 999"
+            // are distinguishable in a log the developer reads a cycle later.
+            Assert.Contains(
+                $"its envelope is schema 1, not {RadBaselineSidecar.Schema}",
+                fresh.PendingFullCompileReason);
+
+            // …and the reason reaches the cycle that pays for it, which is the next one.
+            RadCycleNotes.Drain();
+            var cycle = new BcCompiler().EmitIncremental([tempRoot], RadFixture.ModuleName, fresh);
+            Assert.True(cycle.FullRebuild);
+            Assert.Equal(RadFixture.ObjectCount, cycle.Emit.Sources.Count);
+            Assert.Contains("its envelope is schema 1", string.Join(" | ", RadCycleNotes.Drain()));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The other half of the bump: refusing the old envelope is only worth a full compile if the
+    /// NEW one carries what it claims. Save → hydrate → the hydrated workspace answers a sibling
+    /// app's surface move with the caller that has to be re-emitted.
+    ///
+    /// <para>Asserted through <c>PendingCrossAppRebinds</c> rather than by reading the restored
+    /// map back, because a map that round-trips and is never consulted rebinds nobody. The chain
+    /// this pins is the one a watch cycle walks: persisted edge → hydrated workspace → a
+    /// sibling's publish → the consumer's own object key → the FILE the delta re-emits.</para>
+    ///
+    /// <para>Both directions, over one hydrated workspace: a surface the envelope names widens
+    /// the caller, and one it does not name widens nothing. Without the second, a hydrator that
+    /// returned every object for every key would pass.</para>
+    /// </summary>
+    [SkippableFact]
+    public void SavedEnvelope_RoundTripsCrossAppEdges_SoAHydratedWorkspaceRebindsASiblingCaller()
+    {
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            var baseline = RadFixture.Seed(tempRoot);
+
+            // The fixture is one app, so its compile produced no cross-app edges. Add one
+            // through the same commit token a multi-app bundle's compile would hand the
+            // workspace — "RAD Perf Caller" calling a codeunit in a sibling app — so what is
+            // persisted below is the real committed map and not a hand-built envelope.
+            var sibling = RadWorkspaceStore.IdentityOf(
+                Guid.Parse("1f5cf3a2-9a10-4a6d-b0d2-6f0f6a2a7b31"), "Delta Lib");
+            var caller = new RadObjectKey("Codeunit", 71001);
+            var movedSurface = new RadObjectKey("Codeunit", 60922);
+            var untouchedSurface = new RadObjectKey("Codeunit", 60923);
+            var committed = baseline.Workspace.Snapshot();
+            Assert.NotNull(committed);
+            baseline.Workspace.Commit(committed with
+            {
+                CrossAppReferencesByObject = new Dictionary<RadObjectKey, HashSet<RadAppObjectRef>>
+                {
+                    [caller] = [new RadAppObjectRef(sibling, movedSurface)],
+                },
+            });
+
+            Assert.True(RadBaselineSidecar.TrySave(
+                baseline.Workspace, EnvelopePath(tempRoot), SymbolsPath(tempRoot)));
+
+            // A watch process restarting over this tree: the consumer and the sibling that
+            // publishes to it are two workspaces of ONE bundle, which is the scope every
+            // cross-app query runs in (RadWorkspaceStore.InBundle).
+            var consumer = RadWorkspaceStore.For(
+                RadFixture.ModuleName, RadFixture.AppId, tempRoot, bundleRoot: tempRoot);
+            var producer = RadWorkspaceStore.For(
+                "Delta Lib", Guid.Parse("1f5cf3a2-9a10-4a6d-b0d2-6f0f6a2a7b31"),
+                Path.Combine(tempRoot, "sibling"), bundleRoot: tempRoot);
+            Assert.Equal(sibling, producer.Identity);
+            Assert.Empty(consumer.CrossAppProducers());
+
+            Assert.True(RadBaselineSidecar.TryHydrate(
+                consumer, [tempRoot], EnvelopePath(tempRoot), SymbolsPath(tempRoot)));
+
+            Assert.Equal([sibling], consumer.CrossAppProducers());
+            Assert.Equal(
+                [caller], consumer.CrossAppUsersOf(sibling, new HashSet<RadObjectKey> { movedSurface }));
+            Assert.Empty(
+                consumer.CrossAppUsersOf(sibling, new HashSet<RadObjectKey> { untouchedSurface }));
+
+            // A move the envelope's edges do not name rebinds nothing…
+            producer.PublishSurfaceMoves([untouchedSurface], fullRebuild: false);
+            Assert.Empty(RadWorkspaceStore.PendingCrossAppRebinds(consumer));
+
+            // …and one they do name rebinds exactly the caller, which the restored object map
+            // can still resolve to the file the delta would re-emit.
+            producer.PublishSurfaceMoves([movedSurface], fullRebuild: false);
+            var rebind = Assert.Single(RadWorkspaceStore.PendingCrossAppRebinds(consumer));
+            Assert.Same(producer, rebind.Producer);
+            Assert.False(rebind.Everything);
+            Assert.Equal([caller], rebind.Users);
+            Assert.Equal(
+                RadFixture.SourceFile(tempRoot, "RadPerfCaller.Codeunit.al"), consumer.FileOf(caller));
         }
         finally
         {

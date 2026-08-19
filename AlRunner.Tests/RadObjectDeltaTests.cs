@@ -211,14 +211,35 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     }
 
     /// <summary>
-    /// Adding a procedure moves the callable surface too — generated calls bake
-    /// Microsoft's member ids, so the direct caller has to rebind. What must NOT happen is
-    /// the transitive caller (RAD Perf Unrelated A → Caller → Service) coming along:
-    /// that is the difference between a one-hop rebind and a whole-module rebuild on a
-    /// deep dependency graph.
+    /// Adding a procedure under a name the object did not already have rebinds NOBODY: the
+    /// object itself is re-emitted and its callers are not.
+    ///
+    /// <para><b>This assertion was reversed deliberately.</b> It used to expect
+    /// `["RAD Perf Caller", "RAD Perf Service"]`, on the reasoning that "generated calls bake
+    /// Microsoft's member ids, so an addition moves the callable surface". That reasoning was
+    /// too coarse, and this test was the measurement that recorded it. What it actually
+    /// recorded was the whole-object surface fingerprint's resolution limit — a serialized
+    /// codeunit that gained a method compares unequal, so every addition looked like a moved
+    /// surface — not a property of the ids.</para>
+    ///
+    /// <para>What the member-level diff established instead, measured on the compiler rather
+    /// than assumed (RadSameAppOverloadTests.AddingAnOverload_MovesNoOtherMemberId and
+    /// .RequiresRuntimeOverloadDisambiguation_ReadsOnlyTheMethodItIsAskedAbout): adding a
+    /// member moves no OTHER member's id, and `Added` is a name no call site ever mentioned, so
+    /// no baked id anywhere in the module changes. `RAD Perf Caller` was being recompiled to
+    /// arrive at byte-identical dispatch. On NP Retail the same edit on `NPR POS Session` cost
+    /// 313 objects and 22–54 s.</para>
+    ///
+    /// <para>The line this does NOT cross is the addition that joins an EXISTING name. That is
+    /// an overload, it moves what the caller binds to while leaving every id intact, and it
+    /// fails silently if skipped — RadSameAppOverloadTests.AddingAnOverload_RebindsTheSameAppCaller
+    /// and RadSameAppOverloadWatchTests hold that half, and
+    /// EditingACallableSurface_ReloadsTheChangedObjects_ButNotTheirTransitiveCaller
+    /// immediately above still pins that a retyped parameter rebinds the caller and stops
+    /// there.</para>
     /// </summary>
     [SkippableFact]
-    public void AddingAProcedure_RebindsDirectCallersOnly()
+    public void AddingAProcedureUnderANewName_RebindsNoCallerAtAll()
     {
         RunOverlayScenario(
             "procedure addition",
@@ -233,8 +254,8 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
 
                     procedure Coerce
                 """),
-            ["RAD Perf Caller", "RAD Perf Service"],
-            ["Codeunit71000", "Codeunit71001"]);
+            ["RAD Perf Service"],
+            ["Codeunit71000"]);
     }
 
     /// <summary>
@@ -243,13 +264,20 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
     ///
     /// <para>Concretely: when the compile is given an app root (#1912, which is what the CLI
     /// does on every cycle) BC records a <c>ReferenceSourceFileName</c> on each symbol it
-    /// writes. A RAD compilation cannot be given one — <c>CreateForRad</c> takes no file
-    /// system, and attaching one destroys the packaged baseline — so a re-emitted object comes
-    /// back with that property NULL. If the fingerprint is the raw serialized symbol, every
-    /// modified codeunit therefore reads as "its surface moved", pulls in its direct callers,
-    /// and those pull in theirs: measured on this fixture, a one-line body edit went from 1
-    /// re-emitted object to 3, with two rounds of "rebinding direct caller file(s)". On an app
-    /// the size of NP Retail that is the difference between a delta and a cascade.</para>
+    /// writes. That used to be asymmetric — the full compile got a file system, the RAD one did
+    /// not — so a re-emitted object came back with that property NULL. If the fingerprint is the
+    /// raw serialized symbol, every modified codeunit therefore reads as "its surface moved",
+    /// pulls in its direct callers, and those pull in theirs: measured on this fixture, a
+    /// one-line body edit went from 1 re-emitted object to 3, with two rounds of "rebinding
+    /// direct caller file(s)". On an app the size of NP Retail that is the difference between a
+    /// delta and a cascade.</para>
+    ///
+    /// <para>The delta is now constructed with the same file system, so both producers record
+    /// the identical relative path and the canonicalisation no longer has anything to do here.
+    /// These two tests keep their teeth regardless: withhold the file system from the RAD
+    /// compilation alone and they fail again, the body edit pulling in
+    /// <c>RAD Perf Unrelated A</c>. That is what makes them a check on the fingerprint rather
+    /// than on one BC release's serializer.</para>
     ///
     /// <para>Both directions, because a fingerprint that ignored too much would be worse than
     /// one that ignores too little: the body edit must stay at one object, and changing the
@@ -657,27 +685,26 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
 
     /// <summary>
     /// A `controladdin` declaring a resource file (`StartupScript`, `Scripts`, `StyleSheets`,
-    /// `Images`) must compile on the delta path exactly as it does on the full-compile one.
+    /// `Images`) must be adjudicated BY THE DELTA, exactly as the full compile adjudicates it.
     ///
-    /// <para>BC resolves those paths through an <c>IFileSystem</c> the compilation is given
-    /// (#1899/#1912: <c>Emit</c> attaches one anchored at the app root). A RAD compilation
-    /// cannot be given one — <c>Compilation.CreateForRad</c> takes no file-system parameter,
-    /// and attaching one afterwards with <c>WithFileSystem</c> returns a compilation that has
-    /// LOST its packaged module definition, so every object outside the delta stops resolving
-    /// (measured: AL0247 for the target table of an untouched tableextension). So the delta
-    /// cannot adjudicate a resource path at all, and must hand the question to the compile
-    /// that can.</para>
+    /// <para>BC resolves those paths through an <c>IFileSystem</c> the compilation is given,
+    /// anchored at the app root (#1899/#1912). <c>Compilation.CreateForRad</c> takes one as its
+    /// optional parameter 12 and the delta now passes it, under the same
+    /// <c>appRootDir != null &amp;&amp; Directory.Exists</c> guard the full compile uses — so
+    /// neither path can answer a resource question the other cannot.</para>
     ///
-    /// <para>Without that, editing one line of such an add-in failed the whole cycle with
-    /// AL0327 "Missing file" for a file that is present at the declared path — 0 tests run,
-    /// COMPILE FAIL — on a tree whose cold compile is clean.</para>
+    /// <para>Before that, the delta had no file system, raised AL0327 "Missing file" for a file
+    /// present at the declared path, and the cycle had to hand the whole module to a full
+    /// compile to find out. Measured on this fixture: 20 objects re-emitted for a one-line
+    /// property edit to an add-in that emits no C# at all.</para>
     ///
     /// <para>Both directions, because a fix that simply suppressed AL0327 would pass the first
     /// half and hide every real typo: a resource path that genuinely does not exist must still
-    /// raise AL0327 naming that file.</para>
+    /// raise AL0327 naming that file — and now from the delta itself, without spending a
+    /// whole-module compile to say so.</para>
     /// </summary>
     [SkippableFact]
-    public void AControlAddInResourcePath_IsAnsweredByTheFullCompile_NotSilencedAndNotFailed()
+    public void AControlAddInResourcePath_IsAnsweredByTheDelta_NotSilencedAndNotFailed()
     {
         TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
 
@@ -708,22 +735,103 @@ public sealed class RadObjectDeltaTests(BcEngineFixture engine)
             Assert.DoesNotContain("AL0327", string.Join(Environment.NewLine, edited.Emit.Diagnostics));
             Assert.True(edited.Emit.Diagnostics.Count == 0,
                 string.Join(Environment.NewLine, edited.Emit.Diagnostics));
-            edited.Commit(
-                baseline.Workspace,
-                edited.Emit.Sources.Count == 0
-                    ? null
-                    : RadFixture.AssembleAndLoad(baseline.Workspace, edited.Emit.Sources));
+            // The claim this test exists for: the delta ANSWERED. A controladdin emits no C#,
+            // so a delta that resolved the path emits nothing at all — where the fallback
+            // re-emitted all 20 objects and said so.
+            Assert.False(edited.FullRebuild);
+            Assert.Empty(edited.Emit.Sources);
+            Assert.DoesNotContain(
+                "file resource (AL0327)",
+                string.Join(" | ", AlRunner.Rad.RadCycleNotes.Drain()));
+            edited.Commit(baseline.Workspace, null);
             baseline.AssertSettled(tempRoot);
 
             // Negative: point it at a file that is not there. The answer must still be AL0327
-            // naming that path — the fallback exists to let the compiler decide, not to make
-            // the diagnostic go away.
+            // naming that path — the delta was given a file system so it could tell the two
+            // apart, not so it could stop reporting either.
             RadFixture.ReplaceExactlyOnce(
                 addin, "StartupScript = 'src/addin/startup.js';", "StartupScript = 'src/addin/absent.js';");
             var broken = baseline.Cycle(tempRoot, appRootDir: tempRoot);
             var reported = string.Join(Environment.NewLine, broken.Emit.Diagnostics);
             Assert.Contains("AL0327", reported);
             Assert.Contains("absent.js", reported);
+            Assert.False(broken.FullRebuild);
+            Assert.DoesNotContain(
+                "file resource (AL0327)",
+                string.Join(" | ", AlRunner.Rad.RadCycleNotes.Drain()));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Giving the RAD compilation a file system must not cost it its packaged module
+    /// definition — the thing that lets every object the delta did NOT re-parse still resolve.
+    ///
+    /// <para>This is not hypothetical. The obvious way to attach one —
+    /// <c>rad.WithFileSystem(new RelativeFileSystem(appRoot))</c> on the compilation
+    /// <c>CreateForRad</c> returned — measurably loses it. Run against this exact scenario it
+    /// answers:</para>
+    /// <code>
+    /// RadPerfHeaderExtA.TableExt.al@3:54: error AL0247:
+    ///     The target Table 'RAD Perf Header' for the extension object is not found
+    /// </code>
+    /// <para>…and emits zero objects, because the extension's target lives only in the packaged
+    /// definition that clone dropped. Passing the same file system as <c>CreateForRad</c>'s
+    /// <c>fileSystem</c> parameter does not: the delta below re-emits its one tableextension
+    /// and binds the target out of the packaged definition, as it did with no file system
+    /// at all.</para>
+    ///
+    /// <para>A body edit to a plain codeunit would NOT catch this — it needs nothing from the
+    /// packaged definition and stays green either way (measured). The probe has to be an
+    /// extension object whose target is untouched.</para>
+    /// </summary>
+    [SkippableFact]
+    public void ADeltaGivenAFileSystem_StillResolvesAnUntouchedExtensionTarget()
+    {
+        TestArtifacts.SkipIf(!engine.Ready, engine.SkipReason ?? "BC engine not ready");
+
+        var tempRoot = RadFixture.Copy(ScenarioDir);
+        try
+        {
+            using var identity = BcCompiler.ScopeCurrentAppIdentity(
+                RadFixture.AppId, RadFixture.Publisher, RadFixture.AppVersion);
+            // appRootDir is what makes the file system real — without it there is nothing to
+            // attach and this scenario cannot fail.
+            var baseline = RadFixture.Seed(tempRoot, appRootDir: tempRoot);
+            AlRunner.Rad.RadCycleNotes.Drain();
+
+            var extension = RadFixture.SourceFile(tempRoot, "RadPerfHeaderExtA.TableExt.al");
+            RadFixture.ReplaceExactlyOnce(extension, "'extension-a-v1'", "'extension-a-v2'");
+            var edited = baseline.Cycle(tempRoot, appRootDir: tempRoot);
+
+            Assert.DoesNotContain("AL0247", string.Join(Environment.NewLine, edited.Emit.Diagnostics));
+            Assert.True(edited.Emit.Diagnostics.Count == 0,
+                string.Join(Environment.NewLine, edited.Emit.Diagnostics));
+            Assert.False(edited.FullRebuild);
+            Assert.Empty(AlRunner.Rad.RadCycleNotes.Drain());
+            Assert.Equal(["RAD Perf Header Ext A"], RadFixture.EmittedNames(edited));
+
+            var assembly = RadFixture.AssembleAndLoad(baseline.Workspace, edited.Emit.Sources);
+            edited.Commit(baseline.Workspace, assembly);
+            baseline.AssertSettled(tempRoot);
+
+            // Negative: the same delta must still FAIL when the target genuinely is not there,
+            // and fail with THIS diagnostic. Deleting the target table leaves the extension
+            // bound to nothing, so the answer has to be the very AL0247 the positive half just
+            // proved absent — not a clean cycle, not the packaged definition quietly serving the
+            // old table, and not some other error that merely happens to name the table.
+            File.Delete(RadFixture.SourceFile(tempRoot, "RadPerfHeader.Table.al"));
+            var orphaned = baseline.Cycle(tempRoot, appRootDir: tempRoot);
+            var reported = string.Join(Environment.NewLine, orphaned.Emit.Diagnostics);
+            Assert.Contains("AL0247", reported);
+            Assert.Contains(
+                "The target Table 'RAD Perf Header' for the extension object is not found",
+                reported);
+            Assert.False(orphaned.FullRebuild);
+            Assert.Empty(orphaned.Emit.Sources);
         }
         finally
         {
