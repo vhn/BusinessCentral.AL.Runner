@@ -13,26 +13,36 @@ It carries **85 commits** that are not upstream yet (298 files, +28,333 / −711
 the **first** compile of a large app, and what a **save** costs once the runner is watching.
 
 Measured on **NP Retail** — npcore, 7,053 + 286 `.al` files, 6,949 AL objects, BC 28.1 — as one
-bundle with one test codeunit selected, on an otherwise idle 6-core / 12 GB Mac. The runner is
-exactly as shipped: no environment overrides, no flags beyond `--watch --test`. Each row is one
-scripted edit in a single `--watch` session, timed from save to results on screen; the cold row
-includes compiling the bundle's dependency apps from AL.
+bundle on an otherwise idle 6-core / 12 GB Mac. The runner is exactly as shipped: no environment
+overrides, no flags beyond `--watch --test Codeunit85257`, which selects one 30-test suite. Each
+row is one scripted edit in a single `--watch` session, timed from save to results on screen; the
+cold row includes compiling the bundle's dependency apps from AL.
 
-| What you do | this fork | what the cycle actually did |
-|---|---:|---|
-| **Cold compile** — fresh cache, nothing warm | **282 s** | full compile of both apps + the delta baseline snapshot |
-| **`--watch` — change a codeunit** | **5 s** | `delta +0 ~1 -0` · 1 object re-emitted in 0.8 s |
-| **`--watch` — add a codeunit** | **5 s** | `delta +1 ~0 -0` · the new object only |
-| **`--watch` — delete a codeunit** | **6 s** | `delta +0 ~0 -1` · nothing re-emitted, the name is tombstoned |
-| *Edit shapes that used to cost a whole-module rebuild* | | |
-| First edit after the runner starts | **8 s** | `delta +0 ~1 -0` — the cold compile left a baseline behind, so the very first edit already deltas |
-| Copy-paste a `.al` file → duplicate object id | **1 s** | `AL0264` reported, workspace untouched, **no rebuild** |
-| Copy-paste a procedure → duplicate method | **2 s** | `AL0440` reported, **no rebuild** |
-| Rename an object (same id, new name) | **6 s** | `delta +0 ~1 -0` — a renamed object is still a delta, not an add+remove |
-| Add a field to an existing table | **5 s** | `delta +0 ~1 -0` |
-| Change an existing table field | **5 s** | `delta +0 ~1 -0` |
-| Add an action to an existing page | **5 s** | `delta +0 ~1 -0` |
-| Save a file back to its original bytes | **4 s** | **no compile at all** — the tree re-hashes identical |
+**Read the `tests re-run` column together with the seconds.** Every cycle below re-executes all
+30 selected tests, and that alone is ~2.0 s of each warm number — so these rows measure a
+compile-plus-run loop, not a compiler. Widen the `--test` filter and every row grows with it while
+the compile work stays exactly the same; narrow it and the warm rows approach the sub-second delta
+underneath. The two rows that re-run **0** tests are the ones where the AL error is the whole
+point: the cycle reports the duplicate and never gets to a test run.
+
+| What you do | this fork | tests re-run | what the cycle actually did |
+|---|---:|---:|---|
+| **Cold compile** — fresh cache, nothing warm | **282 s** | 30 | full compile of both apps + the delta baseline snapshot |
+| **`--watch` — change a codeunit** | **5 s** | 30 | `delta +0 ~1 -0` · 1 object re-emitted in 0.8 s |
+| **`--watch` — add a codeunit** | **5 s** | 30 | `delta +1 ~0 -0` · the new object only |
+| **`--watch` — delete a codeunit** | **6 s** | 30 | `delta +0 ~0 -1` · nothing re-emitted, the name is tombstoned |
+| *Edit shapes that used to cost a whole-module rebuild* | | | |
+| First edit after the runner starts | **8 s** | 30 | `delta +0 ~1 -0` — the cold compile left a baseline behind, so the very first edit already deltas |
+| Copy-paste a `.al` file → duplicate object id | **1 s** | 0 † | `AL0264` reported, workspace untouched, **no rebuild** |
+| Copy-paste a procedure → duplicate method | **2 s** | 0 † | `AL0440` reported, **no rebuild** |
+| Rename an object (same id, new name) | **6 s** | 30 | `delta +0 ~1 -0` — a renamed object is still a delta, not an add+remove |
+| Add a field to an existing table | **5 s** | 30 | `delta +0 ~1 -0` |
+| Change an existing table field | **5 s** | 30 | `delta +0 ~1 -0` |
+| Add an action to an existing page | **5 s** | 30 | `delta +0 ~1 -0` |
+| Save a file back to its original bytes | **4 s** | 30 | **no compile at all** — the tree re-hashes identical |
+
+† No tests ran: the AL error is the result, and the workspace is left untouched so the save that
+renumbers or renames the copy deltas straight away.
 
 Cycles 2 and 3 are the ones that prove a delta *ran* rather than merely compiled: flipping a
 `Label` the suite asserts verbatim turns it **28 pass / 2 fail**, and reverting it returns
