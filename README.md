@@ -38,6 +38,15 @@ Cycles 2 and 3 are the ones that prove a delta *ran* rather than merely compiled
 `Label` the suite asserts verbatim turns it **28 pass / 2 fail**, and reverting it returns
 **30 / 0**. The delta-compiled application code really executed.
 
+Those seconds are end-to-end, so most of a warm cycle is not compilation. A representative one
+(change a table field, 5 s on the clock) breaks down as **0.65 s delta compile** — bind and
+generate C# for the one changed object — plus 0.09 s to Roslyn, 0.10 s to load the overlay,
+0.69 s to register and publish symbols, 0.40 s of `RecordPatches` source registration, 0.09 s to
+hash the 7,053-file tree, and then **2.0 s actually executing the 30 tests**. The runner's own
+accounting for that cycle is 3.3 s; the rest is the quiescence debounce, the dashboard, and the
+harness's one-second polling granularity. Compile time is the small part — which is the point of
+the section below.
+
 ### Initial cold compilation performance
 
 Everything in this group is about the one-shot / first-cycle compile of a real app. Nothing here
@@ -208,8 +217,10 @@ Noteworthy changes, in the order they matter:
   `Apply*(records)` half, memoized on (path, content hash, preprocessor symbols), and the
   unchanged files' records are **replayed** in enumeration order. Replay rather than retraction is
   what makes it tractable: the `tableextension` dictionaries accumulate by base-table name in AL
-  declaration order, so one file's contribution genuinely cannot be subtracted. Measured
-  **7.12/7.20/6.06 s → 0.15/0.14/0.12 s** across three warm cycles, at 7,339 parses each → 0.
+  declaration order, so one file's contribution genuinely cannot be subtracted. On the corpus and
+  host the table above was measured on, the stage goes **1.3–1.9 s → 0.24–0.61 s** per warm cycle;
+  the commit's own A/B, taken on a more contended host where the same stage cost 6–7 s, recorded
+  **7.1 s → 0.14 s**. Either way it stops being the largest line item in a warm cycle.
 - **Id-less object kinds delta instead of rebuilding the module** (`0acaf95b`, `81ffbbc5`).
   `interface`, `controladdin`, `profile`, `pagecustomization`, `profileextension` and
   `entitlement` have no object id. On NP Retail that was 84 of 7,339 files where any edit — a
