@@ -30,7 +30,7 @@ whole-module `Emit` when the app has a baseline and the edit is expressible as a
 `Compilation.CreateForRad` re-emits only the changed objects into a small overlay assembly
 loaded beside the module. Everything downstream (Roslyn, `Assembly.Load`, `TestExecutor`) is
 unchanged, and anything the delta cannot classify falls back to the full compile above. See
-`docs/delta-compile.md`.
+`README.md`, "Watch-mode delta compilation".
 
 There is **no type-renaming** layer. The `NavRecordHandle`, `NavSession`, `NavMethodScope` etc. the precompiled BaseApp / SystemApp DLLs reference are the same instances the AL tests touch. v1's `RoslynRewriter`, `MockX.cs` runtime, `AlRunner.Runtime` namespace, and `stubs/` AL stubs are all gone.
 
@@ -76,7 +76,7 @@ When AL test code reaches a surface the runner cannot faithfully support, throw 
 | `AlRunner/Infrastructure/RunnerOutOfScopeException.cs` | Typed OOS exception (named API + reason) |
 | `AlRunner/Patches/*.cs` | Per-API JMP-hook patches (CodeunitPatches, RecordPatches, MetadataPatches, NavRecordIdPatches, etc.) |
 | `AlRunner/WatchSource.cs` | `--watch` file watchers: armed once per process, queue changed paths, quiescence debounce |
-| `AlRunner/Rad/*.cs` | Delta compilation for `--watch` — workspace/baseline, object identity, `CreateForRad` cycle, generation ownership, metadata buffering, cache sidecar. See `docs/delta-compile.md` |
+| `AlRunner/Rad/*.cs` | Delta compilation for `--watch` — workspace/baseline, object identity, `CreateForRad` cycle, generation ownership, metadata buffering, cache sidecar. See `README.md`, "Watch-mode delta compilation" |
 
 ## Exit codes
 
@@ -91,7 +91,7 @@ When AL test code reaches a surface the runner cannot faithfully support, throw 
 
 Defined in `AlRunner/Program.cs`. **`al-runner --help` is the authoritative list** — it is generated from the parser and `CliDocumentationTests` pins it against drift, so read it rather than trusting any inventory written here.
 
-The ones worth knowing before you read it: `--out`, `--package-cache` (repeatable), `--cache`, `--no-cache` (disables EVERY on-disk cache, not just al-out), `--isolation {codeunit|test|disabled}`, `--watch` (delta compilation — see `docs/delta-compile.md`), `--server` (JSON-RPC daemon — see `docs/server-mode.md`), `--test`, `--bc-version`, `--define`, `--coverage`, `--guide`, `--verbose`, `--show-pass`, `--precompile <input.app>` (subcommand). Environment: `AL_RUNNER_VERBOSE`, `AL_RUNNER_SHOW_PASS`, `AL_RUNNER_TRACE_NRE`, `AL_RUNNER_PHASE_LOG`, `AL_RUNNER_RAD=0` (bisect a suspected delta bug).
+The ones worth knowing before you read it: `--out`, `--package-cache` (repeatable), `--cache`, `--no-cache` (disables EVERY on-disk cache, not just al-out), `--isolation {codeunit|test|disabled}`, `--watch` (delta compilation — see `README.md`, "Watch mode"), `--server` (JSON-RPC daemon — see `docs/server-mode.md`), `--test`, `--bc-version`, `--define`, `--coverage`, `--guide`, `--verbose`, `--show-pass`, `--precompile <input.app>` (subcommand). Environment: `AL_RUNNER_VERBOSE`, `AL_RUNNER_SHOW_PASS`, `AL_RUNNER_TRACE_NRE`, `AL_RUNNER_PHASE_LOG`, `AL_RUNNER_RAD=0` (bisect a suspected delta bug).
 
 No `--stubs`, `--dap`, `--extract-deps` — those were v1, and `--help` says so under its own "not implemented" heading.
 
@@ -106,6 +106,6 @@ As of 2026-05-20, new runtime patches go through Cecil IL rewriting (`NclCecilRe
 - `docs/limitations.md` — hard architectural limits
 - `docs/expectations.md` — expectation-manifest schema
 - `docs/cecil-migration.md` — Cecil-rewrite contract and roadmap
-- `docs/delta-compile.md` — what `--watch` recompiles, and why a cycle ever compiles in full
+- `README.md` § "Watch-mode delta compilation" — what `--watch` recompiles, and why a cycle ever compiles in full
 - `.claude/rules/precompiled-dll-respect.md` — the load-chain contract
 - `.claude/rules/loud-failures.md` — runtime-side OOS-throw contract

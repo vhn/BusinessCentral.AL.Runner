@@ -3975,7 +3975,7 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("  --watch                 Stay resident with warm dependencies and re-run IN-PROCESS");
     w.WriteLine("                          when .al source or app.json changes. Each save recompiles");
     w.WriteLine("                          and reloads only the AL objects it changed, added or");
-    w.WriteLine("                          removed. Ctrl+C to quit. See docs/delta-compile.md.");
+    w.WriteLine("                          removed. Ctrl+C to quit. See README.md, Watch mode.");
     w.WriteLine("  --server                Long-running JSON-RPC daemon over stdin/stdout (warm");
     w.WriteLine("                          deps + BC patches loaded once; ~19s->~4s per run). One");
     w.WriteLine("                          JSON request/response per line. stdout carries ONLY the");

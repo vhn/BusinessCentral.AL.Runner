@@ -17,14 +17,11 @@
 //   and the extractors' walk over an already-built tree (milliseconds).
 //
 // REPLAY, NOT RETRACTION
-//   docs/delta-compile.md records why this looked blocked: making it proportional needs
-//   file->parsed-entry provenance, and "the tableextension dictionaries are keyed by
-//   base-table name and accumulate, so one file's contribution cannot currently be retracted."
-//   That is true, and it rules out the tempting design — keep the dictionaries across cycles
-//   and patch the changed files. Two things break it: _extensionIdsByBaseTable is an ORDERED
-//   accumulate whose order is AL declaration order (it drives record-trigger dispatch), and an
-//   object deleted from an edited file would linger, answering for something the source no
-//   longer declares.
+//   The tempting design — keep the dictionaries across cycles and patch only the changed
+//   files — needs one file's contribution to be retractable, and it is not. Two things break
+//   it: _extensionIdsByBaseTable is an ORDERED accumulate keyed by base-table name whose order
+//   is AL declaration order (it drives record-trigger dispatch), and an object deleted from an
+//   edited file would linger, answering for something the source no longer declares.
 //
 //   Replay sidesteps both. ResetForReload still clears everything exactly as before; what
 //   changes is only where each file's contribution comes from. An unchanged file's records are

@@ -202,6 +202,5 @@ public sealed class CliDocumentationTests
         if (next > 0) entry = entry[..next];
 
         Assert.Contains("only the AL objects", entry, StringComparison.Ordinal);
-        Assert.Contains("docs/delta-compile.md", entry, StringComparison.Ordinal);
     }
 }

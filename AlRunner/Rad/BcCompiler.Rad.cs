@@ -768,9 +768,6 @@ public sealed partial class BcCompiler
         // is gone, and then it is loud. So the repair is attached to the diagnostic instead —
         // one widened retry, from the three points below where this cycle would otherwise
         // return an AL error. Everything that binds clean pays nothing.
-        //
-        // See docs/delta-compile.md, "A delta damages surface a bystander holds only because
-        // the stripped object exists".
         bool TryRebindDamagedBystanders(out RadEmitResult? repaired)
         {
             repaired = null;

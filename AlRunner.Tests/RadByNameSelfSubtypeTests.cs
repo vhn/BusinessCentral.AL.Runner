@@ -4,7 +4,7 @@
 // `RadByNameSubtypeTests` pins `TypeDefinition.Subtype` — 13,610 occurrences on npcore, the
 // widest by-name exposure there is — as needing no widening rule: the delta strips the table, the
 // untouched bystander's `var t: Record "Subtype Target"` parameter still resolves, and the cycle
-// matches a cold compile. `docs/delta-compile.md` concluded from that "it is not exposure at all".
+// matches a cold compile.
 //
 // Editing npcore's `codeunit 6150705 "NPR POS Sale"` says the opposite: seven
 // `AL0133: Argument N: cannot convert from 'Codeunit "NPR POS Sale"' to '__MissingTypeSymbol__'`,
