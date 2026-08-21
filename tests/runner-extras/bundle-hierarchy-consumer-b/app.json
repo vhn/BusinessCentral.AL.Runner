@@ -1,0 +1,38 @@
+{
+  "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e62",
+  "name": "HCB Hierarchy Consumer B",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "brief": "Level-3 consumer: depends on the shared library AND sideways on consumer A, its co-dependent.",
+  "description": "The first app in this bundle that depends on a sibling which itself depends on another sibling — HCB -> HCA -> HSL is the bundle's first transitive chain, and HCB -> {HSL, HCA} its first diamond. Contributes: a Contribute() that forwards through HCA into the library, a broadcast subscriber, a tableextension on the SHARED LIBRARY's table (a second app extending the same sibling-owned table as HCA), an enumextension on the shared library's enum, and a sideways read of HCA's extension field on a row HCA inserted. See HTS Hierarchy Tests.",
+  "privacyStatement": "",
+  "EULA": "",
+  "help": "",
+  "url": "",
+  "logo": "",
+  "dependencies": [
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e60",
+      "name": "HSL Hierarchy Shared Lib",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    },
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e61",
+      "name": "HCA Hierarchy Consumer A",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    }
+  ],
+  "screenshots": [],
+  "idRanges": [
+    {
+      "from": 64580,
+      "to": 64589
+    }
+  ],
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "15.0",
+  "target": "Cloud"
+}
