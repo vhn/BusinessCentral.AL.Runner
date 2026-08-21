@@ -345,6 +345,107 @@ public static class ProvisioningCheck
     public static string TestAppsDirFor(string artifactsRootDir, string fullVersion)
         => Path.Combine(artifactsRootDir, fullVersion, "test-apps");
 
+    // ── Reusing an already-provisioned set instead of re-downloading it ───────
+    // The download destinations above were write-only: nothing ever asked whether they
+    // were ALREADY populated before fetching into them again. `EnsurePlatformAppsProvisioned`
+    // decided "there is a gap" from the target bundle's own `.alpackages`, which vendors
+    // symbol-only packages permanently (the runner must never write into the user's
+    // project — #1653), so its check was unsatisfiable by construction and it re-downloaded
+    // ~106 MB on every single invocation. The startup gate had the same hole one step over:
+    // it scans the DEFAULT package caches, which compose these two dirs from the SELECTED
+    // version only, so a set provisioned for any other version — the common case, since the
+    // version the download targets is derived from the project's vendored symbols, not from
+    // the engine — was invisible on the next run.
+    //
+    // These two helpers are DISCOVERY, deliberately not adjudication: they answer "is there
+    // a plausible already-provisioned set for this major.minor?" with a pure filesystem
+    // scan. Callers fold the hit into the dirs they scan and then re-run the authoritative
+    // predicate (CheckPlatformApps / TestToolkitPresent) over the combined set. That split
+    // matters: a discovery predicate strict enough to be authoritative on its own would
+    // re-download forever the moment a BC version shipped one fewer platform app than we
+    // expect, which is the very failure being fixed here.
+    //
+    // No network, by design. Resolving major.minor → a full version costs a CDN index
+    // fetch and returns null when offline, so checking the destination only AFTER that
+    // resolve would still pay a round-trip on every warm run and would fail outright on a
+    // fully provisioned but offline machine.
+
+    /// <summary>
+    /// The runner-owned <c>platform-apps</c> directory of the highest already-provisioned
+    /// version matching <paramref name="majorMinor"/> that carries at least one Microsoft
+    /// platform runtime app as an R2R package, or null when there is none.
+    ///
+    /// <para>Highest-matching mirrors what a fresh download would produce
+    /// (<c>ArtifactDownloader.ResolveVersion</c> returns the latest published build for a
+    /// prefix), so reusing it pairs the same R2R build with the project's symbols that
+    /// downloading would have. The prefix match is segment-wise
+    /// (<see cref="BcArtifacts.VersionNameMatchesPrefix"/>), so "27.5" never matches
+    /// "27.50.x".</para>
+    /// </summary>
+    public static string? FindProvisionedPlatformAppsDir(string artifactsRootDir, string majorMinor)
+        => FindProvisionedDir(artifactsRootDir, majorMinor, PlatformAppsDirFor, HasAnyR2RPlatformApp);
+
+    /// <summary>
+    /// The runner-owned <c>test-apps</c> directory of the highest already-provisioned
+    /// version matching <paramref name="majorMinor"/> in which the Microsoft test toolkit is
+    /// actually present (<see cref="TestToolkitPresent"/>), or null when there is none.
+    /// A directory holding some toolkit apps but not the sentinel is a partial download and
+    /// is deliberately NOT a hit.
+    /// </summary>
+    public static string? FindProvisionedTestAppsDir(string artifactsRootDir, string majorMinor)
+        => FindProvisionedDir(artifactsRootDir, majorMinor, TestAppsDirFor,
+            dir => TestToolkitPresent(new[] { dir }));
+
+    private static string? FindProvisionedDir(
+        string artifactsRootDir, string majorMinor,
+        Func<string, string, string> dirFor, Func<string, bool> satisfied)
+    {
+        if (string.IsNullOrEmpty(artifactsRootDir) || string.IsNullOrEmpty(majorMinor)) return null;
+        if (!Directory.Exists(artifactsRootDir)) return null;
+
+        IEnumerable<string> children;
+        try { children = Directory.EnumerateDirectories(artifactsRootDir); }
+        catch { return null; }
+
+        var candidates = children
+            .Select(d => Path.GetFileName(
+                d.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)))
+            .Where(name => BcArtifacts.VersionNameMatchesPrefix(name, majorMinor))
+            .Select(name => (Name: name, Ver: System.Version.TryParse(name, out var v) ? v : null))
+            .Where(t => t.Ver != null)
+            .OrderByDescending(t => t.Ver)
+            .ToList();
+
+        foreach (var (name, _) in candidates)
+        {
+            var dir = dirFor(artifactsRootDir, name);
+            if (!Directory.Exists(dir)) continue;
+            try { if (satisfied(dir)) return dir; }
+            catch { /* unreadable candidate — try the next one rather than failing the run */ }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// True if <paramref name="dir"/> holds at least one Microsoft platform runtime app
+    /// (<see cref="KnownPlatformRuntimeApps"/>) as an R2R package. Non-empty-ness alone is
+    /// not enough: a directory of symbol-only packages cannot execute anything, and treating
+    /// it as provisioned would bury the provisioning gap one layer deeper instead of
+    /// reporting it.
+    /// </summary>
+    private static bool HasAnyR2RPlatformApp(string dir)
+    {
+        foreach (var appFile in Directory.EnumerateFiles(dir, "*.app", SearchOption.AllDirectories))
+        {
+            var m = AlRunner.AppLoader.ReadManifest(appFile);
+            if (m == null) continue;
+            if (!string.Equals(m.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsKnownPlatformRuntimeApp(m.Name)) continue;
+            if (AlRunner.AppLoader.IsR2R(appFile)) return true;
+        }
+        return false;
+    }
+
     public sealed record Report(string Version, string ServiceTierDir, IReadOnlyList<string> MissingFiles)
     {
         public bool Ok => MissingFiles.Count == 0;

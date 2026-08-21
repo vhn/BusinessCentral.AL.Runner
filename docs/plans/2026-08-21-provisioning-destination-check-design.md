@@ -55,12 +55,22 @@ This is what keeps the change independent of the version-derivation problems (se
 
 ### Call sites
 
+Four, not three — the startup gate's **toolkit** branch has the same hole as its platform
+branch: it checks dirs keyed on `SelectedVersion` but downloads to a dir keyed on the
+version derived from the platform apps, so those disagree in exactly the common case.
+
 | site | today | after |
 |---|---|---|
 | `EnsurePlatformAppsProvisioned` | scans bundle `.alpackages` only → always downloads | scans the provisioned set for the derived `major.minor` first; reuses on a hit |
-| startup gate (`--auto-provision` branch) | scans `packageCacheDirs + bundle .alpackages` | folds a matching provisioned set into `packageCacheDirs` before deciding, so the gate is satisfied without downloading and resolution sees the apps |
+| startup gate, platform branch | scans `packageCacheDirs + bundle .alpackages` | folds a matching provisioned set into `packageCacheDirs` before deciding, so the gate is satisfied without downloading and resolution sees the apps |
+| startup gate, toolkit branch | same hole, second artifact set | same fix, via `FindProvisionedTestAppsDir` |
 | gate's post-download re-check | unchanged predicate | unchanged (already correct) |
 | `EnsureTestToolkitProvisioned` | `Directory.Exists && any *.app` | the real `TestToolkitPresent` predicate, so a partial download stops reading as a hit |
+
+Both gate branches are placed **ahead of the loud `exit 2` bail**, not merely ahead of the
+download. A machine holding a complete provisioned set must never be told it has a
+provisioning gap — without `--auto-provision` today it exits 2 while owning everything it
+needs.
 
 ### Reuse is loud
 
@@ -82,17 +92,36 @@ temp dir:
   `Directory.Exists` check)
 - two provisioned versions match the prefix → the highest wins
 
-**Integration** — a subprocess run that proves the whole gate reuses instead of resolving:
+**Integration** — subprocess runs that prove the real code paths reuse instead of resolving.
 
-- child env `HOME` (and `USERPROFILE`) point at a temp dir, so `ArtifactsRoot` relocates
-  without an env-override hook the runner does not have
-- `--artifact-path <real engine dir>` supplies the engine, so the run gets past selection
-- the fixture uses a **fabricated BC version that does not exist on the CDN** (`99.0`), so
-  the pre-fix path fails at `ResolveVersion` with
-  `could not resolve a full BC artifact version for '99.0'` instead of pulling 100 MB.
-  That message *is* the assertion of the bug: reaching the network at all means the
-  provisioned dir was ignored.
-- post-fix, the reuse line appears, no resolve is attempted, and the run proceeds
+All of them relocate the artifacts root with a new env var, **`AL_RUNNER_ARTIFACTS_ROOT`**.
+This is a real capability gap the tests exposed rather than test scaffolding: `--artifact-path`
+pins *one version's engine dir* and cannot express "the root those version dirs live under",
+so the root was previously reachable only by moving `HOME` — which drags every other
+home-rooted path along (cache roots, default package caches) and forces the caller to rebuild
+the `.local/share/al-runner/artifacts` layout by hand. That hand-spelled path is exactly what
+`TestArtifactsGateTests.OnlyTheSharedHelperNamesTheArtifactCachePathsInCode` exists to forbid,
+and it duly failed the first attempt. Documented in `--help` under ENVIRONMENT; its resolution
+is a pure `internal` helper so both directions are testable without mutating process env,
+which would race every other test reading the root.
+
+Every fixture uses a **fabricated BC version that does not exist on the CDN** (`99.0`), so the
+pre-fix path fails at `ResolveVersion` with `could not resolve a full BC artifact version`
+instead of pulling 100 MB. That message *is* the assertion of the bug: reaching the network at
+all means the provisioned dir was ignored.
+
+- **driver path** — `al-runner provision <bundle>`, fully synthetic. A synthetic engine (just
+  the six files `Check` looks for) suffices because `provision` returns before anything loads
+  the engine, so this needs no BC install and runs anywhere.
+- **contrast** — same, with the provisioned set absent: must still reach the CDN. An
+  "always reuse" implementation fails here.
+- **run path** — the startup gate, with the real engine via `--artifact-path`, asserting the
+  reuse line, no resolve, and that the bundle's test actually executed.
+
+`--package-cache <empty dir>` on the run-path test is load-bearing: it *replaces* the default
+caches, which stops whichever Microsoft symbol packages happen to be cached on the host from
+changing which app the gate reports first — and therefore which `major.minor` the reuse lookup
+is keyed on. Without it the result depends on the machine.
 
 Both directions per `tdd.md`: the positive asserts reuse on a satisfied destination; the
 negative asserts a symbol-only destination still downloads, so a "always reuse" stub

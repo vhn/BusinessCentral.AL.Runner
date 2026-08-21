@@ -60,12 +60,45 @@ public static class BcArtifacts
 
     private static readonly object _lock = new();
 
-    private static string ArtifactsRoot => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ArtifactsRoot_Rel);
+    /// <summary>
+    /// Env var that relocates the whole artifacts root. Set it to a directory holding
+    /// version-named subdirs and every artifact path the runner derives — version
+    /// selection, the engine closure, and the runner-owned <c>platform-apps</c> /
+    /// <c>test-apps</c> provisioning destinations — moves with it.
+    ///
+    /// <para>Distinct from <c>--artifact-path</c>, which pins ONE version's engine dir.
+    /// This names the root the version scan and the provisioning destinations live under,
+    /// which <c>--artifact-path</c> cannot express.</para>
+    ///
+    /// <para>Exists because the root was otherwise only reachable by moving <c>HOME</c>,
+    /// which relocates every other home-rooted path too (caches, default package caches)
+    /// and forces anything wanting an isolated artifacts root to reconstruct the
+    /// <c>.local/share/al-runner/artifacts</c> layout by hand — a second spelling of a
+    /// path this class is supposed to own.</para>
+    /// </summary>
+    public const string ArtifactsRootEnvVar = "AL_RUNNER_ARTIFACTS_ROOT";
 
-    /// <summary>The per-user artifacts root (<c>~/.local/share/al-runner/artifacts</c>),
-    /// where each BC version lives in a version-named subdir. Public for the provisioning
-    /// flow, which downloads into <see cref="ArtifactDirFor"/> before selection runs.</summary>
+    /// <summary>
+    /// Pure resolution of the artifacts root: <paramref name="envOverride"/> when set to
+    /// something non-blank, else the home-rooted default under
+    /// <paramref name="userHome"/>. Separated from the property so both directions are
+    /// testable WITHOUT mutating the process environment — an in-process env-var test would
+    /// race every other test that reads this root, and this root is what decides where the
+    /// runner looks for a multi-GB engine.
+    /// </summary>
+    internal static string ResolveArtifactsRoot(string? envOverride, string userHome)
+        => !string.IsNullOrWhiteSpace(envOverride)
+            ? envOverride.Trim()
+            : Path.Combine(userHome, ArtifactsRoot_Rel);
+
+    private static string ArtifactsRoot => ResolveArtifactsRoot(
+        Environment.GetEnvironmentVariable(ArtifactsRootEnvVar),
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+
+    /// <summary>The per-user artifacts root (<c>~/.local/share/al-runner/artifacts</c>, or
+    /// <see cref="ArtifactsRootEnvVar"/> when set), where each BC version lives in a
+    /// version-named subdir. Public for the provisioning flow, which downloads into
+    /// <see cref="ArtifactDirFor"/> before selection runs.</summary>
     public static string ArtifactsRootDir => ArtifactsRoot;
 
     /// <summary>The artifact directory for a specific full version string.</summary>
@@ -179,7 +212,11 @@ public static class BcArtifacts
 
     // "27.5" matches "27.5.46862.48827"; "28.1.49838.50794" matches itself; "27.50"
     // does NOT match "27.5.x". Segment-wise prefix on the dotted name.
-    private static bool VersionNameMatchesPrefix(string name, string prefix)
+    //
+    // Public because ProvisioningCheck's provisioned-set discovery needs exactly this
+    // semantic when it asks "is there already a provisioned set for this major.minor?".
+    // A second copy of a matcher this subtle is how "27.50" starts matching "27.5.x".
+    public static bool VersionNameMatchesPrefix(string name, string prefix)
     {
         if (string.Equals(name, prefix, StringComparison.Ordinal)) return true;
         var ns = name.Split('.');

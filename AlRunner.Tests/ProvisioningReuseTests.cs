@@ -1,0 +1,469 @@
+// ProvisioningReuseTests — the runner must REUSE an already-provisioned runner-owned
+// artifact set instead of re-downloading it on every invocation.
+//
+// The defect these tests pin down
+// ------------------------------
+// `--auto-provision` re-downloaded the Microsoft platform R2R apps (~106 MB) on EVERY
+// invocation, forever, into a directory it then never read back. Two independent causes:
+//
+//   1. EnsurePlatformAppsProvisioned decided "there is a gap" by scanning only the target
+//      bundle's `.alpackages`. That directory vendors symbol-only packages permanently —
+//      by design, because the runner must never write into the user's project (#1653) — so
+//      the check was unsatisfiable by construction. It never looked at
+//      `<artifactsRoot>/<version>/platform-apps`, which is where its own download lands.
+//
+//   2. The startup gate scans `packageCacheDirs + bundle .alpackages`, and
+//      DefaultPackageCacheDirs composes the provisioned dirs from SelectedVersion ONLY. A
+//      set provisioned for any other version (the common case: the project's symbols are a
+//      different minor/major than the engine) is invisible on the next run, so a fully
+//      provisioned machine reports the same gap again.
+//
+// Ghost-test traps avoided
+// ------------------------
+// A "reuse whenever the directory exists" stub would pass the positive cases and FAIL
+// SymbolOnlyDestination_IsNotAHit / EmptyDestination_IsNotAHit — the destination is only a
+// hit when it actually satisfies the same R2R/toolkit predicate the gate applies.
+//
+// The subprocess test asserts on the runner reaching the CDN at all: the fixture uses a
+// fabricated BC version that does not exist on the artifact index, so the pre-fix run dies
+// in ResolveVersion. Reaching that message IS the bug (the provisioned dir was ignored),
+// and no real artifact is ever downloaded, so the test stays hermetic and network-cheap.
+
+using System.Diagnostics;
+using System.IO.Compression;
+using System.Text;
+using Xunit;
+using AlRunner.Infrastructure;
+
+namespace AlRunner.Tests;
+
+public sealed class ProvisioningReuseTests : IDisposable
+{
+    private static readonly string RepoRoot = Path.GetFullPath(
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
+    private static readonly string ProjectPath = Path.Combine(RepoRoot, "AlRunner");
+
+    // A BC version that will never exist on Microsoft's artifact index. Any code path that
+    // tries to RESOLVE it has, by definition, decided to download rather than reuse.
+    private const string FakeVersion = "99.0.1.2";
+    private const string FakeMajorMinor = "99.0";
+    // A synthetic engine version for the fully-offline `provision` cases. Distinct from
+    // FakeVersion so a reuse hit can never be an accident of both sides sharing a prefix.
+    private const string SyntheticEngineVersion = "98.7.6.5";
+
+    private readonly string _root;
+
+    public ProvisioningReuseTests()
+    {
+        _root = Path.Combine(Path.GetTempPath(), "al-runner-prov-reuse", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_root);
+    }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_root, recursive: true); } catch { }
+    }
+
+    // ── .app fabrication ──────────────────────────────────────────────────────
+    // Same NAVX shape ProvisioningCheckTests uses: an 8-byte "NAVX" header followed by a
+    // zip. R2R-ness is decided by the presence of a `publishedartifacts/*.dll` entry, which
+    // is exactly what AppLoader.IsR2R looks for.
+
+    private static byte[] Navx(string appId, string name, string publisher, string version,
+        bool r2r)
+    {
+        var xml = $"""
+            <?xml version="1.0" encoding="utf-8"?>
+            <Package xmlns="http://schemas.microsoft.com/navx/2015/manifest">
+              <App Id="{appId}" Name="{name}" Publisher="{publisher}" Version="{version}"/>
+            </Package>
+            """;
+        using var ms = new MemoryStream();
+        using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            using (var es = zip.CreateEntry("NavxManifest.xml").Open())
+                es.Write(Encoding.UTF8.GetBytes(xml));
+            if (r2r)
+                using (var ds = zip.CreateEntry("publishedartifacts/app.dll").Open())
+                    ds.Write(new byte[] { 0x4D, 0x5A }); // fake PE header
+        }
+        var zipBytes = ms.ToArray();
+        var result = new byte[8 + zipBytes.Length];
+        result[0] = (byte)'N'; result[1] = (byte)'A'; result[2] = (byte)'V'; result[3] = (byte)'X';
+        BitConverter.TryWriteBytes(result.AsSpan(4, 4), (uint)8);
+        zipBytes.CopyTo(result, 8);
+        return result;
+    }
+
+    private static void WriteApp(string dir, string name, string version, bool r2r,
+        string publisher = "Microsoft")
+    {
+        Directory.CreateDirectory(dir);
+        var file = $"{publisher}_{name}_{version}.app";
+        File.WriteAllBytes(Path.Combine(dir, file),
+            Navx(Guid.NewGuid().ToString(), name, publisher, version, r2r));
+    }
+
+    /// <summary>The three platform runtime apps, as R2R packages, in one directory.</summary>
+    private static void WriteR2RPlatformSet(string dir, string version)
+    {
+        foreach (var n in ProvisioningCheck.KnownPlatformRuntimeApps)
+            WriteApp(dir, n, version, r2r: true);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Unit level: the reuse DECISION, pointed at a temp artifacts root.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Positive: a complete R2R platform set already sitting in the runner-owned
+    /// destination for the major.minor the download would target IS a hit, so the caller
+    /// reuses it instead of downloading.
+    /// </summary>
+    [Fact]
+    public void ProvisionedPlatformApps_AreFound_AndReused()
+    {
+        var dest = ProvisioningCheck.PlatformAppsDirFor(_root, FakeVersion);
+        WriteR2RPlatformSet(dest, FakeVersion);
+
+        var hit = ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor);
+
+        Assert.Equal(dest, hit);
+    }
+
+    /// <summary>
+    /// Negative that kills the "reuse whenever the directory exists" stub: a destination
+    /// holding SYMBOL-ONLY platform apps is not a hit. Symbol-only packages cannot execute
+    /// (procedure bodies are external/native), so reusing them would be exactly the
+    /// provisioning gap the check exists to catch — silently, one layer down.
+    /// </summary>
+    [Fact]
+    public void SymbolOnlyDestination_IsNotAHit()
+    {
+        var dest = ProvisioningCheck.PlatformAppsDirFor(_root, FakeVersion);
+        foreach (var n in ProvisioningCheck.KnownPlatformRuntimeApps)
+            WriteApp(dest, n, FakeVersion, r2r: false);
+
+        Assert.Null(ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor));
+    }
+
+    /// <summary>
+    /// Negative: an empty destination (a download that created the dir then failed) is not
+    /// a hit. This is the case the old `Directory.Exists(dir) &amp;&amp; any *.app` guard on the
+    /// test-toolkit path got wrong in the other direction.
+    /// </summary>
+    [Fact]
+    public void EmptyDestination_IsNotAHit()
+    {
+        Directory.CreateDirectory(ProvisioningCheck.PlatformAppsDirFor(_root, FakeVersion));
+
+        Assert.Null(ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor));
+    }
+
+    /// <summary>Negative: nothing provisioned at all is not a hit.</summary>
+    [Fact]
+    public void AbsentArtifactsRoot_IsNotAHit()
+    {
+        Assert.Null(ProvisioningCheck.FindProvisionedPlatformAppsDir(
+            Path.Combine(_root, "does-not-exist"), FakeMajorMinor));
+    }
+
+    /// <summary>
+    /// Positive: two provisioned builds of the same major.minor — the highest wins, matching
+    /// what a fresh download would produce (ResolveVersion returns the latest published
+    /// build for the prefix). Uses 9 vs 10 in the last segment so a string sort would pick
+    /// the wrong one.
+    /// </summary>
+    [Fact]
+    public void MultipleProvisionedBuilds_HighestVersionWins()
+    {
+        WriteR2RPlatformSet(ProvisioningCheck.PlatformAppsDirFor(_root, "99.0.1.9"), "99.0.1.9");
+        var newest = ProvisioningCheck.PlatformAppsDirFor(_root, "99.0.1.10");
+        WriteR2RPlatformSet(newest, "99.0.1.10");
+
+        Assert.Equal(newest, ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor));
+    }
+
+    /// <summary>
+    /// Negative: the prefix match is segment-wise, so "99.0" must NOT match "99.01.x".
+    /// A naive StartsWith would reuse a set for an unrelated minor.
+    /// </summary>
+    [Fact]
+    public void NeighbouringMinor_DoesNotMatchThePrefix()
+    {
+        WriteR2RPlatformSet(ProvisioningCheck.PlatformAppsDirFor(_root, "99.01.1.2"), "99.01.1.2");
+
+        Assert.Null(ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor));
+    }
+
+    /// <summary>
+    /// Positive, test-toolkit half: a provisioned test-apps dir carrying the toolkit
+    /// sentinel app is a hit.
+    /// </summary>
+    [Fact]
+    public void ProvisionedTestApps_AreFound_AndReused()
+    {
+        var dest = ProvisioningCheck.TestAppsDirFor(_root, FakeVersion);
+        WriteApp(dest, ProvisioningCheck.TestToolkitSentinelApp, FakeVersion, r2r: false);
+
+        Assert.Equal(dest, ProvisioningCheck.FindProvisionedTestAppsDir(_root, FakeMajorMinor));
+    }
+
+    /// <summary>
+    /// Negative, test-toolkit half: a test-apps dir with .app files but WITHOUT the sentinel
+    /// is a partial download and must not read as a hit. This is precisely what the old
+    /// `Directory.Exists &amp;&amp; any *.app` guard accepted.
+    /// </summary>
+    [Fact]
+    public void PartialTestApps_WithoutSentinel_IsNotAHit()
+    {
+        var dest = ProvisioningCheck.TestAppsDirFor(_root, FakeVersion);
+        WriteApp(dest, "Library Assert", FakeVersion, r2r: false);
+        WriteApp(dest, "Any", FakeVersion, r2r: false);
+
+        Assert.Null(ProvisioningCheck.FindProvisionedTestAppsDir(_root, FakeMajorMinor));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // The artifacts-root override itself.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Positive: AL_RUNNER_ARTIFACTS_ROOT wins over the home-rooted default, so a caller can
+    /// isolate the artifacts root (and with it the provisioning destinations) without moving
+    /// HOME and dragging every other home-rooted path along.
+    /// </summary>
+    [Fact]
+    public void ArtifactsRootOverride_WhenSet_WinsOverTheHomeDefault()
+    {
+        Assert.Equal("/somewhere/else",
+            BcArtifacts.ResolveArtifactsRoot("/somewhere/else", "/home/someone"));
+    }
+
+    /// <summary>
+    /// Negative: unset, empty and whitespace-only all fall back to the home-rooted default —
+    /// an exported-but-empty variable must not silently point the runner at the filesystem
+    /// root, where the version scan would find nothing and report the engine missing.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void ArtifactsRootOverride_WhenBlank_FallsBackToTheHomeDefault(string? blank)
+    {
+        var resolved = BcArtifacts.ResolveArtifactsRoot(blank, "/home/someone");
+
+        Assert.StartsWith("/home/someone", resolved);
+        Assert.Contains("artifacts", resolved);
+        Assert.NotEqual("/home/someone", resolved);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Integration level: the real startup gate, in a subprocess, hermetic.
+    //
+    // Relocation is done with AL_RUNNER_ARTIFACTS_ROOT, the runner's own override for the
+    // artifacts root. The alternative was moving HOME, which drags every other home-rooted
+    // path along (cache roots, default package caches) and forces the fixture to rebuild the
+    // `.local/share/al-runner/artifacts` layout by hand — a second spelling of a path
+    // BcArtifacts owns, and the exact drift TestArtifactsGateTests exists to forbid.
+    //
+    // `--package-cache <empty dir>` is load-bearing, not decoration: it REPLACES the default
+    // package caches rather than adding to them, so it stops whatever Microsoft symbol
+    // packages happen to be cached on the host machine from changing which app the gate
+    // reports first — and therefore which major.minor the reuse lookup is keyed on.
+
+    private sealed record Fixture(string ArtifactsRoot, string Bundle, string EmptyPackageCache);
+
+    /// <summary>
+    /// A synthetic artifacts root holding a complete R2R platform set provisioned for the
+    /// fabricated version, plus a bundle whose own `.alpackages` vendors the SYMBOL-ONLY
+    /// counterpart — which is what makes the gate see a provisioning gap in the first place.
+    /// The toolkit sentinel is vendored alongside so the toolkit half of the gate is already
+    /// satisfied and this fixture isolates the platform-app decision.
+    /// </summary>
+    private Fixture WriteFixture(bool withProvisionedSet = true)
+    {
+        var artifacts = Path.Combine(_root, "artifacts");
+        Directory.CreateDirectory(artifacts);
+        if (withProvisionedSet)
+            WriteR2RPlatformSet(ProvisioningCheck.PlatformAppsDirFor(artifacts, FakeVersion), FakeVersion);
+
+        var emptyCache = Path.Combine(_root, "pkgcache");
+        Directory.CreateDirectory(emptyCache);
+
+        var bundle = Path.Combine(_root, "bundle");
+        Directory.CreateDirectory(bundle);
+        File.WriteAllText(Path.Combine(bundle, "app.json"), """
+        {
+          "id": "c7f1a9d2-3b4e-4f50-9a61-2d8e7c0b5f31",
+          "name": "Provisioning Reuse Fixture",
+          "publisher": "AL Runner",
+          "version": "1.0.0.0",
+          "dependencies": [],
+          "platform": "1.0.0.0",
+          "application": "1.0.0.0",
+          "idRanges": [ { "from": 62150, "to": 62159 } ],
+          "runtime": "14.0"
+        }
+        """);
+        File.WriteAllText(Path.Combine(bundle, "Assert.Codeunit.al"), """
+        codeunit 62151 "PRF Assert"
+        {
+            procedure AreEqual(Expected: Integer; Actual: Integer; Msg: Text)
+            begin
+                if Expected <> Actual then
+                    Error('Expected:<%1> Actual:<%2> %3', Expected, Actual, Msg);
+            end;
+        }
+        """);
+        File.WriteAllText(Path.Combine(bundle, "ReuseTest.Codeunit.al"), """
+        codeunit 62152 "PRF Reuse Tests"
+        {
+            Subtype = Test;
+
+            var
+                Assert: Codeunit "PRF Assert";
+
+            [Test]
+            procedure ReuseCheck()
+            begin
+                Assert.AreEqual(7, 3 + 4, 'reuse sanity');
+            end;
+        }
+        """);
+
+        var alpackages = Path.Combine(bundle, ".alpackages");
+        foreach (var n in ProvisioningCheck.KnownPlatformRuntimeApps)
+            WriteApp(alpackages, n, FakeVersion, r2r: false);
+        WriteApp(alpackages, ProvisioningCheck.TestToolkitSentinelApp, FakeVersion, r2r: false);
+
+        return new Fixture(artifacts, bundle, emptyCache);
+    }
+
+    /// <summary>
+    /// Adds a synthetic engine to the fixture's artifacts root: the six files
+    /// ProvisioningCheck.Check looks for, so the engine closure reads as COMPLETE and the
+    /// multi-GB service-tier download never fires. Sufficient for the `provision` subcommand,
+    /// which returns before anything loads the engine — and therefore lets that path be
+    /// tested on a machine with no BC artifacts at all.
+    /// </summary>
+    private static void WriteSyntheticEngine(Fixture fx, string version)
+    {
+        var dir = Path.Combine(fx.ArtifactsRoot, version);
+        Directory.CreateDirectory(dir);
+        foreach (var f in new[]
+        {
+            "Microsoft.Dynamics.Nav.Ncl.dll",
+            "Microsoft.Dynamics.Nav.Types.dll",
+            "Microsoft.Dynamics.Nav.Common.dll",
+            "Microsoft.Dynamics.Nav.Language.dll",
+            "Microsoft.Dynamics.Nav.CodeAnalysis.dll",
+            "Microsoft.Identity.ServiceEssentials.Core.dll",
+        }) File.WriteAllText(Path.Combine(dir, f), "x");
+        // Keep the toolkit half satisfied at the exact version `provision` will ask about.
+        WriteApp(ProvisioningCheck.TestAppsDirFor(fx.ArtifactsRoot, version),
+            ProvisioningCheck.TestToolkitSentinelApp, version, r2r: false);
+    }
+
+    private static (string output, int exit) RunRunner(Fixture fx, string args)
+    {
+        var line = new StringBuilder(TestBuildConfig.RunArgs(ProjectPath));
+        line.Append(' ').Append(args);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet", Arguments = line.ToString(),
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
+        };
+        psi.Environment[AlRunner.Infrastructure.BcArtifacts.ArtifactsRootEnvVar] = fx.ArtifactsRoot;
+
+        var sb = new StringBuilder();
+        var p = Process.Start(psi)!;
+        p.OutputDataReceived += (_, e) => { if (e.Data != null) lock (sb) sb.AppendLine(e.Data); };
+        p.ErrorDataReceived += (_, e) => { if (e.Data != null) lock (sb) sb.AppendLine(e.Data); };
+        p.BeginOutputReadLine();
+        p.BeginErrorReadLine();
+        if (!p.WaitForExit(600_000)) { try { p.Kill(true); } catch { } throw new TimeoutException("runner hung"); }
+        p.WaitForExit();
+        lock (sb) return (sb.ToString(), p.ExitCode);
+    }
+
+    /// <summary>
+    /// The provisioning driver (`al-runner provision`, shared with --auto-provision) must
+    /// reuse an already-provisioned R2R set instead of re-downloading it.
+    ///
+    /// <para>Pre-fix this reached ResolveVersion — the fabricated version 99.0 does not exist
+    /// on Microsoft's artifact index, so it failed there. Touching the network AT ALL is the
+    /// defect: EnsurePlatformAppsProvisioned derived its gap from the bundle's `.alpackages`,
+    /// which vendors symbol-only packages permanently, so no download it ever performed could
+    /// satisfy the check that triggered it.</para>
+    ///
+    /// <para>Fully synthetic — no real BC artifacts, so it runs on any machine.</para>
+    /// </summary>
+    [Fact]
+    public void Provision_ReusesProvisionedPlatformApps_WithoutResolvingOrDownloading()
+    {
+        var fx = WriteFixture();
+        WriteSyntheticEngine(fx, SyntheticEngineVersion);
+
+        var (output, exit) = RunRunner(fx,
+            $"provision \"{fx.Bundle}\" --bc-version {SyntheticEngineVersion}");
+
+        // Negative: no CDN resolution, no download of either artifact set.
+        Assert.DoesNotContain("could not resolve a full BC artifact version", output);
+        Assert.DoesNotContain("Resolving BC version prefix", output);
+        Assert.DoesNotContain("fetching Microsoft platform R2R apps", output);
+        // Positive: it named the directory it reused, and finished cleanly.
+        Assert.Contains($"already provisioned", output);
+        Assert.Contains(ProvisioningCheck.PlatformAppsDirFor(fx.ArtifactsRoot, FakeVersion), output);
+        Assert.Equal(0, exit);
+    }
+
+    /// <summary>
+    /// Contrast case proving the reuse above is conditional on the destination really being
+    /// populated, not on the code path merely being taken: with the provisioned set absent,
+    /// the same command DOES go to the CDN. An "always reuse" implementation fails here.
+    /// </summary>
+    [Fact]
+    public void Provision_WithoutProvisionedPlatformApps_StillGoesToTheCdn()
+    {
+        var fx = WriteFixture(withProvisionedSet: false);
+        WriteSyntheticEngine(fx, SyntheticEngineVersion);
+
+        var (output, _) = RunRunner(fx,
+            $"provision \"{fx.Bundle}\" --bc-version {SyntheticEngineVersion}");
+
+        Assert.Contains("could not resolve a full BC artifact version", output);
+        Assert.DoesNotContain("already provisioned at", output);
+    }
+
+    /// <summary>
+    /// The startup gate — the half that decides whether a normal RUN proceeds — must reuse
+    /// too, and must do so ahead of its loud `exit 2` bail rather than only ahead of the
+    /// download: a machine holding a complete provisioned set must never be told it has a
+    /// provisioning gap. Needs the real engine (the run executes AL), supplied via
+    /// --artifact-path so the synthetic artifacts root stays in charge of everything else.
+    /// </summary>
+    [SkippableFact]
+    public void Run_ReusesProvisionedPlatformApps_AndExecutesTheBundle()
+    {
+        TestArtifacts.SkipIfMissing();
+        var built = BcArtifacts.EngineBuiltVersion();
+        TestArtifacts.SkipIf(built == null, "engine built version is not baked into this build");
+        var engineDir = BcArtifacts.ArtifactDirFor(built!.ToString());
+        TestArtifacts.SkipIfDirectoryMissing(engineDir, "the built engine's artifact dir");
+
+        var fx = WriteFixture();
+
+        var (output, exit) = RunRunner(fx,
+            $"\"{fx.Bundle}\" --artifact-path \"{engineDir}\" " +
+            $"--package-cache \"{fx.EmptyPackageCache}\" --auto-provision");
+
+        Assert.DoesNotContain("could not resolve a full BC artifact version", output);
+        Assert.DoesNotContain("platform R2R apps missing — downloading", output);
+        Assert.Contains("reusing already-provisioned platform R2R apps", output);
+        Assert.Contains("Codeunit62152.ReuseCheck", output);
+        Assert.Equal(0, exit);
+    }
+}
