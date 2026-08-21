@@ -53,6 +53,28 @@ it only asks "is there already a provisioned set for this same `major.minor`?".
 This is what keeps the change independent of the version-derivation problems (see
 "Explicitly out of scope").
 
+### Floored at the version the gap actually needs
+
+Reuse is only correct above a floor, and getting this wrong makes the whole fix a regression.
+`CheckPlatformApps` compares publisher, name and R2R-ness and nothing else, but
+`DependencyResolver.SelectBestVersion` discards any candidate below the declared dependency
+minimum. So an R2R set **older** than the symbols a project vendors satisfies the gate,
+suppresses the download, and then loses at resolution to the very symbol-only copy it was meant
+to replace — the "object with ID 0 does not have a member with that ID" state
+`DependencyResolver` already carries a dedicated diagnostic for. It is also sticky: today
+`--auto-provision` always fetches latest and self-heals, so a naive reuse leaves the machine
+unrepairable by any later run.
+
+The floor is `MinimumUsefulR2RVersion` — the highest version among the gap's own issues. An R2R
+set at least as new as the vendored symbols is exactly the condition under which
+`SelectBestVersion` prefers it. The version-named artifact dir equals the app version inside it,
+so the check is exact rather than heuristic.
+
+Relatedly, discovery returns an **ordered candidate list** rather than the single newest match.
+Returning only the newest would let a partial set (an interrupted download that landed one app)
+mask a complete older one, and the download would fire anyway — the same failure, one version
+narrower.
+
 ### Call sites
 
 Four, not three — the startup gate's **toolkit** branch has the same hole as its platform
