@@ -20,7 +20,14 @@ public sealed record BucketResult(string BucketPath, BucketStage Stage,
                                    // signal alongside the test-count baseline — see that file's header
                                    // for why a whole-group-vanished bug can hide behind an unchanged
                                    // test count.
-                                   int RanGroupCount = 0);
+                                   int RanGroupCount = 0,
+                                   // Dependencies this bundle resolved that NO loader tier can
+                                   // implement (DependencyResolver.UnservableDependencies). Printed
+                                   // once at resolution time, ~20s into a run that then spends
+                                   // minutes compiling — so PrintSummary repeats them at the end,
+                                   // where a scripted caller actually looks. Optional/trailing for
+                                   // the same reason as RanGroupCount above.
+                                   IReadOnlyList<string>? ProvisionGaps = null);
 
 public static class Reporter
 {
@@ -90,6 +97,32 @@ public static class Reporter
         // former pretending to be the latter.
         var wall = DateTime.Now - System.Diagnostics.Process.GetCurrentProcess().StartTime;
         w.WriteLine($"  wall:        {wall.TotalSeconds:F1}s");
+        // A dependency no loader tier can implement is reported once, per bundle, on stderr at
+        // dependency-resolution time — then the run spends minutes compiling and says nothing
+        // more about it. Measured on npcore: three such blocks at ~20s, 212s of emit+compile,
+        // and a failure whose message was exactly what those blocks predicted, with 2,600 lines
+        // of log in between. This is the part a scripted caller and a human scrolling to the
+        // bottom actually read, so it repeats them verbatim — the block is what names the app,
+        // the winning path and the fix command.
+        //
+        // Only when there ARE gaps: a section printed on every run is noise, and every
+        // integration test asserting on the markers above would then be asserting past it.
+        var gaps = buckets
+            .SelectMany(b => b.ProvisionGaps ?? Array.Empty<string>())
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (gaps.Count > 0)
+        {
+            w.WriteLine("-----------------------------------------------------------------");
+            // Counts them and gets out of the way. Two sources feed this — DependencyResolver's
+            // unservable dependencies (every call really does die with "The object with ID 0 does
+            // not have a member with that ID") and DependencyLoader's symbol-only platform runtime
+            // apps (which fall back to service-tier DLL dispatch, as their own block says). A
+            // header asserting either consequence is wrong for the other half, and each block
+            // already carries its own consequence and its own fix command.
+            w.WriteLine($"Provisioning gaps: {gaps.Count} — the package cache could not fully serve this run.");
+            foreach (var g in gaps) w.WriteLine(g);
+        }
         w.WriteLine("=================================================================");
     }
 
