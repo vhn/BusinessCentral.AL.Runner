@@ -1967,11 +1967,28 @@ foreach (var bundle in bundles)
                 // Register this freshly-loaded module by AppId so a LATER bundle that
                 // resolves the same app as a dependency (via DependencyLoader) reuses this
                 // exact Assembly instead of re-emitting/re-compiling a second module for the
-                // same AL identity — see the dedup comment above (issue #1683). Skipped under
-                // --watch: TryAdd is first-wins, so iteration 2's freshly-edited asm would
-                // never overwrite iteration 1's stale entry, and any sibling bundle that
-                // later resolves this AppId as a real dependency would get the stale copy.
-                if (!watchMode && appGroup.AppId is { } newlyLoadedId)
+                // same AL identity — see the dedup comment above (issue #1683).
+                //
+                // Under --watch too. This was `!watchMode` because RegisterLoaded was then a
+                // first-wins TryAdd, so cycle 2's freshly-edited module could never replace
+                // cycle 1's entry and a sibling bundle resolving this AppId as a dependency
+                // would get the stale copy. #1910 gave RegisterLoaded the same-sourcePath
+                // OVERWRITE (and TryGetByAppId the matching same-sourcePath null) that server
+                // mode's warm edit-and-rerun loop needs, which removed the reason for the gate
+                // — but the gate stayed, so `al-runner <app> <app>.Test --watch` kept running
+                // the pre-#1683 path: bundle 2 resolved this app through DependencyLoader's
+                // Tier-3 source compile into a SECOND live module for one AL identity. On an
+                // app Tier-3 cannot compile at all (npcore NP Retail, ~7,000 files) that is a
+                // hard EMIT-ZERO and the session dies in cycle 1. See
+                // WatchCrossBundleModuleIdentityTests for both directions.
+                //
+                // A RAD delta OVERLAY is deliberately not registered: it carries only the
+                // objects that changed, so replacing the whole-module entry with it would hand
+                // a dependent bundle an assembly missing nearly everything it resolves. The
+                // baseline registered by the cycle that compiled the whole module stays, and
+                // the overlay's objects reach a dependent through AlObjectResolution like any
+                // other generation — same rule the app's own bundle already follows.
+                if (!radOverlay && appGroup.AppId is { } newlyLoadedId)
                 {
                     try
                     {
