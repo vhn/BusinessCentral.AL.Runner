@@ -1,0 +1,25 @@
+{
+  "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c50",
+  "name": "BTA Two App Ext A",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "brief": "Peer app A: extends the platform Item table (27) with its own tableextension.",
+  "description": "One of two PEER apps in the same bundle that each extend the platform Item table. Neither depends on the other; both are compiled from source in the same run. Exists so the runner's per-base-table extension merge (RecordPatches._parsedExtensionFields, keyed on the base table name with no app qualifier) can be shown to keep two apps' extension fields distinct. See BTA Two App Ext Main for the assertions.",
+  "privacyStatement": "",
+  "EULA": "",
+  "help": "",
+  "url": "",
+  "logo": "",
+  "dependencies": [],
+  "screenshots": [],
+  "idRanges": [
+    {
+      "from": 64530,
+      "to": 64539
+    }
+  ],
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "15.0",
+  "target": "Cloud"
+}

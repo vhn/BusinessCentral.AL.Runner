@@ -1,0 +1,38 @@
+{
+  "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c52",
+  "name": "BTX Two App Ext Main",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "brief": "Main test app: proves two PEER apps' tableextensions on the same platform table stay distinct when both are loaded in one bundle.",
+  "description": "Depends on BOTH peer apps (BTA Two App Ext A and BTB Two App Ext B), each of which extends the platform Item table (27) with its own tableextension. This is the first fixture in the bundle whose consumer depends on two in-bundle apps at once. The claim is runner-specific: the runner has no per-app extension model — RecordPatches._parsedExtensionFields is a Dictionary<string, List<ParsedField>> keyed on the base table NAME with no app qualifier, and ApplyTableExtensions merges every app's fields into that one list, de-duplicating by field id alone. These tests pin that the merge keeps each app's fields individually addressable by number, name and type, which is what a real tenant with two published extensions on Item observes.",
+  "privacyStatement": "",
+  "EULA": "",
+  "help": "",
+  "url": "",
+  "logo": "",
+  "dependencies": [
+    {
+      "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c50",
+      "name": "BTA Two App Ext A",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    },
+    {
+      "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c51",
+      "name": "BTB Two App Ext B",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    }
+  ],
+  "screenshots": [],
+  "idRanges": [
+    {
+      "from": 64550,
+      "to": 64559
+    }
+  ],
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "15.0",
+  "target": "Cloud"
+}
