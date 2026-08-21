@@ -218,6 +218,50 @@ public class AppIdCollisionLoudFailureTests
         Assert.DoesNotContain("Regenerate the", ex.Message);
     }
 
+    /// <summary>
+    /// The counterpart every other test in this file leaves open: identity moved but the
+    /// SourcePath did not. That is one bundle directory being recompiled — the developer
+    /// edited its `app.json` version — not two apps fighting over one id, and the two
+    /// versions the collision message would name are the same directory twice, which is
+    /// self-evidently not the #1850 hazard.
+    ///
+    /// <para>Reached whenever a warm loop re-registers a bundle after a manifest edit:
+    /// `--watch` (RadWatchNoUnnecessaryRebuildTests bumps 1.0.0.0 → 1.0.0.1 mid-session)
+    /// and `--server` (two requests over one tree with an app.json edit between them).
+    /// Before this, both aborted the whole run with a FATAL naming one path twice.</para>
+    /// </summary>
+    [Fact]
+    public void RegisterLoaded_SameSourcePathVersionEdited_ReplacesTheEntry_NotACollision()
+    {
+        var appId = Guid.NewGuid();
+        var asmA = typeof(DependencyLoader).Assembly;
+        var asmB = typeof(object).Assembly;
+        DependencyLoader.RegisterLoaded(appId, asmA, "AC Edited Suite", "Repro", "1.0.0.0", "/bundles/edited");
+
+        DependencyLoader.RegisterLoaded(appId, asmB, "AC Edited Suite", "Repro", "1.0.0.1", "/bundles/edited");
+
+        // The freshly-compiled module is what a LATER sibling bundle must now resolve to —
+        // asserted by instance, from a different SourcePath so the same-path carve-out below
+        // does not mask it.
+        Assert.Same(asmB, DependencyLoader.TryGetByAppId(
+            appId, "AC Edited Suite", "Repro", "1.0.0.1", "/bundles/some-other"));
+    }
+
+    /// <summary>
+    /// The read side of the same case: the bundle asking about ITSELF after editing its own
+    /// version must be told "nothing to reuse" (so it recompiles), never handed a collision.
+    /// </summary>
+    [Fact]
+    public void TryGetByAppId_SameSourcePathVersionEdited_ReturnsNull_NotACollision()
+    {
+        var appId = Guid.NewGuid();
+        DependencyLoader.RegisterLoaded(
+            appId, typeof(DependencyLoader).Assembly, "AC Reload Suite", "Repro", "1.0.0.0", "/bundles/reload");
+
+        Assert.Null(DependencyLoader.TryGetByAppId(
+            appId, "AC Reload Suite", "Repro", "1.0.0.1", "/bundles/reload"));
+    }
+
     [Fact]
     public void RegisterLoaded_DifferentAppSameId_ThrowsNamingBothPathsAndGuid()
     {

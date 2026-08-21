@@ -90,9 +90,12 @@ public sealed class CacheKeyDependencyClosureTests : IDisposable
 
     /// <summary>
     /// Fast path: runs the fixture in `--print-cache-key` mode, which reaches the exact same
-    /// ComputeAlCacheKey call a real run would (see Program.cs) and exits before Emit+Compile.
-    /// This is what the two behavioural tests below use — they only ever assert a property of
-    /// the key string, so there is nothing lost by not paying for the compile.
+    /// ComputeAlCacheKey call a real run would (see Program.cs) and exits before that app
+    /// group's Emit+Compile. "Fast" is relative — the short-circuit is inside the
+    /// per-app-group loop, so the layered pre-pass still builds any dependency impl bundle
+    /// from source first. This is what the two behavioural tests below use — they only ever
+    /// assert a property of the key string, so there is nothing lost by not paying for the
+    /// bundle's own compile.
     /// </summary>
     private static string RunAndReadCacheKeyOnly(string packageCacheDir, string alCacheDir)
     {

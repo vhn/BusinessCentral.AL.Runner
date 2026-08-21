@@ -674,32 +674,42 @@ public sealed class DependencyLoader
     /// <paramref name="version"/> match the identity already cached for
     /// <paramref name="appId"/> — the legitimate same-app-twice case, safe to reuse.
     /// Returns null when nothing is cached yet for this AppId.
-    /// Throws <see cref="AlRunner.Infrastructure.AppIdCollisionException"/> when an
-    /// entry IS cached but its identity does NOT match — two different apps
-    /// declaring the same app.json id (issue #1850): silently reusing the earlier
-    /// module here would drop every test in <paramref name="sourcePath"/>'s app,
-    /// exactly as it did before this check existed.
     ///
-    /// Also returns null — deliberately NOT a reuse — when the cached entry's own
+    /// Returns null — deliberately NOT a reuse — when the cached entry's own
     /// <c>SourcePath</c> equals <paramref name="sourcePath"/> (#1892 follow-up,
     /// caught by ServerTests.RunTests_Then_EditTable_Then_RunAgain_PicksUpChange):
     /// that is not a genuinely different sibling bundle providing this AppId, it is
-    /// THIS SAME bundle directory being asked about again — server mode's core
-    /// edit-and-rerun contract, where the SAME sourcePath is compiled repeatedly in
-    /// one warm session and each rerun must see any source edit since the last one.
-    /// The CLI loop never hits this branch (a single non-watch invocation visits
-    /// each SuiteDir at most once), so this only narrows the check for the
-    /// caller that genuinely needs it.
+    /// THIS SAME bundle directory being asked about again — the warm edit-and-rerun
+    /// contract of both <c>--server</c> and <c>--watch</c>, where the SAME sourcePath
+    /// is compiled repeatedly in one session and each rerun must see any source edit
+    /// since the last one. A one-shot CLI invocation never hits this branch (it visits
+    /// each SuiteDir at most once), so this only narrows the check for the callers that
+    /// genuinely need it.
+    ///
+    /// Throws <see cref="AlRunner.Infrastructure.AppIdCollisionException"/> when an
+    /// entry is cached for a DIFFERENT <c>SourcePath</c> and its identity does not
+    /// match — two different apps declaring the same app.json id (issue #1850):
+    /// silently reusing the earlier module here would drop every test in
+    /// <paramref name="sourcePath"/>'s app, exactly as it did before this check
+    /// existed. Identity is only ever compared across two distinct directories; one
+    /// directory cannot collide with itself.
     /// </summary>
     public static Assembly? TryGetByAppId(Guid appId, string name, string publisher, string version, string sourcePath)
     {
         if (!_cache.TryGetValue(appId, out var entry)) return null;
+        // Same-SourcePath FIRST, ahead of the identity comparison: this is THIS bundle asking
+        // about itself, so nothing about it can be a collision — including a moved identity.
+        // A warm loop re-runs the same tree after arbitrary edits, and an `app.json` version
+        // edit is one of them; comparing identity first raised the #1850 abort naming one
+        // directory twice as both sides of the "collision" (RadWatchNoUnnecessaryRebuildTests
+        // bumps 1.0.0.0 → 1.0.0.1 mid-session, and a --server session can do the same between
+        // two requests over one tree).
+        if (string.Equals(entry.SourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
+            return null;
         if (!IdentityMatches(entry, name, publisher, version))
             throw new AlRunner.Infrastructure.AppIdCollisionException(
                 appId, entry.Name, entry.Publisher, entry.Version, entry.SourcePath,
                 name, publisher, version, sourcePath);
-        if (string.Equals(entry.SourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
-            return null;
         return entry.Asm;
     }
 
@@ -720,25 +730,32 @@ public sealed class DependencyLoader
     /// caller's own <see cref="TryGetByAppId"/> check raced past — this throws instead
     /// of silently keeping the wrong module registered.
     ///
-    /// When the identity matches AND <paramref name="sourcePath"/> equals the cached
-    /// entry's own SourcePath, this OVERWRITES the entry instead (#1892 follow-up):
-    /// that is not two different bundles racing to register the same AppId, it is the
-    /// SAME bundle re-registering itself after a fresh compile — server mode's
-    /// edit-and-rerun contract, where <see cref="TryGetByAppId"/> deliberately never
-    /// serves a stale reuse for a same-sourcePath lookup (see its own doc comment), so
-    /// each rerun's freshly-compiled module must become the one a LATER sibling
-    /// bundle in a subsequent request resolves to, not whatever compiled first.
+    /// When <paramref name="sourcePath"/> equals the cached entry's own SourcePath, this
+    /// OVERWRITES the entry instead (#1892 follow-up), identity comparison skipped: that
+    /// is not two different bundles racing to register the same AppId, it is the SAME
+    /// bundle re-registering itself after a fresh compile — the edit-and-rerun contract of
+    /// <c>--server</c> and <c>--watch</c>, where <see cref="TryGetByAppId"/> deliberately
+    /// never serves a stale reuse for a same-sourcePath lookup (see its own doc comment),
+    /// so each rerun's freshly-compiled module must become the one a LATER sibling bundle
+    /// resolves to, not whatever compiled first. Whatever the developer edited in that
+    /// directory since — including the manifest's version — travels with it.
     /// </summary>
     public static void RegisterLoaded(Guid appId, Assembly asm, string name, string publisher, string version, string sourcePath)
     {
         var newEntry = new LoadedAppEntry(asm, name, publisher, version, sourcePath);
         if (_cache.TryAdd(appId, newEntry)) return;
         var existing = _cache[appId];
+        // Same-SourcePath FIRST, ahead of the identity comparison — see TryGetByAppId's own
+        // note. One directory recompiled is never a collision with itself, so an `app.json`
+        // version edit mid-session replaces the entry instead of aborting the run.
+        if (string.Equals(existing.SourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
+        {
+            _cache[appId] = newEntry;
+            return;
+        }
         if (!IdentityMatches(existing, name, publisher, version))
             throw new AlRunner.Infrastructure.AppIdCollisionException(
                 appId, existing.Name, existing.Publisher, existing.Version, existing.SourcePath,
                 name, publisher, version, sourcePath);
-        if (string.Equals(existing.SourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
-            _cache[appId] = newEntry;
     }
 }
