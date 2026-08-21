@@ -57,8 +57,7 @@ if (args[0] == "--guide")
 
 if (args[0] == "--version")
 {
-    var asmVer = typeof(Program).Assembly.GetName().Version?.ToString() ?? "unknown";
-    Console.WriteLine($"al-runner v{asmVer}");
+    Console.WriteLine($"al-runner v{AlRunner.Infrastructure.RunnerVersion.Describe(typeof(Program).Assembly)}");
     return 0;
 }
 
@@ -206,11 +205,17 @@ string? cacheRootOverride = null;
 bool noCache = false;
 // --print-cache-key (issue #1851): a diagnostic/test-support mode. Reaches the SAME
 // ComputeAlCacheKey call, with the SAME arguments, that a real run would use for the
-// first app group it processes — then prints it and exits, before Emit+Compile even
-// starts. Exists so callers that only need to assert a property of the KEY (not of a
+// first app group it processes — then prints it and exits, before THAT app group's
+// Emit+Compile. Exists so callers that only need to assert a property of the KEY (not of a
 // compiled DLL) don't have to pay for a full cold AL compile to get one. There is no
 // second/parallel key computation — see the call site below, unchanged from the normal
 // path up to and including the ComputeAlCacheKey call itself.
+//
+// It is NOT free, and the help text says so: the short-circuit lives inside the
+// per-app-group loop, so RunLayeredPrePass has already built every dependency impl bundle
+// from source by the time a key is printed (measured: 16.3s for npcore's NP Retail). That
+// cost cannot be skipped — the key covers the resolved dependency set, so a run that
+// skipped the pre-pass would print a different key than the real run it is standing in for.
 bool printCacheKeyOnly = false;
 // Test isolation mode — default matches BC's "Test Runner - Isol. Codeunit" (130450).
 var isolation = AlRunner.TestIsolation.Codeunit;
@@ -1600,8 +1605,11 @@ foreach (var bundle in bundles)
         // ── --print-cache-key short-circuit (issue #1851) ──────────────────
         // cacheKey above was computed by the SAME ComputeAlCacheKey call, with the SAME
         // arguments, a real run reaches for this app group — nothing here recomputes it a
-        // second way. Print it and exit before touching Emit+Compile at all, whether this
+        // second way. Print it and exit before THIS app group's Emit+Compile, whether this
         // would have been a HIT or a MISS on a real run (irrelevant to the key itself).
+        // Note where this sits: inside the per-app-group loop, so the layered pre-pass has
+        // already built the dependency impl bundles from source. That is deliberate — the
+        // key covers the resolved dependency set — and it is what the help text warns about.
         // Only handles the first app group of the first bundle — that is exactly the shape
         // every caller of this flag needs (a single-app bundle probing its own key), and a
         // second app group would need its own process anyway to avoid cross-bundle module
@@ -4002,9 +4010,12 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("  --print-cache-key       Diagnostic/test-support mode: compute the AL-output cache");
     w.WriteLine("                          key for the first app group of the first bundle exactly as");
     w.WriteLine("                          a real run would, print \"[cache] KEY key=<hash>\", and exit");
-    w.WriteLine("                          before Emit+Compile starts. Requires the cache to be");
-    w.WriteLine("                          enabled (default; not --no-cache). Exit code 2 if no key");
-    w.WriteLine("                          could be computed.");
+    w.WriteLine("                          before THAT app group's Emit+Compile. Not free: the key");
+    w.WriteLine("                          covers the resolved dependency set, so the layered pre-pass");
+    w.WriteLine("                          runs first and dependency impl bundles are still built from");
+    w.WriteLine("                          source (seconds to minutes on a large repo). Requires the");
+    w.WriteLine("                          cache to be enabled (default; not --no-cache). Exit code 2");
+    w.WriteLine("                          if no key could be computed.");
     w.WriteLine("  --watch                 Stay resident with warm dependencies and re-run IN-PROCESS");
     w.WriteLine("                          when .al source or app.json changes. Each save recompiles");
     w.WriteLine("                          and reloads only the AL objects it changed, added or");
