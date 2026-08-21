@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using Xunit;
@@ -193,14 +194,82 @@ public sealed class CliDocumentationTests
     [Fact]
     public void Help_DescribesWatchAsObjectGranular()
     {
-        var (_, help, _) = RunCli("--help");
-
-        var idx = help.IndexOf("  --watch ", StringComparison.Ordinal);
-        Assert.True(idx >= 0, "--help must document --watch.");
-        var entry = help[idx..];
-        var next = entry.IndexOf("\n  --", StringComparison.Ordinal);
-        if (next > 0) entry = entry[..next];
+        var entry = FlagEntry(RunCli("--help").StdOut, "--watch");
 
         Assert.Contains("only the AL objects", entry, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// `--print-cache-key` is sold as a cheap probe, and the help said it exits "before
+    /// Emit+Compile starts". It does not: the short-circuit is inside the per-app-group
+    /// loop, and the layered pre-pass that builds every dependency impl package FROM SOURCE
+    /// has already run by then. Measured: a "cheap probe" of npcore spent 16.3 s compiling
+    /// NP Retail into a .app before printing a key.
+    ///
+    /// The wording is the whole contract here — a caller who believes it and times the flag
+    /// concludes the runner is pathologically slow at hashing files. Don't fix it by moving
+    /// the short-circuit earlier: the key includes the resolved dependency set, so skipping
+    /// the pre-pass would change the answer the flag exists to give.
+    /// </summary>
+    [Fact]
+    public void Help_PrintCacheKey_DoesNotClaimItSkipsAllCompilation()
+    {
+        var entry = FlagEntry(RunCli("--help").StdOut, "--print-cache-key");
+
+        Assert.DoesNotContain("before Emit+Compile starts", entry, StringComparison.Ordinal);
+        Assert.Contains("dependenc", entry, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The invariant that makes the wording above correct, asserted against the source
+    /// rather than trusted: the `--print-cache-key` short-circuit really does sit after the
+    /// layered pre-pass call. If someone moves it before the pre-pass, this fails and the
+    /// help text is the thing to change back.
+    /// </summary>
+    [Fact]
+    public void PrintCacheKey_ShortCircuitsAfterTheLayeredPrePassHasAlreadyRun()
+    {
+        var programSource = File.ReadAllText(Path.Combine(RepoRoot, "AlRunner", "Program.cs"));
+
+        var prePassCall = programSource.IndexOf("packageCacheDirs = RunLayeredPrePass(bundles", StringComparison.Ordinal);
+        var shortCircuit = programSource.IndexOf("if (printCacheKeyOnly)", StringComparison.Ordinal);
+
+        Assert.True(prePassCall > 0, "could not find the RunLayeredPrePass call site in Program.cs.");
+        Assert.True(shortCircuit > 0, "could not find the --print-cache-key short-circuit in Program.cs.");
+        Assert.True(prePassCall < shortCircuit,
+            "the --print-cache-key short-circuit must come after the layered pre-pass; if that "
+            + "changed, Help_PrintCacheKey_DoesNotClaimItSkipsAllCompilation needs updating too.");
+    }
+
+    /// <summary>
+    /// `--version` is how a developer identifies which build they were handed, and the
+    /// identifying part is the prerelease suffix (2.0.0-preview.1, 2.1.2-performance).
+    /// AssemblyVersion is a numeric quad that cannot carry it, so reading that prints
+    /// "2.0.0.0" for every build of the same numeric version — see RunnerVersionTests.
+    /// </summary>
+    [Fact]
+    public void Version_PrintsTheFullInformationalVersion()
+    {
+        var runner = typeof(AlRunner.AppLoader).Assembly;
+        var informational = runner
+            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()!
+            .InformationalVersion;
+
+        var (exit, stdout, stderr) = RunCli("--version");
+
+        Assert.True(exit == 0, $"--version must exit 0. exit={exit}\n{stderr}");
+        Assert.Contains($"al-runner v{informational}", stdout, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The `  --flag  description…` block for <paramref name="flag"/>, up to the next flag.
+    /// </summary>
+    private static string FlagEntry(string help, string flag)
+    {
+        var idx = help.IndexOf($"  {flag} ", StringComparison.Ordinal);
+        Assert.True(idx >= 0, $"--help must document {flag}.");
+        var entry = help[idx..];
+        var next = entry.IndexOf("\n  --", StringComparison.Ordinal);
+        return next > 0 ? entry[..next] : entry;
     }
 }
