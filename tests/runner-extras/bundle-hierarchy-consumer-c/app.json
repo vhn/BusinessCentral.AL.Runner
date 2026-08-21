@@ -1,0 +1,44 @@
+{
+  "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e63",
+  "name": "HCC Hierarchy Consumer C",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "brief": "Level-4 apex: depends on the shared library and sideways on BOTH co-dependents, reaching the library by three different paths.",
+  "description": "The diamond apex. Depends on HSL Hierarchy Shared Lib, HCA Hierarchy Consumer A and HCB Hierarchy Consumer B — out-degree 3, where the bundle's previous maximum was 1 (and 2 with BTX Two App Ext Main). Reaches the shared library three ways: directly, through HCA, and through HCB->HCA, so one call from here traverses HCA twice and the library twice. Sets BOTH ancestors' tableextension fields on the shared library's table, proving an app three levels up sees extensions contributed by two different ancestors. See HTS Hierarchy Tests.",
+  "privacyStatement": "",
+  "EULA": "",
+  "help": "",
+  "url": "",
+  "logo": "",
+  "dependencies": [
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e60",
+      "name": "HSL Hierarchy Shared Lib",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    },
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e61",
+      "name": "HCA Hierarchy Consumer A",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    },
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e62",
+      "name": "HCB Hierarchy Consumer B",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    }
+  ],
+  "screenshots": [],
+  "idRanges": [
+    {
+      "from": 64590,
+      "to": 64599
+    }
+  ],
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "15.0",
+  "target": "Cloud"
+}

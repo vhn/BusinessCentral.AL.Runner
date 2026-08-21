@@ -1,0 +1,25 @@
+{
+  "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e60",
+  "name": "HSL Hierarchy Shared Lib",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "brief": "Shared library at the root of the bundle's only multi-level dependency hierarchy: three sibling apps and the test app all depend on it.",
+  "description": "Root of a 4-level in-bundle dependency graph with fan-out and sideways edges — the topology no other fixture in this bundle contains. Every other *-consumer-* app and the -tests app declares a dependency on this one, so its in-degree is 4; before this fixture the whole 31-app bundle had a maximum in-degree of 1 (nine disconnected main->dep pairs), no A->B->C chain and no diamond. This app owns the four objects the hierarchy is observed through: a table the dependents all write to, a math codeunit the transitive call chain bottoms out in, an event publisher whose subscribers live in three separate dependent apps, and an extensible enum two of the dependents extend. See HTS Hierarchy Tests for the assertions and the graph.",
+  "privacyStatement": "",
+  "EULA": "",
+  "help": "",
+  "url": "",
+  "logo": "",
+  "dependencies": [],
+  "screenshots": [],
+  "idRanges": [
+    {
+      "from": 64560,
+      "to": 64569
+    }
+  ],
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "15.0",
+  "target": "Cloud"
+}

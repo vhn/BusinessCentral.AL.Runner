@@ -1,0 +1,32 @@
+{
+  "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e61",
+  "name": "HCA Hierarchy Consumer A",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "brief": "Level-2 consumer: depends on the shared library only. Both other consumers depend on THIS app sideways.",
+  "description": "The middle of the hierarchy. Depends on HSL Hierarchy Shared Lib, and is itself depended on by HCB Hierarchy Consumer B and HCC Hierarchy Consumer C — the sideways edges between co-dependents of one shared library that no other fixture in this bundle has. Contributes: a Contribute() that calls into the shared library (so a caller two levels above reaches the library through this app), a broadcast subscriber, a tableextension on the SHARED LIBRARY's table, and an enumextension on the shared library's enum. See HTS Hierarchy Tests.",
+  "privacyStatement": "",
+  "EULA": "",
+  "help": "",
+  "url": "",
+  "logo": "",
+  "dependencies": [
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e60",
+      "name": "HSL Hierarchy Shared Lib",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    }
+  ],
+  "screenshots": [],
+  "idRanges": [
+    {
+      "from": 64570,
+      "to": 64579
+    }
+  ],
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "15.0",
+  "target": "Cloud"
+}

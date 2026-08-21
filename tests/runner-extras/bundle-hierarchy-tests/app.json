@@ -1,0 +1,50 @@
+{
+  "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e64",
+  "name": "HTS Hierarchy Tests",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "brief": "Asserts the bundle's only multi-level dependency hierarchy: a shared library with three dependents that also depend on each other sideways.",
+  "description": "Depends on all four apps of the hierarchy (HSL Hierarchy Shared Lib, HCA/HCB/HCC Hierarchy Consumer A/B/C) so it can observe the whole graph from outside it. Pins the transitive call chain across four app boundaries, the diamond traversal, the shared library's table being one table for every app that writes to it, two dependents' tableextensions and enumextensions on sibling-owned objects, event fan-out from the library into three separate dependent assemblies, and per-app module identity at depth.",
+  "privacyStatement": "",
+  "EULA": "",
+  "help": "",
+  "url": "",
+  "logo": "",
+  "dependencies": [
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e60",
+      "name": "HSL Hierarchy Shared Lib",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    },
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e61",
+      "name": "HCA Hierarchy Consumer A",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    },
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e62",
+      "name": "HCB Hierarchy Consumer B",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    },
+    {
+      "id": "9c8d7e6f-5a4b-4c3d-9e8f-0a1b2c3d4e63",
+      "name": "HCC Hierarchy Consumer C",
+      "publisher": "AL Runner",
+      "version": "1.0.0.0"
+    }
+  ],
+  "screenshots": [],
+  "idRanges": [
+    {
+      "from": 64600,
+      "to": 64619
+    }
+  ],
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "15.0",
+  "target": "Cloud"
+}
