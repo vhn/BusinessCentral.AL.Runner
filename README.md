@@ -9,10 +9,10 @@ Run Business Central AL unit tests in **milliseconds** — no BC service tier, n
 
 This is a temporary performance fork of
 [`StefanMaron/BusinessCentral.AL.Runner`](https://github.com/StefanMaron/BusinessCentral.AL.Runner),
-staged for upstreaming. It carries **89 commits** across two areas: the **first** compile of a
-large app, and what a **save** costs once the runner is watching. The product-code change is
-**50 files, +7,982 / −690** in `AlRunner/`; the rest of the 298-file diff is tests and AL
-fixtures (**+18,206** in `AlRunner.Tests/`). The `tests/al-language` corpus pin is untouched.
+staged for upstreaming. It changes two things: the **first** compile of a large app, and what a
+**save** costs once the runner is watching. The product-code surface is small for the size of
+the diff — **50 files, ~8,000 lines** in `AlRunner/`; almost everything else is tests and AL
+fixtures (~18,200 lines across 240 files). The `tests/al-language` corpus pin is untouched.
 
 Measured on **NP Retail** — npcore, two apps, ~7,300 `.al` files, ~6,950 AL objects, BC 28.1 —
 as one bundle on an otherwise idle 6-core / 12 GB Mac. The runner is exactly as shipped: no
