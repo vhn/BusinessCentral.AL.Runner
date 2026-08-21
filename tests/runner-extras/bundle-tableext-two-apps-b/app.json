@@ -1,0 +1,25 @@
+{
+  "id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c51",
+  "name": "BTB Two App Ext B",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "brief": "Peer app B: extends the platform Item table (27) with its own tableextension.",
+  "description": "The second of two PEER apps in the same bundle that each extend the platform Item table. Declares no dependency on peer app A, so neither app's compile order relative to the other is fixed by the dependency graph — BuildAppGroups' topological sort has nothing to order them by. See BTA Two App Ext Main for the assertions.",
+  "privacyStatement": "",
+  "EULA": "",
+  "help": "",
+  "url": "",
+  "logo": "",
+  "dependencies": [],
+  "screenshots": [],
+  "idRanges": [
+    {
+      "from": 64540,
+      "to": 64549
+    }
+  ],
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "15.0",
+  "target": "Cloud"
+}
