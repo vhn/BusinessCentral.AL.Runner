@@ -120,13 +120,21 @@ public sealed class ProvisioningReuseTests : IDisposable
     /// destination for the major.minor the download would target IS a hit, so the caller
     /// reuses it instead of downloading.
     /// </summary>
+    // Thin wrappers so each test reads as one claim: the API returns an ordered candidate
+    // LIST (callers adjudicate each in turn), but most cases assert on the best candidate.
+    private static string? BestPlatform(string root, string mm, Version? floor = null)
+        => ProvisioningCheck.FindProvisionedPlatformAppsDirs(root, mm, floor).FirstOrDefault();
+
+    private static string? BestTestApps(string root, string mm)
+        => ProvisioningCheck.FindProvisionedTestAppsDirs(root, mm, minVersion: null).FirstOrDefault();
+
     [Fact]
     public void ProvisionedPlatformApps_AreFound_AndReused()
     {
         var dest = ProvisioningCheck.PlatformAppsDirFor(_root, FakeVersion);
         WriteR2RPlatformSet(dest, FakeVersion);
 
-        var hit = ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor);
+        var hit = BestPlatform(_root, FakeMajorMinor);
 
         Assert.Equal(dest, hit);
     }
@@ -144,7 +152,7 @@ public sealed class ProvisioningReuseTests : IDisposable
         foreach (var n in ProvisioningCheck.KnownPlatformRuntimeApps)
             WriteApp(dest, n, FakeVersion, r2r: false);
 
-        Assert.Null(ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor));
+        Assert.Null(BestPlatform(_root, FakeMajorMinor));
     }
 
     /// <summary>
@@ -157,15 +165,14 @@ public sealed class ProvisioningReuseTests : IDisposable
     {
         Directory.CreateDirectory(ProvisioningCheck.PlatformAppsDirFor(_root, FakeVersion));
 
-        Assert.Null(ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor));
+        Assert.Null(BestPlatform(_root, FakeMajorMinor));
     }
 
     /// <summary>Negative: nothing provisioned at all is not a hit.</summary>
     [Fact]
     public void AbsentArtifactsRoot_IsNotAHit()
     {
-        Assert.Null(ProvisioningCheck.FindProvisionedPlatformAppsDir(
-            Path.Combine(_root, "does-not-exist"), FakeMajorMinor));
+        Assert.Null(BestPlatform(Path.Combine(_root, "does-not-exist"), FakeMajorMinor));
     }
 
     /// <summary>
@@ -181,7 +188,7 @@ public sealed class ProvisioningReuseTests : IDisposable
         var newest = ProvisioningCheck.PlatformAppsDirFor(_root, "99.0.1.10");
         WriteR2RPlatformSet(newest, "99.0.1.10");
 
-        Assert.Equal(newest, ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor));
+        Assert.Equal(newest, BestPlatform(_root, FakeMajorMinor));
     }
 
     /// <summary>
@@ -193,7 +200,7 @@ public sealed class ProvisioningReuseTests : IDisposable
     {
         WriteR2RPlatformSet(ProvisioningCheck.PlatformAppsDirFor(_root, "99.01.1.2"), "99.01.1.2");
 
-        Assert.Null(ProvisioningCheck.FindProvisionedPlatformAppsDir(_root, FakeMajorMinor));
+        Assert.Null(BestPlatform(_root, FakeMajorMinor));
     }
 
     /// <summary>
@@ -206,7 +213,7 @@ public sealed class ProvisioningReuseTests : IDisposable
         var dest = ProvisioningCheck.TestAppsDirFor(_root, FakeVersion);
         WriteApp(dest, ProvisioningCheck.TestToolkitSentinelApp, FakeVersion, r2r: false);
 
-        Assert.Equal(dest, ProvisioningCheck.FindProvisionedTestAppsDir(_root, FakeMajorMinor));
+        Assert.Equal(dest, BestTestApps(_root, FakeMajorMinor));
     }
 
     /// <summary>
@@ -221,7 +228,55 @@ public sealed class ProvisioningReuseTests : IDisposable
         WriteApp(dest, "Library Assert", FakeVersion, r2r: false);
         WriteApp(dest, "Any", FakeVersion, r2r: false);
 
-        Assert.Null(ProvisioningCheck.FindProvisionedTestAppsDir(_root, FakeMajorMinor));
+        Assert.Null(BestTestApps(_root, FakeMajorMinor));
+    }
+
+    /// <summary>
+    /// The version floor, which is the sharpest correctness rule here. A provisioned R2R set
+    /// OLDER than the symbols a project vendors satisfies CheckPlatformApps (it compares only
+    /// publisher, name and R2R-ness) but DependencyResolver.SelectBestVersion then discards it
+    /// as below the declared minimum and falls back to the symbol-only copy — ending in the
+    /// "object with ID 0 does not have a member with that ID" failure. Reusing it would be
+    /// worse than downloading, and sticky: no later --auto-provision could repair it.
+    /// </summary>
+    [Fact]
+    public void ProvisionedSetOlderThanTheFloor_IsNotReused()
+    {
+        WriteR2RPlatformSet(ProvisioningCheck.PlatformAppsDirFor(_root, "99.0.1.2"), "99.0.1.2");
+
+        Assert.Null(BestPlatform(_root, FakeMajorMinor, new Version("99.0.1.3")));
+    }
+
+    /// <summary>Positive counterpart: exactly at the floor is usable, so the guard is a
+    /// minimum and not an off-by-one exclusion of the only good candidate.</summary>
+    [Fact]
+    public void ProvisionedSetExactlyAtTheFloor_IsReused()
+    {
+        var dest = ProvisioningCheck.PlatformAppsDirFor(_root, FakeVersion);
+        WriteR2RPlatformSet(dest, FakeVersion);
+
+        Assert.Equal(dest, BestPlatform(_root, FakeMajorMinor, new Version(FakeVersion)));
+    }
+
+    /// <summary>
+    /// Why discovery returns a LIST: an interrupted newer download (one R2R app) must not
+    /// mask a complete older set. Returning only the newest candidate would make the caller
+    /// adjudicate the partial one, fail, and download 106 MB it already had.
+    /// </summary>
+    [Fact]
+    public void PartialNewerSet_DoesNotMaskACompleteOlderSet()
+    {
+        WriteApp(ProvisioningCheck.PlatformAppsDirFor(_root, "99.0.9.9"),
+            "Base Application", "99.0.9.9", r2r: true);   // partial: one app only
+        var complete = ProvisioningCheck.PlatformAppsDirFor(_root, "99.0.1.2");
+        WriteR2RPlatformSet(complete, "99.0.1.2");
+
+        var candidates = ProvisioningCheck.FindProvisionedPlatformAppsDirs(_root, FakeMajorMinor, null);
+
+        // Newest first, but the complete older set is still offered so the caller can reach it.
+        Assert.Equal(2, candidates.Count);
+        Assert.Equal(complete, candidates[1]);
+        Assert.Equal(ProvisioningCheck.PlatformAppsDirFor(_root, "99.0.9.9"), candidates[0]);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -434,7 +489,10 @@ public sealed class ProvisioningReuseTests : IDisposable
         var (output, _) = RunRunner(fx,
             $"provision \"{fx.Bundle}\" --bc-version {SyntheticEngineVersion}");
 
-        Assert.Contains("could not resolve a full BC artifact version", output);
+        // Asserts the ATTEMPT (logged before the HTTP call) rather than the CDN's answer, so
+        // the claim "it went to the network" holds identically online and offline. This test
+        // does reach the public artifact index; that is inherent to proving it did not reuse.
+        Assert.Contains("Resolving BC version prefix", output);
         Assert.DoesNotContain("already provisioned at", output);
     }
 

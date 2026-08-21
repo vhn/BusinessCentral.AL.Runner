@@ -638,6 +638,9 @@ var packageCacheDirs = packageCacheArgs.Count > 0
     ? ExpandPackageCacheDirs(packageCacheArgs).ToList()
     : DefaultPackageCacheDirs().ToList();
 Console.WriteLine($"  package caches: {packageCacheDirs.Count} dir(s)");
+// Remembered so the provisioning-reuse block below can re-announce the count if it grows —
+// this header is load-bearing for reading a run and was printed before that block could add.
+var packageCacheDirsAtHeader = packageCacheDirs.Count;
 AlRunner.Infrastructure.PhaseLog.SetPackageCacheDirs(packageCacheDirs.Count);
 AlRunner.Infrastructure.PhaseLog.SetBundles(bundles);
 
@@ -679,43 +682,60 @@ if (!provisionSubcommand && (packageCacheDirs.Count > 0 || bundleAlpackagesDirs.
     // packageCacheDirs is what the post-download code already does — it both closes the gap
     // and makes the apps visible to dependency resolution — so this is that same step,
     // reached without the download.
+    // Derived ONCE, before either reuse attempt, and reused by the download below. Deriving it
+    // per-branch was wrong: a successful platform reuse flips platformReport.Ok to true, which
+    // would switch the toolkit's derivation from DeriveProvisionMajorMinor (the symbol-only
+    // apps' own version — the minor the project targets) to DerivePresentPlatformMajorMinor
+    // (the first Base/System App found while enumerating the caches), silently breaking the
+    // "ONE resolved version for both artifact sets" invariant the download below documents:
+    // platform apps reused for 27.0, toolkit fetched for 28.1.
+    var reuseMm = !platformReport.Ok
+        ? AlRunner.Infrastructure.ProvisioningCheck.DeriveProvisionMajorMinor(platformReport, version)
+        : AlRunner.Infrastructure.ProvisioningCheck.DerivePresentPlatformMajorMinor(PlatformCheckDirs(), version);
     if (!platformReport.Ok)
     {
-        var reuseMm = AlRunner.Infrastructure.ProvisioningCheck.DeriveProvisionMajorMinor(platformReport, version);
-        var reuseDir = AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDir(
-            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, reuseMm);
-        if (reuseDir != null && !packageCacheDirs.Contains(reuseDir))
+        // The floor keeps a set OLDER than the project's vendored symbols out: it satisfies
+        // CheckPlatformApps (publisher + name + R2R-ness only) while
+        // DependencyResolver.SelectBestVersion then discards it as below-minimum and falls back
+        // to the symbol-only copy — the "object with ID 0" failure it has a diagnostic for.
+        var floor = AlRunner.Infrastructure.ProvisioningCheck.MinimumUsefulR2RVersion(platformReport);
+        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
+                     AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, reuseMm, floor))
         {
-            // Only keep the dir if it actually closes the gap: a partial set must fall
-            // through to the normal download/bail rather than adding a dead search root.
+            if (packageCacheDirs.Contains(candidate)) continue;
+            // Keep the dir only if it actually closes the gap; otherwise try the next
+            // candidate, so a partial newer set cannot mask a complete older one.
             var withReuse = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
-                version, PlatformCheckDirs().Append(reuseDir).Distinct().ToList());
-            if (withReuse.Ok)
-            {
-                packageCacheDirs.Add(reuseDir);
-                platformReport = withReuse;
-                Console.Error.WriteLine($"[provision] reusing already-provisioned platform R2R apps " +
-                    $"for BC {reuseMm} at {reuseDir} (no download).");
-            }
+                version, PlatformCheckDirs().Append(candidate).Distinct().ToList());
+            if (!withReuse.Ok) continue;
+            packageCacheDirs.Add(candidate);
+            platformReport = withReuse;
+            Console.Error.WriteLine($"[provision] reusing already-provisioned platform R2R apps " +
+                $"for BC {reuseMm} at {candidate} (no download).");
+            break;
         }
     }
     if (!toolkitPresent)
     {
-        var reuseMm = platformReport.Ok
-            ? AlRunner.Infrastructure.ProvisioningCheck.DerivePresentPlatformMajorMinor(PlatformCheckDirs(), version)
-            : AlRunner.Infrastructure.ProvisioningCheck.DeriveProvisionMajorMinor(platformReport, version);
-        var reuseDir = AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDir(
-            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, reuseMm);
-        if (reuseDir != null && !packageCacheDirs.Contains(reuseDir))
+        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
+                     AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, reuseMm, minVersion: null))
         {
-            packageCacheDirs.Add(reuseDir);
+            if (packageCacheDirs.Contains(candidate)) continue;
+            packageCacheDirs.Add(candidate);
             toolkitPresent = AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(PlatformCheckDirs());
-            // Guarded rather than unconditional: claiming a reuse that did not actually
-            // satisfy the toolkit check would be a message that lies about what happened.
-            if (toolkitPresent)
-                Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit " +
-                    $"for BC {reuseMm} at {reuseDir} (no download).");
+            Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit " +
+                $"for BC {reuseMm} at {candidate} (no download).");
+            break;
         }
+    }
+    // Re-announce the list: the header was printed before these blocks could add to it, and
+    // `--package-cache` REPLACES the defaults rather than adding to them, which makes this count
+    // the only signal that the defaults were discarded. Understating it on exactly the runs
+    // where reuse fired is how a run log becomes unreadable.
+    if (packageCacheDirs.Count != packageCacheDirsAtHeader)
+    {
+        Console.WriteLine($"  package caches: {packageCacheDirs.Count} dir(s) after provisioning reuse");
+        AlRunner.Infrastructure.PhaseLog.SetPackageCacheDirs(packageCacheDirs.Count);
     }
 
     if (!platformReport.Ok && !autoProvision)
@@ -5629,23 +5649,25 @@ static void EnsurePlatformAppsProvisioned(string engineVersion, List<string> bun
     // this check the ~106 MB R2R set was re-fetched on every single invocation, into a
     // directory this code path then never read back. Discovery is a pure filesystem scan, so
     // a warm machine pays no CDN round-trip and an offline one still works.
-    var provisioned = AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDir(
-        AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, mm);
-    if (provisioned != null)
+    // The floor keeps a set older than the project's vendored symbols out — it would satisfy
+    // CheckPlatformApps and then lose to that symbol copy in DependencyResolver.
+    var floor = AlRunner.Infrastructure.ProvisioningCheck.MinimumUsefulR2RVersion(platformReport);
+    foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
+                 AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, mm, floor))
     {
-        // Adjudicate against the same predicate the startup gate uses, over the bundle's
-        // dirs PLUS the provisioned set — discovery only says "plausible", and a partial
-        // set must still fall through to the download rather than silently pass.
+        // Adjudicate against the same predicate the startup gate uses, over the bundle's dirs
+        // PLUS this candidate — discovery only says "plausible". A partial set falls through to
+        // the next candidate, so an interrupted newer download cannot mask a complete older set.
         var withProvisioned = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
-            engineVersion, bundleAlpackagesDirs.Append(provisioned).Distinct().ToList());
+            engineVersion, bundleAlpackagesDirs.Append(candidate).Distinct().ToList());
         if (withProvisioned.Ok)
         {
             Console.Error.WriteLine($"[provision] platform R2R apps for BC {mm} already provisioned " +
-                $"at {provisioned} — reusing (no download).");
+                $"at {candidate} — reusing (no download).");
             return;
         }
-        Console.Error.WriteLine($"[provision] {provisioned} exists but does not close the gap " +
-            $"({string.Join(", ", withProvisioned.Issues.Select(i => i.Name))}) — downloading.");
+        Console.Error.WriteLine($"[provision] {candidate} exists but does not close the gap " +
+            $"({string.Join(", ", withProvisioned.Issues.Select(i => i.Name))}) — trying the next candidate.");
     }
 
     var platformFull = AlRunner.Provisioning.ArtifactDownloader.ResolveVersion(
@@ -5709,6 +5731,20 @@ static void EnsureTestToolkitProvisioned(string fullVersion)
                 $"[provision] warning: could not fetch the test toolkit for BC {fullVersion}. " +
                 $"Test bundles depending on Library Assert / Test Runner / Any will need " +
                 $"--package-cache <dir-with-those-apps>.");
+        // Re-check, mirroring the startup gate: ArtifactDownloader.TestApps reports success on
+        // ANY non-zero extraction count and skips individual entries silently, so rc == 0 does
+        // NOT mean the sentinel landed. Without this, a partial extraction (or a BC version
+        // whose platform artifact genuinely lacks the sentinel app) re-downloads the whole
+        // toolkit on every single invocation and says nothing about why — a silent loop, which
+        // is exactly what .claude/rules/loud-failures.md forbids. The old `any *.app` guard
+        // stopped after one download precisely because it asked a weaker question.
+        else if (!AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(new[] { dir }))
+            Console.Error.WriteLine(
+                $"[provision] warning: the test toolkit download for BC {fullVersion} reported success " +
+                $"but '{AlRunner.Infrastructure.ProvisioningCheck.TestToolkitSentinelApp}' is still " +
+                $"absent from {dir}. The download is incomplete, or this BC version's platform " +
+                $"artifact does not ship that app — either way this will be re-attempted on every " +
+                $"run until it is resolved. Point --package-cache at a dir that has the toolkit.");
     }
     catch (Exception ex)
     {

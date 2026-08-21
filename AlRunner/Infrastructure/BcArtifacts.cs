@@ -86,9 +86,13 @@ public static class BcArtifacts
     /// race every other test that reads this root, and this root is what decides where the
     /// runner looks for a multi-GB engine.
     /// </summary>
+    /// <para>Absolutised: <see cref="TryTranslateArtifactPathToVersion"/> compares a
+    /// <c>Path.GetFullPath</c>'d <c>--artifact-path</c> against this root with an ordinal
+    /// string compare, so a RELATIVE override would never match and would silently route the
+    /// run onto the explicit-root selection branch instead of normal version selection.</para>
     internal static string ResolveArtifactsRoot(string? envOverride, string userHome)
         => !string.IsNullOrWhiteSpace(envOverride)
-            ? envOverride.Trim()
+            ? Path.GetFullPath(envOverride.Trim())
             : Path.Combine(userHome, ArtifactsRoot_Rel);
 
     private static string ArtifactsRoot => ResolveArtifactsRoot(

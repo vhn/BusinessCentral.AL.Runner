@@ -371,48 +371,80 @@ public static class ProvisioningCheck
     // fully provisioned but offline machine.
 
     /// <summary>
-    /// The runner-owned <c>platform-apps</c> directory of the highest already-provisioned
-    /// version matching <paramref name="majorMinor"/> that carries at least one Microsoft
-    /// platform runtime app as an R2R package, or null when there is none.
+    /// Every already-provisioned <c>platform-apps</c> directory matching
+    /// <paramref name="majorMinor"/> that carries at least one Microsoft platform runtime app
+    /// as an R2R package, newest version first. Empty when there is none.
     ///
-    /// <para>Highest-matching mirrors what a fresh download would produce
-    /// (<c>ArtifactDownloader.ResolveVersion</c> returns the latest published build for a
-    /// prefix), so reusing it pairs the same R2R build with the project's symbols that
-    /// downloading would have. The prefix match is segment-wise
+    /// <para><paramref name="minVersion"/> is a hard floor and is the load-bearing parameter:
+    /// <c>DependencyResolver.SelectBestVersion</c> discards any candidate below the declared
+    /// dependency minimum, so an R2R set OLDER than the symbols a project vendors is worse
+    /// than useless — it satisfies <see cref="CheckPlatformApps"/> (which compares only
+    /// publisher, name and R2R-ness) while resolution rejects it and falls back to the
+    /// symbol-only copy, ending in the "object with ID 0 does not have a member with that ID"
+    /// failure that DependencyResolver has a dedicated diagnostic for. Pass the highest
+    /// version among the gap's own issues (<see cref="MinimumUsefulR2RVersion"/>): an R2R set
+    /// at least as new as the vendored symbols is exactly the condition under which
+    /// SelectBestVersion prefers it.</para>
+    ///
+    /// <para>A LIST rather than the single best candidate, because the caller adjudicates:
+    /// returning only the newest would let a partial set (an interrupted download that landed
+    /// one app) mask a complete older one, and the download would fire anyway — the very
+    /// failure this exists to prevent, one version narrower. The prefix match is segment-wise
     /// (<see cref="BcArtifacts.VersionNameMatchesPrefix"/>), so "27.5" never matches
     /// "27.50.x".</para>
     /// </summary>
-    public static string? FindProvisionedPlatformAppsDir(string artifactsRootDir, string majorMinor)
-        => FindProvisionedDir(artifactsRootDir, majorMinor, PlatformAppsDirFor, HasAnyR2RPlatformApp);
+    public static IReadOnlyList<string> FindProvisionedPlatformAppsDirs(
+        string artifactsRootDir, string majorMinor, System.Version? minVersion)
+        => FindProvisionedDirs(artifactsRootDir, majorMinor, minVersion,
+            PlatformAppsDirFor, HasAnyR2RPlatformApp);
 
     /// <summary>
-    /// The runner-owned <c>test-apps</c> directory of the highest already-provisioned
-    /// version matching <paramref name="majorMinor"/> in which the Microsoft test toolkit is
-    /// actually present (<see cref="TestToolkitPresent"/>), or null when there is none.
-    /// A directory holding some toolkit apps but not the sentinel is a partial download and
-    /// is deliberately NOT a hit.
+    /// Every already-provisioned <c>test-apps</c> directory matching
+    /// <paramref name="majorMinor"/> in which the Microsoft test toolkit is actually present
+    /// (<see cref="TestToolkitPresent"/>), newest first. A directory holding some toolkit apps
+    /// but not the sentinel is a partial download and is deliberately excluded.
     /// </summary>
-    public static string? FindProvisionedTestAppsDir(string artifactsRootDir, string majorMinor)
-        => FindProvisionedDir(artifactsRootDir, majorMinor, TestAppsDirFor,
+    public static IReadOnlyList<string> FindProvisionedTestAppsDirs(
+        string artifactsRootDir, string majorMinor, System.Version? minVersion)
+        => FindProvisionedDirs(artifactsRootDir, majorMinor, minVersion, TestAppsDirFor,
             dir => TestToolkitPresent(new[] { dir }));
 
-    private static string? FindProvisionedDir(
-        string artifactsRootDir, string majorMinor,
-        Func<string, string, string> dirFor, Func<string, bool> satisfied)
+    /// <summary>
+    /// The lowest R2R version that could actually close <paramref name="report"/>'s gap: the
+    /// HIGHEST version among the symbol-only apps it names. Anything below that loses to the
+    /// symbol copy it is meant to replace (see
+    /// <see cref="FindProvisionedPlatformAppsDirs"/>). Null when there is no issue to close
+    /// or no issue version parses.
+    /// </summary>
+    public static System.Version? MinimumUsefulR2RVersion(PlatformAppsReport report)
     {
-        if (string.IsNullOrEmpty(artifactsRootDir) || string.IsNullOrEmpty(majorMinor)) return null;
-        if (!Directory.Exists(artifactsRootDir)) return null;
+        System.Version? floor = null;
+        foreach (var (_, appVersion, _) in report.Issues)
+        {
+            if (!System.Version.TryParse(appVersion, out var v)) continue;
+            if (floor == null || v > floor) floor = v;
+        }
+        return floor;
+    }
+
+    private static IReadOnlyList<string> FindProvisionedDirs(
+        string artifactsRootDir, string majorMinor, System.Version? minVersion,
+        Func<string, string, string> dirFor, Func<string, bool> plausible)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrEmpty(artifactsRootDir) || string.IsNullOrEmpty(majorMinor)) return result;
+        if (!Directory.Exists(artifactsRootDir)) return result;
 
         IEnumerable<string> children;
         try { children = Directory.EnumerateDirectories(artifactsRootDir); }
-        catch { return null; }
+        catch { return result; }
 
         var candidates = children
             .Select(d => Path.GetFileName(
                 d.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)))
             .Where(name => BcArtifacts.VersionNameMatchesPrefix(name, majorMinor))
             .Select(name => (Name: name, Ver: System.Version.TryParse(name, out var v) ? v : null))
-            .Where(t => t.Ver != null)
+            .Where(t => t.Ver != null && (minVersion == null || t.Ver >= minVersion))
             .OrderByDescending(t => t.Ver)
             .ToList();
 
@@ -420,10 +452,10 @@ public static class ProvisioningCheck
         {
             var dir = dirFor(artifactsRootDir, name);
             if (!Directory.Exists(dir)) continue;
-            try { if (satisfied(dir)) return dir; }
-            catch { /* unreadable candidate — try the next one rather than failing the run */ }
+            try { if (plausible(dir)) result.Add(dir); }
+            catch { /* unreadable candidate — skip it rather than failing the run */ }
         }
-        return null;
+        return result;
     }
 
     /// <summary>
