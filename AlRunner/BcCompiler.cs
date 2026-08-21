@@ -1517,15 +1517,16 @@ public sealed partial class BcCompiler
     /// <summary>
     /// Locates the owning app's own <c>app.json</c> and reads the properties that feed
     /// ParseOptions/CompilationOptions (#1940/#1941/#1943). Prefers <paramref name="appRootDir"/>
-    /// (the documented "real" app root); falls back to scanning <paramref name="dirs"/> the way
-    /// <see cref="EmitDepSymbols"/> always has, for callers whose app root IS one of the source
-    /// folders.
+    /// (the documented "real" app root); falls back to scanning <paramref name="dirs"/>, for
+    /// callers whose app root IS one of the source folders. Deliberately never climbs to a
+    /// parent directory — see the two-lookups note in <see cref="EmitDepSymbols"/> for why a
+    /// neighbouring app's manifest is worse than none.
     ///
-    /// <para>Shared by the full compile and the delta compile on purpose. The two must resolve
-    /// the SAME manifest and derive the SAME inputs from it, or a delta binds against a different
-    /// language surface than the compile it stands in for — and that difference shows up as an AL
-    /// diagnostic on code the full compile accepts, which reads as a delta bug rather than as a
-    /// missing manifest property.</para>
+    /// <para>Shared by the full compile, the delta compile and the source-dependency /
+    /// sibling-symbol compile on purpose. All three must resolve the SAME manifest and derive
+    /// the SAME inputs from it, or one binds against a different language surface than the
+    /// others — and that difference shows up as an AL diagnostic on code another path accepts,
+    /// which reads as a bug in that path rather than as a manifest that went missing.</para>
     /// </summary>
     private static (string? Path, ManifestCompilerInputs Inputs) ResolveManifestInputs(
         string? appRootDir, IEnumerable<string> dirs)
@@ -2250,10 +2251,12 @@ public sealed partial class BcCompiler
     /// </summary>
     /// <param name="appRootDir">
     /// The directory containing this dep's own app.json — see the identically-named
-    /// parameter on <see cref="Emit"/> for why (#1899). When omitted, falls back to
-    /// whichever of <paramref name="alFolders"/> already carries an app.json — the same
-    /// directory <c>ivtRefs</c> below is read from — since every current caller of this
-    /// overload passes a single flat directory that already IS the app root.
+    /// parameter on <see cref="Emit"/> for why (#1899). It is also where the manifest
+    /// behind ParseOptions/CompilationOptions and <c>internalsVisibleTo</c> is read from,
+    /// which matters whenever it is NOT one of <paramref name="alFolders"/>: an app keeping
+    /// its AL under <c>src/</c> reaches here as <c>alFolders = [&lt;app&gt;/src]</c> with the
+    /// manifest one level up. When omitted, both lookups fall back to whichever of
+    /// <paramref name="alFolders"/> carries an app.json.
     /// </param>
     public void EmitDepSymbols(
         IEnumerable<string> alFolders, string moduleName,
@@ -2274,19 +2277,31 @@ public sealed partial class BcCompiler
         // all need it in hand for the ctors themselves.
         //
         // TWO LOOKUPS, deliberately, and they are not interchangeable. The compiler inputs must
-        // come off THIS DEP's OWN manifest, so they scan `dirs` — the dep's source folders — and
-        // accept "no manifest" as the answer. FindAppManifest below cannot serve that: it prefers
-        // an explicit appRootDir and then climbs to `../app.json`, either of which can resolve to
-        // a DIFFERENT app's manifest, and compiling a dep against another app's `features` breaks
-        // it in both directions (a dep whose manifest omits noImplicitWith would compile cleanly
-        // off a parent that declares it, and one that declares it would fail off a parent that
-        // does not). Pinned by ManifestFeaturesSubprocessTests' two SourceDependency cases.
-        var manifestAppJson = dirs.Select(d => Path.Combine(d, "app.json")).FirstOrDefault(File.Exists);
-        var manifestInputs = ReadManifestCompilerInputs(manifestAppJson);
+        // come off THIS DEP's OWN manifest — appRootDir when the caller named one, since that
+        // parameter is contractually this dep's own app root, otherwise a scan of `dirs` — and
+        // must accept "no manifest" as the answer. What they must NOT do is what FindAppManifest
+        // below does: climb to `../app.json`, which can resolve to a DIFFERENT app's manifest,
+        // and compiling a dep against another app's `features` breaks it in both directions (a
+        // dep whose manifest omits noImplicitWith would compile cleanly off a parent that
+        // declares it, and one that declares it would fail off a parent that does not). Pinned
+        // by ManifestFeaturesSubprocessTests' two SourceDependency cases. ResolveManifestInputs
+        // is precisely that lookup — appRootDir first, then `dirs`, never a parent — and it is
+        // the same one Emit uses, so an app compiled on both paths derives its language surface
+        // from one manifest instead of two.
+        //
+        // Scanning `dirs` ALONE, as this did before, was blind to the app-root-plus-src/ layout:
+        // CollectSuitePaths reduces such an app to [<app>/src], which holds no app.json, so
+        // every manifest property silently fell back to its unset default here while the same
+        // app's own Emit read them correctly. Measured on a real ISV bundle: 295 pages raised
+        // AL0543 in the sibling-symbols compile of an app whose manifest does set
+        // contextSensitiveHelpUrl, which cost the dependent app all 298 of its objects. Every
+        // fixture in the repo was flat — the one layout where the dirs-only scan happens to
+        // find the manifest — so nothing caught it. See SiblingSymbolsAppRootManifestTests.
+        var manifestInputs = ResolveManifestInputs(appRootDir, dirs).Inputs;
 
         // Preprocessor symbols: same union as Emit() — CLEANSCHEMA1..25, any caller-supplied
         // (--define) symbols, AND this dep's OWN manifest symbols (#1943) — never the
-        // consuming bundle's, since manifestAppJson is this dep's own app.json.
+        // consuming bundle's, since the manifest resolved above is this dep's own.
         var parseOpts = new NavCA.ParseOptions(
             runtimeVersion: null!,
             preprocessorSymbols: Enumerable.Range(1, 25).Select(n => $"CLEANSCHEMA{n}")
