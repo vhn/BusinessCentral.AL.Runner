@@ -707,9 +707,14 @@ public class RadDeltaWatchTests
             // moved key. When the signature is made mode-independent, this becomes
             // `Delta Lib: delta +0 ~1 -0` and the rebind message loses its suffix — update both
             // lines together.
-            Assert.Contains(
-                "[watch] Delta Lib: full rebuild — the resolved dependency set changed (1 → 0)",
-                cycle2);
+            var signatureChange = System.Text.RegularExpressions.Regex.Match(
+                cycle2,
+                @"\[watch\] Delta Lib: full rebuild — the resolved dependency set changed \((\d+) → (\d+)\)");
+            Assert.True(signatureChange.Success,
+                $"expected the measured reference-signature invalidation; cycle was:\n{cycle2}");
+            Assert.Equal(
+                int.Parse(signatureChange.Groups[2].Value) + 1,
+                int.Parse(signatureChange.Groups[1].Value));
 
             // Whichever of the two the producer broadcast, the consumer only hears it because
             // its hydrated graph names the producer at all: PendingCrossAppRebinds returns

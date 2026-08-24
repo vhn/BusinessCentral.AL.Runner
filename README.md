@@ -369,6 +369,17 @@ Open, and deliberately not presented as solved:
   (`AlRunner.Tests/CollectionCostOrderer.cs:141-156`), and local and CI disagree by up to 3x on
   the same class.
 
+### CLI provisioning
+
+- **`--auto-provision` now works from empty project caches.** The runner derives the Microsoft
+  platform and test-app sets from every target `app.json`, downloads them for the selected full
+  BC version, and caches them under
+  `~/.local/share/al-runner/artifacts/<version>/{platform-apps,test-apps}`. A warm run checks and
+  reuses those destinations before contacting the CDN, and adds them to dependency resolution
+  automatically. No `--artifact-path` or `--package-cache` is needed: for example,
+  `al-runner <bundle> --watch --auto-provision --test 123456` provisions once and then stays
+  resident.
+
 ### Upstreaming status
 
 The fork is **11 commits behind** upstream, and two of those already fix bugs fixed here
@@ -615,6 +626,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dev-loop) for provisioning them as a separ
 | `--package-cache PATH` | Extra `.app`-package cache directory. Repeatable. |
 | `--cache PATH` | Cache compiled AL output keyed on source + dep set + runner mtime. |
 | `--no-cache` | Disable **every** on-disk cache for this run — AL output plus compiled-deps, workspace-deps, ncl-cecil, bc-symbols, app-manifests, r2r-chunks and install-baseline — not just al-out. `~/.cache/al-runner` is left untouched. Slow on purpose; use it to measure or reproduce a genuinely cold compile. `--cache DIR` and `--no-cache` are last-wins. |
+| `--auto-provision` | Download missing engine, Microsoft platform, and Microsoft test-app artifacts for the selected BC version, cache them in the runner-owned versioned artifact root, and reuse them on later runs. Requirements come from the target `app.json` files, so empty `.alpackages` directories need no cache-path flags. |
 | `--isolation codeunit\|test\|disabled` | Test isolation mode. Default `codeunit`. |
 | `--watch` | Stay resident with warm dependencies; on `.al` or `app.json` changes, recompile only the AL objects that changed and run **in-process**. Debounces on quiescence (default 250ms of no further event, capped at 10s) so a bulk multi-file rewrite — a branch switch, a rebase, a formatter run — settles before a cycle starts, instead of firing mid-checkout. Tune with `AL_RUNNER_WATCH_QUIET_MS` / `AL_RUNNER_WATCH_MAX_WAIT_MS`. |
 | `--server` | Long-running JSON-RPC daemon over stdin/stdout (warm deps → ~19s→~4s/run). See [docs/server-mode.md](docs/server-mode.md). |

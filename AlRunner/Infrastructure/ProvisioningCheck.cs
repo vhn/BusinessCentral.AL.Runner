@@ -1,4 +1,5 @@
 using AlRunner.Provisioning;
+using System.Text.Json;
 
 namespace AlRunner.Infrastructure;
 
@@ -153,6 +154,277 @@ public static class ProvisioningCheck
                     result.Add(dir);
         }
         return result;
+    }
+
+    // ── Manifest-derived Microsoft provisioning requirements ────────────────
+    // Package-cache contents cannot answer what an empty cache needs. app.json can: its
+    // application/platform roots require the curated platform-app set, while explicit
+    // Microsoft test dependencies require both that set and the platform artifact's test
+    // apps. The declared versions are floors, not pins; callers use the BC version selected
+    // for the run as the download target.
+
+    public sealed record MicrosoftProvisioningRequirements(
+        bool PlatformAppsRequired,
+        bool TestAppsRequired,
+        System.Version? MinimumVersion,
+        IReadOnlyList<string> RequiredTestAppNames,
+        IReadOnlyList<string> ManifestPaths);
+
+    // Direct roots used by Microsoft test apps. The platform artifact's test-app stream can
+    // provide these (and their transitive test closure); it cannot provide arbitrary
+    // Microsoft application extensions. Treating every non-platform Microsoft dependency as
+    // a test root makes e.g. Sales and Inventory Forecast trigger a 100-app download that can
+    // never satisfy the manifest, forever. Keep this bounded to the stable framework roots
+    // external test apps actually declare.
+    private static readonly HashSet<string> KnownMicrosoftTestAppRoots = new(
+        StringComparer.OrdinalIgnoreCase)
+    {
+        "Any",
+        "Application Test Library",
+        "Business Foundation Test Libraries",
+        "Library Assert",
+        "Library Variable Storage",
+        "Permissions Mock",
+        "System Application Test Library",
+        "Test Runner",
+        "Tests-TestLibraries",
+    };
+
+    /// <summary>
+    /// Derives the Microsoft artifact sets required by the target bundle manifests without
+    /// consulting <c>.alpackages</c>. A bundle root with no manifest of its own is walked like
+    /// suite enumeration: stop at the first <c>app.json</c> on each branch, and ignore hidden
+    /// workspace metadata plus build-output directories.
+    /// </summary>
+    public static MicrosoftProvisioningRequirements DeriveMicrosoftRequirements(
+        IEnumerable<string> bundlePaths)
+    {
+        var manifests = CollectTargetManifestPaths(bundlePaths);
+        var platformRequired = false;
+        var testAppsRequired = false;
+        System.Version? minimumVersion = null;
+        var requiredTestApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void RaiseFloor(string? value)
+        {
+            if (!System.Version.TryParse(value, out var parsed)) return;
+            if (minimumVersion == null || parsed > minimumVersion)
+                minimumVersion = parsed;
+        }
+
+        static string? StringProperty(JsonElement element, string name)
+            => element.ValueKind == JsonValueKind.Object
+               && element.TryGetProperty(name, out var value)
+               && value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+
+        foreach (var manifest in manifests)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
+                var root = doc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object)
+                    continue;
+                foreach (var field in new[] { "application", "platform" })
+                {
+                    if (!root.TryGetProperty(field, out var value)
+                        || value.ValueKind != JsonValueKind.String
+                        || string.IsNullOrWhiteSpace(value.GetString()))
+                        continue;
+                    platformRequired = true;
+                    RaiseFloor(value.GetString());
+                }
+
+                if (!root.TryGetProperty("dependencies", out var dependencies)
+                    || dependencies.ValueKind != JsonValueKind.Array)
+                    continue;
+
+                foreach (var dependency in dependencies.EnumerateArray())
+                {
+                    var publisher = StringProperty(dependency, "publisher") ?? "";
+                    if (!string.Equals(publisher, "Microsoft", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var name = StringProperty(dependency, "name") ?? "";
+                    var version = StringProperty(dependency, "version");
+                    platformRequired = true;
+                    RaiseFloor(version);
+
+                    if (AlRunner.DependencyResolver.IsMicrosoftPlatformApp(name, publisher))
+                        continue;
+
+                    if (!KnownMicrosoftTestAppRoots.Contains(name))
+                        continue;
+
+                    // Microsoft's test packages depend on both artifact sets. Application
+                    // Test Library itself lives in platform-apps; every other explicitly
+                    // named test app must also be present in test-apps.
+                    testAppsRequired = true;
+                    if (!string.Equals(name, "Application Test Library", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrWhiteSpace(name))
+                        requiredTestApps.Add(name);
+                }
+            }
+            catch (JsonException)
+            {
+                // Normal bundle loading owns malformed-manifest diagnostics. Provisioning
+                // must not invent requirements from a document it cannot read.
+            }
+            catch (IOException)
+            {
+                // A manifest can disappear between discovery and read in watch mode.
+            }
+        }
+
+        return new MicrosoftProvisioningRequirements(
+            platformRequired,
+            testAppsRequired,
+            minimumVersion,
+            requiredTestApps.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList(),
+            manifests);
+    }
+
+    private static IReadOnlyList<string> CollectTargetManifestPaths(IEnumerable<string> bundlePaths)
+    {
+        var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var bundlePath in bundlePaths)
+        {
+            if (string.IsNullOrWhiteSpace(bundlePath)) continue;
+            string path;
+            try { path = Path.GetFullPath(bundlePath); }
+            catch { continue; }
+
+            if (File.Exists(path)
+                && string.Equals(Path.GetFileName(path), "app.json", StringComparison.OrdinalIgnoreCase))
+            {
+                found.Add(path);
+                continue;
+            }
+
+            var start = File.Exists(path) ? Path.GetDirectoryName(path) : path;
+            if (string.IsNullOrEmpty(start) || !Directory.Exists(start)) continue;
+
+            string? current = start;
+            var enclosing = false;
+            while (!string.IsNullOrEmpty(current))
+            {
+                var candidate = Path.Combine(current, "app.json");
+                if (File.Exists(candidate))
+                {
+                    found.Add(Path.GetFullPath(candidate));
+                    enclosing = true;
+                    break;
+                }
+                current = Directory.GetParent(current)?.FullName;
+            }
+            if (enclosing) continue;
+
+            Walk(start);
+        }
+
+        return found.OrderBy(p => p, StringComparer.Ordinal).ToList();
+
+        void Walk(string dir)
+        {
+            var manifest = Path.Combine(dir, "app.json");
+            if (File.Exists(manifest))
+            {
+                found.Add(Path.GetFullPath(manifest));
+                return;
+            }
+
+            IEnumerable<string> children;
+            try { children = Directory.EnumerateDirectories(dir).OrderBy(p => p, StringComparer.Ordinal); }
+            catch { return; }
+
+            foreach (var child in children)
+            {
+                var name = Path.GetFileName(child);
+                if (name.StartsWith(".", StringComparison.Ordinal)
+                    || name.Equals("bin", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("obj", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                Walk(child);
+            }
+        }
+    }
+
+    /// <summary>
+    /// True when the supplied directories contain the complete curated platform set needed
+    /// by <paramref name="requirements"/>. BC 28+ test dependencies additionally require
+    /// Application Test Library, which is delivered by <c>platform-apps</c>, not
+    /// <c>test-apps</c>.
+    /// </summary>
+    public static bool PlatformAppsPresent(
+        string dir, string fullVersion, MicrosoftProvisioningRequirements requirements)
+        => PlatformAppsPresent(new[] { dir }, fullVersion, requirements);
+
+    public static bool PlatformAppsPresent(
+        IEnumerable<string> dirs, string fullVersion, MicrosoftProvisioningRequirements requirements)
+    {
+        if (!requirements.PlatformAppsRequired) return true;
+
+        var packages = ReadMicrosoftPackages(dirs);
+        foreach (var runtimeApp in KnownPlatformRuntimeApps)
+            if (!packages.TryGetValue(runtimeApp, out var candidates)
+                || !candidates.Any(candidate => candidate.IsR2R))
+                return false;
+
+        foreach (var app in new[] { "Application", "System" })
+            if (!packages.ContainsKey(app))
+                return false;
+
+        if (requirements.TestAppsRequired
+            && System.Version.TryParse(fullVersion, out var selected)
+            && selected.Major >= 28
+            && (!packages.TryGetValue("Application Test Library", out var testLibraries)
+                || !testLibraries.Any(candidate => candidate.IsR2R)))
+            return false;
+
+        return true;
+    }
+
+    public static bool TestAppsPresent(
+        string dir, MicrosoftProvisioningRequirements requirements)
+        => TestAppsPresent(new[] { dir }, requirements);
+
+    public static bool TestAppsPresent(
+        IEnumerable<string> dirs, MicrosoftProvisioningRequirements requirements)
+    {
+        if (!requirements.TestAppsRequired) return true;
+        var packages = ReadMicrosoftPackages(dirs);
+        if (!packages.ContainsKey(TestToolkitSentinelApp)) return false;
+        return requirements.RequiredTestAppNames.All(packages.ContainsKey);
+    }
+
+    private sealed record ProvisionedPackage(bool IsR2R);
+
+    private static Dictionary<string, List<ProvisionedPackage>> ReadMicrosoftPackages(
+        IEnumerable<string> dirs)
+    {
+        var packages = new Dictionary<string, List<ProvisionedPackage>>(
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var dir in dirs.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!Directory.Exists(dir)) continue;
+            IEnumerable<string> files;
+            try { files = Directory.EnumerateFiles(dir, "*.app", SearchOption.AllDirectories); }
+            catch { continue; }
+            foreach (var file in files)
+            {
+                var manifest = AlRunner.AppLoader.ReadManifest(file);
+                if (manifest == null
+                    || !string.Equals(manifest.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (!packages.TryGetValue(manifest.Name, out var candidates))
+                    packages[manifest.Name] = candidates = new List<ProvisionedPackage>();
+                candidates.Add(new ProvisionedPackage(AlRunner.AppLoader.IsR2R(file)));
+            }
+        }
+        return packages;
     }
 
     /// <summary>

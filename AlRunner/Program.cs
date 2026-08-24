@@ -528,13 +528,19 @@ if (bcVersionArg == null && artifactPathArg == null)
 // is the ONLY path that downloads — a normal run never does.
 if (provisionSubcommand || autoProvision)
 {
-    var prc = RunProvisioning(bcVersionArg, artifactPathArg, bundles, out var provisionedVersion);
+    var prc = RunProvisioning(
+        bcVersionArg, artifactPathArg, bundles,
+        provisionManifestApps: provisionSubcommand,
+        out var provisionedVersion);
     if (provisionSubcommand)
         return prc; // the subcommand always exits after provisioning, never runs tests
-    if (prc == 0 && provisionedVersion != null)
+    // The early pass owns only the engine for --auto-provision. Manifest-required apps are
+    // handled after BC selection, when the runner can inspect the same default/explicit
+    // package caches dependency resolution will use and avoid an unnecessary download.
+    // A failed engine download is already fully diagnosed, so stop before selection/re-exec.
+    if (prc != 0) return 2;
+    if (provisionedVersion != null)
         bcVersionArg = provisionedVersion; // run against the version we just ensured
-    // On failure with --auto-provision we fall through; SelectVersion below emits the
-    // loud, path-naming error (and the detailed ProvisioningCheck report if partial).
 }
 try
 {
@@ -662,163 +668,117 @@ List<string> PlatformCheckDirs() => packageCacheDirs.Concat(bundleAlpackagesDirs
 // the EMIT-ZERO crash is a provisioning gap, not a user-code error. Fail loud here before
 // any bundle compile, naming the fix, instead of deep inside the dep-load pipeline.
 // (--auto-provision downloads the R2R apps and clears the check.)
-if (!provisionSubcommand && (packageCacheDirs.Count > 0 || bundleAlpackagesDirs.Count > 0))
+var microsoftRequirements =
+    AlRunner.Infrastructure.ProvisioningCheck.DeriveMicrosoftRequirements(bundles);
+if (!provisionSubcommand
+    && (packageCacheDirs.Count > 0
+        || bundleAlpackagesDirs.Count > 0
+        || microsoftRequirements.PlatformAppsRequired
+        || microsoftRequirements.TestAppsRequired))
 {
     var version = AlRunner.Infrastructure.BcArtifacts.SelectedVersion.ToString();
+    var selected = AlRunner.Infrastructure.BcArtifacts.SelectedVersion;
+    var selectedMm = $"{selected.Major}.{selected.Minor}";
+    var artifactsRoot = AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir;
+
+    bool PlatformReady() =>
+        !microsoftRequirements.PlatformAppsRequired
+        || AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
+            PlatformCheckDirs(), version, microsoftRequirements);
+    bool TestAppsReady() =>
+        !microsoftRequirements.TestAppsRequired
+        || AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(
+            PlatformCheckDirs(), microsoftRequirements);
+
+    bool TryReusePlatformSet()
+    {
+        if (PlatformReady()) return true;
+        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
+                     artifactsRoot, selectedMm, microsoftRequirements.MinimumVersion))
+        {
+            if (!AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
+                    PlatformCheckDirs().Append(candidate), version, microsoftRequirements))
+                continue;
+            if (!packageCacheDirs.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                packageCacheDirs.Add(candidate);
+            Console.Error.WriteLine($"[provision] reusing already-provisioned platform apps " +
+                $"for selected BC {selectedMm} at {candidate} (no download).");
+            return true;
+        }
+        return false;
+    }
+
+    bool TryReuseTestSet()
+    {
+        if (TestAppsReady()) return true;
+        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
+                     artifactsRoot, selectedMm, microsoftRequirements.MinimumVersion))
+        {
+            if (!AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(
+                    PlatformCheckDirs().Append(candidate), microsoftRequirements))
+                continue;
+            if (!packageCacheDirs.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                packageCacheDirs.Add(candidate);
+            Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit " +
+                $"for selected BC {selectedMm} at {candidate} (no download).");
+            return true;
+        }
+        return false;
+    }
+
+    // Manifest-derived absence is opt-in, just like the downloads themselves. Without
+    // --auto-provision an explicit --package-cache continues to mean exactly that set of
+    // dirs. Preserve the older local-reuse repair only when symbol-only platform packages
+    // have already made a concrete runtime gap visible.
     var platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
         version, PlatformCheckDirs());
-    // Test-toolkit apps (Business Foundation Test Libraries, Application Test Library, …)
-    // are a SEPARATE artifact set from the w1 platform apps (they live under the
-    // `platform` artifact, not `w1`) — a cache can have complete R2R platform apps and
-    // still be missing the whole test toolkit, which fails compiling any test bundle.
-    var toolkitPresent = AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(PlatformCheckDirs());
+    if (autoProvision || !platformReport.Ok)
+        TryReusePlatformSet();
+    // Reusing a complete local toolkit does not cross the opt-in boundary: it performs no
+    // network or write, and preserves the pre-existing behavior for a toolkit provisioned
+    // at a neighboring build. TestAppsReady makes this a no-op when the manifests do not
+    // declare a known Microsoft test-framework root.
+    TryReuseTestSet();
 
-    // Reuse an already-provisioned runner-owned set before deciding ANYTHING — deliberately
-    // ahead of the loud bail below, not just ahead of the download. DefaultPackageCacheDirs
-    // composes the two provisioned dirs from the SELECTED version only, while the version a
-    // provisioning pass targets is derived from the project's vendored symbols; whenever
-    // those differ (the common case) a fully provisioned machine was told it had a gap and
-    // either exited 2 or re-downloaded a set it already had. Folding the hit into
-    // packageCacheDirs is what the post-download code already does — it both closes the gap
-    // and makes the apps visible to dependency resolution — so this is that same step,
-    // reached without the download.
-    // Derived ONCE, before either reuse attempt, and reused by the download below. Deriving it
-    // per-branch was wrong: a successful platform reuse flips platformReport.Ok to true, which
-    // would switch the toolkit's derivation from DeriveProvisionMajorMinor (the symbol-only
-    // apps' own version — the minor the project targets) to DerivePresentPlatformMajorMinor
-    // (the first Base/System App found while enumerating the caches), silently breaking the
-    // "ONE resolved version for both artifact sets" invariant the download below documents:
-    // platform apps reused for 27.0, toolkit fetched for 28.1.
-    var reuseMm = !platformReport.Ok
-        ? AlRunner.Infrastructure.ProvisioningCheck.DeriveProvisionMajorMinor(platformReport, version)
-        : AlRunner.Infrastructure.ProvisioningCheck.DerivePresentPlatformMajorMinor(PlatformCheckDirs(), version);
-    if (!platformReport.Ok)
+    // --artifact-path intentionally makes the early engine provisioner a no-op, so this
+    // post-selection gate must own app provisioning too. Both paths call the same helpers,
+    // which check the selected version's destination before any network request.
+    if (autoProvision && !PlatformReady())
     {
-        // The floor keeps a set OLDER than the project's vendored symbols out: it satisfies
-        // CheckPlatformApps (publisher + name + R2R-ness only) while
-        // DependencyResolver.SelectBestVersion then discards it as below-minimum and falls back
-        // to the symbol-only copy — the "object with ID 0" failure it has a diagnostic for.
-        var floor = AlRunner.Infrastructure.ProvisioningCheck.MinimumUsefulR2RVersion(platformReport);
-        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
-                     AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, reuseMm, floor))
+        if (!EnsurePlatformAppsProvisioned(version, microsoftRequirements)) return 2;
+        if (!TryReusePlatformSet())
         {
-            if (packageCacheDirs.Contains(candidate)) continue;
-            // Keep the dir only if it actually closes the gap; otherwise try the next
-            // candidate, so a partial newer set cannot mask a complete older one.
-            var withReuse = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
-                version, PlatformCheckDirs().Append(candidate).Distinct().ToList());
-            if (!withReuse.Ok) continue;
-            packageCacheDirs.Add(candidate);
-            platformReport = withReuse;
-            Console.Error.WriteLine($"[provision] reusing already-provisioned platform R2R apps " +
-                $"for BC {reuseMm} at {candidate} (no download).");
-            break;
+            Console.Error.WriteLine(
+                "[provision] platform apps were provisioned but are not visible to dependency resolution.");
+            return 2;
         }
     }
-    if (!toolkitPresent)
+    if (autoProvision && !TestAppsReady())
     {
-        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
-                     AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, reuseMm, minVersion: null))
+        if (!EnsureTestToolkitProvisioned(version, microsoftRequirements)) return 2;
+        if (!TryReuseTestSet())
         {
-            if (packageCacheDirs.Contains(candidate)) continue;
-            packageCacheDirs.Add(candidate);
-            toolkitPresent = AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(PlatformCheckDirs());
-            Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit " +
-                $"for BC {reuseMm} at {candidate} (no download).");
-            break;
+            Console.Error.WriteLine(
+                "[provision] test apps were provisioned but are not visible to dependency resolution.");
+            return 2;
         }
     }
-    // Re-announce the list: the header was printed before these blocks could add to it, and
-    // `--package-cache` REPLACES the defaults rather than adding to them, which makes this count
-    // the only signal that the defaults were discarded. Understating it on exactly the runs
-    // where reuse fired is how a run log becomes unreadable.
-    if (packageCacheDirs.Count != packageCacheDirsAtHeader)
-    {
-        Console.WriteLine($"  package caches: {packageCacheDirs.Count} dir(s) after provisioning reuse");
-        AlRunner.Infrastructure.PhaseLog.SetPackageCacheDirs(packageCacheDirs.Count);
-    }
 
+    // Preserve the existing non-opt-in loud failure for symbol-only platform packages.
+    // Manifest-derived absence is left to the dependency resolver when --auto-provision is
+    // absent, so ordinary runs that rely only on the service-tier runtime do not change.
+    platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+        version, PlatformCheckDirs());
     if (!platformReport.Ok && !autoProvision)
     {
         Console.Error.WriteLine(platformReport.ToDetailedMessage());
         return 2;
     }
 
-    if (autoProvision && (!platformReport.Ok || !toolkitPresent))
+    if (packageCacheDirs.Count != packageCacheDirsAtHeader)
     {
-        // Resolve ONE target full version and reuse it for both artifact sets — avoids
-        // resolving two different minors for what should be the same provisioning pass.
-        // Priority: (a) the missing/symbol-only platform apps carry their OWN version
-        // (the engine is version-agnostic w.r.t. the R2R apps it dispatches to at
-        // runtime, so this can be a different minor than the engine's SelectedVersion);
-        // (b) else derive from whatever platform app IS already present in the cache
-        // (only the toolkit is missing); (c) else fall back to the engine's own version.
-        var mm = !platformReport.Ok
-            ? AlRunner.Infrastructure.ProvisioningCheck.DeriveProvisionMajorMinor(platformReport, version)
-            : AlRunner.Infrastructure.ProvisioningCheck.DerivePresentPlatformMajorMinor(PlatformCheckDirs(), version);
-        var full = AlRunner.Provisioning.ArtifactDownloader.ResolveVersion(
-            mm, m => Console.Error.WriteLine($"[provision] {m}"));
-        if (full == null)
-        {
-            Console.Error.WriteLine($"[provision] could not resolve a full BC artifact version for '{mm}'; cannot continue.");
-            return 2;
-        }
-        // Runner-owned artifact-cache destinations — NEVER a caller-supplied --package-cache
-        // dir (issue #1653: this used to pick packageCacheDirs[0], writing ~135 MB of
-        // downloaded apps straight into the project's .alpackages). Mirrors the destination
-        // the standalone `al-runner provision` step already uses for the test toolkit.
-        var platformAppsOut = AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsDirFor(
-            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, full);
-        var testAppsOut = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
-            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, full);
-
-        if (!platformReport.Ok)
-        {
-            Console.Error.WriteLine("[provision] platform R2R apps missing — downloading...");
-            var rc = AlRunner.Provisioning.ArtifactDownloader.PlatformApps(
-                full, platformAppsOut, m => Console.Error.WriteLine($"[provision] {m}"));
-            if (rc != 0)
-            {
-                Console.Error.WriteLine("[provision] platform-apps download failed; cannot continue.");
-                return 2;
-            }
-            // Make the downloaded apps visible to resolution: add the artifact-cache dir as
-            // an additional search root rather than copying its contents into the project.
-            if (!packageCacheDirs.Contains(platformAppsOut))
-                packageCacheDirs.Add(platformAppsOut);
-            // Re-check: never silently continue on a partial/failed provision.
-            platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
-                version, PlatformCheckDirs());
-            if (!platformReport.Ok)
-            {
-                var stillMissing = string.Join(", ", platformReport.Issues.Select(i => i.Name));
-                Console.Error.WriteLine($"[provision] platform apps still symbol-only after download: {stillMissing}");
-                return 2;
-            }
-        }
-
-        if (!toolkitPresent)
-        {
-            Console.Error.WriteLine("[provision] test-toolkit apps missing — downloading...");
-            var rc = AlRunner.Provisioning.ArtifactDownloader.TestApps(
-                full, testAppsOut, m => Console.Error.WriteLine($"[provision] {m}"));
-            if (rc != 0)
-            {
-                Console.Error.WriteLine("[provision] test-toolkit download failed; cannot continue.");
-                return 2;
-            }
-            // Make the downloaded apps visible to resolution: add the artifact-cache dir as
-            // an additional search root rather than copying its contents into the project.
-            if (!packageCacheDirs.Contains(testAppsOut))
-                packageCacheDirs.Add(testAppsOut);
-            // Re-check: never silently continue on a partial/failed provision.
-            toolkitPresent = AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(PlatformCheckDirs());
-            if (!toolkitPresent)
-            {
-                Console.Error.WriteLine("[provision] test-toolkit apps still missing after download.");
-                return 2;
-            }
-        }
+        Console.WriteLine($"  package caches: {packageCacheDirs.Count} dir(s) after provisioning reuse");
+        AlRunner.Infrastructure.PhaseLog.SetPackageCacheDirs(packageCacheDirs.Count);
     }
 }
 
@@ -4057,10 +4017,12 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("                          platform/ + w1/), bypassing the cache scan. Its version");
     w.WriteLine("                          is read from the dir name or the contained Ncl.dll.");
     w.WriteLine("                          Mutually exclusive with --bc-version.");
-    w.WriteLine("  --auto-provision        Download the BC artifacts for the project's version if");
-    w.WriteLine("                          they are missing, then continue the run. The runner never");
-    w.WriteLine("                          downloads without this flag (or the `provision`");
-    w.WriteLine("                          subcommand) — a missing artifact otherwise fails loud.");
+    w.WriteLine("  --auto-provision        Download the selected BC engine plus manifest-required Microsoft");
+    w.WriteLine("                          platform and test apps, then continue the run. Versioned runner-");
+    w.WriteLine("                          owned caches are checked first, including with empty .alpackages.");
+    w.WriteLine("                          No --package-cache or --artifact-path is required. The runner");
+    w.WriteLine("                          never downloads without this flag (or the `provision` subcommand)");
+    w.WriteLine("                          — a missing artifact otherwise fails loud.");
     w.WriteLine("  --package-cache PATH    Extra directory to scan for .app dependencies");
     w.WriteLine("                          (repeatable). Default scan: ~/.bcartifacts.cache,");
     w.WriteLine("                          ~/.local/share/al-runner/artifacts, and bundle .alpackages/.");
@@ -5554,7 +5516,7 @@ static string? TryDeriveBcMajorFromProject(IEnumerable<string> bundlePaths)
 // sets provisionedVersion to the full version to run against; 1 on failure. This is opt-in
 // — the only path in the runner that downloads.
 static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
-    List<string> bundles, out string? provisionedVersion)
+    List<string> bundles, bool provisionManifestApps, out string? provisionedVersion)
 {
     provisionedVersion = null;
 
@@ -5610,91 +5572,99 @@ static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
     else if (!AlRunner.Infrastructure.ProvisioningCheck.AutoProvision(full, serviceTierDir))
         return 1;
 
-    EnsurePlatformAppsProvisioned(full, bundles);
-    EnsureTestToolkitProvisioned(full);
+    if (provisionManifestApps)
+    {
+        var requirements =
+            AlRunner.Infrastructure.ProvisioningCheck.DeriveMicrosoftRequirements(bundles);
+        if (requirements.PlatformAppsRequired
+            && !EnsurePlatformAppsProvisioned(full, requirements))
+            return 1;
+
+        // Preserve `al-runner provision` with no target: historically it provisioned the
+        // toolkit alongside the engine. With a target, app.json decides whether test-apps
+        // are needed; an application-only bundle no longer pays for irrelevant packages.
+        if (requirements.TestAppsRequired
+            && !EnsureTestToolkitProvisioned(full, requirements))
+            return 1;
+        if (requirements.ManifestPaths.Count == 0)
+        {
+            var toolkitOnly = new AlRunner.Infrastructure.ProvisioningCheck.MicrosoftProvisioningRequirements(
+                PlatformAppsRequired: false,
+                TestAppsRequired: true,
+                MinimumVersion: null,
+                RequiredTestAppNames: Array.Empty<string>(),
+                ManifestPaths: Array.Empty<string>());
+            if (!EnsureTestToolkitProvisioned(full, toolkitOnly))
+                return 1;
+        }
+    }
     provisionedVersion = full;
     return 0;
 }
 
-// Issue #1678: `provision` used to stop at the engine closure + test toolkit, so its half
-// of the "[provision-gap]" fix text ("al-runner provision") was wrong — the subcommand
-// never touched platform apps at all, and re-running it after the gap message reported the
-// engine "already complete" and exited without ever creating <artifacts>/<version>/platform-apps.
-// Detect the gap the same way the --auto-provision path does: scan the TARGET bundles'
-// own `.alpackages` (the standard shape any AL project's symbol download produces) for
-// symbol-only Microsoft platform apps, and download the R2R package set for THEIR version
-// (which can be a different minor than <paramref name="full"/>, the engine's own version —
-// see DeriveProvisionMajorMinor) into the runner-owned platform-apps dir for that version.
-// No-op when no bundle is given (`al-runner provision` with no target) or the bundle(s)
-// carry no symbol-only platform apps.
-static void EnsurePlatformAppsProvisioned(string engineVersion, List<string> bundles)
+// Ensure the manifest-required platform set for the selected full BC version. app.json
+// versions are compatibility floors, not download pins: a BC 27 project can run on the
+// selected BC 28 engine, and must receive BC 28 runtime packages. The exact versioned
+// destination is checked first; compatible warm builds from the same minor are reusable.
+static bool EnsurePlatformAppsProvisioned(
+    string selectedFullVersion,
+    AlRunner.Infrastructure.ProvisioningCheck.MicrosoftProvisioningRequirements requirements)
 {
-    var bundleAlpackagesDirs = AlRunner.Infrastructure.ProvisioningCheck.CollectBundleAlpackagesDirs(bundles);
-    if (bundleAlpackagesDirs.Count == 0)
-        return;
-
-    var platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
-        engineVersion, bundleAlpackagesDirs);
-    if (platformReport.Ok)
-    {
-        Console.Error.WriteLine("[provision] platform R2R apps already present for the target bundle(s).");
-        return;
-    }
-
-    var mm = AlRunner.Infrastructure.ProvisioningCheck.DeriveProvisionMajorMinor(platformReport, engineVersion);
-
-    // Reuse before downloading. The gap above is derived from the bundle's own `.alpackages`,
-    // which vendors symbol-only packages permanently (the runner never writes into the user's
-    // project — #1653), so it can NEVER be satisfied by anything this function does. Without
-    // this check the ~106 MB R2R set was re-fetched on every single invocation, into a
-    // directory this code path then never read back. Discovery is a pure filesystem scan, so
-    // a warm machine pays no CDN round-trip and an offline one still works.
-    // The floor keeps a set older than the project's vendored symbols out — it would satisfy
-    // CheckPlatformApps and then lose to that symbol copy in DependencyResolver.
-    var floor = AlRunner.Infrastructure.ProvisioningCheck.MinimumUsefulR2RVersion(platformReport);
-    foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
-                 AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, mm, floor))
-    {
-        // Adjudicate against the same predicate the startup gate uses, over the bundle's dirs
-        // PLUS this candidate — discovery only says "plausible". A partial set falls through to
-        // the next candidate, so an interrupted newer download cannot mask a complete older set.
-        var withProvisioned = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
-            engineVersion, bundleAlpackagesDirs.Append(candidate).Distinct().ToList());
-        if (withProvisioned.Ok)
-        {
-            Console.Error.WriteLine($"[provision] platform R2R apps for BC {mm} already provisioned " +
-                $"at {candidate} — reusing (no download).");
-            return;
-        }
-        Console.Error.WriteLine($"[provision] {candidate} exists but does not close the gap " +
-            $"({string.Join(", ", withProvisioned.Issues.Select(i => i.Name))}) — trying the next candidate.");
-    }
-
-    var platformFull = AlRunner.Provisioning.ArtifactDownloader.ResolveVersion(
-        mm, m => Console.Error.WriteLine($"[provision] {m}"));
-    if (platformFull == null)
+    var artifactsRoot = AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir;
+    var selectedDir = AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsDirFor(
+        artifactsRoot, selectedFullVersion);
+    if (AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
+            selectedDir, selectedFullVersion, requirements))
     {
         Console.Error.WriteLine(
-            $"[provision] warning: could not resolve a full BC artifact version for platform apps '{mm}'. " +
-            $"Symbol-only Microsoft platform apps found: {string.Join(", ", platformReport.Issues.Select(i => i.Name))}.");
-        return;
+            $"[provision] platform apps already complete at {selectedDir} (no download).");
+        return true;
     }
-    var platformAppsOut = AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsDirFor(
-        AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, platformFull);
-    Console.Error.WriteLine($"[provision] fetching Microsoft platform R2R apps for BC {platformFull} → {platformAppsOut}");
+
+    var selected = System.Version.Parse(selectedFullVersion);
+    var mm = $"{selected.Major}.{selected.Minor}";
+    foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
+                 artifactsRoot, mm, requirements.MinimumVersion))
+    {
+        if (string.Equals(candidate, selectedDir, StringComparison.OrdinalIgnoreCase))
+            continue;
+        if (AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
+                candidate, selectedFullVersion, requirements))
+        {
+            Console.Error.WriteLine($"[provision] platform apps for BC {mm} already provisioned " +
+                $"at {candidate} — reusing (no download).");
+            return true;
+        }
+        Console.Error.WriteLine(
+            $"[provision] {candidate} is incomplete for the target manifests — trying the next candidate.");
+    }
+
+    Console.Error.WriteLine(
+        $"[provision] fetching Microsoft platform R2R apps for BC {selectedFullVersion} → {selectedDir}");
     try
     {
         var rc = AlRunner.Provisioning.ArtifactDownloader.PlatformApps(
-            platformFull, platformAppsOut, m => Console.Error.WriteLine($"[provision] {m}"));
+            selectedFullVersion, selectedDir, m => Console.Error.WriteLine($"[provision] {m}"));
         if (rc != 0)
+        {
             Console.Error.WriteLine(
-                $"[provision] warning: could not fetch platform apps for BC {platformFull}. " +
-                $"Test bundles calling into Base Application / System Application / Business Foundation " +
-                $"codeunits will need --package-cache <dir-with-those-apps>.");
+                $"[provision] could not fetch platform apps for BC {selectedFullVersion}; cannot continue.");
+            return false;
+        }
+        if (!AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
+                selectedDir, selectedFullVersion, requirements))
+        {
+            Console.Error.WriteLine(
+                $"[provision] platform-apps download completed but {selectedDir} is still incomplete " +
+                "for the target app.json requirements; cannot continue.");
+            return false;
+        }
+        return true;
     }
     catch (Exception ex)
     {
-        Console.Error.WriteLine($"[provision] warning: platform-apps download failed: {ex.Message}");
+        Console.Error.WriteLine($"[provision] platform-apps download failed: {ex.Message}");
+        return false;
     }
 }
 
@@ -5706,31 +5676,47 @@ static void EnsurePlatformAppsProvisioned(string engineVersion, List<string> bun
 // had to hand-assemble a package dir with no command that could produce one.
 // Provisioned into <artifacts>/<version>/test-apps/, which DefaultPackageCacheDirs scans,
 // so a provisioned machine needs no --package-cache for the toolkit at all.
-static void EnsureTestToolkitProvisioned(string fullVersion)
+static bool EnsureTestToolkitProvisioned(
+    string fullVersion,
+    AlRunner.Infrastructure.ProvisioningCheck.MicrosoftProvisioningRequirements requirements)
 {
-    var dir = TestAppsDirFor(fullVersion);
+    var artifactsRoot = AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir;
+    var dir = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(artifactsRoot, fullVersion);
     // The real toolkit predicate, not "the dir has some .app files in it". An interrupted
     // download leaves a dir full of country test apps without Business Foundation Test
     // Libraries — the one app every test bundle transitively needs — and the old presence
     // test reported that as provisioned, so the gap resurfaced later as an unresolvable
-    // dependency instead of being finished here. Deliberately keyed on the EXACT requested
-    // version, unlike the startup gate's reuse: `provision --bc-version X` must provision X,
-    // not decide that a neighbouring build of X's minor is close enough.
-    if (AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(new[] { dir }))
+    // dependency instead of being finished here. The exact requested destination wins;
+    // compatible warm builds from the selected minor are considered before a download.
+    if (AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(dir, requirements))
     {
         Console.Error.WriteLine($"[provision] test toolkit already present at {dir}.");
-        return;
+        return true;
     }
+
+    var selected = System.Version.Parse(fullVersion);
+    var mm = $"{selected.Major}.{selected.Minor}";
+    foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
+                 artifactsRoot, mm, requirements.MinimumVersion))
+    {
+        if (string.Equals(candidate, dir, StringComparison.OrdinalIgnoreCase)) continue;
+        if (!AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(candidate, requirements)) continue;
+        Console.Error.WriteLine($"[provision] test toolkit for BC {mm} already provisioned " +
+            $"at {candidate} — reusing (no download).");
+        return true;
+    }
+
     Console.Error.WriteLine($"[provision] fetching the MS test toolkit for BC {fullVersion} → {dir}");
     try
     {
         var rc = AlRunner.Provisioning.ArtifactDownloader.TestApps(
             fullVersion, dir, m => Console.Error.WriteLine($"[provision] {m}"));
         if (rc != 0)
+        {
             Console.Error.WriteLine(
-                $"[provision] warning: could not fetch the test toolkit for BC {fullVersion}. " +
-                $"Test bundles depending on Library Assert / Test Runner / Any will need " +
-                $"--package-cache <dir-with-those-apps>.");
+                $"[provision] could not fetch the test toolkit for BC {fullVersion}; cannot continue.");
+            return false;
+        }
         // Re-check, mirroring the startup gate: ArtifactDownloader.TestApps reports success on
         // ANY non-zero extraction count and skips individual entries silently, so rc == 0 does
         // NOT mean the sentinel landed. Without this, a partial extraction (or a BC version
@@ -5738,23 +5724,21 @@ static void EnsureTestToolkitProvisioned(string fullVersion)
         // toolkit on every single invocation and says nothing about why — a silent loop, which
         // is exactly what .claude/rules/loud-failures.md forbids. The old `any *.app` guard
         // stopped after one download precisely because it asked a weaker question.
-        else if (!AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(new[] { dir }))
+        if (!AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(dir, requirements))
+        {
             Console.Error.WriteLine(
-                $"[provision] warning: the test toolkit download for BC {fullVersion} reported success " +
-                $"but '{AlRunner.Infrastructure.ProvisioningCheck.TestToolkitSentinelApp}' is still " +
-                $"absent from {dir}. The download is incomplete, or this BC version's platform " +
-                $"artifact does not ship that app — either way this will be re-attempted on every " +
-                $"run until it is resolved. Point --package-cache at a dir that has the toolkit.");
+                $"[provision] test-apps download completed but {dir} is still incomplete for " +
+                "the target app.json requirements; cannot continue.");
+            return false;
+        }
+        return true;
     }
     catch (Exception ex)
     {
-        Console.Error.WriteLine($"[provision] warning: test-toolkit download failed: {ex.Message}");
+        Console.Error.WriteLine($"[provision] test-toolkit download failed: {ex.Message}");
+        return false;
     }
 }
-
-static string TestAppsDirFor(string fullVersion)
-    => AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
-        AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, fullVersion);
 
 static void SetBundleInfoFromAppJson(string appJsonPath)
 {

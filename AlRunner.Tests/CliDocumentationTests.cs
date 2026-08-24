@@ -118,6 +118,16 @@ public sealed class CliDocumentationTests
         Assert.Contains("provision", help, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Help_ExplainsPathFreeAutoProvisioningFromAnEmptyProjectCache()
+    {
+        var (_, help, _) = RunCli("--help");
+
+        Assert.Contains("empty .alpackages", help, StringComparison.Ordinal);
+        Assert.Contains("platform and test apps", help, StringComparison.Ordinal);
+        Assert.Contains("No --package-cache", help, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// --server is fully implemented (docs/server-mode.md, ServerTests.cs) but was
     /// also listed under "NOT YET IMPLEMENTED". A reader who hits the second list
