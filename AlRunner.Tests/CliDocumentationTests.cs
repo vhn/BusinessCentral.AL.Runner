@@ -126,6 +126,31 @@ public sealed class CliDocumentationTests
         Assert.Contains("empty .alpackages", help, StringComparison.Ordinal);
         Assert.Contains("platform and test apps", help, StringComparison.Ordinal);
         Assert.Contains("No --package-cache", help, StringComparison.Ordinal);
+        Assert.Contains("exact BC build compiled", help, StringComparison.Ordinal);
+        Assert.Contains("into this runner is selected and never substituted", help,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Help_ExplainsImplicitBcVersionSelectionWithoutClaimingLatestCache()
+    {
+        var (_, help, _) = RunCli("--help");
+        var entry = FlagEntry(help, "--bc-version");
+
+        Assert.DoesNotContain("Default: the latest version", entry, StringComparison.Ordinal);
+        Assert.Contains("exact build", entry, StringComparison.Ordinal);
+        Assert.Contains("highest cached build", entry, StringComparison.Ordinal);
+        Assert.Contains("never substituted", entry, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Guide_ExplainsThatProvisioningPrintsAndPinsItsImplicitSelection()
+    {
+        var (_, guide, _) = RunCli("--guide");
+
+        Assert.DoesNotContain("does not currently print its selection", guide, StringComparison.Ordinal);
+        Assert.Contains("prints its effective choice", guide, StringComparison.Ordinal);
+        Assert.Contains("exact four-part build baked into the binary", guide, StringComparison.Ordinal);
     }
 
     /// <summary>

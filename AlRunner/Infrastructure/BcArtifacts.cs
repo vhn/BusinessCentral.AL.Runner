@@ -278,16 +278,6 @@ public static class BcArtifacts
     }
 
     /// <summary>
-    /// Startup consistency check: the engine DLL (Ncl) baked into bin/ is built for a
-    /// specific BC version. If the selected artifact/dependency version has a different
-    /// MAJOR, the dependency symbols and the engine disagree at the API level — fail loud.
-    ///
-    /// We compare MAJOR only: BC pins its assembly version at <c>MAJOR.0.0.0</c>
-    /// regardless of the product/file version (the 28.1.x artifact ships Ncl with
-    /// AssemblyName.Version = 28.0.0.0), so minor/patch skew (28.1.x build vs 28.1.y
-    /// cache, or a 28.0-stamped assembly inside a 28.1 artifact) is expected and tolerated.
-    /// </summary>
-    /// <summary>
     /// The BC MAJOR version the engine (bin Ncl.dll) was built for, or null when the
     /// engine DLL is absent / unversioned. This is the only major this binary can run
     /// (cross-major needs a matching engine build); used to default artifact selection.
@@ -310,17 +300,26 @@ public static class BcArtifacts
     /// The full 4-part BC version this binary was BUILT against, baked in at compile time
     /// from the csproj `_BCVersion` property (see the AssemblyMetadata item there). This is
     /// the only place the built MINOR survives into the shipped binary — Ncl.dll's own
-    /// assembly version is major.0.0.0. Null if the attribute is missing or unparseable.
+    /// assembly version is major.0.0.0. Null if the attribute is missing, unparseable, or
+    /// not a full four-part build (a prefix cannot prove exact compatibility).
     /// </summary>
     public static Version? EngineBuiltVersion()
     {
         var attrs = typeof(BcArtifacts).Assembly
             .GetCustomAttributes(typeof(System.Reflection.AssemblyMetadataAttribute), false);
         foreach (System.Reflection.AssemblyMetadataAttribute a in attrs)
-            if (a.Key == "BcEngineVersion" && Version.TryParse(a.Value, out var v))
-                return v;
+            if (a.Key == "BcEngineVersion")
+            {
+                var parsed = ParseEngineBuiltVersion(a.Value);
+                if (parsed != null) return parsed;
+            }
         return null;
     }
+
+    internal static Version? ParseEngineBuiltVersion(string? value)
+        => Version.TryParse(value, out var parsed) && parsed.Revision >= 0
+            ? parsed
+            : null;
 
     /// <summary>
     /// The version prefix to select by when the user pinned neither --bc-version nor
@@ -375,6 +374,16 @@ public static class BcArtifacts
         }
     }
 
+    /// <summary>
+    /// Startup consistency check: the engine DLL (Ncl) baked into bin/ is built for a
+    /// specific BC version. If the selected artifact/dependency version has a different
+    /// MAJOR, the dependency symbols and the engine disagree at the API level — fail loud.
+    ///
+    /// We compare MAJOR only: BC pins its assembly version at <c>MAJOR.0.0.0</c>
+    /// regardless of the product/file version (the 28.1.x artifact ships Ncl with
+    /// AssemblyName.Version = 28.0.0.0), so minor/patch skew cannot be detected here.
+    /// Implicit provisioning avoids that skew by targeting the baked four-part version.
+    /// </summary>
     public static void VerifyEngineConsistency(string binDir)
     {
         var ncl = Path.Combine(binDir, "Microsoft.Dynamics.Nav.Ncl.dll");

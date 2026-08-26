@@ -515,7 +515,8 @@ public sealed class ProvisioningReuseTests : IDisposable
             File.CreateSymbolicLink(Path.Combine(dir, Path.GetFileName(source)), source);
     }
 
-    private static (string output, int exit) RunRunner(Fixture fx, string args)
+    private static (string output, int exit) RunRunner(
+        Fixture fx, string args, bool blockNetwork = false)
     {
         var line = new StringBuilder(TestBuildConfig.RunArgs(ProjectPath));
         line.Append(' ').Append(args);
@@ -527,6 +528,20 @@ public sealed class ProvisioningReuseTests : IDisposable
             UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RepoRoot,
         };
         psi.Environment[AlRunner.Infrastructure.BcArtifacts.ArtifactsRootEnvVar] = fx.ArtifactsRoot;
+        if (blockNetwork)
+        {
+            // Provisioning must reveal the version it chose before any HTTP request. Route
+            // HTTP through a guaranteed-closed local endpoint so the exact-version negative
+            // path stays hermetic and fails immediately instead of downloading an engine.
+            const string closedProxy = "http://127.0.0.1:1";
+            foreach (var name in new[]
+            {
+                "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
+                "all_proxy", "ALL_PROXY",
+            }) psi.Environment[name] = closedProxy;
+            psi.Environment.Remove("no_proxy");
+            psi.Environment.Remove("NO_PROXY");
+        }
 
         var sb = new StringBuilder();
         var p = Process.Start(psi)!;
@@ -620,6 +635,116 @@ public sealed class ProvisioningReuseTests : IDisposable
         Assert.Contains("platform apps already complete", output);
         Assert.Contains(ProvisioningCheck.PlatformAppsDirFor(
             fx.ArtifactsRoot, SyntheticEngineVersion), output);
+        Assert.Equal(0, exit);
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ProvisioningModes_WithoutExplicitVersion_TargetTheExactBuiltEngine(bool autoProvision)
+    {
+        var built = BcArtifacts.EngineBuiltVersion();
+        TestArtifacts.SkipIf(built == null, "engine built version is not baked into this build");
+        var differentMinor = $"{built!.Major}.{built.Minor + 3}.999998.999998";
+        var fx = WriteEmptyMicrosoftFixture(withProvisionedSets: false);
+        WriteSyntheticEngine(fx, differentMinor);
+
+        var args = autoProvision
+            ? $"\"{fx.Bundle}\" --auto-provision --test 85257"
+            : "provision";
+        var (output, exit) = RunRunner(fx, args, blockNetwork: true);
+
+        Assert.Contains($"targeting BC {built}", output);
+        Assert.Contains($"downloading BC {built} engine service-tier closure", output);
+        Assert.DoesNotContain(differentMinor, output);
+        Assert.Contains("could not be provisioned. If that build is no longer published", output);
+        Assert.Equal(autoProvision ? 2 : 1, exit);
+        Assert.False(Directory.Exists(Path.Combine(fx.ArtifactsRoot, built.ToString())),
+            "a failed cold provision must not leave an empty exact-version cache that wins later selection");
+    }
+
+    [SkippableFact]
+    public void Provision_WithoutExplicitVersion_ReusesTheWarmExactBuild()
+    {
+        var built = BcArtifacts.EngineBuiltVersion();
+        TestArtifacts.SkipIf(built == null, "engine built version is not baked into this build");
+        var fx = WriteEmptyMicrosoftFixture(withProvisionedSets: false);
+        WriteSyntheticEngine(fx, built!.ToString());
+
+        var (output, exit) = RunRunner(fx, "provision", blockNetwork: true);
+
+        Assert.Contains($"targeting BC {built}", output);
+        Assert.Contains($"BC {built} engine artifacts already complete", output);
+        Assert.DoesNotContain("downloading BC", output);
+        Assert.DoesNotContain("Resolving BC version prefix", output);
+        Assert.Equal(0, exit);
+    }
+
+    [SkippableFact]
+    public void Provision_ManifestAppFailure_DoesNotBlameTheExactEngineBuild()
+    {
+        var built = BcArtifacts.EngineBuiltVersion();
+        TestArtifacts.SkipIf(built == null, "engine built version is not baked into this build");
+        var fx = WriteEmptyMicrosoftFixture(withProvisionedSets: false);
+        WriteSyntheticEngine(fx, built!.ToString());
+
+        var (output, exit) = RunRunner(fx,
+            $"provision \"{fx.Bundle}\"", blockNetwork: true);
+
+        Assert.Contains($"BC {built} engine artifacts already complete", output);
+        Assert.Contains($"fetching Microsoft platform R2R apps for BC {built}", output);
+        Assert.DoesNotContain("If that build is no longer published", output);
+        Assert.Equal(1, exit);
+    }
+
+    [Fact]
+    public void AutoProvision_DownloaderException_CleansEmptyTargetAndReturnsFalse()
+    {
+        var target = Path.Combine(_root, "artifacts", "28.1.999997.999997");
+        var messages = new List<string>();
+
+        var ok = ProvisioningCheck.AutoProvision(
+            "28.1.999997.999997",
+            target,
+            (_, outputDir, _) =>
+            {
+                Directory.CreateDirectory(outputDir);
+                throw new IOException("synthetic interrupted download");
+            },
+            messages.Add);
+
+        Assert.False(ok);
+        Assert.False(Directory.Exists(target));
+        Assert.Contains(messages,
+            message => message.Contains("synthetic interrupted download", StringComparison.Ordinal));
+    }
+
+    [SkippableFact]
+    public void AutoProvision_WithoutExplicitVersion_ReusesWarmExactBuildAndRuns()
+    {
+        TestArtifacts.SkipIfMissing();
+        var built = BcArtifacts.EngineBuiltVersion();
+        TestArtifacts.SkipIf(built == null, "engine built version is not baked into this build");
+        var engineDir = BcArtifacts.ArtifactDirFor(built!.ToString());
+        TestArtifacts.SkipIfDirectoryMissing(engineDir, "the built engine's artifact dir");
+        var fx = WriteFixture(provisionedVersion: built.ToString());
+        try
+        {
+            LinkRealEngineClosure(fx, built.ToString(), engineDir);
+        }
+        catch (Exception ex)
+        {
+            throw new SkipException($"engine-closure symlinks unavailable: {ex.Message}");
+        }
+
+        var (output, exit) = RunRunner(fx,
+            $"\"{fx.Bundle}\" --auto-provision --test 62152", blockNetwork: true);
+
+        Assert.Contains($"targeting BC {built}", output);
+        Assert.Contains($"BC {built} engine artifacts already complete", output);
+        Assert.Contains($"selected BC {built}", output);
+        Assert.DoesNotContain("downloading BC", output);
+        Assert.Contains("Codeunit62152.ReuseCheck", output);
         Assert.Equal(0, exit);
     }
 

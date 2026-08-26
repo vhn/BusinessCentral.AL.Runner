@@ -238,10 +238,11 @@ bool watchMode = false;
 // polyfill injection) to disk for every bundle compile. Useful for debugging codegen.
 string? dumpCsharpDir = null;
 // --bc-version X / --artifact-path DIR: BC artifact/version selection overrides.
-// Default (neither set) = latest version in the artifacts cache. --bc-version accepts a
-// prefix ("28.1") or full version; --artifact-path points at an explicit artifact root
-// (the dir containing platform/ + w1/). Mutually exclusive. Resolved into the
-// process-global BcArtifacts selection below, before any resolver runs.
+// Without either override, normal runs use the built-engine cache hierarchy while opt-in
+// provisioning targets the exact baked four-part build. --bc-version accepts a prefix
+// ("28.1") or full version; --artifact-path points at an explicit artifact root (the dir
+// containing platform/ + w1/). Mutually exclusive. Resolved into the process-global
+// BcArtifacts selection below, before any resolver runs.
 string? bcVersionArg = null;
 string? artifactPathArg = null;
 // Extra preprocessor symbols supplied via --define SYM / --preprocessor-symbols A,B,C.
@@ -475,46 +476,53 @@ if (artifactPathArg != null)
         return 2;
     }
 }
-// When the user pinned neither --bc-version nor --artifact-path, default the artifact
-// selection to the ENGINE's built MAJOR rather than blindly latest-in-cache: this binary
-// can only faithfully run its own major (cross-major needs a matching engine build), so a
-// stray download of another major must never become the default. Within the major, any
-// cached minor is interchangeable (verified 28.1<->28.2), so latest-in-major is picked.
-// The target project's app.json (application/platform) is read purely as a cross-check —
-// a mismatch means the project targets a BC major this runner build can't run, surfaced
-// as a clear message instead of a deep failure. All of this stays overridable.
+System.Version? implicitlySelectedBuiltVersion = null;
+// When the user pinned neither --bc-version nor --artifact-path, an opt-in provisioning
+// mode targets the exact four-part BC build baked into this binary. Provisioning is
+// allowed to populate the cache, so it must not silently reuse an incompatible cached
+// minor. A normal non-downloading run retains the cache fallback hierarchy (exact build,
+// built minor, then built major). The target project's app.json (application/platform)
+// is read purely as a cross-check. All of this stays overridable.
 if (bcVersionArg == null && artifactPathArg == null)
 {
     // The BUILT version (4-part, baked in at compile time) — not Ncl.dll's assembly
     // version, whose minor is always 0. Falls back to the Ncl major if the attribute is
     // missing (e.g. an older build), which restores the previous major-only behaviour.
-    var engineVersion = AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion()
+    var builtEngineVersion = AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion();
+    var engineVersion = builtEngineVersion
         ?? AlRunner.Infrastructure.BcArtifacts.EngineVersion(AppContext.BaseDirectory);
     var engineMajor = engineVersion?.Major;
     if (engineVersion != null && engineMajor != null)
     {
-        // Prefer the engine's OWN major.minor. Latest-in-major used to win here, which
-        // silently selected a minor the engine was not built for — measured at -45 passing
-        // / +42 failing / +3 errors on Pageworks. See BcArtifacts.DefaultVersionPrefix.
-        bcVersionArg = AlRunner.Infrastructure.BcArtifacts.DefaultVersionPrefix(
-            engineVersion, AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir);
-
-        var engineMajorMinor = $"{engineVersion.Major}.{engineVersion.Minor}";
-        if (bcVersionArg == engineVersion.ToString())
-            Console.Error.WriteLine($"[bc] no --bc-version given — selecting BC {engineVersion}, the exact " +
+        if ((provisionSubcommand || autoProvision) && builtEngineVersion != null)
+        {
+            bcVersionArg = builtEngineVersion.ToString();
+            implicitlySelectedBuiltVersion = builtEngineVersion;
+            Console.Error.WriteLine($"[bc] no --bc-version given — targeting BC {builtEngineVersion}, the exact " +
                 $"build this binary was compiled against. Override with --bc-version.");
-        else if (bcVersionArg == engineMajorMinor)
-            // Degraded but usually survivable: right minor, different build. The CodeAnalysis
-            // assembly version can still differ between builds of one minor, which fails loud
-            // at startup rather than silently — see BcArtifacts.DefaultVersionPrefix.
-            Console.Error.WriteLine($"[bc] warning: no cached BC {engineVersion} — selecting the latest " +
-                $"{engineMajorMinor}.x instead. Build-level skew within a minor can still fail to load " +
-                $"Microsoft.Dynamics.Nav.CodeAnalysis. Fix with: al-runner provision --bc-version {engineVersion}");
+        }
         else
-            Console.Error.WriteLine($"[bc] warning: no cached BC {engineMajorMinor}.x — this binary's engine was " +
-                $"built for {engineVersion}, so a different minor is a KNOWN-DEGRADED configuration " +
-                $"(measured: dozens of extra failures from engine/artifact minor skew). Falling back to the " +
-                $"latest cached {engineMajor}.x. Fix with: al-runner provision --bc-version {engineMajorMinor}");
+        {
+            bcVersionArg = AlRunner.Infrastructure.BcArtifacts.DefaultVersionPrefix(
+                engineVersion, AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir);
+
+            var engineMajorMinor = $"{engineVersion.Major}.{engineVersion.Minor}";
+            if (bcVersionArg == engineVersion.ToString())
+                Console.Error.WriteLine($"[bc] no --bc-version given — selecting BC {engineVersion}, the exact " +
+                    $"build this binary was compiled against. Override with --bc-version.");
+            else if (bcVersionArg == engineMajorMinor)
+                // Degraded but usually survivable: right minor, different build. The CodeAnalysis
+                // assembly version can still differ between builds of one minor, which fails loud
+                // at startup rather than silently — see BcArtifacts.DefaultVersionPrefix.
+                Console.Error.WriteLine($"[bc] warning: no cached BC {engineVersion} — selecting the latest " +
+                    $"{engineMajorMinor}.x instead. Build-level skew within a minor can still fail to load " +
+                    $"Microsoft.Dynamics.Nav.CodeAnalysis. Fix with: al-runner provision --bc-version {engineVersion}");
+            else
+                Console.Error.WriteLine($"[bc] warning: no cached BC {engineMajorMinor}.x — this binary's engine was " +
+                    $"built for {engineVersion}, so a different minor is a KNOWN-DEGRADED configuration " +
+                    $"(measured: dozens of extra failures from engine/artifact minor skew). Falling back to the " +
+                    $"latest cached {engineMajor}.x. Fix with: al-runner provision --bc-version {engineMajorMinor}");
+        }
 
         var projMajor = TryDeriveBcMajorFromProject(bundles);
         if (projMajor != null && projMajor != engineMajor.Value.ToString())
@@ -531,7 +539,16 @@ if (provisionSubcommand || autoProvision)
     var prc = RunProvisioning(
         bcVersionArg, artifactPathArg, bundles,
         provisionManifestApps: provisionSubcommand,
-        out var provisionedVersion);
+        out var provisionedVersion,
+        out var engineProvisioningFailed);
+    if (engineProvisioningFailed && implicitlySelectedBuiltVersion != null)
+    {
+        var fallbackPrefix = $"{implicitlySelectedBuiltVersion.Major}.{implicitlySelectedBuiltVersion.Minor}";
+        Console.Error.WriteLine($"[provision] BC {implicitlySelectedBuiltVersion} is the exact build this " +
+            $"binary was compiled against and could not be provisioned. If that build is no longer published, " +
+            $"retry with the explicit same-minor prefix --bc-version {fallbackPrefix} " +
+            $"(known-degraded).");
+    }
     if (provisionSubcommand)
         return prc; // the subcommand always exits after provisioning, never runs tests
     // The early pass owns only the engine for --auto-provision. Manifest-required apps are
@@ -545,10 +562,9 @@ if (provisionSubcommand || autoProvision)
 try
 {
     AlRunner.Infrastructure.BcArtifacts.SelectVersion(bcVersionArg, artifactPathArg);
-    // Consistency guard: the engine DLLs baked into bin/ are built for a fixed BC
-    // major.minor; if the selected version's major.minor differs, dependency symbols
-    // and the engine can disagree — fail loud rather than crash deep in BC. Patch-level
-    // skew (28.1.x build vs 28.1.y cache) is tolerated.
+    // Consistency guard: cross-major selections cannot run against the engine DLLs baked
+    // into bin/. Within-major skew remains allowed for explicit selections and the normal
+    // non-downloading cache fallback, though startup warns when that fallback is degraded.
     AlRunner.Infrastructure.BcArtifacts.VerifyEngineConsistency(AppContext.BaseDirectory);
     Console.Error.WriteLine($"[bc] selected BC {AlRunner.Infrastructure.BcArtifacts.SelectedVersion} " +
         $"({AlRunner.Infrastructure.BcArtifacts.ServiceTierDir})");
@@ -3864,28 +3880,25 @@ static void PrintGuide(TextWriter w)
     w.WriteLine("  the app under test — that is normal and must be preserved, not normalised.");
     w.WriteLine();
     w.WriteLine("  WHICH BC VERSION TO PASS. Do NOT infer it from the app under test. The runner");
-    w.WriteLine("  selects within the major its ENGINE was built against, and one engine build");
-    w.WriteLine("  spans the minors of that major — a 28.1-built engine runs 28.2 business logic");
-    w.WriteLine("  correctly. So the right --bc-version is the one whose service-tier artifacts");
-    w.WriteLine("  are present for this engine, which is NOT necessarily the version stamped on");
-    w.WriteLine("  the app's dependencies. `--bc-version 28.1` while the app references 28.2");
-    w.WriteLine("  packages is a normal, working configuration, not a mismatch to \"fix\".");
-    w.WriteLine("  Attributing a runtime failure to \"the engine's BC-X.Y patch set\" without");
-    w.WriteLine("  knowing which version was actually selected is a guess. NOTE: the runner does");
-    w.WriteLine("  not currently print its selection, so pass --bc-version explicitly rather than");
-    w.WriteLine("  relying on the default — leaving it off can silently change test outcomes.");
+    w.WriteLine("  prints its effective choice in the [bc] startup lines. With provision or");
+    w.WriteLine("  --auto-provision and no override, it targets the");
+    w.WriteLine("  exact four-part build baked into the binary. This avoids strong-name and");
+    w.WriteLine("  runtime skew even between builds of one minor.");
+    w.WriteLine("  A normal non-downloading run prefers that exact cached build, then its built");
+    w.WriteLine("  minor, then its major, warning whenever it degrades. Use --bc-version only to");
+    w.WriteLine("  make an intentional override; it is NOT necessarily the version stamped on");
+    w.WriteLine("  the app's dependencies, whose versions are compatibility floors.");
     w.WriteLine();
     w.WriteLine("  BC artifacts are never downloaded silently. Obtain them explicitly:");
     w.WriteLine("    al-runner provision <bundle-dir>     # provision for that project's version, then exit");
     w.WriteLine("    al-runner --auto-provision <dirs>    # provision on demand, then continue the run");
-    w.WriteLine("  The engine must be built against the same BC MINOR as the target artifacts");
-    w.WriteLine("  (28.1 vs 28.2 matters; a major-only match is not sufficient).");
+    w.WriteLine("  Exact engine/artifact build alignment is the supported configuration; an");
+    w.WriteLine("  explicit different build or minor is a known-degraded override.");
     w.WriteLine();
 
     w.WriteLine("PRE-FLIGHT — do these before concluding anything about a failure");
     w.WriteLine("  1. al-runner --version");
-    w.WriteLine("  2. Confirm the artifact version you are running against resolves as intended");
-    w.WriteLine("     (pass --bc-version explicitly rather than relying on \"latest in cache\").");
+    w.WriteLine("  2. Read the [bc] startup line and confirm the effective artifact selection.");
     w.WriteLine("  3. Re-run the failing case alone with --test <name> --verbose. --verbose turns");
     w.WriteLine("     on the internal [Component] logs that name the failing subsystem.");
     w.WriteLine("  4. Re-run with --no-cache once. Compiled output is cached by default, and a few");
@@ -4008,10 +4021,11 @@ static void PrintHelp(TextWriter w)
     w.WriteLine();
     w.WriteLine("EXECUTION");
     w.WriteLine("  --bc-version X          Select the BC artifact version (e.g. \"28.1\" or a full");
-    w.WriteLine("                          version). Default: the latest version present in");
-    w.WriteLine("                          ~/.local/share/al-runner/artifacts. A prefix matches the");
-    w.WriteLine("                          highest version with that prefix. The runner never");
-    w.WriteLine("                          auto-downloads; an unavailable version fails loud.");
+    w.WriteLine("                          version). Without an override, a normal run selects the exact");
+    w.WriteLine("                          cached build, else the highest cached build of its built minor,");
+    w.WriteLine("                          else its built major. Under provisioning, the exact build is");
+    w.WriteLine("                          targeted and never substituted. A prefix selects the highest");
+    w.WriteLine("                          matching cache. Normal runs never auto-download.");
     w.WriteLine("                          Mutually exclusive with --artifact-path.");
     w.WriteLine("  --artifact-path DIR     Use an explicit BC artifact root (the dir containing");
     w.WriteLine("                          platform/ + w1/), bypassing the cache scan. Its version");
@@ -4020,6 +4034,8 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("  --auto-provision        Download the selected BC engine plus manifest-required Microsoft");
     w.WriteLine("                          platform and test apps, then continue the run. Versioned runner-");
     w.WriteLine("                          owned caches are checked first, including with empty .alpackages.");
+    w.WriteLine("                          With no explicit version/path, the exact BC build compiled");
+    w.WriteLine("                          into this runner is selected and never substituted.");
     w.WriteLine("                          No --package-cache or --artifact-path is required. The runner");
     w.WriteLine("                          never downloads without this flag (or the `provision` subcommand)");
     w.WriteLine("                          — a missing artifact otherwise fails loud.");
@@ -5473,13 +5489,10 @@ static IEnumerable<DepsSidecarWriter.DepEntry> ScanVendoredPlatformApps(IEnumera
 }
 
 // Derive the BC MAJOR version the target project is built for, from the first bundle's
-// app.json `application` field (falling back to `platform`). Used to default the BC
-// artifact selection when the user gave neither --bc-version nor --artifact-path, so the
-// runner picks the cache version matching the project instead of blindly latest-in-cache
-// (a stray higher-minor download must not silently become the default). Returns the MAJOR
-// as a selection prefix (e.g. "28") — the MAJOR-only engine-consistency contract means any
-// cached minor within that major is interchangeable (verified 28.1<->28.2). Returns null
-// when no app.json / no version field is found (caller then falls back to latest-in-cache).
+// app.json `application` field (falling back to `platform`). Returns the MAJOR as a
+// compatibility cross-check (e.g. "28") and as a legacy provisioning fallback when an
+// older runner has no baked build version. Returns null when no app.json / no version
+// field is found.
 static string? TryDeriveBcMajorFromProject(IEnumerable<string> bundlePaths)
 {
     foreach (var bundle in bundlePaths)
@@ -5509,16 +5522,18 @@ static string? TryDeriveBcMajorFromProject(IEnumerable<string> bundlePaths)
 }
 
 // Provisioning driver for the `provision` subcommand / --auto-provision. Resolves the
-// target BC version (explicit --bc-version, else the engine major, else the project major),
+// target BC version (explicit/defaulted exact build, else the engine/project major),
 // prefers an already-cached matching version (completing a partial one) and otherwise
 // resolves the latest full version from the CDN, then downloads the engine service-tier
 // closure if it is missing/incomplete. Returns 0 on success (already-complete counts) and
 // sets provisionedVersion to the full version to run against; 1 on failure. This is opt-in
 // — the only path in the runner that downloads.
 static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
-    List<string> bundles, bool provisionManifestApps, out string? provisionedVersion)
+    List<string> bundles, bool provisionManifestApps, out string? provisionedVersion,
+    out bool engineProvisioningFailed)
 {
     provisionedVersion = null;
+    engineProvisioningFailed = false;
 
     if (artifactPathArg != null)
     {
@@ -5570,7 +5585,10 @@ static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
     if (report.Ok)
         Console.Error.WriteLine($"[provision] BC {full} engine artifacts already complete at {serviceTierDir}.");
     else if (!AlRunner.Infrastructure.ProvisioningCheck.AutoProvision(full, serviceTierDir))
+    {
+        engineProvisioningFailed = true;
         return 1;
+    }
 
     if (provisionManifestApps)
     {

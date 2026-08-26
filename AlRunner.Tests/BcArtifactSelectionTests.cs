@@ -157,6 +157,19 @@ public sealed class BcArtifactSelectionTests : IDisposable
         Assert.Equal(BcArtifacts.EngineMajor(AppContext.BaseDirectory) ?? built.Major, built.Major);
     }
 
+    [Theory]
+    [InlineData("28.1.49838.50794", true)]
+    [InlineData("28.1.49838", false)]
+    [InlineData("28.1", false)]
+    [InlineData("28", false)]
+    [InlineData("not-a-version", false)]
+    [InlineData(null, false)]
+    public void ParseEngineBuiltVersion_AcceptsOnlyFullFourPartBuilds(
+        string? value, bool expectedExact)
+    {
+        Assert.Equal(expectedExact, BcArtifacts.ParseEngineBuiltVersion(value) != null);
+    }
+
     /// <summary>
     /// Negative control documenting WHY EngineBuiltVersion exists: the engine DLL's own
     /// version carries no minor. If this ever starts failing, Microsoft changed their

@@ -376,7 +376,12 @@ Open, and deliberately not presented as solved:
   BC version, and caches them under
   `~/.local/share/al-runner/artifacts/<version>/{platform-apps,test-apps}`. A warm run checks and
   reuses those destinations before contacting the CDN, and adds them to dependency resolution
-  automatically. No `--artifact-path` or `--package-cache` is needed: for example,
+  automatically. In packaged builds with baked version metadata, provisioning pins the exact BC
+  build this binary was compiled against, even if another minor from the same major is already
+  cached. If that exact build cannot be obtained, provisioning stops instead of silently running
+  against another minor; an explicit version remains available as a known-degraded override.
+  Older builds without a full four-part baked version retain the legacy fallback. No
+  `--artifact-path` or `--package-cache` is needed: for example,
   `al-runner <bundle> --watch --auto-provision --test 123456` provisions once and then stays
   resident.
 
@@ -626,7 +631,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dev-loop) for provisioning them as a separ
 | `--package-cache PATH` | Extra `.app`-package cache directory. Repeatable. |
 | `--cache PATH` | Cache compiled AL output keyed on source + dep set + runner mtime. |
 | `--no-cache` | Disable **every** on-disk cache for this run — AL output plus compiled-deps, workspace-deps, ncl-cecil, bc-symbols, app-manifests, r2r-chunks and install-baseline — not just al-out. `~/.cache/al-runner` is left untouched. Slow on purpose; use it to measure or reproduce a genuinely cold compile. `--cache DIR` and `--no-cache` are last-wins. |
-| `--auto-provision` | Download missing engine, Microsoft platform, and Microsoft test-app artifacts for the selected BC version, cache them in the runner-owned versioned artifact root, and reuse them on later runs. Requirements come from the target `app.json` files, so empty `.alpackages` directories need no cache-path flags. |
+| `--auto-provision` | Download missing engine, Microsoft platform, and Microsoft test-app artifacts for the selected BC version, cache them in the runner-owned versioned artifact root, and reuse them on later runs. In packaged builds, no explicit version/path selects the exact baked BC build; it will not silently substitute another minor. Requirements come from the target `app.json` files, so empty `.alpackages` directories need no cache-path flags. |
 | `--isolation codeunit\|test\|disabled` | Test isolation mode. Default `codeunit`. |
 | `--watch` | Stay resident with warm dependencies; on `.al` or `app.json` changes, recompile only the AL objects that changed and run **in-process**. Debounces on quiescence (default 250ms of no further event, capped at 10s) so a bulk multi-file rewrite — a branch switch, a rebase, a formatter run — settles before a cycle starts, instead of firing mid-checkout. Tune with `AL_RUNNER_WATCH_QUIET_MS` / `AL_RUNNER_WATCH_MAX_WAIT_MS`. |
 | `--server` | Long-running JSON-RPC daemon over stdin/stdout (warm deps → ~19s→~4s/run). See [docs/server-mode.md](docs/server-mode.md). |

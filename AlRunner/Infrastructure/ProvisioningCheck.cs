@@ -819,22 +819,59 @@ public static class ProvisioningCheck
     /// opt-in auto-resolve; callers gate it behind `al-runner provision` / `--auto-provision`.
     /// </summary>
     public static bool AutoProvision(string version, string serviceTierDir, Action<string>? log = null)
+        => AutoProvision(version, serviceTierDir, ArtifactDownloader.ServiceTier, log);
+
+    internal static bool AutoProvision(
+        string version,
+        string serviceTierDir,
+        Func<string, string, Action<string>?, int> downloadServiceTier,
+        Action<string>? log = null)
     {
         var logf = log ?? Console.Error.WriteLine;
         logf($"[provision] downloading BC {version} engine service-tier closure → {serviceTierDir}");
-        var rc = ArtifactDownloader.ServiceTier(version, serviceTierDir, logf);
+        int rc;
+        try
+        {
+            rc = downloadServiceTier(version, serviceTierDir, logf);
+        }
+        catch (Exception ex)
+        {
+            RemoveEmptyFailedProvisioningTarget(serviceTierDir);
+            logf($"[provision] download failed before completion: {ex.Message}");
+            return false;
+        }
         if (rc != 0)
         {
+            RemoveEmptyFailedProvisioningTarget(serviceTierDir);
             logf($"[provision] download failed (exit {rc}). See messages above.");
             return false;
         }
         var after = Check(version, serviceTierDir);
         if (!after.Ok)
         {
+            RemoveEmptyFailedProvisioningTarget(serviceTierDir);
             logf($"[provision] still incomplete after download; missing: {string.Join(", ", after.MissingFiles)}");
             return false;
         }
         logf($"[provision] BC {version} engine artifacts complete.");
         return true;
+    }
+
+    private static void RemoveEmptyFailedProvisioningTarget(string serviceTierDir)
+    {
+        try
+        {
+            // ArtifactDownloader creates the version directory before its first request.
+            // Do not let an empty failed target outrank a usable same-major cache on the
+            // next non-provisioning run. Never remove a partial/non-empty download.
+            if (Directory.Exists(serviceTierDir)
+                && !Directory.EnumerateFileSystemEntries(serviceTierDir).Any())
+                Directory.Delete(serviceTierDir);
+        }
+        catch
+        {
+            // Cleanup is best-effort. A concurrent writer or filesystem race must not hide
+            // the provisioning error that caused this path.
+        }
     }
 }
