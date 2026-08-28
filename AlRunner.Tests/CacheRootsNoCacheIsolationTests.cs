@@ -150,17 +150,16 @@ public class CacheRootsNoCacheIsolationTests
         Assert.Contains("[source-dep] WROTE NoCache Dep App", outputA);
         Assert.Contains("[cache] --no-cache: every on-disk cache redirected to", outputA);
 
-        // ncl-cecil is bypassed too, and the re-exec it triggers still lands on a HIT.
+        // ncl-cecil is bypassed too, and the shadow re-exec still lands on a HIT.
         //
-        // A fresh rewrite makes the runner re-exec itself: a process that rewrites Ncl and then
-        // loads the byte-identical result in-process intermittently dies with
-        // BadImageFormatException 0x80131124, so the child exists to load it from cache. Give
-        // the child its own throwaway root and it MISSes, rewrites a second time, and then
-        // takes exactly that fatal path — which is why the root is inherited across the
-        // re-exec. MISS then re-exec then HIT, in one run's output, is what proves both halves:
-        // the cache really was cold, and the child really did adopt the parent's root.
+        // The packaged runner first builds a shadow runtime containing rewritten Ncl, then
+        // launches the child that loads it. Give the child its own throwaway root and it
+        // MISSes, rewrites a second time, and takes the unsafe same-process load path — which
+        // is why the root is inherited across the re-exec. MISS then shadow re-exec then HIT,
+        // in one run's output, proves both halves: the cache really was cold, and the child
+        // really did adopt the parent's root.
         Assert.Contains("[Cecil] Cecil cache MISS", outputA);
-        Assert.Contains("[Cecil] Fresh rewrite done — re-execing", outputA);
+        Assert.Contains("[reexec] Ncl.dll not shipped in this install — re-execing into a shadow runtime dir that has it", outputA);
         Assert.Contains("[Cecil] Cecil cache HIT", outputA);
 
         var (outputB, exitB) = RunRunnerNoCache(testsDir, absentPackageCache);

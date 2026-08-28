@@ -18,7 +18,7 @@
 // assembly the moment it references AlRunner.Infrastructure.BcArtifacts.
 //
 // DOTNET_STARTUP_HOOKS runs every configured hook assembly's Initialize() IN THE ORDER
-// LISTED (':'-separated on Linux). test-matrix.yml lists THIS assembly's bin-deployed
+// LISTED (':'-separated on Linux). bc-tests.yml lists THIS assembly's bin-deployed
 // copy inside AlRunner.Tests' own output directory FIRST, then AlRunner.Tests.dll SECOND
 // — so this hook's Resolving handler is already installed by the time AlRunner.Tests.dll
 // is entered and its module initializer runs.
@@ -27,7 +27,7 @@
 // -----------------------------------------------------------------------------
 // Measured regression: environment variables set on the testhost process (this is set via
 // VSTest's RunConfiguration.EnvironmentVariables, scoped to the testhost child process —
-// see test-matrix.yml / engine.runsettings) are, by default, INHERITED by every subprocess
+// see bc-tests.yml / engine.runsettings) are, by default, INHERITED by every subprocess
 // the test suite itself spawns with Process.Start — and roughly two dozen AlRunner.Tests
 // classes (CliServer, WatchTests, OutputFormatTests, …) spawn `dotnet run --project
 // AlRunner …` to test the CLI/server's own behaviour. Left set, those child `al-runner`
@@ -67,6 +67,23 @@ internal static class StartupHook
         var hookDir = System.IO.Path.GetDirectoryName(typeof(StartupHook).Assembly.Location);
         if (!string.IsNullOrEmpty(hookDir))
         {
+            // Deliberately AssemblyLoadContext.Default, NOT EngineLoadContext.Current —
+            // confirmed empirically to matter. A DOTNET_STARTUP_HOOKS-loaded assembly
+            // runs before the CLR's normal ALC bookkeeping is fully settled; installing
+            // this Resolving handler via EngineLoadContext.Current (which calls
+            // AssemblyLoadContext.GetLoadContext(Assembly.GetExecutingAssembly()) fresh
+            // each time, rather than reusing the Default singleton) caused
+            // `System.IO.FileLoadException: Assembly with same name is already loaded`
+            // across the whole watch-mode/server subprocess-spawning test surface in CI
+            // (~8 tests, every matrix leg — see the PR this comment landed in). This
+            // class's entire job is specifically about Default (the ALC DOTNET_STARTUP_
+            // HOOKS itself operates on), not "whichever ALC I happen to be in" — that
+            // generality is what the other 7 EngineLoadContext.Current call sites need,
+            // for a design (an ALC-isolated engine) this repo ultimately did not ship
+            // (see #2027) — so there is no live scenario where Current would even need
+            // to differ from Default here. Pin it back explicitly rather than relying on
+            // Current happening to still equal Default in this one narrow, early-boot
+            // context that's meaningfully different from every other caller.
             System.Runtime.Loader.AssemblyLoadContext.Default.Resolving += (ctx, name) =>
             {
                 if (name.Name is null) return null;

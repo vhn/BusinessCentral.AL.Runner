@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using Xunit;
@@ -107,9 +108,9 @@ public sealed class CliDocumentationTests
     }
 
     /// <summary>
-    /// The `provision` subcommand is the only supported way to obtain BC artifacts
-    /// (the runner never auto-downloads). If --help omits it, an agent on a machine
-    /// without artifacts has no path forward.
+    /// The `provision` subcommand is the supported explicit way to obtain BC artifacts
+    /// without running tests. If --help omits it, an agent preparing a machine or an
+    /// offline cache has no discoverable path forward.
     /// </summary>
     [Fact]
     public void Help_DocumentsProvisionSubcommand()
@@ -167,9 +168,74 @@ public sealed class CliDocumentationTests
         Assert.True(idx >= 0, "--help should keep a 'NOT YET IMPLEMENTED' section.");
         var notYet = help[idx..];
 
-        foreach (var implemented in new[] { "--server", "--watch", "--define", "--auto-provision", "--output-json", "--output-junit" })
+        foreach (var implemented in new[] { "--server", "--watch", "--define", "--auto-provision", "--output-json", "--output-junit", "--tdd" })
             Assert.False(notYet.Contains(implemented, StringComparison.Ordinal),
                 $"{implemented} is implemented but listed under 'NOT YET IMPLEMENTED'.");
+    }
+
+    /// <summary>
+    /// --help is user-facing documentation, not a source-comment scratchpad. A flag
+    /// whose behavior --help calls "TODO" is either not shipped (and must not claim
+    /// otherwise) or is shipped and the text just never got updated — issue #2118:
+    /// `--server`'s `execute` command shipped and returns real results (tests,
+    /// `capturedValues`, `coverage`, and — as of #2117/#2120 — `messages`), but
+    /// --help still read "Commands: runTests, shutdown (execute: TODO)" for multiple
+    /// releases of the thing it describes. Neither the flag-name scrape
+    /// (<see cref="Help_DocumentsEveryRecognizedFlag"/>) nor the "not listed as
+    /// unimplemented" check (<see cref="Help_DoesNotListImplementedFlagsAsUnimplemented"/>)
+    /// would have caught this: `execute` is not a `--flag`, and the stale text lived
+    /// under EXECUTION, not under "NOT YET IMPLEMENTED". A blanket "no literal TODO"
+    /// guard catches this whole class without needing to know which command it names.
+    /// </summary>
+    [Fact]
+    public void Help_NeverMarksAShippedCommandAsTodo()
+    {
+        var (_, help, _) = RunCli("--help");
+        Assert.DoesNotContain("TODO", help, StringComparison.Ordinal);
+
+        var (_, guide, _) = RunCli("--guide");
+        Assert.DoesNotContain("TODO", guide, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// --dap is documented in full later in the flag list (its own EXECUTION entries,
+    /// with docs/dap-mode.md), but the USAGE synopsis at the very top of --help never
+    /// mentioned it (issue #2118) even though every other mode flag with its own
+    /// invocation shape (--server, --precompile, --emit-app) got a synopsis line. An
+    /// agent that only skims USAGE before scrolling to the flag it already knows the
+    /// name of would not learn --dap exists at all.
+    /// </summary>
+    [Fact]
+    public void Usage_SynopsisListsDap()
+    {
+        var (_, help, _) = RunCli("--help");
+        var usageIdx = help.IndexOf("USAGE", StringComparison.Ordinal);
+        var selectionIdx = help.IndexOf("SELECTION", StringComparison.Ordinal);
+        Assert.True(usageIdx >= 0 && selectionIdx > usageIdx, "--help should keep USAGE/SELECTION sections.");
+        var usage = help[usageIdx..selectionIdx];
+        Assert.Contains("--dap", usage, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// --dap (issue #1642, stdio transport in #2058) is fully implemented and already
+    /// documented as such earlier in --help, but "NOT YET IMPLEMENTED" carried a stale
+    /// "(debug adapter)" bullet dating from before --dap existed (issue #2118), naming
+    /// a DapServer.cs that has since been deleted from the repository entirely. The
+    /// curated-flag-name check in <see cref="Help_DoesNotListImplementedFlagsAsUnimplemented"/>
+    /// does not catch this shape of staleness: the stale bullet never spells out the
+    /// literal flag ("--dap") it is actually describing, so a flag-name-based
+    /// allowlist has nothing to match against.
+    /// </summary>
+    [Fact]
+    public void Help_DoesNotDescribeDapAsUnimplemented()
+    {
+        var (_, help, _) = RunCli("--help");
+        var idx = help.IndexOf("NOT YET IMPLEMENTED", StringComparison.Ordinal);
+        Assert.True(idx >= 0, "--help should keep a 'NOT YET IMPLEMENTED' section.");
+        var notYet = help[idx..];
+
+        Assert.DoesNotContain("debug adapter", notYet, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("DapServer", notYet, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -210,6 +276,56 @@ public sealed class CliDocumentationTests
         var (_, guide, _) = RunCli("--guide");
         Assert.Contains("CAPABILITY", guide, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// Flags that materially change WHAT A RUN DOES — not merely how output is formatted —
+    /// must be covered in --guide, because CLAUDE.md and the al-runner-workflow skill both
+    /// tell an agent to start with --guide. --help alone is not sufficient: --tdd was fully
+    /// documented in --help (<see cref="Help_DocumentsEveryRecognizedFlag"/> already passed)
+    /// and STILL went undiscovered by an agent, because nothing ever pointed it at --guide's
+    /// existence for that flag (issue #2001).
+    /// <para>
+    /// Deliberately NOT every recognized flag — <see cref="Help_DocumentsEveryRecognizedFlag"/>
+    /// already owns that broader surface, and most flags there are output-shape switches
+    /// (--output-json, --quiet, --no-strict-exit, …) that don't need a guide section.
+    /// <see cref="BehaviorChangingFlags"/> is the curated set that DOES, and the check below
+    /// is a loop over it rather than one hardcoded <c>Assert.Contains</c> per flag — the
+    /// previous shape (<see cref="Guide_ExistsAndCoversInvocationEssentials"/>'s fixed list
+    /// of unrelated prose fragments) could never notice a new flag went undocumented, because
+    /// nothing connected that list to the flags the parser actually recognizes. Adding a flag
+    /// to <see cref="BehaviorChangingFlags"/> is now the ONLY step a future PR needs for this
+    /// gate to catch it — an omission there is a decision made in one auditable place, not a
+    /// gap nobody wrote a test for.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Guide_CoversEveryBehaviorChangingFlag()
+    {
+        var (exit, guide, stderr) = RunCli("--guide");
+        Assert.True(exit == 0, $"--guide must exit 0. exit={exit}\n{stderr}");
+
+        var missing = BehaviorChangingFlags
+            .Where(f => !guide.Contains(f, StringComparison.Ordinal))
+            .ToList();
+
+        Assert.True(missing.Count == 0,
+            "These behavior-changing flags are missing from --guide. An agent that starts "
+            + "with --guide (per CLAUDE.md / the al-runner-workflow skill) has no way to "
+            + "discover them exist, even if --help documents them:\n  "
+            + string.Join("\n  ", missing));
+    }
+
+    /// <summary>
+    /// The curated set <see cref="Guide_CoversEveryBehaviorChangingFlag"/> checks against.
+    /// A flag belongs here when passing it changes WHICH CODE PATH a run takes or WHAT GETS
+    /// EXECUTED (compiles against different source, runs a daemon instead of one-shot,
+    /// changes the compile symbol set, generates code, watches for changes, …) — not when it
+    /// only reshapes how an unchanged run's result is reported.
+    /// </summary>
+    private static readonly string[] BehaviorChangingFlags =
+    {
+        "--tdd", "--watch", "--server", "--define", "--auto-provision", "--no-auto-provision", "--no-cache",
+    };
 
     /// <summary>Negative: an unknown documentation flag must not be silently accepted.</summary>
     [Fact]
@@ -306,5 +422,123 @@ public sealed class CliDocumentationTests
         var entry = help[idx..];
         var next = entry.IndexOf("\n  --", StringComparison.Ordinal);
         return next > 0 ? entry[..next] : entry;
+    }
+
+    /// <summary>
+    /// --help accepts three spellings (--help, -h, help). --version accepted only
+    /// one, so `al-runner -v` fell through to the bundle-path parser and produced
+    /// an unrelated "directory not found" error instead of pointing at --version
+    /// (issue #2072). -v, -V and bare "version" must all print the identical
+    /// version string and exit 0, same as --version itself.
+    /// </summary>
+    [Fact]
+    public void Version_AcceptsAllDocumentedSpellings()
+    {
+        var (baseExit, baseOut, baseErr) = RunCli("--version");
+        Assert.True(baseExit == 0, $"--version must exit 0. exit={baseExit}\n{baseErr}");
+        Assert.Matches(new Regex(@"^al-runner v\S+"), baseOut.Trim());
+
+        foreach (var spelling in new[] { "-v", "-V", "version" })
+        {
+            var (exit, stdout, stderr) = RunCli(spelling);
+            Assert.True(exit == 0, $"'{spelling}' must exit 0 like --version. exit={exit}\n{stderr}");
+            Assert.Equal(baseOut.Trim(), stdout.Trim());
+        }
+    }
+
+    /// <summary>
+    /// Negative: accepting -v/-V/version must not turn into accepting arbitrary
+    /// short flags. An unrecognized single-dash flag still falls through to the
+    /// existing bundle-path handling and fails loud, not silently as version 0.
+    /// </summary>
+    [Fact]
+    public void Version_UnrecognizedShortFlag_StillFailsAsBefore()
+    {
+        var (exit, stdout, _) = RunCli("-q");
+        Assert.True(exit != 0, "An unrecognized short flag must not exit 0.");
+        Assert.DoesNotContain("al-runner v", stdout, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// --help never printed which build is running (issue #2072). Someone pasting
+    /// --help output into a gap report should carry their runner version with it
+    /// without being asked separately for --version's output too.
+    /// </summary>
+    [Fact]
+    public void Help_PrintsVersionAsFirstLine()
+    {
+        var (_, version, _) = RunCli("--version");
+        var (exit, help, stderr) = RunCli("--help");
+        Assert.True(exit == 0, $"--help must exit 0. exit={exit}\n{stderr}");
+
+        var firstLine = help.Split('\n', 2)[0].Trim();
+        Assert.Equal(version.Trim(), firstLine);
+    }
+
+    /// <summary>
+    /// The REPORTING A RUNNER GAP section is the replacement for telemetry (#1643,
+    /// closed as not-planned). It must actually be able to produce a report: a
+    /// caller with only the binary needs the repository URL, and the section must
+    /// tell the agent to ask its human for permission before posting anything —
+    /// without that instruction the only two behaviors left are "post without
+    /// asking" and "say nothing and work around it silently", both wrong per
+    /// .claude/rules/file-issues-for-gaps.md.
+    /// </summary>
+    [Fact]
+    public void Guide_ReportingSectionCoversWhereAndPermission()
+    {
+        var (exit, guide, stderr) = RunCli("--guide");
+        Assert.True(exit == 0, $"--guide must exit 0. exit={exit}\n{stderr}");
+
+        var idx = guide.IndexOf("REPORTING A RUNNER GAP", StringComparison.Ordinal);
+        Assert.True(idx >= 0, "--guide should keep a 'REPORTING A RUNNER GAP' section.");
+        var section = guide[idx..];
+
+        Assert.Contains("github.com/StefanMaron/BusinessCentral.AL.Runner", section, StringComparison.Ordinal);
+        Assert.Contains("ask", section, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("permission", section, StringComparison.OrdinalIgnoreCase);
+        // The existing constraint against naming an unsupported cause must survive
+        // alongside the new instructions, not be displaced by them.
+        Assert.Contains("worse than none", section, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Issue #2085: `dotnet run --project tools/DownloadArtifacts` requires a source
+    /// checkout of this repository. A `dotnet tool install -g msdyn365bc.al.runner` user
+    /// has none — `tools/DownloadArtifacts` ships only as source, never as part of the
+    /// packaged tool — so a provisioning-gap message naming it as a fix is a dead end for
+    /// exactly the audience it's printed for (measured on the published 2.7.0: two of the
+    /// three "Resolve it" routes were unusable). `al-runner provision
+    /// --platform-apps/--test-apps/--service-tier [--force]` is the tool-install-valid
+    /// replacement every remediation message must use instead.
+    ///
+    /// Scans the actual source that BUILDS these messages, the same style as
+    /// <see cref="Help_DocumentsEveryRecognizedFlag"/>'s Program.cs scrape, rather than
+    /// driving every message site through a real provisioning-gap scenario. Comment-only
+    /// lines are excluded — they legitimately document the history/rationale (e.g. this
+    /// very test's own doc comment) — only live code lines that could actually reach a
+    /// console/exception message count.
+    /// </summary>
+    [Fact]
+    public void NoRemediationText_NamesTheCheckoutOnlyDownloadArtifactsInvocation()
+    {
+        var root = Path.Combine(RepoRoot, "AlRunner");
+        var offenders = new List<string>();
+        foreach (var file in Directory.EnumerateFiles(root, "*.cs", SearchOption.AllDirectories))
+        {
+            var lines = File.ReadAllLines(file);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                var trimmed = lines[i].TrimStart();
+                if (trimmed.StartsWith("//")) continue; // comment: rationale, never emitted
+                if (lines[i].Contains("dotnet run --project", StringComparison.Ordinal))
+                    offenders.Add($"{Path.GetRelativePath(RepoRoot, file)}:{i + 1}: {lines[i].Trim()}");
+            }
+        }
+        Assert.True(offenders.Count == 0,
+            "These lines under AlRunner/ (the shipped binary's own source) build "
+            + "remediation text containing 'dotnet run --project', which requires a source "
+            + "checkout a `dotnet tool install` user never has:\n  "
+            + string.Join("\n  ", offenders));
     }
 }

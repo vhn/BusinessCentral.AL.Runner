@@ -50,10 +50,40 @@ public sealed record EmittedSource(string Name, string Code);
 /// silently cost 7 tests (1904 -> 1897) with no output at any verbosity below --verbose.
 /// The caller MUST treat this as a hard failure (.claude/rules/loud-failures.md).
 /// </param>
+/// <summary>
+/// Per-excluded-object detail captured DURING the emit-retry loop (issue #1997 —
+/// <c>--tdd</c>), before the retry loop's compilation/emitResult variables get
+/// reassigned to the next round's smaller retry compile and the diagnostics that
+/// identified this object become unreachable. Only populated when
+/// <see cref="BcCompiler.SetTddMode"/> is on — see that method's doc comment for why.
+/// </summary>
+/// <param name="FilePath">
+/// The excluded object's own source file — NOT a temp copy (precompiled-dll-respect.md
+/// / this issue's "do not compile from a temp-directory copy" note applies equally to
+/// this path: it is what makes a --tdd synthetic failure's message point at a real,
+/// clickable file).
+/// </param>
+/// <param name="ObjectDisplayName">Matches the corresponding entry in <c>ExcludedObjects</c>.</param>
+/// <param name="Diagnostics">
+/// The AL diagnostics (alc-style: <c>path(line,col): error ALXXXX: message</c>) that
+/// caused THIS object specifically to be excluded — not the whole module's diagnostics.
+/// </param>
+public sealed record TddExcludedObjectDetail(
+    string FilePath,
+    string ObjectDisplayName,
+    IReadOnlyList<string> Diagnostics);
+
 public sealed record BcEmitOutput(
     IReadOnlyList<EmittedSource> Sources,
     IReadOnlyList<string> Diagnostics,
-    IReadOnlyList<string> ExcludedObjects);
+    IReadOnlyList<string> ExcludedObjects,
+    IReadOnlyList<TddExcludedObjectDetail>? TddExcludedDetails = null,
+    // --tdd (issue #2001): every member TddGeneration.Generate inferred and generated during
+    // THIS Emit call, regardless of whether the object it targeted ultimately still ended up
+    // excluded (a wrong guess still shows up here — see TddGeneration.cs's header for why
+    // that's fine: the object's own exclusion is what catches a bad guess, not this list).
+    // Null (not merely empty) when not in --tdd mode — same discipline as TddExcludedDetails.
+    IReadOnlyList<TddGeneratedMember>? TddGeneratedMembers = null);
 
 public sealed partial class BcCompiler
 {
@@ -249,6 +279,34 @@ public sealed partial class BcCompiler
             lock (_refSync) { _resolvedDeps = _saved; _refSpecs = null; }
         }
     }
+    // --tdd (issue #1997): off by default. When on, the emit-retry loop in Emit()
+    // additionally captures per-excluded-object TddExcludedObjectDetail (file path +
+    // the diagnostics that identified it) into the returned BcEmitOutput, so the
+    // caller (Program.cs) can turn each excluded object's [Test] procedures into
+    // synthetic FAILED TestResults instead of discarding the whole module — see
+    // Program.cs's EMIT-EXCLUDED handling. Gated behind this flag (rather than always
+    // capturing) so the default (non-tdd) path is PROVABLY unchanged: no extra
+    // allocation, no extra diagnostic formatting work, on every ordinary run.
+    private static bool _tddMode;
+
+    /// <summary>
+    /// Sets whether the emit-retry loop should capture <see cref="TddExcludedObjectDetail"/>
+    /// for excluded objects. Follows the same static-setter pattern as
+    /// <see cref="SetExtraPreprocessorSymbols"/> — compile-affecting CLI options are pushed
+    /// into BcCompiler this way because there are four Emit call sites in Program.cs and no
+    /// single place to thread a parameter through all of them.
+    /// </summary>
+    public static void SetTddMode(bool enabled)
+    {
+        lock (_refSync) { _tddMode = enabled; }
+    }
+
+    /// <summary>True when a --tdd run is in progress. Read-only mirror of <see cref="SetTddMode"/>.</summary>
+    public static bool IsTddMode()
+    {
+        lock (_refSync) { return _tddMode; }
+    }
+
     // Extra preprocessor symbols supplied by the caller via --define / --preprocessor-symbols.
     // Merged with the built-in CLEANSCHEMA1..25 set at both ParseOptions sites.
     private static IReadOnlyList<string>? _extraPreprocessorSymbols;
@@ -608,9 +666,11 @@ public sealed partial class BcCompiler
         // transitive Ncl reference does not match the pinned-version Ncl on the path → the
         // toolkit's Azure-KV / Azure-AD codeunits fail to bind the interface (AL0133). Scope
         // to the pinned version (mirrors BcArtifacts' highest-version convention).
+        // AlRunner.Infrastructure.AlRunnerPaths.UserHome throws loudly (issue #2114) rather
+        // than silently handing back a relative path when $HOME names a directory that
+        // does not exist.
         var sandbox = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".bcartifacts.cache", "sandbox");
+            AlRunner.Infrastructure.AlRunnerPaths.UserHome, ".bcartifacts.cache", "sandbox");
         if (Directory.Exists(sandbox))
         {
             var bestSandbox = Directory.EnumerateDirectories(sandbox)
@@ -764,6 +824,35 @@ public sealed partial class BcCompiler
             _loaderBuildCount = 0;
         }
         _appMetaCache.Clear();
+    }
+
+    /// <summary>
+    /// Test seam: pin <c>_packageCacheDirs</c> to an explicit (possibly empty) list so
+    /// <see cref="GetSharedReferences"/> never falls through to <see cref="ResolveSymbolDirs"/>
+    /// (issue #1992). That fallback reads the CALLING MACHINE's real, process-wide symbol
+    /// caches — <c>~/.local/share/al-runner/symbols/&lt;ver&gt;</c> and
+    /// <c>~/.bcartifacts.cache/sandbox/&lt;ver&gt;/{w1/Extensions,platform/Applications}</c> —
+    /// which is exactly the behaviour <see cref="SetResolvedDeps"/> gives the real compile
+    /// pipeline, but tests that exercise the memo directly (bypassing SetResolvedDeps) got it
+    /// only by accident of whichever dirs happen to exist on whoever's machine runs them.
+    ///
+    /// A test asserting an EXACT rebuild count is reading BcCompiler's memo signature, which
+    /// folds in every scanned package dir (see ComputeLoaderSignature/DeduplicateAppPackageDirs).
+    /// On a dev box with a populated `.bcartifacts.cache/sandbox` (hundreds of real .app
+    /// files, some already deduped against each other), DeduplicateAppPackageDirs' "changed"
+    /// flag can already be true before the test's own fixture contributes anything — so the
+    /// FIRST call already takes the content-addressed staging path instead of the
+    /// unchanged-dirs fast path the test's math assumes as its baseline. A later call whose
+    /// only real-world change is a test-fixture duplicate (deduped away to the SAME surviving
+    /// file set) then hashes to the SAME staging key as the first call — the loader legitimately
+    /// serves the same modules, so this isn't wrong on the merits, but it defeats the test's
+    /// contract of forcing a rebuild through a specific narrow mechanism. Scoping
+    /// `_packageCacheDirs` here removes that machine-state coupling entirely: these tests then
+    /// see ONLY the dirs they construct, on every machine, deterministically.
+    /// </summary>
+    internal static void SetPackageCacheDirsForTests(IReadOnlyList<string> dirs)
+    {
+        lock (_refSync) { _packageCacheDirs = dirs; }
     }
 
     private static List<string> DeduplicateAppPackageDirs(List<string> packageDirs, Guid? excludeAppId = null)
@@ -1081,8 +1170,8 @@ public sealed partial class BcCompiler
                 // This block is built BEFORE the .app scanner and independently of it: with
                 // no package-cache dir at all (a bundle whose only dependency is a SIBLING
                 // SOURCE app — no .alpackages, no ~/.bcartifacts.cache, no provisioned
-                // test-apps/platform-apps dir; exactly CI's `package caches: 0 dir(s)`), the
-                // old `loaderScanDirs.Count == 0` early-return bailed out here and the
+                // test-apps/platform-apps dir; exactly CI's `package caches (requested): 0
+                // dir(s)`), the old `loaderScanDirs.Count == 0` early-return bailed out here and the
                 // source dep's freshly written *.symbols.json was never consulted. The dep
                 // loaded fine at RUNTIME and was invisible at COMPILE time — AL0185
                 // "Codeunit 'X' is missing", after which BC's emitter crashes on the
@@ -1767,11 +1856,66 @@ public sealed partial class BcCompiler
         // quietly cost the al-language corpus 7 tests. Logging is therefore NOT the mechanism
         // that makes this loud: `excludedObjects` is returned to the caller, which fails the
         // bundle. Keep both — the log explains, the return value enforces.
+        // --tdd (issue #2001): before falling back to exclude-and-retry, try to infer and
+        // generate the missing member(s) any AL0132 ("does not contain a definition for")
+        // diagnostic names, directly into the SOURCE-COMPILED implementing app's own
+        // SyntaxTree (see TddGeneration.cs's header for the full rationale). Only attempted
+        // on a CLEAN diagnostic failure — not an emitter crash — so the crash-handling branch
+        // of the retry loop just below is completely unaffected when nothing was generated.
+        // A wrong or unrecognized guess costs nothing beyond this attempt: the recompile right
+        // here either succeeds outright, or leaves whatever's still broken for the SAME
+        // exclude-and-retry loop that runs unconditionally afterwards.
+        var tddGeneratedMembers = new List<TddGeneratedMember>();
+        if (_tddMode && caught == null && emitResult != null && !emitResult.Success)
+        {
+            var newlyGenerated = TddGeneration.Generate(compilation, trees, parseOpts, emitResult);
+            if (newlyGenerated.Count > 0)
+            {
+                tddGeneratedMembers.AddRange(newlyGenerated);
+                var genCompilation = NavCA.Compilation.Create(
+                    moduleName: moduleName, publisher: _currentPublisher ?? "AlRunner",
+                    version: _currentVersion ?? new Version(1, 0, 0, 0), appId: appId,
+                    syntaxTrees: trees, options: compOpts);
+                if (appRootDir != null && Directory.Exists(appRootDir))
+                    genCompilation = genCompilation.WithFileSystem(new NavCA.RelativeFileSystem(appRootDir));
+                if (refLoader != null)
+                {
+                    genCompilation = genCompilation.WithReferenceLoader(refLoader);
+                    if (specs.Length > 0) genCompilation = genCompilation.AddReferences(specs);
+                }
+                genCompilation = genCompilation.WithDotNetResolverFactory(GetOrCreateDotNetFactory());
+                var genOutputter = new CaptureOutputter();
+                Exception? genCaught = null;
+                NavEmit.EmitResult? genEmitResult = null;
+                try { genEmitResult = genCompilation.Emit(NavCA.EmitOptions.Default, genOutputter); }
+                catch (Exception exGen) { genCaught = exGen; }
+
+                Console.Error.WriteLine(
+                    $"[BcCompiler] {moduleName}: --tdd generated {newlyGenerated.Count} missing member(s) and " +
+                    $"recompiled ({(genEmitResult?.Success == true ? "compile now succeeds" : "still incomplete, falling through to exclusion")}): " +
+                    string.Join(", ", newlyGenerated.Select(g => $"{g.ObjectDisplayName}.{g.Signature}")));
+
+                outputter = genOutputter;
+                caught = genCaught;
+                emitResult = genEmitResult;
+                compilation = genCompilation;
+            }
+        }
+
         // Hoisted out of the retry block below so it survives into the returned
         // BcEmitOutput: the caller has to fail the run when anything was excluded, and
         // a stderr line alone does not do that (Log's [Component] filter eats it, and
         // nothing counts it).
         var excludedObjects = new List<string>();
+        // --tdd only (issue #1997): file path + the diagnostics that identified each
+        // excluded object, captured HERE — inside the round that identifies it — because
+        // `emitResult`/`caught` get reassigned to the next (smaller) retry compile's
+        // result at the bottom of this loop, at which point the diagnostics that named
+        // an EARLIER round's excluded object are no longer reachable from any variable
+        // in scope. Left null (not merely empty) when not in --tdd mode, so the emitted
+        // BcEmitOutput.TddExcludedDetails is null on the default path exactly as before
+        // this issue — no behavioural difference for a non-tdd caller.
+        var tddDetails = _tddMode ? new List<TddExcludedObjectDetail>() : null;
         {
             const int maxRounds = 10;
             // Indices are always relative to the ORIGINAL alFiles/trees arrays (captured once,
@@ -1810,7 +1954,17 @@ public sealed partial class BcCompiler
                         catch { nextKeepIdx.Add(i); continue; }
                         var hit = failing.FirstOrDefault(f => DeclaresObject(src, f.Type, f.Namespace, f.Name));
                         if (hit.Name != null)
-                            roundExcluded.Add($"{hit.Type} {hit.Namespace}.\"{hit.Name}\"");
+                        {
+                            var label = $"{hit.Type} {hit.Namespace}.\"{hit.Name}\"";
+                            roundExcluded.Add(label);
+                            // No structured Location for an emitter-crash exclusion — only the
+                            // exception's own message names it. Still useful for a --tdd
+                            // synthetic failure: it says WHICH object and WHY, even without a
+                            // path@line:col anchor.
+                            tddDetails?.Add(new TddExcludedObjectDetail(
+                                alFiles[i], label,
+                                new[] { $"emit-crash: {label} — {caught.Message.Split('\n', 2)[0]}" }));
+                        }
                         else
                             nextKeepIdx.Add(i);
                     }
@@ -1834,7 +1988,20 @@ public sealed partial class BcCompiler
                     foreach (var i in keepIdx)
                     {
                         if (badTrees.Contains(originalTrees[i]))
-                            roundExcluded.Add(Path.GetFileNameWithoutExtension(alFiles[i]));
+                        {
+                            var label = Path.GetFileNameWithoutExtension(alFiles[i]);
+                            roundExcluded.Add(label);
+                            if (tddDetails != null)
+                            {
+                                var objDiags = emitResult.Diagnostics
+                                    .Where(d => d.Severity == NavDiag.DiagnosticSeverity.Error
+                                        && d.Location.IsInSource
+                                        && d.Location.SourceTree == originalTrees[i])
+                                    .Select(d => $"{d.Location}: error {d.Id}: {d.GetMessage().Split('\n', 2)[0]}")
+                                    .ToList();
+                                tddDetails.Add(new TddExcludedObjectDetail(alFiles[i], label, objDiags));
+                            }
+                        }
                         else
                             nextKeepIdx.Add(i);
                     }
@@ -2055,7 +2222,9 @@ public sealed partial class BcCompiler
             ? OrderCapturesDeterministically(outputter.Captured)
             : outputter.Captured;
 
-        var emitOutput = new BcEmitOutput(captured, alDiags, excludedObjects);
+        var emitOutput = new BcEmitOutput(
+            captured, alDiags, excludedObjects, tddDetails,
+            _tddMode ? tddGeneratedMembers : null);
 
         // #1902: only a CLEAN success (nothing excluded, every source captured) is trustworthy
         // as a RAD baseline — a module that only compiled after dropping broken objects must
@@ -2073,7 +2242,7 @@ public sealed partial class BcCompiler
                 RecordIncrementalBaseline(
                     moduleName, compilation, alFiles, captured, specs,
                     manifestInputs, manifestAppJsonPath, appId, _currentPublisher ?? "AlRunner", _currentVersion ?? new Version(1, 0, 0, 0),
-                    emitOutput);
+                    appRootDir, emitOutput);
             }
             catch (Exception ex)
             {

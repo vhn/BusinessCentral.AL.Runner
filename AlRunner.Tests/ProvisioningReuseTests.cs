@@ -116,7 +116,7 @@ public sealed class ProvisioningReuseTests : IDisposable
             WriteApp(dir, "Application Test Library", version, r2r: true);
     }
 
-    private ProvisioningCheck.MicrosoftProvisioningRequirements WriteEmptyMicrosoftBundle(
+    private IReadOnlyList<DependencyRef> WriteEmptyMicrosoftBundle(
         string bundle, string dependencyName = "Application Test Library")
     {
         Directory.CreateDirectory(bundle);
@@ -140,7 +140,11 @@ public sealed class ProvisioningReuseTests : IDisposable
           "runtime": "17.0"
         }
         """);
-        return ProvisioningCheck.DeriveMicrosoftRequirements(new[] { bundle });
+        return new[]
+        {
+            new DependencyRef(
+                Guid.NewGuid(), dependencyName, "Microsoft", new Version(28, 0, 0, 0)),
+        };
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -175,29 +179,34 @@ public sealed class ProvisioningReuseTests : IDisposable
     public void Bc28PlatformSet_MissingApplicationTestLibrary_IsNotCompleteForATestBundle()
     {
         var bundle = Path.Combine(_root, "bundle");
-        var requirements = WriteEmptyMicrosoftBundle(bundle, "Tests-TestLibraries");
+        var roots = WriteEmptyMicrosoftBundle(bundle, "Tests-TestLibraries");
         var dest = ProvisioningCheck.PlatformAppsDirFor(_root, "28.1.49838.50794");
         WriteCompleteSelectedPlatformSet(dest, "28.1.49838.50794",
             includeApplicationTestLibrary: false);
 
-        Assert.False(ProvisioningCheck.PlatformAppsPresent(dest, "28.1.49838.50794", requirements));
+        var report = ProvisioningCheck.CheckPlatformApps("28.1.49838.50794", new[] { dest });
+        Assert.True(ProvisioningCheck.DecideManifestProvisioning(roots, report, new[] { dest })
+            .ShouldDownloadPlatform);
 
         WriteApp(dest, "Application Test Library", "28.1.49838.50794", r2r: true);
-        Assert.True(ProvisioningCheck.PlatformAppsPresent(dest, "28.1.49838.50794", requirements));
+        report = ProvisioningCheck.CheckPlatformApps("28.1.49838.50794", new[] { dest });
+        Assert.False(ProvisioningCheck.DecideManifestProvisioning(roots, report, new[] { dest })
+            .ShouldDownloadPlatform);
     }
 
     [Fact]
     public void TestSet_MustContainTheMicrosoftAppsNamedByTheTargetManifest()
     {
         var bundle = Path.Combine(_root, "bundle");
-        var requirements = WriteEmptyMicrosoftBundle(bundle, "Tests-TestLibraries");
+        var roots = WriteEmptyMicrosoftBundle(bundle, "Tests-TestLibraries");
+        var floors = ProvisioningCheck.DetermineVersionFloors(roots);
         var dest = ProvisioningCheck.TestAppsDirFor(_root, "28.1.49838.50794");
         WriteApp(dest, ProvisioningCheck.TestToolkitSentinelApp, "28.1.49838.50794", r2r: false);
 
-        Assert.False(ProvisioningCheck.TestAppsPresent(dest, requirements));
+        Assert.False(ProvisioningCheck.TestToolkitPresent(new[] { dest }, floors));
 
         WriteApp(dest, "Tests-TestLibraries", "28.1.49838.50794", r2r: false);
-        Assert.True(ProvisioningCheck.TestAppsPresent(dest, requirements));
+        Assert.True(ProvisioningCheck.TestToolkitPresent(new[] { dest }, floors));
     }
 
     /// <summary>
@@ -831,7 +840,7 @@ public sealed class ProvisioningReuseTests : IDisposable
 
         var (output, _) = RunRunner(fx,
             $"\"{fx.Bundle}\" --bc-version {selectedVersion} " +
-            $"--package-cache \"{fx.EmptyPackageCache}\"");
+            $"--package-cache \"{fx.EmptyPackageCache}\" --no-auto-provision");
 
         Assert.Contains("reusing already-provisioned MS test toolkit", output);
         Assert.DoesNotContain("fetching the MS test toolkit", output);

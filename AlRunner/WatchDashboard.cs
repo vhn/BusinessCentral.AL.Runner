@@ -31,22 +31,18 @@ public static class WatchDashboard
 {
     /// <summary>
     /// Builds the full dashboard renderable: header (bundle · status · last-run
-    /// timestamp+duration), the full-recompile notes for this cycle when there are any, a
-    /// per-codeunit tree of test procedures, and a footer with P/F/E counts. Pure — no console
-    /// side effects — so it is repaintable and testable.
+    /// timestamp+duration), full-rebuild and delta-rebind notes for this cycle when present,
+    /// a per-codeunit tree of test procedures, and a footer with P/F/E counts. Pure — no
+    /// console side effects — so it is repaintable and testable.
     /// </summary>
     /// <param name="fullCompileNotes">
     /// Why an app rebuilt in full this cycle rather than deltaing — see
-    /// <see cref="Rad.RadCycleNotes"/>. Rendered because the bundle loop redirects stderr while
-    /// it runs, so the <c>[watch]</c> log lines that carry these reasons never reach this screen:
-    /// a cycle that suddenly cost minutes looked identical to one that cost a second.
+    /// <see cref="Rad.RadCycleNotes"/>. The bundle loop redirects stderr while it runs, so the
+    /// dashboard must carry the reason itself.
     /// </param>
     /// <param name="rebindNotes">
-    /// Why a delta did binding work its changed-file count does not explain: a sibling app moved
-    /// a callable surface and this app re-emitted callers, or a namespace-free file needed a
-    /// second bind against freshly compiled packaged symbols. Same reason for rendering as
-    /// <paramref name="fullCompileNotes"/> and a separate panel for the opposite one: this is the
-    /// narrow path working, not the whole-module path.
+    /// Why a narrow delta performed binding work its changed-file count does not explain.
+    /// This is deliberately separate from the full-rebuild panel because the delta path worked.
     /// </param>
     public static IRenderable Build(
         IReadOnlyList<BucketResult> results,
@@ -79,6 +75,25 @@ public static class WatchDashboard
     }
 
     /// <summary>
+    /// Compatibility shape for the upstream incremental compiler's structured fallback reasons.
+    /// RAD remains the production watch engine, but callers and tests that supply structured
+    /// reasons retain the same visible diagnostic.
+    /// </summary>
+    public static IRenderable Build(
+        IReadOnlyList<BucketResult> results,
+        string bundleName,
+        WatchStatus status,
+        DateTime lastRun,
+        TimeSpan lastDuration,
+        IReadOnlyList<(string Module, string Reason)>? fullRebuildReasons)
+    {
+        var notes = fullRebuildReasons?
+            .Select(reason => $"{reason.Module}: {reason.Reason}")
+            .ToArray();
+        return Build(results, bundleName, status, lastRun, lastDuration, notes);
+    }
+
+    /// <summary>
     /// The "this cycle was not a delta, and here is why" panel. Yellow rather than red: a full
     /// compile is correct behaviour and the results below it are trustworthy — it is only slow.
     /// </summary>
@@ -88,7 +103,7 @@ public static class WatchDashboard
             Environment.NewLine,
             notes.Select(note => $"[yellow]·[/] [grey]{Markup.Escape(note)}[/]"));
         return new Panel(new Markup(body))
-            .Header("[yellow]full recompile[/]")
+            .Header("[yellow]FULL REBUILD · full recompile[/]")
             .Border(BoxBorder.Rounded)
             .BorderColor(Color.Yellow)
             .Expand();

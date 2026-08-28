@@ -55,9 +55,13 @@ if (args[0] == "--guide")
     return 0;
 }
 
-if (args[0] == "--version")
+// -v/-V accepted alongside --version and bare "version" (#2072), matching the
+// three-spelling treatment --help already gets at the top of this file. -v is
+// free: --verbose (line ~348) is matched only as its long form and has no
+// short alias, so there is no ambiguity to resolve here.
+if (args[0] == "--version" || args[0] == "-v" || args[0] == "-V" || args[0] == "version")
 {
-    Console.WriteLine($"al-runner v{AlRunner.Infrastructure.RunnerVersion.Describe(typeof(Program).Assembly)}");
+    Console.WriteLine(VersionString());
     return 0;
 }
 
@@ -106,6 +110,57 @@ if (serverMode)
     serverStdin = Console.In;
     serverStdout = Console.Out;
     Console.SetOut(Console.Error);
+}
+
+// ── --dap [port|stdio]: Debug Adapter Protocol server (issue #1642; stdio transport
+// added for #2058) — restores v1's AL breakpoint debugging. Two transports:
+//   --dap [PORT]  TCP on 127.0.0.1:PORT (default 4711, v1's default, see
+//                 docs/archive/dap.md). That IS the DAP transport every socket-based
+//                 DAP client expects, so there is no protocol reason to redirect
+//                 Console here — this branch is unchanged from before #2058.
+//   --dap stdio   speaks DAP over the process's own stdin/stdout (issue #2058, for
+//                 VS Code's DebugAdapterExecutable — no port to pick, no readiness
+//                 race polling for a free port or a "listening" line). Stdout
+//                 becomes the DAP channel the instant this is selected, so —
+//                 exactly like --server above — the raw OS stdin/stdout handles
+//                 must be captured via Console.OpenStandardInput()/OpenStandardOutput()
+//                 RIGHT NOW, before Log.Install or any Console.Write runs, and
+//                 Console.Out redirected to Console.Error so every startup banner
+//                 (including RunDapLoop's own readiness line) lands on stderr
+//                 instead. Capturing the raw Stream directly — not Console.Out —
+//                 means the transport's byte channel can never be intercepted by
+//                 anything that already cached a Console.Out reference; it also
+//                 gives DapTransport exactly the Stream-based input its constructor
+//                 already wants (see DapTransport.cs's own header), rather than the
+//                 TextReader/TextWriter pair --server hands to RunServerLoop.
+bool dapMode = args.Contains("--dap");
+int dapPort = 4711;
+bool dapStdioMode = false;
+System.IO.Stream? dapStdioInput = null;
+System.IO.Stream? dapStdioOutput = null;
+if (dapMode)
+{
+    var dapFlagIndex = Array.IndexOf(args, "--dap");
+    if (dapFlagIndex >= 0 && dapFlagIndex + 1 < args.Length)
+    {
+        var dapArg = args[dapFlagIndex + 1];
+        if (string.Equals(dapArg, "stdio", StringComparison.OrdinalIgnoreCase))
+        {
+            dapStdioMode = true;
+            dapStdioInput = Console.OpenStandardInput();
+            dapStdioOutput = Console.OpenStandardOutput();
+            Console.SetOut(Console.Error);
+        }
+        else if (int.TryParse(dapArg, out var parsedDapPort))
+        {
+            dapPort = parsedDapPort;
+        }
+    }
+}
+if (serverMode && dapMode)
+{
+    Console.Error.WriteLine("--server and --dap are mutually exclusive (both are long-running session modes; pick one).");
+    return 2;
 }
 
 // Output filters must be installed BEFORE any other code prints to Console.
@@ -192,9 +247,23 @@ bool bundledMode = true;
 // of (all .al source files contributing to the bundle, the resolved-deps list,
 // the runner assembly mtime). See `precompiled-dll-respect.md` —
 // "Our AL output is meant to be cacheable".
-string? alCacheDir = Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-    ".cache", "al-runner", "al-out");
+// AlRunner.Infrastructure.AlRunnerPaths.UserHome throws loudly (issue #2114) rather than
+// silently handing back a relative path when $HOME names a directory that does not exist.
+// Caught HERE (not left to propagate) because nothing wraps top-level statements at this
+// point in the file — an uncaught exception this early reproduces the exact bug being
+// fixed (an unhandled .NET exception aborts the process instead of a documented exit).
+string? alCacheDir;
+try
+{
+    alCacheDir = Path.Combine(
+        AlRunner.Infrastructure.AlRunnerPaths.UserHome,
+        ".cache", "al-runner", "al-out");
+}
+catch (InvalidOperationException ex)
+{
+    Console.Error.WriteLine(ex.Message);
+    return 2;
+}
 // #1821: mirrors alCacheDir, but only ever set by an explicit --cache flag (never by
 // the default init above) — see the --cache parsing branch below and
 // AlRunner.Infrastructure.CacheRoots for what this drives.
@@ -234,6 +303,17 @@ int? testTimeoutSeconds = null;
 // --watch: stay resident with warm dependencies and re-run IN-PROCESS when AL source
 // or app.json changes, recompiling only the AL objects the save actually changed.
 bool watchMode = false;
+// --tdd (issue #1997): local-development-only flag, off by default. Normally a test
+// referencing a not-yet-implemented table field / procedure / enum value is a
+// method-body compile ERROR, which drops the WHOLE app group (BC's ContinueBuildOnError
+// does not cover method bodies — see BcCompiler.Emit's emit-retry-loop comment) and the
+// run reports a compile failure with zero test results, not a failing test. --tdd keeps
+// the recovered sources for the objects that DID compile and turns every [Test]
+// procedure inside an object that could NOT be recovered into a synthetic FAILED
+// TestResult naming the AL diagnostic that broke it — see TddSupport.BuildFailedTests
+// and Program.cs's EMIT-EXCLUDED handling below. Not recommended for CI: it exists so a
+// red-green TDD cycle can start with an honestly red test, not a compile failure.
+bool tddMode = false;
 // --dump-csharp DIR: write the emitted C# (BC Compilation.Emit output, post-BcAssembler
 // polyfill injection) to disk for every bundle compile. Useful for debugging codegen.
 string? dumpCsharpDir = null;
@@ -249,8 +329,9 @@ string? artifactPathArg = null;
 // Validated as AL identifiers and merged with CLEANSCHEMA1..25 in BcCompiler.
 var extraPreprocessorSymbols = new List<string>();
 // --expectations DIR: test-expectations manifest directory (issue #1734; schema in
-// docs/expectations.md). Null = probe the default ./tests/expectations below; only an
-// existing directory activates classification, so ordinary runs outside this repo are
+// docs/expectations.md). Null = auto-probe below (walk up from each bundle path,
+// then cwd, looking for a tests/expectations sibling — #1984); only an existing
+// directory activates classification, so ordinary runs outside this repo are
 // untouched.
 string? expectationsDirArg = null;
 // --count-baseline PATH: opt-in test/app-group expected-count manifest (issue #1880;
@@ -262,14 +343,46 @@ string? expectationsDirArg = null;
 string? countBaselinePath = null;
 // `provision` subcommand: `al-runner provision [<project>]` provisions the BC artifacts
 // for the project's version and exits (no test run). `--auto-provision` provisions on the
-// fly when artifacts are missing, then continues the normal run. Both are the opt-in that
-// gates the runner's otherwise-forbidden downloads (no silent auto-download).
+// fly when artifacts are missing, then continues the normal run.
+//
+// Issue #2024 (item 2): auto-provisioning is ON BY DEFAULT. Since PR #2023/#2026 the
+// packaged tool ships none of the BC engine assemblies — they resolve ONLY from
+// ~/.local/share/al-runner/artifacts/<version>/, populated by nothing but provisioning
+// itself. A first-time `dotnet tool install` user with an empty cache has no copy
+// anywhere, so opt-in provisioning (the pre-#2024 default) meant a clean install could
+// never run a single test without the user first discovering `--auto-provision` exists.
+// `--no-auto-provision` is the explicit opt-out for offline/air-gapped environments,
+// where reaching the network unasked for gigabyte-scale artifacts is a real problem —
+// see docs/scope.md and .claude/rules/loud-failures.md (a refused/failed provision must
+// still fail loud with an actionable, tool-install-valid fix command, never silently).
+// `--auto-provision` itself is kept as an explicit, redundant-with-the-default alias for
+// back-compat with existing scripts/docs that already pass it.
 bool provisionSubcommand = args.Length > 0 && args[0] == "provision";
-bool autoProvision = false;
+bool autoProvision = true;
+// Issue #2085: `provision --platform-apps` / `--test-apps` / `--service-tier` [--force]
+// force-download ONE specific artifact set into its canonical directory, bypassing
+// need-detection entirely. This is the tool-install-valid replacement for
+// `dotnet run --project tools/DownloadArtifacts -- <mode> <ver> <dir>`, which requires a
+// source checkout that a `dotnet tool install -g` user never has — see the issue for the
+// measured dead-end. `--resolve-version PREFIX` mirrors the CLI's `resolve-version` mode.
+// All four are only meaningful under the `provision` subcommand; validated below.
+bool provisionPlatformApps = false;
+bool provisionTestApps = false;
+bool provisionServiceTier = false;
+bool provisionForce = false;
+string? provisionResolveVersionPrefix = null;
+bool provisionHelp = false;
 for (int i = 0; i < args.Length; i++)
 {
     if (i == 0 && args[i] == "provision") { continue; } // consumed as subcommand
+    if (provisionSubcommand && (args[i] == "--help" || args[i] == "-h")) { provisionHelp = true; continue; }
+    if (args[i] == "--platform-apps") { provisionPlatformApps = true; continue; }
+    if (args[i] == "--test-apps") { provisionTestApps = true; continue; }
+    if (args[i] == "--service-tier") { provisionServiceTier = true; continue; }
+    if (args[i] == "--force") { provisionForce = true; continue; }
+    if (args[i] == "--resolve-version" && i + 1 < args.Length) { provisionResolveVersionPrefix = args[++i]; continue; }
     if (args[i] == "--auto-provision") { autoProvision = true; continue; }
+    if (args[i] == "--no-auto-provision") { autoProvision = false; continue; }
     if (args[i] == "--bc-version" && i + 1 < args.Length) { bcVersionArg = args[++i]; continue; }
     if (args[i] == "--artifact-path" && i + 1 < args.Length) { artifactPathArg = args[++i]; continue; }
     if (args[i] == "--out" && i + 1 < args.Length) { outPath = args[++i]; printClassification = true; continue; }
@@ -305,7 +418,13 @@ for (int i = 0; i < args.Length; i++)
     if (args[i] == "--no-cache") { alCacheDir = null; cacheRootOverride = null; noCache = true; continue; }
     if (args[i] == "--print-cache-key") { printCacheKeyOnly = true; continue; }
     if (args[i] == "--watch") { watchMode = true; continue; }
+    if (args[i] == "--tdd") { tddMode = true; continue; }
     if (args[i] == "--server") { continue; }  // handled above (serverMode); consume so it isn't "unknown"
+    if (args[i] == "--dap")  // handled above (dapMode/dapPort/dapStdioMode); consume the flag and its optional value (numeric port, or "stdio")
+    {
+        if (i + 1 < args.Length && (int.TryParse(args[i + 1], out _) || string.Equals(args[i + 1], "stdio", StringComparison.OrdinalIgnoreCase))) i++;
+        continue;
+    }
     if (args[i] == "--verbose") { AlRunner.Log.Verbose = true; continue; }
     if (args[i] == "--show-pass") { showPass = true; continue; }   // no-op (default in v2); kept for v1 back-compat
     if (args[i] == "--failures-only" || args[i] == "--quiet") { showPass = false; continue; }
@@ -375,6 +494,90 @@ if (serverMode && watchMode)
     Console.Error.WriteLine("--server and --watch are mutually exclusive (both stay warm in-process; pick one).");
     return 2;
 }
+// Issue #2085: --platform-apps/--test-apps/--service-tier/--resolve-version only make
+// sense under the `provision` subcommand (they force/bypass a specific artifact-set
+// download; a normal test run has no use for them). Reject early rather than silently
+// accepting-and-ignoring, which would look like support that isn't there.
+if (!provisionSubcommand && (provisionPlatformApps || provisionTestApps || provisionServiceTier
+    || provisionResolveVersionPrefix != null))
+{
+    var badFlag = provisionPlatformApps ? "--platform-apps"
+        : provisionTestApps ? "--test-apps"
+        : provisionServiceTier ? "--service-tier"
+        : "--resolve-version";
+    Console.Error.WriteLine($"{badFlag} is only valid with the `provision` subcommand (e.g. `al-runner provision {badFlag}`).");
+    return 2;
+}
+if (!provisionSubcommand && provisionForce)
+{
+    Console.Error.WriteLine("--force is only valid with `provision --platform-apps` / `--test-apps` / `--service-tier`.");
+    return 2;
+}
+// `al-runner provision --help`: subcommands must accept --help like everything else —
+// previously this fell through to the generic arg-parser and answered "Unknown option
+// '--help'. Run with --help for the supported flags.", which tells the caller to run the
+// exact command it just ran. Handled before any BC type loads, same as the top-level
+// --help/--guide fast paths.
+if (provisionHelp)
+{
+    PrintProvisionHelp(Console.Out);
+    return 0;
+}
+// `provision --resolve-version PREFIX` / `--platform-apps` / `--test-apps` / `--service-tier`:
+// force a specific artifact set, bypassing need-detection, and exit — never reaches the
+// bundle/version-auto-select machinery below (none of it applies: there's no run to size a
+// BC selection for). Handled here, before the shadow-re-exec / BcArtifacts.SelectVersion
+// machinery further down, so it works even with a completely empty artifacts cache.
+if (provisionSubcommand && (provisionPlatformApps || provisionTestApps || provisionServiceTier
+    || provisionResolveVersionPrefix != null))
+{
+    return RunExplicitProvisionModes(bcVersionArg, bundles, provisionPlatformApps, provisionTestApps,
+        provisionServiceTier, provisionForce, provisionResolveVersionPrefix);
+}
+// --tdd (issue #1997) only changes the bundled-mode CLI run loop's EMIT-EXCLUDED
+// handling (Program.cs, below). --server has its own, separate EMIT-EXCLUDED guard
+// (a different Emit() call site) that this issue's reduced scope does not touch, so
+// --tdd + --server stays rejected. Rejecting explicitly beats silently ignoring the
+// flag — a --tdd run that quietly behaved like a normal run under --server would be
+// far more confusing than an upfront error naming the gap.
+if (tddMode && serverMode)
+{
+    Console.Error.WriteLine("--tdd is not supported together with --server yet (local-development flag; --server's EMIT-EXCLUDED handling is a separate code path this hasn't reached). Run --tdd from the CLI directly.");
+    return 2;
+}
+// --tdd + --watch is supported. A full emit that excludes an object cannot become a
+// RadWorkspace baseline, so later cycles remain on the diagnosed full-compile path until
+// the source is healthy. That path carries the exclusion details used for synthetic failed
+// tests; a partial baseline would instead make those tests disappear from the run.
+
+// --tdd forces the AL-output cache off (same effect as --no-cache), on top of the
+// tdd:<0|1> cache-key line added above. The line alone stops a --tdd run from ever
+// SERVING a normal-mode DLL or vice versa (criterion 11) — but it does not make a
+// --tdd HIT correct on its own: the synthetic FAILED TestResults for excluded
+// objects are derived fresh from source every Emit() call (TddSupport.BuildFailedTests
+// re-parses the excluded .al files), and nothing about them is baked into the cached
+// DLL. A --tdd cache HIT would skip Emit() entirely and silently drop back to
+// reporting only the objects that DID compile — the exact "tests vanished, run looks
+// green" failure mode this whole issue exists to fix, just moved one level down. Until
+// the excluded-object detail has its own cache sidecar (a --tdd cache HIT is a
+// reasonable follow-up), disabling the cache is what keeps every --tdd run correct.
+//
+// #2097 considered — but rejected — deferring this notice: unlike the trio (#2066) and
+// the "already cached, proceeds normally" BC-selection lines below, this print sits
+// upstream of several unrelated failure returns still to come in THIS SAME generation
+// (bad bundle root, malformed --expectations/--count-baseline manifest, BC version
+// selection failure, no matching engine variant, an incomplete artifact closure) — any
+// of which would silently discard this notice along with it if it were queued instead
+// of printed immediately. It duplicates on a stacked re-exec exactly like the lines
+// below do, but staying immediate here is the smaller cost versus losing it on error.
+if (tddMode && alCacheDir != null)
+{
+    Console.Error.WriteLine(
+        "--tdd disables the AL-output cache for this run — its synthetic FAILED tests " +
+        "for excluded objects are derived fresh from source on every Emit() call and " +
+        "are not part of the cached DLL, so a cache HIT would silently drop them.");
+    alCacheDir = null;
+}
 // ── Positional bundle roots must exist (#1713) ────────────────────────────────
 // Checked HERE — at argument-parse time, before the BC artifact selection, the Cecil
 // re-exec and the ~6s patch pass — so a mistyped path costs milliseconds. Before this,
@@ -391,12 +594,60 @@ if (serverMode && watchMode)
         return 2;
     }
 }
+// #2041/#2066/#2097: rather than PREDICTING whether this generation will need to
+// re-exec (the #2041 approach — a flag computed from NeedsShadow alone, before either
+// the per-BC-minor variant swap or the Cecil-rewrite cache state is knowable), the
+// success-path startup lines below are DEFERRED into this list and only flushed once
+// this generation has cleared every re-exec decision point in the function — the
+// shadow-hop check AND the Cecil-fresh-rewrite check, in that order, however many of
+// them fire.
+//
+// #2041's predict-then-suppress design covered exactly one re-exec (the shadow hop) and
+// silently broke the moment a SECOND one stacked on top: a per-BC-minor engine-variant
+// swap forces its own shadow-hop generation to also perform its first-ever Cecil rewrite
+// of that variant's Ncl.dll (a cache MISS, since the shadow-dir builder skips the
+// pre-rewrite for a variant swap — see EnsureShadowDir's doc comment), which is a SECOND
+// re-exec `reexecPending` had no way to see coming. That intermediate generation printed
+// the trio believing itself final, then re-exec'd anyway, and the real final generation
+// printed it again — three generations, two prints. See #2066.
+//
+// #2097: #2066 only fixed the trio. The "[expectations] loaded/not found" lines just
+// below, and the reusable exact/minor branches of the BC auto-selection switch further
+// down, had the identical shape and duplicated the identical way, because they
+// all print BEFORE either re-exec decision point below and this list did not exist yet
+// at the point they ran. Declared here — ahead of all of them, instead of just ahead of
+// the trio — so none of those prints can slip past deferral.
+//
+// NOT every candidate found by #2097's own audit of this startup path got moved into
+// this list, even though every one of them duplicates the same way on a stacked re-exec.
+// The --tdd cache-disable notice, the "cdn-exact"/"cdn-minor"/KNOWN-DEGRADED branches of
+// the switch below, and the per-BC-minor-variants-shipped branch's own auto-select line
+// all sit upstream of a LOUD FAILURE that can return from THIS SAME generation before
+// ever reaching the flush point — deferring them risks silently discarding the one
+// piece of output that explains why that failure happened, or (for "cdn-exact"/"cdn-
+// minor" specifically) delays the caller's only signal that a real, possibly
+// multi-minute download is about to start until AFTER that download finishes. See each
+// site's own comment for why it was left immediate instead. Confirmed necessary by
+// DefaultProvisionTargetMessagingTests, which failed against an earlier draft of this
+// fix that deferred all of them uniformly.
+//
+// A generation that re-execs further always `return`s from inside one of the two
+// decision blocks below, before ever reaching the flush point — so its accumulated
+// entries are silently discarded, exactly as #2041 intended for the single-re-exec case,
+// but now correctly for however many stack. LOUD FAILURES on the lines that ARE deferred
+// here are still fine to lose this way: every error path in this function returns its
+// own specific message immediately regardless, and the `[reexec]` explanation lines
+// (#2034/#2038) are a different print entirely and stay unconditional, printed from
+// whichever generation actually decides to hand off.
+var deferredStartupLines = new List<Action>();
 // ── Test-expectations manifest (issue #1734; docs/expectations.md) ────────────────
 // Loaded HERE — at parse time, before BC init — so a malformed manifest aborts the
 // invocation (exit 2, the "bad invocation" ladder entry) without running a single
-// test. An explicit --expectations dir must exist; without the flag, the documented
-// default ./tests/expectations activates only when present (this repo's corpus CI),
-// leaving every other invocation exactly as before.
+// test. An explicit --expectations dir must exist; without the flag, the auto-probe
+// walks up from each bundle path (and, secondarily, cwd) looking for a
+// `tests/expectations` sibling — see ExpectationsDirectoryResolution for why cwd
+// alone silently missed it (#1984) — activating classification only when found,
+// leaving every invocation with no reachable manifest exactly as before.
 AlRunner.Infrastructure.ExpectationManifest? expectations = null;
 {
     var expectationsDir = expectationsDirArg;
@@ -405,14 +656,45 @@ AlRunner.Infrastructure.ExpectationManifest? expectations = null;
         Console.Error.WriteLine($"--expectations: directory not found: {expectationsDir}");
         return 2;
     }
-    expectationsDir ??= Directory.Exists(Path.Combine(Environment.CurrentDirectory, "tests", "expectations"))
-        ? Path.Combine(Environment.CurrentDirectory, "tests", "expectations")
-        : null;
+    if (expectationsDir == null)
+    {
+        expectationsDir = AlRunner.Infrastructure.ExpectationsDirectoryResolution.Resolve(bundles, Environment.CurrentDirectory);
+        if (expectationsDir == null)
+        {
+            // #1984: this used to be silent — an explicit --expectations miss exits 2
+            // loudly, but the auto-probed default just left `expectations` null and
+            // every expect-oos/expect-divergence test in the run flipped to a plain
+            // FAIL with nothing in the output to say why. Diagnosable, not inferred.
+            var cwdCandidate = Path.Combine(Path.GetFullPath(Environment.CurrentDirectory), "tests", "expectations");
+            // #2097: deferred — see `deferredStartupLines`'s declaration above. Captured
+            // into a local now: `bundles` itself is never mutated again after arg
+            // parsing, but capturing its count here (rather than reading `bundles.Count`
+            // fresh inside the closure) keeps this consistent with every other deferred
+            // line's rule of freezing values at queue time, not at flush time.
+            var bundleCountForPrint = bundles.Count;
+            deferredStartupLines.Add(() => Console.Error.WriteLine(
+                $"[expectations] no tests/expectations manifest found (probed {cwdCandidate}" +
+                (bundleCountForPrint > 0 ? $" and the ancestor tree of {bundleCountForPrint} bundle path(s)" : "") +
+                ") — expect-oos / expect-fail-known-gap / expect-divergence classification is OFF " +
+                "this run. Pass --expectations DIR to set it explicitly."));
+        }
+    }
     if (expectationsDir != null)
     {
         try
         {
             expectations = AlRunner.Infrastructure.ExpectationManifest.LoadFromDirectory(expectationsDir);
+            // #2097: deferred — see `deferredStartupLines`'s declaration above. Captured
+            // into locals now (LoadFromDirectory has already returned, so these values
+            // are fixed) so the closure below reads exactly what THIS generation loaded,
+            // not `expectations`/`expectationsDir` as they stand whenever the list is
+            // eventually flushed.
+            var expectationsEntryCountForPrint = expectations.Entries.Count;
+            var expectationsDirForPrint = expectationsDir;
+            deferredStartupLines.Add(() => Console.Error.WriteLine(
+                $"[expectations] loaded {expectationsEntryCountForPrint} " +
+                (expectationsEntryCountForPrint == 1 ? "entry" : "entries") +
+                $" from {expectationsDirForPrint}"));
         }
         catch (InvalidOperationException ex)
         {
@@ -477,68 +759,255 @@ if (artifactPathArg != null)
     }
 }
 System.Version? implicitlySelectedBuiltVersion = null;
-// When the user pinned neither --bc-version nor --artifact-path, an opt-in provisioning
-// mode targets the exact four-part BC build baked into this binary. Provisioning is
-// allowed to populate the cache, so it must not silently reuse an incompatible cached
-// minor. A normal non-downloading run retains the cache fallback hierarchy (exact build,
-// built minor, then built major). The target project's app.json (application/platform)
-// is read purely as a cross-check. All of this stays overridable.
+// When the user pinned neither --bc-version nor --artifact-path, default the artifact
+// selection to the ENGINE's built MAJOR rather than blindly latest-in-cache: this binary
+// can only faithfully run its own major (cross-major needs a matching engine build), so a
+// stray download of another major must never become the default. Within the major, any
+// cached minor is interchangeable (verified 28.1<->28.2), so latest-in-major is picked.
+// The target project's app.json (application/platform) is read purely as a cross-check —
+// a mismatch means the project targets a BC major this runner build can't run, surfaced
+// as a clear message instead of a deep failure. All of this stays overridable.
+// Tracks whether bcVersionArg/artifactPathArg came from the auto-select default
+// below, so the explicit-selection engine-minor-mismatch warning further down (see
+// BcArtifacts.WarnIfExplicitEngineMinorMismatch) does not double-warn a case the
+// auto-select branch already covers with its own, richer message.
+bool bcVersionAutoSelected = false;
 if (bcVersionArg == null && artifactPathArg == null)
 {
-    // The BUILT version (4-part, baked in at compile time) — not Ncl.dll's assembly
-    // version, whose minor is always 0. Falls back to the Ncl major if the attribute is
-    // missing (e.g. an older build), which restores the previous major-only behaviour.
-    var builtEngineVersion = AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion();
-    var engineVersion = builtEngineVersion
-        ?? AlRunner.Infrastructure.BcArtifacts.EngineVersion(AppContext.BaseDirectory);
-    var engineMajor = engineVersion?.Major;
-    if (engineVersion != null && engineMajor != null)
+    // #2027 BEHAVIOUR CHANGE: when this install ships per-BC-minor engine variants
+    // (variants/ present — see EngineVariants), the no-flags default INVERTS from
+    // engine-first to artifact-first. Below, ENGINE-first means "prefer whichever
+    // minor THIS compiled binary happens to be" — that bias existed because there was
+    // only ever one engine that could run at all, so a mismatched artifact was a real
+    // problem to steer away from (see the -45/+42/+3 Pageworks regression in the
+    // comment inside the else branch). With N correctly-matched variants shipped and
+    // auto-swapped-to below, that bias no longer protects anything — ANY of the N
+    // shipped minors is equally "this install's own engine" now, so picking the
+    // LATEST CACHED artifact (this was the runner's ORIGINAL default, before the
+    // engine-first change) is the more useful behaviour: a user who has since
+    // downloaded a newer BC artifact gets it by default, rather than being pinned to
+    // whichever minor happened to be copied into the package's top-level slot at pack
+    // time. TryDeriveBcMajorFromProject(bundles) is still the cross-check either way.
+    var shippedVariantsForDefault = AlRunner.Infrastructure.EngineVariants.Discover(AppContext.BaseDirectory);
+    if (shippedVariantsForDefault.Count > 0)
     {
-        if ((provisionSubcommand || autoProvision) && builtEngineVersion != null)
+        bcVersionAutoSelected = true;
+        // Prefer the engine's OWN major.minor. Latest-in-major used to win here, which
+        // silently selected a minor the engine was not built for — measured at -45 passing
+        // / +42 failing / +3 errors on Pageworks. See BcArtifacts.DefaultVersionPrefix.
+        //
+        // #2027: with per-BC-minor engine variants shipped, this branch (variants present)
+        // goes artifact-first instead of engine-first — see the outer if/else below for why.
+        try
         {
-            bcVersionArg = builtEngineVersion.ToString();
-            implicitlySelectedBuiltVersion = builtEngineVersion;
-            Console.Error.WriteLine($"[bc] no --bc-version given — targeting BC {builtEngineVersion}, the exact " +
-                $"build this binary was compiled against. Override with --bc-version.");
+            var latestDir = AlRunner.Infrastructure.BcArtifacts.SelectArtifactVersionDir(
+                AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, null);
+            bcVersionArg = Path.GetFileName(latestDir);
+            // #2097 considered — but rejected — deferring this line and the mismatch
+            // warning just below: unlike the "cached-exact"/"cached-minor" branches of
+            // the OTHER (no-variants-shipped) half of this if/else, this branch's own
+            // "latest cached artifact" can still fail to have a matching engine variant
+            // a few dozen lines further down (EngineVariants.SelectBestMatch returning
+            // null is a loud, immediate `return 2`) — the exact silent-discard-on-error
+            // shape proven real by DefaultProvisionTargetMessagingTests below, one
+            // if/else branch over. Staying immediate accepts the same "duplicates 3x on
+            // a stacked re-exec" cost the no-variants-shipped switch's KNOWN-DEGRADED
+            // branches also still pay, for the same reason.
+            Console.Error.WriteLine($"[bc] no --bc-version given — selecting BC {bcVersionArg}, the latest " +
+                $"cached artifact ({shippedVariantsForDefault.Count} engine variant(s) shipped; the matching " +
+                $"one is selected automatically below). Override with --bc-version.");
         }
-        else
+        catch (InvalidOperationException)
         {
-            bcVersionArg = AlRunner.Infrastructure.BcArtifacts.DefaultVersionPrefix(
-                engineVersion, AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir);
+            // No artifacts cached at all — leave bcVersionArg null. SelectVersion below
+            // throws the loud, path-naming "no artifacts" error users already see today.
+        }
 
-            var engineMajorMinor = $"{engineVersion.Major}.{engineVersion.Minor}";
-            if (bcVersionArg == engineVersion.ToString())
-                Console.Error.WriteLine($"[bc] no --bc-version given — selecting BC {engineVersion}, the exact " +
-                    $"build this binary was compiled against. Override with --bc-version.");
-            else if (bcVersionArg == engineMajorMinor)
-                // Degraded but usually survivable: right minor, different build. The CodeAnalysis
-                // assembly version can still differ between builds of one minor, which fails loud
-                // at startup rather than silently — see BcArtifacts.DefaultVersionPrefix.
-                Console.Error.WriteLine($"[bc] warning: no cached BC {engineVersion} — selecting the latest " +
-                    $"{engineMajorMinor}.x instead. Build-level skew within a minor can still fail to load " +
-                    $"Microsoft.Dynamics.Nav.CodeAnalysis. Fix with: al-runner provision --bc-version {engineVersion}");
+        var projMajorV = TryDeriveBcMajorFromProject(bundles);
+        if (projMajorV != null && bcVersionArg != null
+            && Version.TryParse(bcVersionArg, out var selV) && selV.Major.ToString() != projMajorV)
+            Console.Error.WriteLine($"[bc] warning: project app.json targets BC major {projMajorV} but the " +
+                $"latest cached artifact is {bcVersionArg} (major {selV.Major}).");
+    }
+    else
+    {
+        // The BUILT version (4-part, baked in at compile time) — not Ncl.dll's assembly
+        // version, whose minor is always 0. Falls back to the Ncl major if the attribute is
+        // missing (e.g. an older build), which restores the previous major-only behaviour.
+        var engineVersion = AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion()
+            ?? AlRunner.Infrastructure.BcArtifacts.EngineVersion(AppContext.BaseDirectory);
+        var engineMajor = engineVersion?.Major;
+        // #2114: ArtifactsRootDir (used twice inside this block) throws loudly when $HOME
+        // cannot be resolved to an absolute path. Probing it here — instead of letting the
+        // two calls below throw UNCAUGHT (nothing wraps this block, unlike the sibling
+        // "shippedVariantsForDefault" branch above, which already swallows the same
+        // exception the same way) — lets a broken $HOME fall through to the
+        // unconditionally-reached SelectVersion call further down, which IS wrapped in a
+        // try/catch that turns this into the correct "BC version selection failed: ..."
+        // exit-2 diagnostic, instead of crashing here unhandled.
+        bool artifactsRootResolvable;
+        try { _ = AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir; artifactsRootResolvable = true; }
+        catch (InvalidOperationException) { artifactsRootResolvable = false; }
+        if (engineVersion != null && engineMajor != null && artifactsRootResolvable)
+        {
+            bcVersionAutoSelected = true;
+            // Prefer the engine's OWN major.minor. Latest-in-major used to win here, which
+            // silently selected a minor the engine was not built for — measured at -45 passing
+            // / +42 failing / +3 errors on Pageworks. See BcArtifacts.DefaultVersionPrefix.
+            //
+            // Issue #2033: when auto-provisioning is about to run anyway (the default since
+            // #2024/#2028), ask what it can FETCH — cache, then the CDN, at each tier — not
+            // just what's already cached. Otherwise a genuinely empty cache collapses this
+            // straight to "major only" before a single byte is downloaded, and provisioning
+            // then fetches "latest in major" (e.g. 28.4) while the engine was built for 28.1,
+            // landing a first run in the exact KNOWN-DEGRADED skew #2020 describes. Without
+            // --auto-provision there is no network step coming, so stay cache-only exactly as
+            // before — that path has nothing to gain from probing a CDN it will never use.
+            string tier;
+            if ((provisionSubcommand || autoProvision)
+                && AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion() is { } builtEngineVersion)
+            {
+                // A single-engine install must provision the exact build it was compiled
+                // against. Falling through to a neighboring patch can load a different
+                // CodeAnalysis ABI while still looking like a compatible cache hit.
+                bcVersionArg = builtEngineVersion.ToString();
+                implicitlySelectedBuiltVersion = builtEngineVersion;
+                tier = "pinned-exact";
+            }
+            else if (provisionSubcommand || autoProvision)
+                bcVersionArg = AlRunner.Infrastructure.BcArtifacts.DefaultProvisionTarget(
+                    engineVersion, AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, out tier);
             else
-                Console.Error.WriteLine($"[bc] warning: no cached BC {engineMajorMinor}.x — this binary's engine was " +
-                    $"built for {engineVersion}, so a different minor is a KNOWN-DEGRADED configuration " +
-                    $"(measured: dozens of extra failures from engine/artifact minor skew). Falling back to the " +
-                    $"latest cached {engineMajor}.x. Fix with: al-runner provision --bc-version {engineMajorMinor}");
-        }
+            {
+                bcVersionArg = AlRunner.Infrastructure.BcArtifacts.DefaultVersionPrefix(
+                    engineVersion, AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir);
+                var engineMinorPfx = $"{engineVersion.Major}.{engineVersion.Minor}";
+                tier = bcVersionArg == engineVersion.ToString() ? "cached-exact"
+                    : bcVersionArg == engineMinorPfx ? "cached-minor"
+                    : "major-fallback-offline"; // distinct from "major-fallback": no CDN was consulted
+            }
+            var engineMajorMinor = $"{engineVersion.Major}.{engineVersion.Minor}";
+            // #2097: reusable exact/minor selections below are deferred — see
+            // `deferredStartupLines`'s declaration above. They describe an artifact
+            // that is ALREADY complete on disk, so SelectVersion just below reliably
+            // succeeds against it and this generation proceeds normally to the flush
+            // point, same shape as the reported "cached-exact" duplication. A pinned
+            // exact build that is missing or incomplete stays immediate because its
+            // line is the caller's only early signal before auto-provisioning begins;
+            // the `provision` subcommand also stays immediate because it exits before
+            // the normal-run flush point.
+            // The other branches are deliberately left printing immediately, for two
+            // DIFFERENT reasons:
+            //   - "cdn-exact"/"cdn-minor": ResolveProvisionTargetCore checks the cache
+            //     BEFORE the CDN at every tier (see its own doc comment), so once
+            //     RunProvisioning below successfully downloads what these branches
+            //     describe, EVERY later generation's tier recomputation finds it
+            //     already cached and takes the "cached-exact"/"cached-minor" branch
+            //     instead — a "cdn-*" branch can only ever fire in the one generation
+            //     that is about to perform the download, so it cannot itself
+            //     duplicate across re-execs the way the cached branches do. Deferring
+            //     it anyway would be a straight regression: the download that follows
+            //     can take minutes, and this line is the ONLY signal a caller gets
+            //     that a download is about to start at all — see
+            //     DefaultProvisionTargetMessagingTests.
+            //     AutoProvisionDefault_EmptyCache_TargetsEngineExactBuild_NeverDegradedWarning,
+            //     which kills the process the instant this line appears specifically
+            //     so it never has to wait out the real download, and failed hard
+            //     (30s timeout) the one time this was deferred here.
+            //   - "major-fallback-offline"/default ("major-fallback"): both are a
+            //     KNOWN-DEGRADED warning that commonly precedes an immediate failure
+            //     in THIS SAME generation (SelectVersion below has nothing durable to
+            //     select if nothing at all could be resolved) — deferring would risk
+            //     silently discarding the one piece of output that explains WHY the
+            //     following generic "BC version selection failed" error happened.
+            //     Confirmed by DefaultProvisionTargetMessagingTests.
+            //     NoAutoProvision_EmptyCache_MajorFallbackWarning_NeverClaimsCdnWasChecked,
+            //     which asserts on this exact text and failed the one time it was
+            //     deferred here (the process exits 2 before ever reaching the flush
+            //     point, so the deferred entry was silently dropped).
+            switch (tier)
+            {
+                case "pinned-exact":
+                    var pinnedExactLine =
+                        $"[bc] no --bc-version given — targeting BC {engineVersion}, the exact " +
+                        "build this binary was compiled against. Override with --bc-version.";
+                    var pinnedExactDir = AlRunner.Infrastructure.BcArtifacts.ArtifactDirFor(
+                        engineVersion.ToString());
+                    if (!provisionSubcommand && AlRunner.Infrastructure.ProvisioningCheck.Check(
+                            engineVersion.ToString(), pinnedExactDir).Ok)
+                        deferredStartupLines.Add(() => Console.Error.WriteLine(pinnedExactLine));
+                    else
+                        Console.Error.WriteLine(pinnedExactLine);
+                    break;
+                case "cached-exact":
+                    deferredStartupLines.Add(() => Console.Error.WriteLine(
+                        $"[bc] no --bc-version given — selecting BC {engineVersion}, the exact " +
+                        $"build this binary was compiled against. Override with --bc-version."));
+                    break;
+                case "cdn-exact":
+                    Console.Error.WriteLine($"[bc] no --bc-version given — provisioning BC {engineVersion}, the exact " +
+                        $"build this binary was compiled against. Override with --bc-version.");
+                    break;
+                case "cached-minor":
+                    // Degraded but usually survivable: right minor, different build. The CodeAnalysis
+                    // assembly version can still differ between builds of one minor, which fails loud
+                    // at startup rather than silently — see BcArtifacts.DefaultVersionPrefix.
+                    deferredStartupLines.Add(() => Console.Error.WriteLine(
+                        $"[bc] warning: no cached BC {engineVersion} — selecting the latest " +
+                        $"{engineMajorMinor}.x instead. Build-level skew within a minor can still fail to load " +
+                        $"Microsoft.Dynamics.Nav.CodeAnalysis. Fix with: al-runner provision --bc-version {engineVersion}"));
+                    break;
+                case "cdn-minor":
+                    Console.Error.WriteLine($"[bc] no --bc-version given and BC {engineVersion} is not published on " +
+                        $"the CDN — provisioning the latest {engineMajorMinor}.x instead (still this binary's own " +
+                        $"engine minor). Build-level skew within a minor can still fail to load " +
+                        $"Microsoft.Dynamics.Nav.CodeAnalysis. Fix with: al-runner provision --bc-version {engineVersion}");
+                    break;
+                case "major-fallback-offline":
+                    // No network step is coming (--no-auto-provision, or the rare case where
+                    // engineVersion resolved but auto-provisioning is off) — this can only speak
+                    // to what's CACHED, never to CDN availability. Original pre-#2033 wording.
+                    Console.Error.WriteLine($"[bc] warning: no cached BC {engineMajorMinor}.x — this binary's engine " +
+                        $"was built for {engineVersion}, so a different minor is a KNOWN-DEGRADED configuration " +
+                        $"(measured: dozens of extra failures from engine/artifact minor skew). Falling back to the " +
+                        $"latest cached {engineMajor}.x. Fix with: al-runner provision --bc-version {engineMajorMinor}");
+                    break;
+                default: // major-fallback: neither the exact build nor the engine's own minor is
+                         // available from cache or the CDN — a genuine degradation (e.g. #2010,
+                         // Microsoft withdrew the build), not the default-path norm.
+                    Console.Error.WriteLine($"[bc] warning: BC {engineMajorMinor}.x is not cached and not available " +
+                        $"from the CDN — this binary's engine was built for {engineVersion}, so a different minor is " +
+                        $"a KNOWN-DEGRADED configuration (measured: dozens of extra failures from engine/artifact " +
+                        $"minor skew). Falling back to the latest {engineMajor}.x. Fix with: al-runner provision " +
+                        $"--bc-version {engineMajorMinor}");
+                    break;
+            }
 
-        var projMajor = TryDeriveBcMajorFromProject(bundles);
-        if (projMajor != null && projMajor != engineMajor.Value.ToString())
-            Console.Error.WriteLine($"[bc] warning: project app.json targets BC major {projMajor} but this " +
-                $"runner build supports major {engineMajor} (cross-major needs a matching runner build).");
+            // #2097: NOT deferred — deliberately kept immediate, unlike the cached-tier
+            // branches above. This fires regardless of which tier won, including the two
+            // KNOWN-DEGRADED branches that can precede an immediate failure return in
+            // this same generation — deferring it would risk the same silent-discard-on-
+            // error trap documented on the switch above.
+            var projMajor = TryDeriveBcMajorFromProject(bundles);
+            if (projMajor != null && projMajor != engineMajor.Value.ToString())
+                Console.Error.WriteLine($"[bc] warning: project app.json targets BC major {projMajor} but this " +
+                    $"runner build supports major {engineMajor} (cross-major needs a matching runner build).");
+        }
     }
 }
-// ── Provisioning (opt-in): `provision` subcommand or --auto-provision. Resolves the
-// target version, downloads the engine service-tier closure if it's missing/incomplete,
-// then (subcommand) exits or (flag) continues the run against what was provisioned. This
-// is the ONLY path that downloads — a normal run never does.
+// ── Provisioning (on by default since issue #2024; opt out with --no-auto-provision):
+// `provision` subcommand or autoProvision (default true). Resolves the target version,
+// downloads the engine service-tier closure if it's missing/incomplete, then (subcommand)
+// exits or (flag/default) continues the run against what was provisioned. This is the
+// ONLY path that downloads — a run with --no-auto-provision never does.
 if (provisionSubcommand || autoProvision)
 {
-    var prc = RunProvisioning(
-        bcVersionArg, artifactPathArg, bundles,
+    // Manifest-app provisioning has exactly one owner per invocation. The subcommand
+    // exits here and handles it itself; a continuing run waits until after BC selection,
+    // where the actual package-cache search set is known.
+    var prc = RunProvisioning(bcVersionArg, artifactPathArg, bundles,
         provisionManifestApps: provisionSubcommand,
+        deferredLines: provisionSubcommand ? null : deferredStartupLines,
         out var provisionedVersion,
         out var engineProvisioningFailed);
     if (engineProvisioningFailed && implicitlySelectedBuiltVersion != null)
@@ -559,6 +1028,10 @@ if (provisionSubcommand || autoProvision)
     if (provisionedVersion != null)
         bcVersionArg = provisionedVersion; // run against the version we just ensured
 }
+// #2037: discovered here, OUTSIDE and BEFORE the try block below, so both the warn-gate
+// (inside the try) and the variant-swap block (after it) share one discovery — see the
+// comments at each use site.
+var shippedVariants = AlRunner.Infrastructure.EngineVariants.Discover(AppContext.BaseDirectory);
 try
 {
     AlRunner.Infrastructure.BcArtifacts.SelectVersion(bcVersionArg, artifactPathArg);
@@ -566,13 +1039,92 @@ try
     // into bin/. Within-major skew remains allowed for explicit selections and the normal
     // non-downloading cache fallback, though startup warns when that fallback is degraded.
     AlRunner.Infrastructure.BcArtifacts.VerifyEngineConsistency(AppContext.BaseDirectory);
-    Console.Error.WriteLine($"[bc] selected BC {AlRunner.Infrastructure.BcArtifacts.SelectedVersion} " +
-        $"({AlRunner.Infrastructure.BcArtifacts.ServiceTierDir})");
+    // #2008's root cause: VerifyEngineConsistency only catches a MAJOR mismatch (Ncl.dll's
+    // own AssemblyVersion is always major.0.0.0, so it cannot see a same-major
+    // different-minor selection). The auto-select default path above already warns about
+    // minor skew; an EXPLICIT --bc-version/--artifact-path bypassed that warning entirely
+    // and ran a mismatched engine silently. Only warn here for the explicit path.
+    //
+    // #2037: also only warn when this install ships NO per-BC-minor engine variants at
+    // all (see ShouldWarnExplicitEngineMinorMismatch) — once any variant is shipped, the
+    // variant-swap block below is the sole authority on whether the selection is
+    // degraded, not this generic same-process-engine comparison.
+    if (AlRunner.Infrastructure.BcArtifacts.ShouldWarnExplicitEngineMinorMismatch(
+            bcVersionAutoSelected, shippedVariants.Count))
+        AlRunner.Infrastructure.BcArtifacts.WarnIfExplicitEngineMinorMismatch();
+    // #2041/#2066: deferred — see `deferredStartupLines`' declaration above. Captured into
+    // locals now (the values are fixed the instant SelectVersion above returns) so the
+    // closure below reads exactly what THIS generation selected, not whatever the static
+    // BcArtifacts state happens to hold whenever the list is eventually flushed.
+    var selectedVersionForPrint = AlRunner.Infrastructure.BcArtifacts.SelectedVersion;
+    var serviceTierDirForPrint = AlRunner.Infrastructure.BcArtifacts.ServiceTierDir;
+    deferredStartupLines.Add(() => Console.Error.WriteLine(
+        $"[bc] selected BC {selectedVersionForPrint} ({serviceTierDirForPrint})"));
 }
 catch (InvalidOperationException ex)
 {
     Console.Error.WriteLine($"BC version selection failed: {ex.Message}");
     return 2;
+}
+
+// ── Per-BC-minor engine variant selection (#2024 item 3 / #2027). A packaged install
+// ships one thin engine variant per .github/bc-versions.txt entry under
+// variants/<full-build-version>/ (see EngineVariants) — this process's own compiled-in
+// engine is just ONE of them. A plain dev/test build (`dotnet build`/`dotnet run`) has no
+// variants/ directory at all, and this whole block is then a complete no-op: `variants`
+// comes back empty, `variantSwapDir` stays null, and every existing single-build code
+// path below behaves exactly as it always has.
+//
+// No match found among the shipped variants is a LOUD failure, never a silent fallback
+// to a nearby minor — that silent fallback is the root cause #2020 traced this whole
+// mechanism back to (see .claude/rules/loud-failures.md).
+//
+// `shippedVariants` was already discovered above (see #2037 comment on the warn gate) —
+// reused here rather than re-walking the variants/ directory a second time.
+string? variantSwapDir = null;
+{
+    if (shippedVariants.Count > 0)
+    {
+        var selected = AlRunner.Infrastructure.BcArtifacts.SelectedVersion;
+        var match = AlRunner.Infrastructure.EngineVariants.SelectBestMatch(shippedVariants, selected);
+        if (match == null)
+        {
+            Console.Error.WriteLine(
+                $"BC version selection failed: no shipped engine variant supports BC {selected} " +
+                $"(major {selected.Major}). Available variants: " +
+                $"{AlRunner.Infrastructure.EngineVariants.DescribeAvailable(shippedVariants)}. Select a " +
+                $"cached BC version this install ships an engine for (--bc-version), or update al-runner.");
+            return 2;
+        }
+
+        var (variant, degraded) = match.Value;
+        if (degraded)
+        {
+            // #2041/#2066: deferred — see `deferredStartupLines`' declaration above. This
+            // block runs in EVERY generation that reaches it (it is not itself gated on a
+            // re-exec prediction), so without deferring it this warning reprints once per
+            // generation — the specific "[bc] warning: ... built against ..." duplication
+            // (×3 on a stacked variant-swap-then-fresh-rewrite run) the issue measured.
+            var degradedVariantBuild = variant.BuildVersion;
+            var degradedSelected = selected;
+            deferredStartupLines.Add(() => Console.Error.WriteLine(
+                $"[bc] warning: the shipped {degradedVariantBuild.Major}.{degradedVariantBuild.Minor} engine " +
+                $"variant was built against {degradedVariantBuild}, not the selected {degradedSelected} — " +
+                $"different BUILDS of the same minor can still fail to load " +
+                $"Microsoft.Dynamics.Nav.CodeAnalysis (it's strong-named per build, not per minor). Expected: " +
+                $"variants pin the newest build of a minor AT PACK TIME, so any user on a different build of " +
+                $"that same minor hits this. See docs/limitations.md."));
+        }
+
+        var runningBuild = AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion();
+        if (runningBuild != variant.BuildVersion)
+        {
+            variantSwapDir = variant.Dir;
+            Console.Error.WriteLine(
+                $"[bc] selecting engine variant {variant.BuildVersion} for BC {selected} (this process is " +
+                $"currently running the {(runningBuild?.ToString() ?? "unknown")} variant) — re-execing.");
+        }
+    }
 }
 
 // Completeness gate: the selected version's dir exists, but is its engine closure whole?
@@ -607,11 +1159,60 @@ if (noCache)
         "nothing is reused from a previous run, and ~/.cache/al-runner is neither read nor written.");
 }
 else AlRunner.Infrastructure.CacheRoots.SetOverride(cacheRootOverride);
-Console.WriteLine(serverMode
+// #2041/#2066: deferred — see `deferredStartupLines`' declaration above. This generation
+// may still hand off via either re-exec decision below, and touches no bundle work at all
+// before doing so — the flush after both decisions is what makes this print exactly once,
+// from whichever generation is actually terminal.
+deferredStartupLines.Add(() => Console.WriteLine(serverMode
     ? "al-runner — server mode (JSON-RPC over stdin/stdout)"
     : watchMode
         ? $"al-runner — watch mode, {bundles.Count} bundle(s) (Ctrl+C to quit)"
-        : $"al-runner — running {bundles.Count} bundle(s)");
+        : $"al-runner — running {bundles.Count} bundle(s)"));
+
+// The packaged tool no longer ships Microsoft.Dynamics.Nav.Ncl.dll (see
+// check-nupkg-contents.sh) — it must be resolved from the user's own BC artifact
+// cache at runtime, like every other BC/Aspose/Graph DLL already stripped from the
+// package. CoreCLR's TPA list is computed once, by the native host, before any of
+// our code runs, so a THIS-process fix is impossible once we're past that point:
+// re-exec into a shadow runtime dir (see NclShadowRuntime) that legitimately has the
+// file on disk before ITS TPA is computed. A shadow child's own base directory
+// always has the real file, so this naturally does not re-fire there.
+// variantSwapDir != null (set above) ALSO routes through this same shadow-dir
+// mechanism: NclShadowRuntime.EnsureShadowDir's entrySourceDir parameter copies the
+// entry-assembly manifest set from the SELECTED VARIANT's own directory instead of this
+// process's, so one re-exec covers both "Ncl.dll isn't shipped" and "a different BC-minor
+// engine variant is needed" — see the doc comment on EnsureShadowDir.
+if ((AlRunner.Infrastructure.NclShadowRuntime.NeedsShadow(AppContext.BaseDirectory) || variantSwapDir != null)
+    && Environment.GetEnvironmentVariable("AL_RUNNER_NCL_SHADOW_DONE") != "1")
+{
+    var srcDirForShadow = AlRunner.Infrastructure.BcArtifacts.ServiceTierDir;
+    var shadowDll = AlRunner.Infrastructure.NclShadowRuntime.EnsureShadowDir(
+        AppContext.BaseDirectory, srcDirForShadow, variantSwapDir);
+    var dotnetMuxer = AlRunner.Infrastructure.NclShadowRuntime.FindDotnetMuxer();
+
+    var psi = new System.Diagnostics.ProcessStartInfo(dotnetMuxer) { UseShellExecute = false };
+    psi.ArgumentList.Add("exec");
+    psi.ArgumentList.Add(shadowDll);
+    // argv[0] is THIS process's own entry path (apphost exe, or the dll path the
+    // dotnet muxer forwarded) — never a user arg, and irrelevant here since we've
+    // already picked the child's entry point explicitly above.
+    var argv = RewriteArtifactPathArg(Environment.GetCommandLineArgs());
+    foreach (var a in argv.Skip(1)) psi.ArgumentList.Add(a);
+    psi.Environment["AL_RUNNER_NCL_SHADOW_DONE"] = "1";
+
+    Console.Error.WriteLine(variantSwapDir != null
+        // #2034: this line explains why a second process is about to launch — a
+        // genuinely operational fact, not an internal Cecil-rewrite diagnostic — so it
+        // uses the exempted `[reexec]` tag rather than `[Cecil]`. Under `[Cecil]`, Log's
+        // filter suppressed a real, live re-exec silently: the shadow dir was built, the
+        // child launched, and nothing on stderr said why.
+        ? "[reexec] Re-execing into a shadow runtime dir with the matching BC-minor engine variant"
+        : "[reexec] Ncl.dll not shipped in this install — re-execing into a shadow runtime dir that has it");
+    AlRunner.Infrastructure.PhaseLog.MarkReexecParent();
+    using var shadowChild = System.Diagnostics.Process.Start(psi)!;
+    shadowChild.WaitForExit();
+    return shadowChild.ExitCode;
+}
 
 // Cecil-rewrite Ncl.dll IN-PLACE on the bin path BEFORE CoreCLR's TPA probe
 // resolves it. Must run BEFORE any reference to BcRuntime (whose field metadata
@@ -645,7 +1246,10 @@ Console.WriteLine(serverMode
         foreach (var a in userArgs)
             psi.ArgumentList.Add(a);
         psi.Environment["AL_RUNNER_REEXECED"] = "1";
-        Console.Error.WriteLine("[Cecil] Fresh rewrite done — re-execing for a clean Ncl load");
+        // #2034 audit: this is the SAME class of silently-swallowed re-exec explanation
+        // (a fresh Cecil IL rewrite forces one more relaunch so the child loads the
+        // now-cached bytes cleanly) — also retagged so it survives the default filter.
+        Console.Error.WriteLine("[reexec] Fresh rewrite done — re-execing for a clean Ncl load");
         // This process waits for the child below, so its wall clock CONTAINS the
         // child's entire run. Re-label the row so aggregates that sum `kind=="process"`
         // do not double-count it.
@@ -656,13 +1260,21 @@ Console.WriteLine(serverMode
     }
 }
 
+// #2041/#2066: this generation has now cleared BOTH re-exec decision points above (the
+// shadow hop and the Cecil-fresh-rewrite hop) without returning — it is the terminal
+// generation for this invocation, so this is the one and only point that flushes the
+// startup lines queued in `deferredStartupLines`, in the order they were queued
+// (provisioning result, selected BC version, any degraded-variant warning, then the
+// running/watch/server-mode banner). Any earlier generation that instead re-exec'd
+// returned from inside one of those blocks and never reaches this line, so its own queued
+// entries are simply discarded — however many generations preceded this one.
+foreach (var deferredLine in deferredStartupLines) deferredLine();
+
 var packageCacheDirs = packageCacheArgs.Count > 0
     ? ExpandPackageCacheDirs(packageCacheArgs).ToList()
     : DefaultPackageCacheDirs().ToList();
-Console.WriteLine($"  package caches: {packageCacheDirs.Count} dir(s)");
-// Remembered so the provisioning-reuse block below can re-announce the count if it grows —
-// this header is load-bearing for reading a run and was printed before that block could add.
-var packageCacheDirsAtHeader = packageCacheDirs.Count;
+// This is the requested/default set before provisioning and runner-owned caches are folded in.
+Console.WriteLine($"  package caches (requested): {packageCacheDirs.Count} dir(s)");
 AlRunner.Infrastructure.PhaseLog.SetPackageCacheDirs(packageCacheDirs.Count);
 AlRunner.Infrastructure.PhaseLog.SetBundles(bundles);
 
@@ -676,7 +1288,22 @@ AlRunner.Infrastructure.PhaseLog.SetBundles(bundles);
 // bundles' own .alpackages into the dirs the gate scans (recomputed via PlatformCheckDirs
 // below so it picks up anything --auto-provision adds to packageCacheDirs afterward).
 var bundleAlpackagesDirs = AlRunner.Infrastructure.ProvisioningCheck.CollectBundleAlpackagesDirs(bundles);
-List<string> PlatformCheckDirs() => packageCacheDirs.Concat(bundleAlpackagesDirs).Distinct().ToList();
+
+// Issue #1996 (AC #3/#4): the runner-owned versioned destination(s) from a PRIOR
+// --auto-provision / `provision` run — checked BEFORE any network attempt, and BEFORE any
+// --package-cache dir even needs to exist, so a warm re-run (even one still passing an
+// empty/nonexistent --package-cache, as issue #1996's own repro does) never re-hits the
+// CDN. Populated once the selected BC version is known (already true at this point).
+var selectedVersionForProvisioning = AlRunner.Infrastructure.BcArtifacts.SelectedVersion.ToString();
+var runnerOwnedPlatformAppsDir = AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsDirFor(
+    AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, selectedVersionForProvisioning);
+var runnerOwnedTestAppsDir = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
+    AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, selectedVersionForProvisioning);
+var extraProvisionSearchDirs = new List<string>();
+if (Directory.Exists(runnerOwnedPlatformAppsDir)) extraProvisionSearchDirs.Add(runnerOwnedPlatformAppsDir);
+if (Directory.Exists(runnerOwnedTestAppsDir)) extraProvisionSearchDirs.Add(runnerOwnedTestAppsDir);
+List<string> PlatformCheckDirs() =>
+    packageCacheDirs.Concat(bundleAlpackagesDirs).Concat(extraProvisionSearchDirs).Distinct().ToList();
 
 // Platform-app R2R check: scan the package cache for known Microsoft platform runtime apps
 // (System Application, Base Application, Business Foundation). If any are present as
@@ -684,119 +1311,263 @@ List<string> PlatformCheckDirs() => packageCacheDirs.Concat(bundleAlpackagesDirs
 // the EMIT-ZERO crash is a provisioning gap, not a user-code error. Fail loud here before
 // any bundle compile, naming the fix, instead of deep inside the dep-load pipeline.
 // (--auto-provision downloads the R2R apps and clears the check.)
-var microsoftRequirements =
-    AlRunner.Infrastructure.ProvisioningCheck.DeriveMicrosoftRequirements(bundles);
-if (!provisionSubcommand
-    && (packageCacheDirs.Count > 0
-        || bundleAlpackagesDirs.Count > 0
-        || microsoftRequirements.PlatformAppsRequired
-        || microsoftRequirements.TestAppsRequired))
+//
+// Issue #1996: this used to be gated on `packageCacheDirs.Count > 0 || bundleAlpackagesDirs
+// .Count > 0` — an EMPTY cache (no .alpackages at all, or a --package-cache dir that simply
+// doesn't exist yet) skipped the whole gate, so a bundle whose app.json genuinely needs a
+// Microsoft app with no service-tier DLL fallback (Application Test Library) got neither
+// the loud failure nor the auto-provision download; it limped to a cryptic "Missing:" error
+// deep in dependency resolution instead. The gate now ALWAYS runs (dropping that count
+// check) and consults the bundle's own manifests — an independent source of truth for what
+// is actually needed — instead of only what happens to already be on disk.
+if (!provisionSubcommand)
 {
-    var version = AlRunner.Infrastructure.BcArtifacts.SelectedVersion.ToString();
-    var selected = AlRunner.Infrastructure.BcArtifacts.SelectedVersion;
-    var selectedMm = $"{selected.Major}.{selected.Minor}";
-    var artifactsRoot = AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir;
+    var version = selectedVersionForProvisioning;
+    // Manifest-driven need (issue #1996): independent of what CheckPlatformApps/
+    // TestToolkitPresent can see on disk. See ProvisioningCheck.DecideManifestProvisioning.
+    var manifestDependencyRoots = ScanManifestDependencyRoots(bundles);
+    var requestedSearchDirs = packageCacheDirs.Concat(bundleAlpackagesDirs)
+        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    var requestedPlatformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+        version, requestedSearchDirs);
+    var requestedDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+        manifestDependencyRoots, requestedPlatformReport, requestedSearchDirs);
 
-    bool PlatformReady() =>
-        !microsoftRequirements.PlatformAppsRequired
-        || AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
-            PlatformCheckDirs(), version, microsoftRequirements);
-    bool TestAppsReady() =>
-        !microsoftRequirements.TestAppsRequired
-        || AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(
-            PlatformCheckDirs(), microsoftRequirements);
+    // These are read-only, already-on-disk runner-owned dirs for the SELECTED version —
+    // fold them into the set dependency resolution actually uses too. Keeping the
+    // before/after decisions lets the runner state when one of those dirs closed a real
+    // gap instead of silently looking as though the project cache had supplied it.
+    foreach (var d in extraProvisionSearchDirs)
+        if (!packageCacheDirs.Contains(d, StringComparer.OrdinalIgnoreCase))
+            packageCacheDirs.Add(d);
 
-    bool TryReusePlatformSet()
-    {
-        if (PlatformReady()) return true;
-        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
-                     artifactsRoot, selectedMm, microsoftRequirements.MinimumVersion))
-        {
-            if (!AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
-                    PlatformCheckDirs().Append(candidate), version, microsoftRequirements))
-                continue;
-            if (!packageCacheDirs.Contains(candidate, StringComparer.OrdinalIgnoreCase))
-                packageCacheDirs.Add(candidate);
-            Console.Error.WriteLine($"[provision] reusing already-provisioned platform apps " +
-                $"for selected BC {selectedMm} at {candidate} (no download).");
-            return true;
-        }
-        return false;
-    }
-
-    bool TryReuseTestSet()
-    {
-        if (TestAppsReady()) return true;
-        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
-                     artifactsRoot, selectedMm, microsoftRequirements.MinimumVersion))
-        {
-            if (!AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(
-                    PlatformCheckDirs().Append(candidate), microsoftRequirements))
-                continue;
-            if (!packageCacheDirs.Contains(candidate, StringComparer.OrdinalIgnoreCase))
-                packageCacheDirs.Add(candidate);
-            Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit " +
-                $"for selected BC {selectedMm} at {candidate} (no download).");
-            return true;
-        }
-        return false;
-    }
-
-    // Manifest-derived absence is opt-in, just like the downloads themselves. Without
-    // --auto-provision an explicit --package-cache continues to mean exactly that set of
-    // dirs. Preserve the older local-reuse repair only when symbol-only platform packages
-    // have already made a concrete runtime gap visible.
     var platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
         version, PlatformCheckDirs());
-    if (autoProvision || !platformReport.Ok)
-        TryReusePlatformSet();
-    // Reusing a complete local toolkit does not cross the opt-in boundary: it performs no
-    // network or write, and preserves the pre-existing behavior for a toolkit provisioned
-    // at a neighboring build. TestAppsReady makes this a no-op when the manifests do not
-    // declare a known Microsoft test-framework root.
-    TryReuseTestSet();
+    var decision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+        manifestDependencyRoots, platformReport, PlatformCheckDirs());
+    var selected = Version.Parse(version);
+    var mm = $"{selected.Major}.{selected.Minor}";
+    var versionFloors = AlRunner.Infrastructure.ProvisioningCheck.DetermineVersionFloors(
+        manifestDependencyRoots);
 
-    // --artifact-path intentionally makes the early engine provisioner a no-op, so this
-    // post-selection gate must own app provisioning too. Both paths call the same helpers,
-    // which check the selected version's destination before any network request.
-    if (autoProvision && !PlatformReady())
+    if (requestedDecision.ShouldDownloadPlatform && !decision.ShouldDownloadPlatform
+        && Directory.Exists(runnerOwnedPlatformAppsDir))
+        Console.Error.WriteLine($"[provision] reusing already-provisioned platform apps for selected BC " +
+            $"{mm} at {runnerOwnedPlatformAppsDir} (no download).");
+    if (requestedDecision.ShouldDownloadTest && !decision.ShouldDownloadTest
+        && Directory.Exists(runnerOwnedTestAppsDir))
+        Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit for selected BC " +
+            $"{mm} at {runnerOwnedTestAppsDir} (no download).");
+
+    // An exact-build cache is preferred above. If it is incomplete, a complete neighboring
+    // build of the same minor is still a valid warm source, but only after the same
+    // manifest/floor checks that govern a fresh download accept it. Attach platform and
+    // toolkit sets independently so an opt-out run can reuse either one before reporting
+    // whatever gap remains; no network or write crosses the opt-out boundary.
+    if (decision.ShouldDownloadPlatform)
     {
-        if (!EnsurePlatformAppsProvisioned(version, microsoftRequirements)) return 2;
-        if (!TryReusePlatformSet())
+        var legacyFloor = AlRunner.Infrastructure.ProvisioningCheck.MinimumUsefulR2RVersion(platformReport);
+        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
+                     AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, mm, legacyFloor))
         {
-            Console.Error.WriteLine(
-                "[provision] platform apps were provisioned but are not visible to dependency resolution.");
-            return 2;
+            var candidateDirs = PlatformCheckDirs().Append(candidate)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var candidateReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+                version, candidateDirs);
+            var candidateDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+                manifestDependencyRoots, candidateReport, candidateDirs);
+            if (candidateDecision.ShouldDownloadPlatform) continue;
+
+            if (!packageCacheDirs.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                packageCacheDirs.Add(candidate);
+            Console.Error.WriteLine($"[provision] reusing already-provisioned platform apps for selected BC " +
+                $"{mm} at {candidate} (no download).");
+            platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+                version, PlatformCheckDirs());
+            decision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+                manifestDependencyRoots, platformReport, PlatformCheckDirs());
+            break;
         }
     }
-    if (autoProvision && !TestAppsReady())
+
+    if (decision.ShouldDownloadTest)
     {
-        if (!EnsureTestToolkitProvisioned(version, microsoftRequirements)) return 2;
-        if (!TryReuseTestSet())
+        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
+                     AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, mm, minVersion: null))
         {
-            Console.Error.WriteLine(
-                "[provision] test apps were provisioned but are not visible to dependency resolution.");
-            return 2;
+            var candidateDirs = PlatformCheckDirs().Append(candidate)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (!AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(candidateDirs, versionFloors))
+                continue;
+
+            if (!packageCacheDirs.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                packageCacheDirs.Add(candidate);
+            Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit for selected BC " +
+                $"{mm} at {candidate} (no download).");
+            decision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+                manifestDependencyRoots, platformReport, PlatformCheckDirs());
+            break;
         }
     }
 
-    // Preserve the existing non-opt-in loud failure for symbol-only platform packages.
-    // Manifest-derived absence is left to the dependency resolver when --auto-provision is
-    // absent, so ordinary runs that rely only on the service-tier runtime do not change.
-    platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
-        version, PlatformCheckDirs());
-    if (!platformReport.Ok && !autoProvision)
+    // Test-toolkit apps (Business Foundation Test Libraries, Application Test Library, …)
+    // are a SEPARATE artifact set from the w1 platform apps (they live under the
+    // `platform` artifact, not `w1`) — a cache can have complete R2R platform apps and
+    // still be missing the whole test toolkit, which fails compiling any test bundle.
+    var toolkitPresent = decision.TestComplete;
+
+    if (decision.ShouldDownloadAny && !autoProvision)
     {
-        Console.Error.WriteLine(platformReport.ToDetailedMessage());
+        // Issue #1996 acceptance criterion #10 / issue #2024: no download when the caller
+        // has explicitly refused it with --no-auto-provision, on EITHER path.
+        Console.Error.WriteLine(!platformReport.Ok
+            ? platformReport.ToDetailedMessage()
+            : AlRunner.Infrastructure.ProvisioningCheck.BuildManifestNeedsMissingMessage(
+                decision.ShouldDownloadPlatform, decision.ShouldDownloadTest, PlatformCheckDirs()));
         return 2;
     }
 
-    if (packageCacheDirs.Count != packageCacheDirsAtHeader)
+    if (autoProvision && decision.ShouldDownloadAny)
     {
-        Console.WriteLine($"  package caches: {packageCacheDirs.Count} dir(s) after provisioning reuse");
-        AlRunner.Infrastructure.PhaseLog.SetPackageCacheDirs(packageCacheDirs.Count);
+        // Issue #2077: always target the SELECTED BC version's own major.minor — never one
+        // derived from cache contents (a symbol-only app, or a project-vendored
+        // `.alpackages` closure) as this used to. That derivation silently redirected the
+        // whole provisioning pass to whatever minor happened to already be on disk (e.g.
+        // `--bc-version 28.4` provisioning 28.1 platform apps because the bundle's own
+        // committed `.alpackages` vendors 28.1 symbols) — the engine ended up running R2R
+        // apps from a build nobody asked for, with the mismatch never stated.
+        {
+            // Loud mismatch note (acceptance criterion): tell the user when the cache would
+            // have suggested a DIFFERENT minor than the one actually being provisioned, even
+            // though we no longer act on that suggestion.
+            var cacheMm = !platformReport.Ok
+                ? AlRunner.Infrastructure.ProvisioningCheck.DeriveProvisionMajorMinor(platformReport, version)
+                : AlRunner.Infrastructure.ProvisioningCheck.DerivePresentPlatformMajorMinor(PlatformCheckDirs(), version);
+            var skewNote = AlRunner.Infrastructure.ProvisioningCheck.BuildProvisionVersionSkewNote(
+                mm, cacheMm,
+                !platformReport.Ok
+                    ? "a symbol-only platform app already in the package cache"
+                    : "platform apps already in the package cache");
+            if (skewNote != null)
+                Console.Error.WriteLine(skewNote);
+        }
+        // Selection has already resolved a concrete four-part engine/artifact build. A
+        // missing app set must be downloaded for that build, not silently replaced by the
+        // CDN's newest patch of the minor. Warm neighboring sets were adjudicated above.
+        var full = version;
+        // Runner-owned artifact-cache destinations — NEVER a caller-supplied --package-cache
+        // dir (issue #1653: this used to pick packageCacheDirs[0], writing ~135 MB of
+        // downloaded apps straight into the project's .alpackages). Mirrors the destination
+        // the standalone `al-runner provision` step already uses for the test toolkit.
+        var platformAppsOut = AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsDirFor(
+            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, full);
+        var testAppsOut = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
+            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, full);
+
+        if (decision.ShouldDownloadPlatform)
+        {
+            // Reuse-first (AC #4/#5): the resolved `full` version can be a warm same-
+            // major/minor destination that a PRIOR run already completed (e.g. a
+            // different patch of the same minor, or this exact invocation retried after
+            // a transient failure) — check before ever touching the network. Folding
+            // platformAppsOut into the search set FIRST and re-deciding against it (rather
+            // than a standalone ATL-only presence check) correctly covers BOTH triggers:
+            // the legacy symbol-only gap (some BC versions — e.g. 27.x — never ship
+            // Application Test Library at all, so an ATL-only check would never be
+            // satisfiable for them) and the manifest-driven ATL need.
+            if (!packageCacheDirs.Contains(platformAppsOut))
+                packageCacheDirs.Add(platformAppsOut);
+            var reuseReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+                version, PlatformCheckDirs());
+            var reuseDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+                manifestDependencyRoots, reuseReport, PlatformCheckDirs());
+            if (!reuseDecision.ShouldDownloadPlatform)
+            {
+                Console.Error.WriteLine($"[provision] platform apps already complete at {platformAppsOut}.");
+            }
+            else
+            {
+                Console.Error.WriteLine($"[provision] fetching Microsoft platform R2R apps for BC " +
+                    $"{full} → {platformAppsOut}");
+                var rc = AlRunner.Provisioning.ArtifactDownloader.PlatformApps(
+                    full, platformAppsOut, m => Console.Error.WriteLine($"[provision] {m}"));
+                if (rc != 0)
+                {
+                    Console.Error.WriteLine("[provision] platform-apps download failed; cannot continue.");
+                    return 2;
+                }
+            }
+            // Re-check: never silently continue on a partial/failed provision.
+            platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+                version, PlatformCheckDirs());
+            if (!platformReport.Ok)
+            {
+                var stillMissing = string.Join(", ", platformReport.Issues.Select(i => i.Name));
+                Console.Error.WriteLine($"[provision] platform apps still symbol-only after download: {stillMissing}");
+                return 2;
+            }
+            // Only demand literal Application Test Library presence when the MANIFEST
+            // actually declared a need for it — some BC versions never ship it at all, so
+            // requiring it unconditionally would fail every platform-apps download
+            // triggered solely by the legacy symbol-only gap (e.g. corpus bundles on BC 27.x).
+            if (decision.NeedsPlatformApps
+                && !AlRunner.Infrastructure.ProvisioningCheck.NoFallbackPlatformAppsPresent(
+                    PlatformCheckDirs(), versionFloors))
+            {
+                Console.Error.WriteLine("[provision] platform apps (Application Test Library) still missing after download.");
+                return 2;
+            }
+        }
+
+        if (decision.ShouldDownloadTest)
+        {
+            if (AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(
+                    new[] { testAppsOut }, versionFloors))
+            {
+                Console.Error.WriteLine($"[provision] test toolkit already complete at {testAppsOut}.");
+            }
+            else
+            {
+                Console.Error.WriteLine("[provision] test-toolkit apps missing — downloading...");
+                var rc = AlRunner.Provisioning.ArtifactDownloader.TestApps(
+                    full, testAppsOut, m => Console.Error.WriteLine($"[provision] {m}"));
+                if (rc != 0)
+                {
+                    Console.Error.WriteLine("[provision] test-toolkit download failed; cannot continue.");
+                    return 2;
+                }
+            }
+            // Make the downloaded apps visible to resolution: add the artifact-cache dir as
+            // an additional search root rather than copying its contents into the project.
+            if (!packageCacheDirs.Contains(testAppsOut))
+                packageCacheDirs.Add(testAppsOut);
+            // Re-check: never silently continue on a partial/failed provision.
+            toolkitPresent = AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(
+                PlatformCheckDirs(), versionFloors);
+            if (!toolkitPresent)
+            {
+                Console.Error.WriteLine("[provision] test-toolkit apps still missing after download.");
+                return 2;
+            }
+        }
     }
 }
+
+// #2107: packageCacheDirs is now complete — every fold-in above (extraProvisionSearchDirs,
+// then platformAppsOut/testAppsOut inside the provisioning block just closed) has already
+// run, whichever branch of `if (!provisionSubcommand)` was taken. This is the number
+// dependency resolution (PlatformCheckDirs, DependencyResolver's resolverDirs) actually
+// searches — the "(requested)" line above is scoped to before these folds by its label.
+AlRunner.Infrastructure.PhaseLog.SetPackageCacheDirs(packageCacheDirs.Count);
+Console.WriteLine($"  package caches (final search set): {packageCacheDirs.Count} dir(s)");
+// --verbose: name the directories themselves, not just the count. The count alone was
+// exactly what made #2067 hard to read — "0" on a machine that went on to search several
+// dirs — so the natural companion to the --verbose "[dep] Publisher/Name" line below (which
+// names which package WON each dependency slot) is naming what got SEARCHED to produce that
+// winner in the first place.
+if (AlRunner.Log.Verbose)
+    foreach (var d in packageCacheDirs)
+        Console.WriteLine($"    [pkg-cache] {d}");
 
 // One-time runtime setup. Must happen BEFORE any BC type is touched.
 // Install the assembly Resolving handler FIRST so patch reflection or generic
@@ -811,6 +1582,7 @@ AlRunner.Rad.RadWorkspaceStore.Enabled =
     watchMode && Environment.GetEnvironmentVariable("AL_RUNNER_RAD") != "0";
 if (extraPreprocessorSymbols.Count > 0)
     BcCompiler.SetExtraPreprocessorSymbols(extraPreprocessorSymbols.Distinct().ToList());
+BcCompiler.SetTddMode(tddMode);
 if (Environment.GetEnvironmentVariable("AL_RUNNER_DIAG_FCE") is "1" or "2")
 {
     var fceFull = Environment.GetEnvironmentVariable("AL_RUNNER_DIAG_FCE") == "2";
@@ -861,6 +1633,9 @@ var fullCompileNotes = new List<string>();
 // repaired packaged surface. Same lifetime and same reason as the list above; a separate one
 // because the dashboard renders it as the narrow path working, not as a full recompile.
 var rebindNotes = new List<string>();
+// --tdd (issue #2001) acceptance criterion 8: every member generated across the WHOLE run
+// (every bundle's Emit call), printed as one list at the end — see the print site below.
+var allTddGeneratedMembers = new List<TddGeneratedMember>();
 
 // ── Layered source build pre-pass ─────────────────────────────────────────
 // When multiple bundles are passed and one depends on another (by AppId or
@@ -892,11 +1667,33 @@ var layeredWorkspaceDirs = new List<string>();
 // compile-time failure in this file does: a "<layered-deps>: COMPILE-FAIL" line on
 // stderr and the documented exit code 3 (docs/server-mode.md's "3 compilation error"
 // ladder — same code EMIT-ZERO/COMPILE-FAIL already return elsewhere in Main).
+//
+// #2095: a MissingDependencyException / DependencyVersionMismatchException reaching
+// either catch below is NOT a compile failure — it is a provisioning/version gap
+// discovered while resolving THIS pre-pass's OWN dependency closure (e.g. a sibling
+// source app's declared dep that no cache dir has, or has only too-old builds of).
+// Folding it into the generic "COMPILE-FAIL — {ex.Message}" line prints the short
+// one-liner (ex.Message) instead of the detailed, actionable ToDetailedMessage() the
+// exception already carries, and mislabels a missing/too-old package as "your AL code
+// did not compile". Special-case both (via the shared IDependencyProvisioningDiagnostic
+// marker) ahead of the generic path; every other exception keeps today's COMPILE-FAIL /
+// exit 3 behavior unchanged. Exit code 2 ("execution error" in docs/server-mode.md's
+// ladder) matches the ProvisioningCheck gap report a few hundred lines up (Program.cs,
+// the "Completeness gate" block) — same shape (bare ToDetailedMessage, no compile even
+// attempted yet) and the same exit code.
 if (bundles.Count > 1)
 {
     try
     {
         packageCacheDirs = RunLayeredPrePass(bundles, packageCacheDirs, layeredWorkspaceDirs);
+    }
+    catch (Exception ex) when (ex is AlRunner.Infrastructure.IDependencyProvisioningDiagnostic diag)
+    {
+        var bcVer = AlRunner.Infrastructure.BcArtifacts.SelectedVersion.ToString();
+        Console.Error.WriteLine();
+        Console.Error.WriteLine(diag.ToDetailedMessage(bcVer));
+        Console.Error.WriteLine();
+        return 2;
     }
     catch (Exception ex)
     {
@@ -909,9 +1706,18 @@ if (bundles.Count > 1)
 // .app in any cache) — e.g. the corpus internalsVisibleTo fixture next to the
 // main test app. Inert when no declared dep matches a sibling source app.
 // Same unhandled-exception exposure as RunLayeredPrePass above (#1898) — same fix.
+// Same #2095 provisioning/version-gap special-case as RunLayeredPrePass above.
 try
 {
     packageCacheDirs = BuildSiblingSourceDeps(bundles, packageCacheDirs, layeredWorkspaceDirs);
+}
+catch (Exception ex) when (ex is AlRunner.Infrastructure.IDependencyProvisioningDiagnostic diag)
+{
+    var bcVer = AlRunner.Infrastructure.BcArtifacts.SelectedVersion.ToString();
+    Console.Error.WriteLine();
+    Console.Error.WriteLine(diag.ToDetailedMessage(bcVer));
+    Console.Error.WriteLine();
+    return 2;
 }
 catch (Exception ex)
 {
@@ -931,6 +1737,22 @@ var compilerPackageDirs = packageCacheDirs
 // same-identity bundle is picked up. Never returns to the bundle loop below.
 if (serverMode)
     return RunServerLoop(serverStdin!, serverStdout!);
+
+// ── --dap: start a Debug Adapter Protocol session and stay resident until the
+// client disconnects or the debuggee run finishes (issue #1642). Never returns to
+// the bundle loop below — same "stay resident" shape as --server above, minus the
+// warm-reload contract (a debug session runs the bundle exactly once).
+if (dapMode)
+{
+    if (bundles.Count != 1)
+    {
+        Console.Error.WriteLine(
+            $"--dap currently supports exactly one bundle path (got {bundles.Count}) — " +
+            "multi-bundle debugging is tracked as follow-up work, see issue #1642's PR.");
+        return 2;
+    }
+    return RunDapLoop(bundles[0], dapPort, dapStdioMode, dapStdioInput, dapStdioOutput);
+}
 
 // Watch loop: normal mode runs exactly one pass then breaks to the summary below.
 // Watch mode loops forever — each pass re-emits (warm) and re-runs in-process.
@@ -1359,6 +2181,46 @@ foreach (var bundle in bundles)
     var bundleErrors = new List<string>();
     var bundleStage = BucketStage.Ran;
     int sP = 0, sF = 0, sE = 0;
+    // --tdd (orchestrator review on #2005): "ObjectDisplayName.MethodName" -> every member
+    // that test's compile depended on --tdd generating. Populated below wherever this
+    // bundle's emitOutput.TddGeneratedMembers is collected; consumed by
+    // OverrideTddDependentResults right before either execution loop's real TestResult set
+    // is counted/added, so a test that only ran against scaffolding can never report pass —
+    // see TddGeneratedMember.DependentTests' doc comment for why a generated field is a fully
+    // functional fake, not a default return, and must be treated as strictly WORSE.
+    var bundleTddDependents = new Dictionary<string, List<TddGeneratedMember>>();
+    // --tdd (orchestrator review on #2005): forces every TestResult whose compile depended on
+    // a --tdd-generated member to report FAIL, regardless of what actually happened when it
+    // ran. The test still executes in full — "keep running the test... only the reported
+    // outcome changes" — a generated PROCEDURE stub already fails on its own (it raises
+    // Error()), but a generated FIELD or enum value has nothing to fail on: it is real,
+    // functioning storage, so a test that only writes and reads it back legitimately passes,
+    // and a green result there would be the exact lie loud-failures.md's first paragraph
+    // describes — worse than a default return, because it's a fully working fake. Message is
+    // rewritten uniformly for BOTH cases (not just the field/enum one) so the failure always
+    // names the generated member(s) and their inferred type(s) explicitly, per the review.
+    List<TestResult> OverrideTddDependentResults(IReadOnlyList<TestResult> raw)
+    {
+        if (bundleTddDependents.Count == 0) return raw as List<TestResult> ?? raw.ToList();
+        var overridden = new List<TestResult>(raw.Count);
+        foreach (var t in raw)
+        {
+            var label = string.IsNullOrEmpty(t.CodeunitDisplayName) ? t.Codeunit : t.CodeunitDisplayName!;
+            if (bundleTddDependents.TryGetValue($"{label}.{t.Method}", out var deps) && deps.Count > 0)
+            {
+                var depList = string.Join("; ", deps.Select(d => $"{d.ObjectDisplayName}: {d.MemberKind} {d.Signature}"));
+                var msg = $"--tdd: this test depends on {deps.Count} generated member(s) the " +
+                    $"implementing app has not defined yet: {depList}";
+                if (!string.IsNullOrEmpty(t.Message)) msg += $" (underlying result: {t.Message})";
+                overridden.Add(t with { Outcome = TestOutcome.Fail, Message = msg });
+            }
+            else
+            {
+                overridden.Add(t);
+            }
+        }
+        return overridden;
+    }
     // #1880: counts app groups (bundled mode) / suites (--per-suite) that actually
     // reached test execution and contributed to bundleTests — incremented at the
     // SAME point as bundleTests.AddRange below, in both loops, so a group that threw
@@ -1730,6 +2592,13 @@ foreach (var bundle in bundles)
             var et = System.Diagnostics.Stopwatch.StartNew();
             IReadOnlyList<EmittedSource> sources = Array.Empty<EmittedSource>();
             IReadOnlyList<string> alDiagnostics = Array.Empty<string>();
+            // --tdd only (issue #1997): count of objects the TDD-EXCLUDED branch below
+            // deliberately kept `sources` short by. The PARTIAL-EMIT-DROP guard further
+            // down flags any declared-vs-emitted gap as a SILENT drop — under --tdd that
+            // gap is not silent (it is exactly the TDD-EXCLUDED objects, already reported
+            // above with a synthetic FAILED test each), so the guard must subtract this
+            // count before deciding there is an unexplained gap left.
+            int tddExcludedCount = 0;
             // Containment: keep a symbol-less .app in ONE suite's .alpackages from failing
             // every OTHER suite in the bundle. BC's native .app scanner reports AL1023
             // ("package file is not valid") for a package with no SymbolReference.json and
@@ -1746,19 +2615,9 @@ foreach (var bundle in bundles)
             // already applies — see BcCompiler.ScopeSymbolBearingDepsOnly.
             using var bundleDepScope = BcCompiler.ScopeSymbolBearingDepsOnly();
             AppMark("pre-emit setup");
-            // The delta path is RunEmit -> BcCompiler.EmitIncremental, against the resident
-            // RadWorkspace. #1962 landed a second, narrower incremental path on main
-            // (BcCompiler.TryEmitIncremental, still present and still directly tested) whose
-            // hook was here; it is deliberately NOT wired, because the two cannot both own the
-            // baseline and this one is a strict superset of it. TryEmitIncremental falls back to
-            // a whole-module compile for an added/removed/renamed file, an id-less object kind,
-            // a file declaring anything other than exactly one object, a changed object
-            // identity, and every first cycle of a new process (its baseline is per-instance and
-            // in-memory); the workspace deltas all of those, persists its baseline through the
-            // AL-output cache so a cache HIT arrives delta-ready, and rebinds cross-app callers
-            // instead of rebuilding them. RadWorkspace.ReferenceSignature covers what
-            // TryEmitIncremental's two fingerprints covered — resolved dependency specs,
-            // preprocessor symbols, app identity.
+            // RadWorkspace is the sole production incremental engine. It owns the persistent
+            // baseline, overlay generations, structural deltas, and cross-app rebinding; a
+            // second dispatcher cannot safely share that state or decide which baseline wins.
             var emitTask = Task.Run(() => RunEmit(emitter, allPaths, moduleName, radWs, appGroup.SuiteDir));
             try
             {
@@ -1781,6 +2640,23 @@ foreach (var bundle in bundles)
                     radOverlay = result is { FullRebuild: false, NoChange: false };
                     sources = emitOutput.Sources;
                     alDiagnostics = emitOutput.Diagnostics;
+                    // --tdd (issue #2001): collect regardless of whether anything ended up
+                    // excluded afterward — generation can fully resolve an object with NO
+                    // exclusion remaining, and that case still belongs in criterion 8's list.
+                    if (emitOutput.TddGeneratedMembers != null)
+                    {
+                        allTddGeneratedMembers.AddRange(emitOutput.TddGeneratedMembers);
+                        // Invert DependentTests (member -> tests) into (test -> members), so
+                        // OverrideTddDependentResults can look a REAL TestResult up by its own
+                        // (CodeunitDisplayName ?? Codeunit, Method) in O(1).
+                        foreach (var m in emitOutput.TddGeneratedMembers)
+                            foreach (var testLabel in m.DependentTests)
+                            {
+                                if (!bundleTddDependents.TryGetValue(testLabel, out var list))
+                                    bundleTddDependents[testLabel] = list = new List<TddGeneratedMember>();
+                                list.Add(m);
+                            }
+                    }
 
                     // An emit-retry exclusion means one or more AL objects are NOT in the
                     // compiled module. Any test they declared is now absent from the run —
@@ -1795,17 +2671,44 @@ foreach (var bundle in bundles)
                     if (emitOutput.ExcludedObjects.Count > 0)
                     {
                         var names = string.Join(", ", emitOutput.ExcludedObjects);
-                        // Untagged on purpose: a `[Component]` prefix would be swallowed by
-                        // Log's filter at default verbosity, which is the original defect.
-                        Console.Error.WriteLine(
-                            $"<bundled>: EMIT-EXCLUDED — {moduleName}: {emitOutput.ExcludedObjects.Count} object(s) " +
-                            $"could not be compiled and were dropped from the module, so any tests they declare " +
-                            $"are MISSING from this run: [{names}]. Re-run with --verbose for the AL diagnostics " +
-                            $"that identified them.");
-                        bundleErrors.Add(
-                            $"<bundled>: EMIT-EXCLUDED for {moduleName}: {emitOutput.ExcludedObjects.Count} " +
-                            $"object(s) dropped from the module — tests they declare are missing: [{names}].");
-                        sources = Array.Empty<EmittedSource>(); // do not run a module that is missing objects
+                        if (tddMode)
+                        {
+                            // --tdd (issue #1997): the default path above (else branch) is
+                            // UNCHANGED — this branch only runs when --tdd was passed. Keep the
+                            // recovered `sources` (BcCompiler's emit-retry loop already dropped
+                            // ONLY the broken objects and recompiled the survivors) instead of
+                            // discarding the whole module, and turn every [Test] procedure the
+                            // excluded objects declared into a synthetic FAILED TestResult naming
+                            // the AL diagnostic that broke it. bundleErrors MUST stay untouched
+                            // here: any entry there forces exit code 3 at the exit-code ladder
+                            // below, and the whole point of --tdd is to report a RED TEST (exit
+                            // 1), not a compile failure.
+                            var synthetic = TddSupport.BuildFailedTests(
+                                emitOutput.TddExcludedDetails ?? Array.Empty<TddExcludedObjectDetail>());
+                            Console.Error.WriteLine(
+                                $"<bundled>: TDD-EXCLUDED — {moduleName}: {emitOutput.ExcludedObjects.Count} " +
+                                $"object(s) could not be compiled: [{names}]. {synthetic.Count} [Test] " +
+                                $"procedure(s) they declare report as FAILED instead of vanishing from the run. " +
+                                $"Re-run with --verbose for the AL diagnostics that identified them.");
+                            bundleTests.AddRange(synthetic);
+                            tddExcludedCount = emitOutput.ExcludedObjects.Count;
+                            // sources stays as BcCompiler returned it (the recovered set) — do
+                            // NOT clear it, unlike the non-tdd branch below.
+                        }
+                        else
+                        {
+                            // Untagged on purpose: a `[Component]` prefix would be swallowed by
+                            // Log's filter at default verbosity, which is the original defect.
+                            Console.Error.WriteLine(
+                                $"<bundled>: EMIT-EXCLUDED — {moduleName}: {emitOutput.ExcludedObjects.Count} object(s) " +
+                                $"could not be compiled and were dropped from the module, so any tests they declare " +
+                                $"are MISSING from this run: [{names}]. Re-run with --verbose for the AL diagnostics " +
+                                $"that identified them.");
+                            bundleErrors.Add(
+                                $"<bundled>: EMIT-EXCLUDED for {moduleName}: {emitOutput.ExcludedObjects.Count} " +
+                                $"object(s) dropped from the module — tests they declare are missing: [{names}].");
+                            sources = Array.Empty<EmittedSource>(); // do not run a module that is missing objects
+                        }
                     }
 
                     // --dump-csharp DIR: write the emitted intermediate C# (BC's
@@ -1880,7 +2783,11 @@ foreach (var bundle in bundles)
                         .Select(m => m.Groups[2].Value.Trim())
                         .ToList());
                 var declaredObjects = perFile.SelectMany(names => names).ToList();
-                if (declaredObjects.Count > sources.Count)
+                // #1997: the gap is not silent when it exactly matches tddExcludedCount — the
+                // TDD-EXCLUDED branch above already reported those objects loudly, with a
+                // synthetic FAILED test each. Only a gap BEYOND that is the unexplained,
+                // genuinely silent drop this guard exists to catch.
+                if (declaredObjects.Count > sources.Count + tddExcludedCount)
                 {
                     var emittedNames = sources.Select(s => s.Name).ToList();
                     bundleErrors.Add(
@@ -2105,24 +3012,43 @@ foreach (var bundle in bundles)
                 }
                 else if (radWs != null)
                 {
-                    if (radResult?.CanCommit != true)
+                    if (radResult?.CanCommit == true)
+                    {
+                        radResult.Commit(radWs, loaded);
+                        appAssemblies.AddRange(radWs.Generations);
+                        // Persist the baseline this full compile just established, beside the DLL
+                        // written for the same key above, so the NEXT watch process over this tree
+                        // starts delta-ready instead of paying for a baseline again.
+                        //
+                        // After the commit, not at the DLL write site: there the baseline still
+                        // lives only on the uncommitted token, and — more importantly — a baseline
+                        // whose generated C# was rejected, or which failed to load, must never
+                        // become a cache entry. Only a full compile has a whole module to persist;
+                        // a delta overlay is a fragment, which is the same reason its assembly is
+                        // not cached either.
+                        if (radResult.FullRebuild && radBaselinePath != null && radSymbolsPath != null
+                            && radWs.HasBaseline)
+                            AlRunner.Rad.RadBaselineSidecar.TrySave(radWs, radBaselinePath, radSymbolsPath);
+                    }
+                    else if (radResult?.FullRebuild == true)
+                    {
+                        // A whole-module compile can be runnable without being safe as a future
+                        // delta baseline: --tdd deliberately excludes an unfixable object while
+                        // compiling the survivors, and baseline extraction can also fail after a
+                        // successful emit. Make that loaded assembly authoritative for THIS cycle,
+                        // but do not commit hashes/symbols. With ws.Baseline still absent, the next
+                        // edit takes the diagnosed full-compile path again instead of deltaing from
+                        // an incomplete compiler picture.
+                        AlRunner.Rad.AlObjectResolution.RegisterGeneration(radWs, loaded);
+                        radWs.Generations.Clear();
+                        radWs.Generations.Add(loaded);
+                        appAssemblies.Add(loaded);
+                    }
+                    else
+                    {
                         throw new InvalidOperationException(
-                            "the successful RAD assembly has no prepared workspace update");
-                    radResult.Commit(radWs, loaded);
-                    appAssemblies.AddRange(radWs.Generations);
-                    // Persist the baseline this full compile just established, beside the DLL
-                    // written for the same key above, so the NEXT watch process over this tree
-                    // starts delta-ready instead of paying for a baseline again.
-                    //
-                    // After the commit, not at the DLL write site: there the baseline still
-                    // lives only on the uncommitted token, and — more importantly — a baseline
-                    // whose generated C# was rejected, or which failed to load, must never
-                    // become a cache entry. Only a full compile has a whole module to persist;
-                    // a delta overlay is a fragment, which is the same reason its assembly is
-                    // not cached either.
-                    if (radResult.FullRebuild && radBaselinePath != null && radSymbolsPath != null
-                        && radWs.HasBaseline)
-                        AlRunner.Rad.RadBaselineSidecar.TrySave(radWs, radBaselinePath, radSymbolsPath);
+                            "the successful RAD delta has no prepared workspace update");
+                    }
                 }
                 else
                 {
@@ -2273,11 +3199,11 @@ foreach (var bundle in bundles)
                     BcRuntime.SetTestAssembly(asm, wireFieldTriggers: false);
                 BcRuntime.OosHooksActive = true;
                 var execSw = System.Diagnostics.Stopwatch.StartNew();
-                tests = executor.Run(
+                tests = OverrideTddDependentResults(executor.Run(
                     asm,
                     appGenerations: generationsByAssembly.TryGetValue(asm, out var generations)
                         ? generations
-                        : null);
+                        : null));
                 execSw.Stop();
                 AlRunner.PerfTrace.Log($"TestExecutor.Run {rel} {execSw.ElapsedMilliseconds}ms");
             }
@@ -2399,7 +3325,7 @@ foreach (var bundle in bundles)
                     BcRuntime.RegisterTestAssemblyInfo(asm);
                 }
                 BcRuntime.OosHooksActive = true;
-                tests = executor.Run(asm);
+                tests = OverrideTddDependentResults(executor.Run(asm));
             }
             catch (Exception ex)
             {
@@ -2685,6 +3611,30 @@ else
         Reporter.PrintFailureClassification(results, Console.Out);
     Reporter.PrintSummary(results, Console.Out);
 }
+if (tddMode)
+{
+    // issue #2001 acceptance criterion 8: print the members --tdd actually generated this
+    // run — the API the implementing app still has to provide, derived from the tests
+    // rather than written by hand. A symbol --tdd could not confidently infer (or that
+    // resolved onto a precompiled dependency, out of scope) still falls through to
+    // TddSupport's refuse path and shows up as a FAILED test above, never in this list —
+    // this list is only what was actually inferred, generated, and recompiled clean.
+    var tddOut = outputJson ? Console.Error : Console.Out;
+    tddOut.WriteLine();
+    if (allTddGeneratedMembers.Count == 0)
+    {
+        tddOut.WriteLine(
+            "--tdd: no members were generated this run — every missing symbol was reported " +
+            "as a failed test instead (see the FAILED test messages above for each missing " +
+            "symbol).");
+    }
+    else
+    {
+        tddOut.WriteLine($"--tdd: generated {allTddGeneratedMembers.Count} member(s) this run:");
+        foreach (var m in allTddGeneratedMembers)
+            tddOut.WriteLine($"  {m.ObjectDisplayName}: {m.MemberKind} {m.Signature}");
+    }
+}
 if (outPath != null)
 {
     Reporter.WriteClassification(results, outPath);
@@ -2717,494 +3667,6 @@ if (coverageEnabled)
 // Exit non-zero if anything failed — the default since the v2 cut, matching main/v1.
 // --no-strict-exit restores the old always-0 behaviour for JSON-only consumers.
 return strictExitCode ? computedExitCode : 0;
-
-// ── --server loop ──────────────────────────────────────────────────────────────
-// Non-static so it captures the warm pipeline objects (emitter/assembler/executor/
-// depLoader) and the resolved cache dirs established above. Reads newline-delimited
-// JSON requests from stdin, writes one JSON response line per request to stdout.
-// Protocol shape matches v1 (see ServerProtocol). Returns the process exit code.
-//
-// `cancel` (#1641/v1 #1613-#1614) needs a stdin-reader thread: without one, this
-// loop is fully synchronous — it blocks in ReadLine() while a `runtests` request
-// streams, so a `cancel` sitting on stdin is not even READ until the run finishes,
-// let alone acted on. A dedicated background thread keeps reading stdin the whole
-// time; it recognises `cancel` itself and answers it immediately as a side channel
-// (bypassing the normal one-line-processed-at-a-time queue entirely), while every
-// other command still goes through `mainQueue` and is processed sequentially by
-// this method exactly as before. See `outputLock`/`activeRunCts` below.
-int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
-{
-    // Per-session memory of the last served request's .al file hashes, so a cache
-    // miss can report which files changed (v1 `changedFiles`).
-    Dictionary<string, string>? lastFileHashes = null;
-
-    // Guards every write to `output`: the reader thread's cancel-ack and this
-    // method's normal command responses / streaming runtests output are now genuine
-    // concurrent writers to the same stream once a runtests request is streaming.
-    var outputLock = new object();
-
-    // CancellationTokenSource for the currently-active `runtests` request, or null
-    // when none is running. Written (via Interlocked) at the start/end of
-    // HandleServerRunTests on THIS (main dispatch) thread; read (via Interlocked,
-    // for an atomic reference snapshot) from the READER thread when a `cancel`
-    // command arrives. No `lock` needed — CancellationTokenSource.Cancel() is
-    // itself thread-safe, and Interlocked.CompareExchange gives an atomic
-    // snapshot-or-null read/write of the reference without one.
-    System.Threading.CancellationTokenSource? activeRunCts = null;
-
-    // The side-channel command set: recognised and answered by the reader thread
-    // itself, never enqueued onto mainQueue. Currently only `cancel`.
-    string? HandleSideChannelCommand(AlRunner.ServerRequest? req)
-    {
-        if (!string.Equals(req?.Command, "cancel", StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        // Atomic snapshot read of the reference (see activeRunCts doc comment).
-        var cts = System.Threading.Interlocked.CompareExchange(ref activeRunCts, null, null);
-        if (cts == null || cts.IsCancellationRequested)
-            return AlRunner.ServerProtocol.Ack("cancel", noop: true);
-        try
-        {
-            cts.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
-            // Race: HandleServerRunTests's finally already disposed the CTS between
-            // our snapshot and Cancel() — the request had already completed.
-            return AlRunner.ServerProtocol.Ack("cancel", noop: true);
-        }
-        return AlRunner.ServerProtocol.Ack("cancel", noop: false);
-    }
-
-    // Producer: reads stdin continuously on a dedicated background thread so the
-    // main dispatch loop below is never blocked from seeing a `cancel` by a
-    // synchronous `runtests`/`execute` handler. Side-channel commands are answered
-    // here directly; everything else is handed to `mainQueue` for the sequential
-    // dispatch loop, unchanged from before this command existed.
-    var mainQueue = new System.Collections.Concurrent.BlockingCollection<string>();
-    var readerThread = new System.Threading.Thread(() =>
-    {
-        string? readerLine;
-        while ((readerLine = input.ReadLine()) != null)
-        {
-            if (readerLine.Length == 0) continue;
-            AlRunner.ServerRequest? parsed = null;
-            try { parsed = AlRunner.ServerProtocol.Parse(readerLine); }
-            catch { /* malformed JSON — let the main loop's existing catch report it */ }
-
-            var sideChannelResponse = HandleSideChannelCommand(parsed);
-            if (sideChannelResponse != null)
-            {
-                lock (outputLock)
-                {
-                    output.WriteLine(sideChannelResponse);
-                    output.Flush();
-                }
-                continue;
-            }
-            mainQueue.Add(readerLine);
-        }
-        mainQueue.CompleteAdding();
-    })
-    { IsBackground = true, Name = "al-runner-server-stdin" };
-    readerThread.Start();
-
-    // The isolation mode in effect when the server started (CLI --isolation, or
-    // TestIsolation.Codeunit if not given) — the fallback for any request that
-    // doesn't carry its own `testIsolation` field. Captured once so a request that
-    // DOES set testIsolation never leaks its mode onto a later request that
-    // doesn't (see #1616 — the whole point is per-request control, not a sticky
-    // session-wide override).
-    var defaultServerIsolation = executor.Isolation;
-
-    // Readiness handshake — MUST be the first line on stdout.
-    lock (outputLock)
-    {
-        output.WriteLine("{\"ready\":true}");
-        output.Flush();
-    }
-
-    // Sequential dispatch loop, unchanged in shape from before `cancel` existed —
-    // it now consumes from `mainQueue` (fed by the reader thread above) instead of
-    // calling input.ReadLine() itself, so a `cancel` sitting ahead of a `runtests`
-    // line in the OS pipe buffer never gets stuck behind it.
-    foreach (var line in mainQueue.GetConsumingEnumerable())
-    {
-        if (line.Length == 0) continue;
-        // Null means "already fully written to output" — currently only the
-        // streaming runTests path (see HandleServerRunTests below), which emits
-        // its own {"type":"test"}* + {"type":"summary"} lines directly instead of
-        // going through the single-response write below.
-        string? response;
-        bool shuttingDown = false;
-        try
-        {
-            var req = AlRunner.ServerProtocol.Parse(line);
-            switch (req?.Command?.ToLowerInvariant())
-            {
-                case null:
-                    response = AlRunner.ServerProtocol.Error("Invalid request (missing 'command')");
-                    break;
-                case "runtests":
-                    HandleServerRunTests(req, output);
-                    response = null;
-                    break;
-                case "execute":
-                    response = HandleServerExecute(req);
-                    break;
-                case "shutdown":
-                    response = AlRunner.ServerProtocol.Shutdown();
-                    shuttingDown = true;
-                    break;
-                default:
-                    response = AlRunner.ServerProtocol.Error($"Unknown command: {req.Command}");
-                    break;
-            }
-        }
-        catch (Exception ex)
-        {
-            response = AlRunner.ServerProtocol.Error(ex.Message);
-        }
-
-        if (response != null)
-        {
-            lock (outputLock)
-            {
-                output.WriteLine(response);
-                output.Flush();
-            }
-        }
-        if (shuttingDown) return 0;
-    }
-    // EOF — client disconnected.
-    return 0;
-
-    // Sets executor.Isolation from req.TestIsolation (see #1616), falling back to
-    // defaultServerIsolation when the request doesn't specify one. Returns an
-    // error response string on an unrecognised mode, else null.
-    string? ApplyRequestIsolation(AlRunner.ServerRequest req)
-    {
-        if (req.TestIsolation == null)
-        {
-            executor.Isolation = defaultServerIsolation;
-            return null;
-        }
-        try
-        {
-            executor.Isolation = AlRunner.TestIsolationParser.Parse(req.TestIsolation);
-            return null;
-        }
-        catch (ArgumentException ex)
-        {
-            return AlRunner.ServerProtocol.Error($"testIsolation: {ex.Message}");
-        }
-    }
-
-    // ── runTests: re-emit + run every requested bundle in-process, STREAMING one
-    // {"type":"test"} NDJSON line per completed test (via TestExecutor.Run's
-    // onTestComplete hook) as it finishes, then exactly one terminal
-    // {"type":"summary"} line once every bundle has run — protocol-v2
-    // (protocol-v2.schema.json), see #1641. Writes directly to `output` rather
-    // than returning a single response string, unlike every other command.
-    //
-    // Owns the CancellationTokenSource a concurrent `cancel` side-channel command
-    // signals (see HandleSideChannelCommand above `activeRunCts`). Published to
-    // `activeRunCts` for the WHOLE multi-bundle request, not per-bundle, so a
-    // cancel arriving between two sourcePaths entries still takes effect on the
-    // remaining bundles. Cooperative only (TestExecutor.Run's doc comment): a test
-    // already in flight always finishes; cancellation stops the NEXT one.
-    // ─────────────────────────────────────────────────────────────────────────
-    void HandleServerRunTests(AlRunner.ServerRequest req, System.IO.TextWriter output)
-    {
-        // #1936: real wall-clock duration of THIS request (received → summary
-        // written), for the `wallSeconds` field on the terminal summary line. Not
-        // the process's total uptime — a warm server serves many requests, so
-        // "since process start" is only meaningful for the very first one. Started
-        // here (before the sourcePaths/isolation validation below) so it also
-        // captures those cheap up-front checks, not just the run itself.
-        var reqSw = System.Diagnostics.Stopwatch.StartNew();
-        if (req.SourcePaths == null || req.SourcePaths.Length == 0)
-        {
-            lock (outputLock)
-            {
-                output.WriteLine(AlRunner.ServerProtocol.Error("sourcePaths is required"));
-                output.Flush();
-            }
-            return;
-        }
-
-        foreach (var p in req.SourcePaths)
-            if (!Directory.Exists(p))
-            {
-                lock (outputLock)
-                {
-                    output.WriteLine(AlRunner.ServerProtocol.Error($"bundle directory not found: {p}"));
-                    output.Flush();
-                }
-                return;
-            }
-
-        var isolationError = ApplyRequestIsolation(req);
-        if (isolationError != null)
-        {
-            lock (outputLock)
-            {
-                output.WriteLine(isolationError);
-                output.Flush();
-            }
-            return;
-        }
-
-        var cts = new System.Threading.CancellationTokenSource();
-        System.Threading.Interlocked.Exchange(ref activeRunCts, cts);
-        try
-        {
-            // Flushed after every line so a client watching stdout sees each test the
-            // instant it finishes, not batched behind the whole bundle (or worse, every
-            // bundle in a multi-sourcePaths request).
-            void OnTestComplete(TestResult t)
-            {
-                lock (outputLock)
-                {
-                    output.WriteLine(AlRunner.ServerProtocol.TestEvent(t));
-                    output.Flush();
-                }
-                // #1845: test-only barrier, no-op unless AL_RUNNER_TEST_BARRIER_DIR is
-                // set on THIS process — see AlRunner.Infrastructure.TestBarrier's doc
-                // comment. Called AFTER the write+flush above so a client observing the
-                // `test` line is guaranteed the server has not yet started the next test.
-                AlRunner.Infrastructure.TestBarrier.WaitForRelease();
-            }
-
-            var runs = RunAllBundlesForServer(req.SourcePaths, req.PackagePaths,
-                asm => executor.Run(asm, OnTestComplete, cts.Token), cts.Token);
-
-            var allTests = runs.SelectMany(r => r.Tests).ToList();
-            var allCompileErrors = runs.SelectMany(r => r.CompileErrors ?? Array.Empty<CompilationErrorGroup>()).ToList();
-            // Same priority as the CLI's computedExitCode: 3 (compile) > 2 (exec) > 1 (test fail) > 0.
-            var exitCode = runs.Count > 0 ? runs.Max(r => r.ExitCode) : 0;
-            var cached = runs.Count > 0 && runs.All(r => r.Cached);
-
-            var combinedHashes = new Dictionary<string, string>();
-            foreach (var r in runs)
-                foreach (var kv in r.FileHashes)
-                    combinedHashes[kv.Key] = kv.Value;
-
-            // changedFiles is only meaningful on a cache miss (a hit means nothing changed).
-            List<string>? changed = null;
-            if (!cached)
-                changed = DiffServerFiles(lastFileHashes, combinedHashes);
-            lastFileHashes = combinedHashes;
-
-            // Read BEFORE clearing activeRunCts below (still valid — not yet disposed).
-            var cancelled = cts.Token.IsCancellationRequested;
-
-            // #1809: clear activeRunCts BEFORE writing+flushing the summary line, not
-            // after (the old code cleared it in `finally`, which runs AFTER this write).
-            // The reader thread's `cancel` side channel (HandleSideChannelCommand,
-            // above) only has something to observe once the client sends a `cancel`
-            // request, and a well-behaved client can only do that once it has actually
-            // read the summary line this method is about to emit. So clearing first
-            // makes "cancel sent right after the summary" ALWAYS see activeRunCts
-            // already null — by program order on this one thread, not by winning a race
-            // against the reader thread. The old ordering left a real gap: the client
-            // could read+flush-observe the summary and fire `cancel` before this
-            // thread ever reached its `finally`, during which HandleSideChannelCommand
-            // would still see the stale non-null cts and answer noop:false for a run
-            // that had already finished — a bug the wider concurrency #1809 introduces
-            // (more collections running at once → more scheduler contention → this
-            // window widens) makes far more likely to actually land, not merely a
-            // theoretical TOCTOU. See ServerCancelTests.Cancel_AfterRunTestsCompletes_IsNoop.
-            System.Threading.Interlocked.CompareExchange(ref activeRunCts, null, cts);
-
-            lock (outputLock)
-            {
-                output.WriteLine(AlRunner.ServerProtocol.Summary(
-                    allTests, exitCode, cached, changed,
-                    allCompileErrors.Count > 0 ? allCompileErrors : null,
-                    cancelled: cancelled, wallSeconds: reqSw.Elapsed.TotalSeconds));
-                output.Flush();
-            }
-        }
-        finally
-        {
-            // Belt-and-braces: reaches the same state as the explicit clear above on
-            // every path, INCLUDING an exception thrown before that point (e.g. from
-            // RunAllBundlesForServer) — a pathological caller must never be left with a
-            // permanently-stuck activeRunCts pointing at a cts nothing will ever
-            // complete. A no-op on the normal path (already null there).
-            System.Threading.Interlocked.CompareExchange(ref activeRunCts, null, cts);
-            cts.Dispose();
-        }
-    }
-
-    // ── execute: run every requested bundle's first OnRun-bearing codeunit
-    // (run-mode), aggregating the results. #1917: v1 also accepted an inline
-    // `code` string — a temp single-file bundle is synthesised from it (see
-    // SynthesizeInlineCodeBundle) and run through the SAME compile pipeline a
-    // sourcePaths-based execute already uses (RunAllBundlesForServer →
-    // RunBundleForServer → RunFirstCodeunitOnRun), rather than inventing a
-    // second execution path. `captureValues` stays out of scope — it needs the
-    // Cecil instrumentation pass tracked on #1640 — so that case still fails
-    // LOUD (never a silent fake) per .claude/rules/loud-failures.md.
-    string HandleServerExecute(AlRunner.ServerRequest req)
-    {
-        if (req.CaptureValues == true)
-            return AlRunner.ServerProtocol.Error(
-                "execute: 'captureValues' is not yet supported in v2. See docs/server-mode.md.");
-
-        string? scratchDir = null;
-        string[] sourcePaths;
-        if (!string.IsNullOrWhiteSpace(req.Code))
-        {
-            if (req.SourcePaths != null && req.SourcePaths.Length > 0)
-                return AlRunner.ServerProtocol.Error(
-                    "execute: 'code' and 'sourcePaths' are mutually exclusive — pass one or the other.");
-            scratchDir = SynthesizeInlineCodeBundle(req.Code!);
-            sourcePaths = new[] { scratchDir };
-        }
-        else
-        {
-            if (req.SourcePaths == null || req.SourcePaths.Length == 0)
-                return AlRunner.ServerProtocol.Error("sourcePaths is required");
-            foreach (var p in req.SourcePaths)
-                if (!Directory.Exists(p))
-                    return AlRunner.ServerProtocol.Error($"bundle directory not found: {p}");
-            sourcePaths = req.SourcePaths;
-        }
-
-        var isolationError = ApplyRequestIsolation(req);
-        if (isolationError != null) return isolationError;
-
-        try
-        {
-            var runs = RunAllBundlesForServer(sourcePaths, req.PackagePaths, RunFirstCodeunitOnRun);
-
-            var allTests = runs.SelectMany(r => r.Tests).ToList();
-            var allCompileErrors = runs.SelectMany(r => r.CompileErrors ?? Array.Empty<CompilationErrorGroup>()).ToList();
-            var exitCode = runs.Count > 0 ? runs.Max(r => r.ExitCode) : 0;
-
-            var combinedHashes = new Dictionary<string, string>();
-            foreach (var r in runs)
-                foreach (var kv in r.FileHashes)
-                    combinedHashes[kv.Key] = kv.Value;
-            lastFileHashes = combinedHashes;
-
-            return AlRunner.ServerProtocol.Execute(allTests, exitCode, null,
-                allCompileErrors.Count > 0 ? allCompileErrors : null);
-        }
-        finally
-        {
-            // Best-effort cleanup: the scratch dir's contents are fully consumed
-            // once RunBundleForServer has emitted+compiled them into an in-memory
-            // assembly (or failed trying) — nothing downstream needs the files on
-            // disk after this call returns, and a leaked temp dir per `execute`
-            // call would otherwise accumulate for the life of the server process.
-            if (scratchDir != null)
-            {
-                try { Directory.Delete(scratchDir, recursive: true); }
-                catch { /* not fatal — OS temp cleanup will catch it eventually */ }
-            }
-        }
-    }
-
-    // #1917: synthesise a temp single-file AL bundle from an inline `code`
-    // string so `execute`'s "code" field can go through the same compile
-    // pipeline as a sourcePaths-based execute, instead of a separate inline-AL
-    // execution path. v1 parity (see git history for e1a22f84, "fixes #12"):
-    // `code` that already looks like a full AL object definition is used
-    // verbatim; anything else is treated as a bare statement list and wrapped
-    // in a scratch codeunit's OnRun trigger body, matching v1's CLI `-e` shape.
-    //
-    // #1931: "already looks like a full AL object" used to be
-    // `trimmed.StartsWith("codeunit"/"table")` — a two-keyword allowlist that
-    // misclassified every other object type (page/enum/report/query/xmlport/
-    // interface/...) AND any codeunit behind a leading `//` comment (TrimStart
-    // leaves the `//` in place, so it never matched). See IsFullAlObjectDeclaration
-    // for the fix: ask BC's own parser instead of maintaining a keyword list.
-    static string SynthesizeInlineCodeBundle(string code)
-    {
-        var isFullObject = IsFullAlObjectDeclaration(code);
-        var source = isFullObject
-            ? code
-            : $"codeunit 50100 \"AL Runner Inline Execute\" {{ trigger OnRun() begin {code} end; }}";
-
-        var dir = Path.Combine(Path.GetTempPath(), "al-runner-server-inline", Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, "Scratch.al"), source);
-        return dir;
-    }
-
-    // #1931: is `code` already a full AL object declaration (should be used
-    // verbatim), or a bare statement list (needs wrapping in a scratch OnRun
-    // body)? Answered by asking BC's OWN parser rather than maintaining a
-    // keyword allowlist that drifts as AL gains object types — the same
-    // approach RecordPatches.AlSourceParser.ParseAlObjects already uses for
-    // table/tableextension extraction (#1696). SyntaxTree.ParseObjectText needs
-    // only a ParseOptions, no Compilation and no reference closure, so this is
-    // cheap and side-effect-free.
-    //
-    // Every top-level AL object syntax type shares one common base,
-    // Microsoft.Dynamics.Nav.CodeAnalysis.Syntax.ObjectSyntax — verified via
-    // reflection over the shipped CodeAnalysis DLL: table/codeunit/page/report/
-    // query/xmlport/enum/(+ extension variants) all derive from
-    // ApplicationObjectSyntax : ObjectSyntax, while interface/controladdin/
-    // profile/dotnet/entitlement derive from ObjectSyntax directly (they have no
-    // object id, so they don't go through ApplicationObjectSyntax) — so "did the
-    // compilation-unit root produce at least one ObjectSyntax child" answers
-    // "is this a full object declaration" for the whole AL object-keyword set at
-    // once, with no list to keep in sync.
-    //
-    // Leading trivia (a `//` comment, a blank line, a `#pragma`) needs no manual
-    // skipping: comments/blank lines are trivia the parser already attaches to
-    // the first real token when it scans for the object keyword, so a
-    // `//`-prefixed codeunit still yields a CodeunitSyntax child.
-    //
-    // A malformed-but-recognisable object (e.g. `codeunit 50100 "X" { trigger
-    // OnRun() begin Error(` with an unclosed paren) still parses to exactly one
-    // ObjectSyntax child — BC's parser recovers past the syntax error and still
-    // recognises the object shape — so it is STILL used verbatim. That is
-    // deliberate: the caller's real compile error then names the caller's real
-    // code (via the normal `compilationErrors` channel `execute` already
-    // returns), not a wrapper the caller never wrote. A genuine bare statement
-    // list, or text that isn't AL at all, produces zero children (BC's parser
-    // reports AL0198 "expected one of the application object keywords" and
-    // recovers to an empty compilation unit) and falls through to wrapping.
-    //
-    // Never throws: this is fed arbitrary text a human may have typed by hand,
-    // and a parse ParseObjectText itself cannot make sense of must fall back to
-    // "not a full object" (wrap it) rather than blow up the request — the same
-    // never-throw contract RecordPatches.AlSourceParser.ParseAlObjects documents
-    // for the identical call.
-    //
-    // Classification is deterministic (yes/no), never ambiguous, so there is no
-    // third "couldn't tell" state to surface as a request-level protocol error:
-    // whichever branch is chosen, a real problem in the caller's AL still comes
-    // back through the existing `compilationErrors` channel that
-    // Execute_InlineCode_CompileError_ReturnsCompilationErrors already proves —
-    // exactly where every other AL-content problem in this protocol surfaces.
-    // The top-level `error` field stays reserved for request-shape problems
-    // (unknown command, missing sourcePaths, mutually exclusive fields) that
-    // have nothing to do with what the AL says.
-    static bool IsFullAlObjectDeclaration(string code)
-    {
-        try
-        {
-            var parseOpts = new NavCA.ParseOptions(
-                runtimeVersion: null!,
-                preprocessorSymbols: Enumerable.Range(1, 25).Select(n => $"CLEANSCHEMA{n}")
-                    .Concat(AlRunner.BcCompiler.GetExtraPreprocessorSymbols()),
-                documentationMode: NavCA.DocumentationMode.None);
-            var tree = NavSyntax.SyntaxTree.ParseObjectText(code, path: "", encoding: null!, parseOpts, default);
-            return tree.GetRoot() is NavSyntax.CompilationUnitSyntax root &&
-                   root.ChildNodes().Any(n => n is NavSyntax.ObjectSyntax);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
     // Runs every bundle in sourcePaths in order and returns one ServerRunResult per
     // bundle. Restores v1's "honour every sourcePaths entry" behaviour (v1 fed them
     // all into a single compile; v2 keeps one bundle = one compile, so it runs each
@@ -3653,6 +4115,959 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
         }
     }
 
+
+// ── --dap loop (issue #1642; stdio transport added for #2058) ────────────────────
+// Non-static so it captures the warm pipeline objects (executor et al.) and
+// RunAllBundlesForServer, same reasons as RunServerLoop below. Unlike --server this
+// is not a warm-reload daemon: one client, one bundle, one run, then exit — a
+// debug session is inherently single-shot (VS Code starts al-runner, debugs,
+// disconnects, the process goes away).
+//
+// `stdioMode` selects the transport: stdio (stdioInput/stdioOutput, captured as raw
+// OS handles before Log.Install — see the argument-parsing block above) or the
+// original TCP accept loop. Everything from AlDapSession.Reset() onward is
+// transport-agnostic and identical either way, matching DapTransport's own
+// Stream-based design (its header comment: proven against a non-socket stream by
+// AlRunner.Tests' in-memory-pipe harness well before this issue existed).
+//
+// Session shape (see docs/archive/dap.md for the mechanism this restores, and
+// AlDapSession's file header for why pausing at StmtHit(N) — unlike
+// --capture-values, #1640 — needs no Exit()-style redesign):
+//   initialize     -> capabilities, then an `initialized` event
+//   launch/attach  -> compiles the bundle SYNCHRONOUSLY (blocks the response until
+//                     compiledTcs resolves or the whole run finishes without ever
+//                     reaching runStep, i.e. a compile failure) so setBreakpoints
+//                     right after has real statement indices to resolve against
+//   setBreakpoints -> DapBreakpointResolver against the now-loaded scope types;
+//                     REPLACES this source's previous set (DAP contract)
+//   configurationDone -> releases the run-start gate; AL execution begins
+//   (AlDapSession.Stopped fires on the AL thread when a breakpoint hits; this loop
+//    pushes the "stopped" event the moment it fires — see the subscription below)
+//   threads/stackTrace/scopes/variables -> read AlDapSession.PausedScope while paused
+//   continue -> AlDapSession.Continue(); next/stepIn/stepOut -> AlDapSession.StepOver()/
+//    StepIn()/StepOut() (issue #2045 — real step granularity, arms a depth-based
+//    qualifying condition instead of releasing unconditionally; see AlDapSession's file
+//    header for exactly what "qualifies" means for each)
+//   disconnect/terminate -> AlDapSession.Detach() (never leaves the AL thread stuck)
+int RunDapLoop(string bundleDir, int port, bool stdioMode, System.IO.Stream? stdioInput, System.IO.Stream? stdioOutput)
+{
+    System.Net.Sockets.TcpListener? listener = null;
+    System.Net.Sockets.TcpClient? tcpClient = null;
+    AlRunner.Infrastructure.DapTransport transport;
+    if (stdioMode)
+    {
+        // Readiness signal for a stdio client: unlike the TCP branch below, there is
+        // no "listening" state to report (stdin/stdout are already connected the
+        // moment this process exists) — this just tells a human/log watcher the
+        // session loop is about to start reading. Console.Error directly, not
+        // Console.WriteLine: Console.Out is redirected to Console.Error already (see
+        // the argument-parsing block above) so it would land in the same place
+        // either way, but writing to Console.Error here documents the intent at the
+        // call site rather than relying on the earlier redirect being remembered.
+        Console.Error.WriteLine("[dap] stdio transport ready — waiting for a debug client to send 'initialize'...");
+        transport = new AlRunner.Infrastructure.DapTransport(stdioInput!, stdioOutput!);
+    }
+    else
+    {
+        listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, port);
+        listener.Start();
+        Console.WriteLine($"[dap] listening on 127.0.0.1:{port} — waiting for a debug client to connect...");
+        tcpClient = listener.AcceptTcpClient();
+        listener.Stop();
+        Console.WriteLine("[dap] client connected.");
+        transport = new AlRunner.Infrastructure.DapTransport(tcpClient.GetStream(), tcpClient.GetStream());
+    }
+    using var transportDisposable = transport;
+    using var tcpClientDisposable = tcpClient;
+    AlRunner.Infrastructure.AlDapSession.Reset();
+
+    Dictionary<(string Label, int Id), string> sourceMap = new();
+    var lastFrames = new List<AlRunner.Infrastructure.AlDapFrame>();
+
+    var compiledTcs = new System.Threading.Tasks.TaskCompletionSource<Assembly>(
+        System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+    var configurationDoneGate = new System.Threading.SemaphoreSlim(0, 1);
+    var cts = new System.Threading.CancellationTokenSource();
+
+    Func<Assembly, IReadOnlyList<TestResult>> dapRunStep = asm =>
+    {
+        compiledTcs.TrySetResult(asm);
+        configurationDoneGate.Wait(cts.Token);
+        return executor.Run(asm, t =>
+        {
+            Console.WriteLine($"[dap] {t.Codeunit}.{t.Method}: {t.Outcome}");
+            // issue #2045: a step armed for THIS test but never consumed (it ran to
+            // completion without another qualifying StmtHit) must not leak into the
+            // NEXT test — see AlDapSession.OnTestBoundary's doc comment.
+            AlRunner.Infrastructure.AlDapSession.OnTestBoundary();
+        }, cts.Token);
+    };
+
+    var bundleRunTask = System.Threading.Tasks.Task.Run(
+        () => RunAllBundlesForServer(new[] { bundleDir }, null, dapRunStep, cts.Token));
+
+    int exitCode = 0;
+    bool terminatedSent = false;
+    void SendTerminatedOnce()
+    {
+        if (terminatedSent) return;
+        terminatedSent = true;
+        transport.WriteEvent("terminated");
+        transport.WriteEvent("exited", new { exitCode });
+    }
+    // Reports the run's outcome the moment it finishes, on WHATEVER thread that is —
+    // Stopped's handler below writes to `transport` from the AL execution thread
+    // too, and DapTransport's write lock is what keeps those from interleaving.
+    _ = bundleRunTask.ContinueWith(t =>
+    {
+        if (t.IsFaulted)
+        {
+            exitCode = 2;
+        }
+        else
+        {
+            var runs = t.Result;
+            exitCode = runs.Count > 0 ? runs.Max(r => r.ExitCode) : 0;
+        }
+        SendTerminatedOnce();
+    }, System.Threading.Tasks.TaskScheduler.Default);
+
+    // Pushed synchronously on the AL EXECUTION thread by AlDapSession.OnStmtHit,
+    // right before it blocks — see that method's doc comment. Must not throw. `reason`
+    // is "breakpoint" or "step" (issue #2045), whichever condition actually caused
+    // this particular pause.
+    //
+    // Issue #2070 root cause (found chasing a CI hang that survived the watchdog fix
+    // AND ruled out client-side starvation via socket.Available/ThreadPool evidence —
+    // see the PR discussion): this used to be `try { Walk(...); WriteEvent(...); }
+    // catch { Console.Error.WriteLine(...); }` — if Walk threw, WriteEvent was never
+    // reached, the catch swallowed the exception into a bare stderr line (invisible
+    // whenever DapClient's now-fixed two-reader bug happened to steal it), and the
+    // handler returned NORMALLY. OnStmtHit reads "the handler returned" as "the stop
+    // was reported" and proceeds straight into gate.Wait() — a real AL execution
+    // thread parked forever with NO "stopped" event ever sent, which is
+    // indistinguishable from the outside (and from every trace this issue built before
+    // this one) from "the step never fired" or "the client was never scheduled to
+    // read it". Per .claude/rules/loud-failures.md: a handler that cannot report a
+    // stop must never leave the client waiting with nothing sent. Walk failing now
+    // degrades (empty frame list, line 0) rather than aborting the whole report, and
+    // the client is told WHY via a DAP `output` event instead of silently getting
+    // nothing — the session stays alive and the developer sees the cause instead of
+    // an unexplained hang.
+    AlRunner.Infrastructure.AlDapSession.Stopped += (scope, stmt, reason) =>
+    {
+        AlRunner.Infrastructure.AlDapSession.Trace(
+            $"STOPPED-HANDLER enter scope={scope.GetType().Name} stmt={stmt} reason={reason}");
+        var line = 0;
+        Exception? walkError = null;
+        try
+        {
+            lastFrames = AlRunner.Infrastructure.AlDapStackWalker.Walk(scope, stmt, sourceMap);
+            line = lastFrames.Count > 0 ? lastFrames[0].Line : 0;
+            AlRunner.Infrastructure.AlDapSession.Trace(
+                $"STOPPED-HANDLER walk ok frames={lastFrames.Count} line={line}");
+        }
+        catch (Exception ex)
+        {
+            walkError = ex;
+            lastFrames = new List<AlRunner.Infrastructure.AlDapFrame>();
+            AlRunner.Infrastructure.AlDapSession.Trace(
+                $"STOPPED-HANDLER walk THREW {ex.GetType().Name}: {ex.Message}");
+        }
+
+        try
+        {
+            transport.WriteEvent("stopped", new
+            {
+                reason,
+                threadId = 1,
+                allThreadsStopped = true,
+                line,
+            });
+            AlRunner.Infrastructure.AlDapSession.Trace("STOPPED-HANDLER write-event(stopped) ok");
+            if (walkError != null)
+            {
+                transport.WriteEvent("output", new
+                {
+                    category = "stderr",
+                    output = $"[dap] failed to compute the stack frame for this stop " +
+                             $"(reason={reason}, stmt={stmt}): {walkError.GetType().Name}: " +
+                             $"{walkError.Message}\n",
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            AlRunner.Infrastructure.AlDapSession.Trace(
+                $"STOPPED-HANDLER write-event THREW {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine($"[dap] failed to report a stop: {ex.Message}");
+        }
+    };
+
+    try
+    {
+        while (true)
+        {
+            AlRunner.Infrastructure.DapIncomingMessage? msg;
+            try { msg = transport.ReadMessageAsync().GetAwaiter().GetResult(); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[dap] transport error: {ex.Message}");
+                break;
+            }
+            if (msg == null) break; // client closed the connection
+
+            var command = msg.Command ?? "";
+            var args = msg.Arguments;
+            try
+            {
+                switch (command)
+                {
+                    case "initialize":
+                        transport.WriteResponse(msg.Seq, command, true, new
+                        {
+                            supportsConfigurationDoneRequest = true,
+                        });
+                        transport.WriteEvent("initialized");
+                        break;
+
+                    case "launch":
+                    case "attach":
+                    {
+                        var winner = System.Threading.Tasks.Task.WhenAny(compiledTcs.Task, bundleRunTask)
+                            .GetAwaiter().GetResult();
+                        if (!ReferenceEquals(winner, compiledTcs.Task))
+                        {
+                            // The run finished (or failed) before ever reaching dapRunStep —
+                            // a compile failure. Report it on the launch response rather than
+                            // silently proceeding into a session that will never run anything.
+                            var runs = bundleRunTask.Result;
+                            var errMsg = runs
+                                .SelectMany(r => r.CompileErrors ?? Array.Empty<CompilationErrorGroup>())
+                                .SelectMany(g => g.Errors)
+                                .FirstOrDefault() ?? "compile failed (no diagnostic captured)";
+                            transport.WriteResponse(msg.Seq, command, false, message: errMsg);
+                            break;
+                        }
+                        sourceMap = AlRunner.Infrastructure.AlCoverageSourceMap.Build(
+                            new[] { bundleDir }, relativeTo: null);
+                        transport.WriteResponse(msg.Seq, command, true);
+                        break;
+                    }
+
+                    case "setBreakpoints":
+                    {
+                        if (args == null || !args.Value.TryGetProperty("source", out var srcEl) ||
+                            !srcEl.TryGetProperty("path", out var pathEl) || pathEl.GetString() is not string srcPath)
+                        {
+                            transport.WriteResponse(msg.Seq, command, false, message: "setBreakpoints: missing source.path");
+                            break;
+                        }
+                        var lines = new List<int>();
+                        if (args.Value.TryGetProperty("breakpoints", out var bpsEl) && bpsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                            foreach (var bp in bpsEl.EnumerateArray())
+                                if (bp.TryGetProperty("line", out var lineEl)) lines.Add(lineEl.GetInt32());
+                        else if (args.Value.TryGetProperty("lines", out var legacyLinesEl) && legacyLinesEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                            foreach (var l in legacyLinesEl.EnumerateArray()) lines.Add(l.GetInt32());
+
+                        var requests = lines.Select(l => new AlRunner.Infrastructure.DapBreakpointRequest(srcPath, l)).ToList();
+                        var resolved = AlRunner.Infrastructure.DapBreakpointResolver.Resolve(requests, sourceMap);
+
+                        var fullSrcPath = Path.GetFullPath(srcPath);
+                        // Replace (not accumulate) — DAP's setBreakpoints contract: this
+                        // request is the COMPLETE set for `source` from now on.
+                        foreach (var rb in resolved)
+                            if (rb.ScopeType != null) AlRunner.Infrastructure.AlDapSession.ClearBreakpoints(rb.ScopeType);
+                        foreach (var rb in resolved)
+                            if (rb.Verified && rb.ScopeType != null)
+                                AlRunner.Infrastructure.AlDapSession.SetBreakpoint(rb.ScopeType, rb.StatementIndex);
+
+                        transport.WriteResponse(msg.Seq, command, true, new
+                        {
+                            breakpoints = resolved.Select((rb, idx) => new
+                            {
+                                id = idx,
+                                verified = rb.Verified,
+                                line = rb.Verified ? rb.ActualLine : rb.RequestedLine,
+                            }),
+                        });
+                        break;
+                    }
+
+                    case "configurationDone":
+                        transport.WriteResponse(msg.Seq, command, true);
+                        AlRunner.Infrastructure.AlDapSession.Enabled = true;
+                        configurationDoneGate.Release();
+                        break;
+
+                    case "threads":
+                        transport.WriteResponse(msg.Seq, command, true, new
+                        {
+                            threads = new[] { new { id = 1, name = "AL Test Thread" } },
+                        });
+                        break;
+
+                    case "stackTrace":
+                        if (!AlRunner.Infrastructure.AlDapSession.IsPaused)
+                        {
+                            transport.WriteResponse(msg.Seq, command, false, message: "not stopped");
+                            break;
+                        }
+                        transport.WriteResponse(msg.Seq, command, true, new
+                        {
+                            stackFrames = lastFrames.Select(f => new
+                            {
+                                id = f.Id,
+                                name = f.ScopeName,
+                                source = f.SourcePath != null ? new { path = f.SourcePath, name = Path.GetFileName(f.SourcePath) } : null,
+                                line = f.Line,
+                                column = 1,
+                            }),
+                            totalFrames = lastFrames.Count,
+                        });
+                        break;
+
+                    case "scopes":
+                    {
+                        var frameId = args?.GetProperty("frameId").GetInt32() ?? -1;
+                        transport.WriteResponse(msg.Seq, command, true, new
+                        {
+                            scopes = new[] { new { name = "Locals", variablesReference = frameId, expensive = false } },
+                        });
+                        break;
+                    }
+
+                    case "variables":
+                    {
+                        var varsRef = args?.GetProperty("variablesReference").GetInt32() ?? -1;
+                        var frame = lastFrames.FirstOrDefault(f => f.Id == varsRef);
+                        if (frame.Scope == null)
+                        {
+                            transport.WriteResponse(msg.Seq, command, false, message: $"unknown variablesReference {varsRef}");
+                            break;
+                        }
+                        var locals = AlRunner.Infrastructure.AlScopeInspector.ReadLocals(frame.Scope);
+                        transport.WriteResponse(msg.Seq, command, true, new
+                        {
+                            variables = locals.Select(v => new
+                            {
+                                name = v.Name,
+                                value = v.Readable ? System.Text.Json.JsonSerializer.Serialize(v.Value) : (string)v.Value!,
+                                variablesReference = 0,
+                            }),
+                        });
+                        break;
+                    }
+
+                    case "continue":
+                    case "pause":
+                        AlRunner.Infrastructure.AlDapSession.Continue();
+                        transport.WriteResponse(msg.Seq, command, true,
+                            command == "continue" ? new { allThreadsContinued = true } : null);
+                        break;
+
+                    // issue #2045: real step granularity — each arms a depth-based
+                    // qualifying condition (see AlDapSession's file header) instead of
+                    // releasing unconditionally like "continue" above.
+                    case "next":
+                        AlRunner.Infrastructure.AlDapSession.StepOver();
+                        transport.WriteResponse(msg.Seq, command, true);
+                        break;
+
+                    case "stepIn":
+                        AlRunner.Infrastructure.AlDapSession.StepIn();
+                        transport.WriteResponse(msg.Seq, command, true);
+                        break;
+
+                    case "stepOut":
+                        AlRunner.Infrastructure.AlDapSession.StepOut();
+                        transport.WriteResponse(msg.Seq, command, true);
+                        break;
+
+                    case "disconnect":
+                    case "terminate":
+                        AlRunner.Infrastructure.AlDapSession.Enabled = false;
+                        AlRunner.Infrastructure.AlDapSession.Detach();
+                        cts.Cancel();
+                        transport.WriteResponse(msg.Seq, command, true);
+                        SendTerminatedOnce();
+                        return exitCode;
+
+                    default:
+                        transport.WriteResponse(msg.Seq, command, false, message: $"unsupported command: {command}");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                transport.WriteResponse(msg.Seq, command, false, message: ex.Message);
+            }
+        }
+    }
+    finally
+    {
+        AlRunner.Infrastructure.AlDapSession.Enabled = false;
+        AlRunner.Infrastructure.AlDapSession.Detach();
+        cts.Cancel();
+    }
+    return exitCode;
+}
+
+// ── --server loop ──────────────────────────────────────────────────────────────
+// Non-static so it captures the warm pipeline objects (emitter/assembler/executor/
+// depLoader) and the resolved cache dirs established above. Reads newline-delimited
+// JSON requests from stdin, writes one JSON response line per request to stdout.
+// Protocol shape matches v1 (see ServerProtocol). Returns the process exit code.
+//
+// `cancel` (#1641/v1 #1613-#1614) needs a stdin-reader thread: without one, this
+// loop is fully synchronous — it blocks in ReadLine() while a `runtests` request
+// streams, so a `cancel` sitting on stdin is not even READ until the run finishes,
+// let alone acted on. A dedicated background thread keeps reading stdin the whole
+// time; it recognises `cancel` itself and answers it immediately as a side channel
+// (bypassing the normal one-line-processed-at-a-time queue entirely), while every
+// other command still goes through `mainQueue` and is processed sequentially by
+// this method exactly as before. See `outputLock`/`activeRunCts` below.
+int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
+{
+    // Per-session memory of the last served request's .al file hashes, so a cache
+    // miss can report which files changed (v1 `changedFiles`).
+    Dictionary<string, string>? lastFileHashes = null;
+
+    // Guards every write to `output`: the reader thread's cancel-ack and this
+    // method's normal command responses / streaming runtests output are now genuine
+    // concurrent writers to the same stream once a runtests request is streaming.
+    var outputLock = new object();
+
+    // CancellationTokenSource for the currently-active `runtests` request, or null
+    // when none is running. Written (via Interlocked) at the start/end of
+    // HandleServerRunTests on THIS (main dispatch) thread; read (via Interlocked,
+    // for an atomic reference snapshot) from the READER thread when a `cancel`
+    // command arrives. No `lock` needed — CancellationTokenSource.Cancel() is
+    // itself thread-safe, and Interlocked.CompareExchange gives an atomic
+    // snapshot-or-null read/write of the reference without one.
+    System.Threading.CancellationTokenSource? activeRunCts = null;
+
+    // The side-channel command set: recognised and answered by the reader thread
+    // itself, never enqueued onto mainQueue. Currently only `cancel`.
+    string? HandleSideChannelCommand(AlRunner.ServerRequest? req)
+    {
+        if (!string.Equals(req?.Command, "cancel", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        // Atomic snapshot read of the reference (see activeRunCts doc comment).
+        var cts = System.Threading.Interlocked.CompareExchange(ref activeRunCts, null, null);
+        if (cts == null || cts.IsCancellationRequested)
+            return AlRunner.ServerProtocol.Ack("cancel", noop: true);
+        try
+        {
+            cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Race: HandleServerRunTests's finally already disposed the CTS between
+            // our snapshot and Cancel() — the request had already completed.
+            return AlRunner.ServerProtocol.Ack("cancel", noop: true);
+        }
+        return AlRunner.ServerProtocol.Ack("cancel", noop: false);
+    }
+
+    // Producer: reads stdin continuously on a dedicated background thread so the
+    // main dispatch loop below is never blocked from seeing a `cancel` by a
+    // synchronous `runtests`/`execute` handler. Side-channel commands are answered
+    // here directly; everything else is handed to `mainQueue` for the sequential
+    // dispatch loop, unchanged from before this command existed.
+    var mainQueue = new System.Collections.Concurrent.BlockingCollection<string>();
+    var readerThread = new System.Threading.Thread(() =>
+    {
+        string? readerLine;
+        while ((readerLine = input.ReadLine()) != null)
+        {
+            if (readerLine.Length == 0) continue;
+            AlRunner.ServerRequest? parsed = null;
+            try { parsed = AlRunner.ServerProtocol.Parse(readerLine); }
+            catch { /* malformed JSON — let the main loop's existing catch report it */ }
+
+            var sideChannelResponse = HandleSideChannelCommand(parsed);
+            if (sideChannelResponse != null)
+            {
+                lock (outputLock)
+                {
+                    output.WriteLine(sideChannelResponse);
+                    output.Flush();
+                }
+                continue;
+            }
+            mainQueue.Add(readerLine);
+        }
+        mainQueue.CompleteAdding();
+    })
+    { IsBackground = true, Name = "al-runner-server-stdin" };
+    readerThread.Start();
+
+    // The isolation mode in effect when the server started (CLI --isolation, or
+    // TestIsolation.Codeunit if not given) — the fallback for any request that
+    // doesn't carry its own `testIsolation` field. Captured once so a request that
+    // DOES set testIsolation never leaks its mode onto a later request that
+    // doesn't (see #1616 — the whole point is per-request control, not a sticky
+    // session-wide override).
+    var defaultServerIsolation = executor.Isolation;
+
+    // Readiness handshake — MUST be the first line on stdout.
+    lock (outputLock)
+    {
+        output.WriteLine("{\"ready\":true}");
+        output.Flush();
+    }
+
+    // Sequential dispatch loop, unchanged in shape from before `cancel` existed —
+    // it now consumes from `mainQueue` (fed by the reader thread above) instead of
+    // calling input.ReadLine() itself, so a `cancel` sitting ahead of a `runtests`
+    // line in the OS pipe buffer never gets stuck behind it.
+    foreach (var line in mainQueue.GetConsumingEnumerable())
+    {
+        if (line.Length == 0) continue;
+        // Null means "already fully written to output" — currently only the
+        // streaming runTests path (see HandleServerRunTests below), which emits
+        // its own {"type":"test"}* + {"type":"summary"} lines directly instead of
+        // going through the single-response write below.
+        string? response;
+        bool shuttingDown = false;
+        try
+        {
+            var req = AlRunner.ServerProtocol.Parse(line);
+            switch (req?.Command?.ToLowerInvariant())
+            {
+                case null:
+                    response = AlRunner.ServerProtocol.Error("Invalid request (missing 'command')");
+                    break;
+                case "runtests":
+                    HandleServerRunTests(req, output);
+                    response = null;
+                    break;
+                case "execute":
+                    response = HandleServerExecute(req);
+                    break;
+                case "shutdown":
+                    response = AlRunner.ServerProtocol.Shutdown();
+                    shuttingDown = true;
+                    break;
+                default:
+                    response = AlRunner.ServerProtocol.Error($"Unknown command: {req.Command}");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            response = AlRunner.ServerProtocol.Error(ex.Message);
+        }
+
+        if (response != null)
+        {
+            lock (outputLock)
+            {
+                output.WriteLine(response);
+                output.Flush();
+            }
+        }
+        if (shuttingDown) return 0;
+    }
+    // EOF — client disconnected.
+    return 0;
+
+    // Sets executor.Isolation from req.TestIsolation (see #1616), falling back to
+    // defaultServerIsolation when the request doesn't specify one. Returns an
+    // error response string on an unrecognised mode, else null.
+    string? ApplyRequestIsolation(AlRunner.ServerRequest req)
+    {
+        if (req.TestIsolation == null)
+        {
+            executor.Isolation = defaultServerIsolation;
+            return null;
+        }
+        try
+        {
+            executor.Isolation = AlRunner.TestIsolationParser.Parse(req.TestIsolation);
+            return null;
+        }
+        catch (ArgumentException ex)
+        {
+            return AlRunner.ServerProtocol.Error($"testIsolation: {ex.Message}");
+        }
+    }
+
+    // ── runTests: re-emit + run every requested bundle in-process, STREAMING one
+    // {"type":"test"} NDJSON line per completed test (via TestExecutor.Run's
+    // onTestComplete hook) as it finishes, then exactly one terminal
+    // {"type":"summary"} line once every bundle has run — protocol-v2
+    // (protocol-v2.schema.json), see #1641. Writes directly to `output` rather
+    // than returning a single response string, unlike every other command.
+    //
+    // Owns the CancellationTokenSource a concurrent `cancel` side-channel command
+    // signals (see HandleSideChannelCommand above `activeRunCts`). Published to
+    // `activeRunCts` for the WHOLE multi-bundle request, not per-bundle, so a
+    // cancel arriving between two sourcePaths entries still takes effect on the
+    // remaining bundles. Cooperative only (TestExecutor.Run's doc comment): a test
+    // already in flight always finishes; cancellation stops the NEXT one.
+    // ─────────────────────────────────────────────────────────────────────────
+    void HandleServerRunTests(AlRunner.ServerRequest req, System.IO.TextWriter output)
+    {
+        // #1936: real wall-clock duration of THIS request (received → summary
+        // written), for the `wallSeconds` field on the terminal summary line. Not
+        // the process's total uptime — a warm server serves many requests, so
+        // "since process start" is only meaningful for the very first one. Started
+        // here (before the sourcePaths/isolation validation below) so it also
+        // captures those cheap up-front checks, not just the run itself.
+        var reqSw = System.Diagnostics.Stopwatch.StartNew();
+        if (req.SourcePaths == null || req.SourcePaths.Length == 0)
+        {
+            lock (outputLock)
+            {
+                output.WriteLine(AlRunner.ServerProtocol.Error("sourcePaths is required"));
+                output.Flush();
+            }
+            return;
+        }
+
+        foreach (var p in req.SourcePaths)
+            if (!Directory.Exists(p))
+            {
+                lock (outputLock)
+                {
+                    output.WriteLine(AlRunner.ServerProtocol.Error($"bundle directory not found: {p}"));
+                    output.Flush();
+                }
+                return;
+            }
+
+        var isolationError = ApplyRequestIsolation(req);
+        if (isolationError != null)
+        {
+            lock (outputLock)
+            {
+                output.WriteLine(isolationError);
+                output.Flush();
+            }
+            return;
+        }
+
+        // #2042: 'coverage:true' opts into per-statement hit counts + a position table
+        // on the terminal summary line — reuses AlCoverageTracker's existing StmtHit
+        // hook (#1922), same process-global-flag pattern as AlValueCapture.Enabled in
+        // HandleServerExecute below. Reset() (not just Enabled=true) so a warm
+        // server's hit counts from a PRIOR request never leak into this one — the
+        // dictionary is process-global and this process outlives many requests.
+        AlRunner.Infrastructure.AlCoverageTracker.Enabled = req.Coverage == true;
+        if (req.Coverage == true) AlRunner.Infrastructure.AlCoverageTracker.Reset();
+
+        var cts = new System.Threading.CancellationTokenSource();
+        System.Threading.Interlocked.Exchange(ref activeRunCts, cts);
+        try
+        {
+            // Flushed after every line so a client watching stdout sees each test the
+            // instant it finishes, not batched behind the whole bundle (or worse, every
+            // bundle in a multi-sourcePaths request).
+            void OnTestComplete(TestResult t)
+            {
+                lock (outputLock)
+                {
+                    output.WriteLine(AlRunner.ServerProtocol.TestEvent(t));
+                    output.Flush();
+                }
+                // #1845: test-only barrier, no-op unless AL_RUNNER_TEST_BARRIER_DIR is
+                // set on THIS process — see AlRunner.Infrastructure.TestBarrier's doc
+                // comment. Called AFTER the write+flush above so a client observing the
+                // `test` line is guaranteed the server has not yet started the next test.
+                AlRunner.Infrastructure.TestBarrier.WaitForRelease();
+            }
+
+            var runs = RunAllBundlesForServer(req.SourcePaths, req.PackagePaths,
+                asm => executor.Run(asm, OnTestComplete, cts.Token), cts.Token);
+
+            var allTests = runs.SelectMany(r => r.Tests).ToList();
+            var allCompileErrors = runs.SelectMany(r => r.CompileErrors ?? Array.Empty<CompilationErrorGroup>()).ToList();
+            // Same priority as the CLI's computedExitCode: 3 (compile) > 2 (exec) > 1 (test fail) > 0.
+            var exitCode = runs.Count > 0 ? runs.Max(r => r.ExitCode) : 0;
+            var cached = runs.Count > 0 && runs.All(r => r.Cached);
+
+            var combinedHashes = new Dictionary<string, string>();
+            foreach (var r in runs)
+                foreach (var kv in r.FileHashes)
+                    combinedHashes[kv.Key] = kv.Value;
+
+            // changedFiles is only meaningful on a cache miss (a hit means nothing changed).
+            List<string>? changed = null;
+            if (!cached)
+                changed = DiffServerFiles(lastFileHashes, combinedHashes);
+            lastFileHashes = combinedHashes;
+
+            // Read BEFORE clearing activeRunCts below (still valid — not yet disposed).
+            var cancelled = cts.Token.IsCancellationRequested;
+
+            // #1809: clear activeRunCts BEFORE writing+flushing the summary line, not
+            // after (the old code cleared it in `finally`, which runs AFTER this write).
+            // The reader thread's `cancel` side channel (HandleSideChannelCommand,
+            // above) only has something to observe once the client sends a `cancel`
+            // request, and a well-behaved client can only do that once it has actually
+            // read the summary line this method is about to emit. So clearing first
+            // makes "cancel sent right after the summary" ALWAYS see activeRunCts
+            // already null — by program order on this one thread, not by winning a race
+            // against the reader thread. The old ordering left a real gap: the client
+            // could read+flush-observe the summary and fire `cancel` before this
+            // thread ever reached its `finally`, during which HandleSideChannelCommand
+            // would still see the stale non-null cts and answer noop:false for a run
+            // that had already finished — a bug the wider concurrency #1809 introduces
+            // (more collections running at once → more scheduler contention → this
+            // window widens) makes far more likely to actually land, not merely a
+            // theoretical TOCTOU. See ServerCancelTests.Cancel_AfterRunTestsCompletes_IsNoop.
+            System.Threading.Interlocked.CompareExchange(ref activeRunCts, null, cts);
+
+            // #2042: built from sourcePaths (the SAME roots the run just compiled),
+            // matching the CLI --coverage path's AlCoverageSourceMap.Build call —
+            // scopes whose owning object isn't found here (framework/dependency
+            // assemblies outside the bundle under test) are silently excluded, same
+            // as --coverage. Only built when requested: reflection-scanning every
+            // loaded assembly's types on every plain runTests call would be wasted
+            // work for callers who never asked for it.
+            IReadOnlyList<AlRunner.Infrastructure.AlCoverageTracker.AlStatementRecord>? statementTable = null;
+            if (req.Coverage == true)
+            {
+                var covSourceMap = AlRunner.Infrastructure.AlCoverageSourceMap.Build(
+                    req.SourcePaths, relativeTo: null);
+                statementTable = AlRunner.Infrastructure.AlCoverageTracker.CollectStatementTable(covSourceMap);
+            }
+
+            lock (outputLock)
+            {
+                output.WriteLine(AlRunner.ServerProtocol.Summary(
+                    allTests, exitCode, cached, changed,
+                    allCompileErrors.Count > 0 ? allCompileErrors : null,
+                    cancelled: cancelled, wallSeconds: reqSw.Elapsed.TotalSeconds,
+                    statementTable: statementTable));
+                output.Flush();
+            }
+        }
+        finally
+        {
+            // Scoped to THIS request only, same reasoning as HandleServerExecute's
+            // AlValueCapture.Enabled reset below — a coverage:true request must never
+            // leave hit-count tracking on for a later request that didn't ask for it.
+            AlRunner.Infrastructure.AlCoverageTracker.Enabled = false;
+            // Belt-and-braces: reaches the same state as the explicit clear above on
+            // every path, INCLUDING an exception thrown before that point (e.g. from
+            // RunAllBundlesForServer) — a pathological caller must never be left with a
+            // permanently-stuck activeRunCts pointing at a cts nothing will ever
+            // complete. A no-op on the normal path (already null there).
+            System.Threading.Interlocked.CompareExchange(ref activeRunCts, null, cts);
+            cts.Dispose();
+        }
+    }
+
+    // ── execute: run every requested bundle's first OnRun-bearing codeunit
+    // (run-mode), aggregating the results. #1917: v1 also accepted an inline
+    // `code` string — a temp single-file bundle is synthesised from it (see
+    // SynthesizeInlineCodeBundle) and run through the SAME compile pipeline a
+    // sourcePaths-based execute already uses (RunAllBundlesForServer →
+    // RunBundleForServer → RunFirstCodeunitOnRun), rather than inventing a
+    // second execution path. `captureValues` (#1640, second slice — --coverage
+    // was the first, #1922) gates AlValueCapture.Enabled for the duration of
+    // this call; RunFirstCodeunitOnRun resets+collects it per bundle.
+    string HandleServerExecute(AlRunner.ServerRequest req)
+    {
+        string? scratchDir = null;
+        string[] sourcePaths;
+        if (!string.IsNullOrWhiteSpace(req.Code))
+        {
+            if (req.SourcePaths != null && req.SourcePaths.Length > 0)
+                return AlRunner.ServerProtocol.Error(
+                    "execute: 'code' and 'sourcePaths' are mutually exclusive — pass one or the other.");
+            scratchDir = SynthesizeInlineCodeBundle(req.Code!);
+            sourcePaths = new[] { scratchDir };
+        }
+        else
+        {
+            if (req.SourcePaths == null || req.SourcePaths.Length == 0)
+                return AlRunner.ServerProtocol.Error("sourcePaths is required");
+            foreach (var p in req.SourcePaths)
+                if (!Directory.Exists(p))
+                    return AlRunner.ServerProtocol.Error($"bundle directory not found: {p}");
+            sourcePaths = req.SourcePaths;
+        }
+
+        var isolationError = ApplyRequestIsolation(req);
+        if (isolationError != null) return isolationError;
+
+        // Scoped to THIS request only — reset in `finally` below regardless of outcome,
+        // so a captureValues:true request never leaves the flag on for a later request
+        // that didn't ask for it (the flag is process-global, same as AlCoverageTracker.Enabled).
+        AlRunner.Infrastructure.AlValueCapture.Enabled = req.CaptureValues == true;
+        // #2042: 'coverage:true' on `execute` — same request/response correlation the
+        // issue's acceptance criteria need: THIS single `execute` call can enable BOTH
+        // captureValues AND coverage together, so a caller can prove statementId lines
+        // up between capturedValues and the statement table from ONE run (see
+        // AlStatementTableTests.CapturedValueStatementId_MatchesStatementTableScopeAndId).
+        AlRunner.Infrastructure.AlCoverageTracker.Enabled = req.Coverage == true;
+        if (req.Coverage == true) AlRunner.Infrastructure.AlCoverageTracker.Reset();
+        // #2117: Message() output — UNCONDITIONAL, not gated by a request field, matching
+        // ServerProtocol's own long-standing doc comment for `execute`'s `messages`
+        // (`messages|null` was documented before this field was ever populated). Reset
+        // ONCE before the whole (possibly multi-bundle) run so messages from every bundle
+        // land in ONE ordered list — see AlMessageCapture.Reset's doc comment for why
+        // that differs from AlValueCapture's per-bundle scoping. ClientCallbackOverride
+        // is installed on the skeleton session for the SAME reason AlValueCapture.Enabled
+        // /AlCoverageTracker.Enabled are process-global flags reset in `finally` below: a
+        // later request that isn't `execute` (e.g. `runTests`) must never see it — though
+        // in practice nothing on the [Test]-procedure path would ever consult it (see
+        // RunnerClientCallback.cs's header).
+        AlRunner.Infrastructure.AlMessageCapture.Reset();
+        var messageCaptureSession = AlRunner.BcRuntime.SkeletonSession as Microsoft.Dynamics.Nav.Runtime.NavSession;
+        if (messageCaptureSession != null)
+            messageCaptureSession.ClientCallbackOverride = new AlRunner.Patches.RunnerClientCallback();
+        try
+        {
+            var runs = RunAllBundlesForServer(sourcePaths, req.PackagePaths, RunFirstCodeunitOnRun);
+
+            var allTests = runs.SelectMany(r => r.Tests).ToList();
+            var allCompileErrors = runs.SelectMany(r => r.CompileErrors ?? Array.Empty<CompilationErrorGroup>()).ToList();
+            var exitCode = runs.Count > 0 ? runs.Max(r => r.ExitCode) : 0;
+
+            var combinedHashes = new Dictionary<string, string>();
+            foreach (var r in runs)
+                foreach (var kv in r.FileHashes)
+                    combinedHashes[kv.Key] = kv.Value;
+            lastFileHashes = combinedHashes;
+
+            // Built BEFORE returning (i.e. before `finally` deletes an inline-code
+            // scratchDir below) — sourcePaths here is either the caller's real
+            // sourcePaths or that same scratchDir, and AlCoverageSourceMap.Build
+            // needs the .al files on disk to still exist when it scans them.
+            IReadOnlyList<AlRunner.Infrastructure.AlCoverageTracker.AlStatementRecord>? statementTable = null;
+            if (req.Coverage == true)
+            {
+                var covSourceMap = AlRunner.Infrastructure.AlCoverageSourceMap.Build(sourcePaths, relativeTo: null);
+                statementTable = AlRunner.Infrastructure.AlCoverageTracker.CollectStatementTable(covSourceMap);
+            }
+
+            return AlRunner.ServerProtocol.Execute(allTests, exitCode,
+                AlRunner.Infrastructure.AlMessageCapture.Snapshot(),
+                allCompileErrors.Count > 0 ? allCompileErrors : null,
+                statementTable: statementTable);
+        }
+        finally
+        {
+            AlRunner.Infrastructure.AlValueCapture.Enabled = false;
+            AlRunner.Infrastructure.AlCoverageTracker.Enabled = false;
+            if (messageCaptureSession != null) messageCaptureSession.ClientCallbackOverride = null;
+            // Best-effort cleanup: the scratch dir's contents are fully consumed
+            // once RunBundleForServer has emitted+compiled them into an in-memory
+            // assembly (or failed trying) — nothing downstream needs the files on
+            // disk after this call returns, and a leaked temp dir per `execute`
+            // call would otherwise accumulate for the life of the server process.
+            if (scratchDir != null)
+            {
+                try { Directory.Delete(scratchDir, recursive: true); }
+                catch { /* not fatal — OS temp cleanup will catch it eventually */ }
+            }
+        }
+    }
+
+    // #1917: synthesise a temp single-file AL bundle from an inline `code`
+    // string so `execute`'s "code" field can go through the same compile
+    // pipeline as a sourcePaths-based execute, instead of a separate inline-AL
+    // execution path. v1 parity (see git history for e1a22f84, "fixes #12"):
+    // `code` that already looks like a full AL object definition is used
+    // verbatim; anything else is treated as a bare statement list and wrapped
+    // in a scratch codeunit's OnRun trigger body, matching v1's CLI `-e` shape.
+    //
+    // #1931: "already looks like a full AL object" used to be
+    // `trimmed.StartsWith("codeunit"/"table")` — a two-keyword allowlist that
+    // misclassified every other object type (page/enum/report/query/xmlport/
+    // interface/...) AND any codeunit behind a leading `//` comment (TrimStart
+    // leaves the `//` in place, so it never matched). See IsFullAlObjectDeclaration
+    // for the fix: ask BC's own parser instead of maintaining a keyword list.
+    static string SynthesizeInlineCodeBundle(string code)
+    {
+        var isFullObject = IsFullAlObjectDeclaration(code);
+        var source = isFullObject
+            ? code
+            : $"codeunit 50100 \"AL Runner Inline Execute\" {{ trigger OnRun() begin {code} end; }}";
+
+        var dir = Path.Combine(Path.GetTempPath(), "al-runner-server-inline", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "Scratch.al"), source);
+        return dir;
+    }
+
+    // #1931: is `code` already a full AL object declaration (should be used
+    // verbatim), or a bare statement list (needs wrapping in a scratch OnRun
+    // body)? Answered by asking BC's OWN parser rather than maintaining a
+    // keyword allowlist that drifts as AL gains object types — the same
+    // approach RecordPatches.AlSourceParser.ParseAlObjects already uses for
+    // table/tableextension extraction (#1696). SyntaxTree.ParseObjectText needs
+    // only a ParseOptions, no Compilation and no reference closure, so this is
+    // cheap and side-effect-free.
+    //
+    // Every top-level AL object syntax type shares one common base,
+    // Microsoft.Dynamics.Nav.CodeAnalysis.Syntax.ObjectSyntax — verified via
+    // reflection over the shipped CodeAnalysis DLL: table/codeunit/page/report/
+    // query/xmlport/enum/(+ extension variants) all derive from
+    // ApplicationObjectSyntax : ObjectSyntax, while interface/controladdin/
+    // profile/dotnet/entitlement derive from ObjectSyntax directly (they have no
+    // object id, so they don't go through ApplicationObjectSyntax) — so "did the
+    // compilation-unit root produce at least one ObjectSyntax child" answers
+    // "is this a full object declaration" for the whole AL object-keyword set at
+    // once, with no list to keep in sync.
+    //
+    // Leading trivia (a `//` comment, a blank line, a `#pragma`) needs no manual
+    // skipping: comments/blank lines are trivia the parser already attaches to
+    // the first real token when it scans for the object keyword, so a
+    // `//`-prefixed codeunit still yields a CodeunitSyntax child.
+    //
+    // A malformed-but-recognisable object (e.g. `codeunit 50100 "X" { trigger
+    // OnRun() begin Error(` with an unclosed paren) still parses to exactly one
+    // ObjectSyntax child — BC's parser recovers past the syntax error and still
+    // recognises the object shape — so it is STILL used verbatim. That is
+    // deliberate: the caller's real compile error then names the caller's real
+    // code (via the normal `compilationErrors` channel `execute` already
+    // returns), not a wrapper the caller never wrote. A genuine bare statement
+    // list, or text that isn't AL at all, produces zero children (BC's parser
+    // reports AL0198 "expected one of the application object keywords" and
+    // recovers to an empty compilation unit) and falls through to wrapping.
+    //
+    // Never throws: this is fed arbitrary text a human may have typed by hand,
+    // and a parse ParseObjectText itself cannot make sense of must fall back to
+    // "not a full object" (wrap it) rather than blow up the request — the same
+    // never-throw contract RecordPatches.AlSourceParser.ParseAlObjects documents
+    // for the identical call.
+    //
+    // Classification is deterministic (yes/no), never ambiguous, so there is no
+    // third "couldn't tell" state to surface as a request-level protocol error:
+    // whichever branch is chosen, a real problem in the caller's AL still comes
+    // back through the existing `compilationErrors` channel that
+    // Execute_InlineCode_CompileError_ReturnsCompilationErrors already proves —
+    // exactly where every other AL-content problem in this protocol surfaces.
+    // The top-level `error` field stays reserved for request-shape problems
+    // (unknown command, missing sourcePaths, mutually exclusive fields) that
+    // have nothing to do with what the AL says.
+    static bool IsFullAlObjectDeclaration(string code)
+    {
+        try
+        {
+            var parseOpts = new NavCA.ParseOptions(
+                runtimeVersion: null!,
+                preprocessorSymbols: Enumerable.Range(1, 25).Select(n => $"CLEANSCHEMA{n}")
+                    .Concat(AlRunner.BcCompiler.GetExtraPreprocessorSymbols()),
+                documentationMode: NavCA.DocumentationMode.None);
+            var tree = NavSyntax.SyntaxTree.ParseObjectText(code, path: "", encoding: null!, parseOpts, default);
+            return tree.GetRoot() is NavSyntax.CompilationUnitSyntax root &&
+                   root.ChildNodes().Any(n => n is NavSyntax.ObjectSyntax);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+
     // Run the bundle's OnRun-bearing codeunit (run-mode), mirroring CodeunitPatches'
     // OnRun dispatch. Prefers a non-[Test] codeunit; returns one TestResult named
     // "<Codeunit>.OnRun". An AL Error inside OnRun surfaces as a Fail (exitCode 1).
@@ -3684,6 +5099,15 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         AlRunner.Infrastructure.AlCallStackCapture.Clear();
+        // #1640: only meaningfully non-null when the caller enabled
+        // AlValueCapture (HandleServerExecute, gated by req.CaptureValues). Reset
+        // BEFORE invoking, mirroring AlCallStackCapture.Clear() above — same
+        // process-global, sequential-invocation assumption.
+        AlRunner.Infrastructure.AlValueCapture.Reset();
+        IReadOnlyList<AlRunner.Infrastructure.AlCapturedValue>? Captured() =>
+            AlRunner.Infrastructure.AlValueCapture.Enabled
+                ? AlRunner.Infrastructure.AlValueCapture.Collect()
+                : null;
         try
         {
             var ctor = target.GetConstructors().FirstOrDefault(c =>
@@ -3699,19 +5123,21 @@ int RunServerLoop(System.IO.TextReader input, System.IO.TextWriter output)
             else target.GetMethod("OnRun",
                 System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance, null,
                 Type.EmptyTypes, null)!.Invoke(instance, null);
-            return new[] { new TestResult(target.Name, "OnRun", TestOutcome.Pass, null, null, sw.Elapsed) };
+            return new[] { new TestResult(target.Name, "OnRun", TestOutcome.Pass, null, null, sw.Elapsed,
+                CapturedValues: Captured()) };
         }
         catch (System.Reflection.TargetInvocationException tex)
         {
             var inner = tex.InnerException ?? tex;
             var alStack = AlRunner.Infrastructure.AlCallStackCapture.GetCaptured(inner);
             return new[] { new TestResult(target.Name, "OnRun", TestOutcome.Fail,
-                $"{inner.GetType().Name}: {inner.Message}", inner.ToString(), sw.Elapsed, alStack) };
+                $"{inner.GetType().Name}: {inner.Message}", inner.ToString(), sw.Elapsed, alStack,
+                CapturedValues: Captured()) };
         }
         catch (Exception ex)
         {
             return new[] { new TestResult(target.Name, "OnRun", TestOutcome.Error,
-                ex.Message, ex.ToString(), sw.Elapsed) };
+                ex.Message, ex.ToString(), sw.Elapsed, CapturedValues: Captured()) };
         }
     }
 }
@@ -3791,6 +5217,13 @@ static string SanitiseFilename(string name)
 // common failure signatures mean. Keep it self-contained — the moment an agent
 // has to go read docs/ or a HANDOFF file to form a correct invocation, this
 // guide has failed at its job.
+// Shared by --version/-v/-V/version and --help's first line, so a build's
+// self-reported version can never drift between the two surfaces (#2072).
+static string VersionString()
+{
+    return $"al-runner v{AlRunner.Infrastructure.RunnerVersion.Describe(typeof(Program).Assembly)}";
+}
+
 static void PrintGuide(TextWriter w)
 {
     w.WriteLine("al-runner — AGENT GUIDE");
@@ -3872,6 +5305,12 @@ static void PrintGuide(TextWriter w)
     w.WriteLine("    That is the resolved set. Check the path and version of each dependency that");
     w.WriteLine("    is actually on the failing call's path, not just the one that threw.");
     w.WriteLine();
+    w.WriteLine("    The [dep] winner comes FROM somewhere: --verbose also lists every directory");
+    w.WriteLine("    actually searched to produce it, as [pkg-cache] lines under the \"package");
+    w.WriteLine("    caches (final search set): N dir(s)\" count — not the earlier \"(requested)\"");
+    w.WriteLine("    count, which is the explicit/default set only. If a package you expect to");
+    w.WriteLine("    win is missing, check whether its directory is even in the final list.");
+    w.WriteLine();
     w.WriteLine("  VERSION SKEW ACROSS A FAMILY. When a workspace's .alpackages reference two");
     w.WriteLine("  different minors of the same platform family, stage BOTH minors in the");
     w.WriteLine("  dependency directory. Supplying only the higher one lets a symbols-only copy");
@@ -3889,11 +5328,28 @@ static void PrintGuide(TextWriter w)
     w.WriteLine("  make an intentional override; it is NOT necessarily the version stamped on");
     w.WriteLine("  the app's dependencies, whose versions are compatibility floors.");
     w.WriteLine();
-    w.WriteLine("  BC artifacts are never downloaded silently. Obtain them explicitly:");
-    w.WriteLine("    al-runner provision <bundle-dir>     # provision for that project's version, then exit");
-    w.WriteLine("    al-runner --auto-provision <dirs>    # provision on demand, then continue the run");
-    w.WriteLine("  Exact engine/artifact build alignment is the supported configuration; an");
-    w.WriteLine("  explicit different build or minor is a known-degraded override.");
+    w.WriteLine("  BC artifacts are provisioned AUTOMATICALLY by default (issue #2024): a first run");
+    w.WriteLine("  against an empty ~/.local/share/al-runner/artifacts downloads the engine +");
+    w.WriteLine("  platform/test apps it needs and continues, no flag required. Pass");
+    w.WriteLine("  --no-auto-provision to refuse network access (offline/air-gapped machines) —");
+    w.WriteLine("  a refused or failed provision still fails loud, naming exactly what is");
+    w.WriteLine("  missing and a fix command that is valid for a `dotnet tool install`, never a");
+    w.WriteLine("  silent stub. Other provisioning entry points:");
+    w.WriteLine("    al-runner provision <bundle-dir>        # provision for that project's version, then exit");
+    w.WriteLine("    al-runner --auto-provision <dirs>       # same as the default, explicit for scripts");
+    w.WriteLine("    al-runner --no-auto-provision <dirs>    # fail loud instead of reaching the network");
+    w.WriteLine("  If a provisioning-gap message names a specific missing set, force just that one");
+    w.WriteLine("  (bypasses need-detection entirely — useful when the default `provision` mis-detects,");
+    w.WriteLine("  issue #2085):");
+    w.WriteLine("    al-runner provision --platform-apps --bc-version V [--force]");
+    w.WriteLine("    al-runner provision --test-apps --bc-version V [--force]");
+    w.WriteLine("    al-runner provision --service-tier --bc-version V [--force]");
+    w.WriteLine("  Every one of these works from a plain `dotnet tool install -g` with no source");
+    w.WriteLine("  checkout — the standalone tools/DownloadArtifacts project these wrap ships only");
+    w.WriteLine("  as source in this repo and is unreachable from an installed tool.");
+    w.WriteLine("  A single-engine install implicitly provisions the exact four-part build baked");
+    w.WriteLine("  into the binary. An install with per-minor variants selects the variant matching");
+    w.WriteLine("  the chosen artifact. In either shape, engine and artifacts must share a BC minor.");
     w.WriteLine();
 
     w.WriteLine("PRE-FLIGHT — do these before concluding anything about a failure");
@@ -3937,8 +5393,10 @@ static void PrintGuide(TextWriter w)
     w.WriteLine("      Action: add the missing .app's directory via --package-cache.");
     w.WriteLine();
     w.WriteLine("  Artifact version not found");
-    w.WriteLine("      Action: the runner never auto-downloads. Run `al-runner provision`, or pass");
-    w.WriteLine("      --auto-provision, or point --artifact-path at an existing artifact root.");
+    w.WriteLine("      Action: auto-provisioning is on by default and should have fetched it —");
+    w.WriteLine("      if you passed --no-auto-provision, drop it (or run `al-runner provision`");
+    w.WriteLine("      explicitly). If provisioning itself failed (no network), point");
+    w.WriteLine("      --artifact-path at an existing artifact root instead.");
     w.WriteLine();
     w.WriteLine("  Compile succeeds, tests still do not run");
     w.WriteLine("      Action: read the DEPENDENCIES trap above. Compilation validates symbols");
@@ -3950,6 +5408,49 @@ static void PrintGuide(TextWriter w)
     w.WriteLine("  echoed live — a probe that writes to stdout will appear to produce nothing.");
     w.WriteLine("  Write diagnostics to a FILE instead.");
     w.WriteLine("  In --server mode stdout carries ONLY the JSON protocol; all logs go to stderr.");
+    w.WriteLine("  Same for --dap stdio: stdout carries ONLY the DAP wire format, all logs go to");
+    w.WriteLine("  stderr. --dap [PORT] (TCP) is unaffected — stdout is normal there.");
+    w.WriteLine();
+
+    w.WriteLine("TDD MODE (--tdd) — starting a red-green cycle before the app has the symbol yet");
+    w.WriteLine("  Local development only. Not for CI: it deliberately runs tests that reference");
+    w.WriteLine("  symbols the implementing app doesn't have yet, instead of failing the compile.");
+    w.WriteLine();
+    w.WriteLine("  Normally, a test written before its implementation is a compile error —");
+    w.WriteLine("  method-body errors drop the WHOLE app group (BC's continue-on-error does not");
+    w.WriteLine("  cover them), so the run reports exit 3 and zero test results, not a red test.");
+    w.WriteLine("  --tdd infers the missing member's type from how the test uses it (a field's");
+    w.WriteLine("  type from what's assigned to it, a procedure's parameter/return types from its");
+    w.WriteLine("  call site), generates it into the implementing app's source in memory, and");
+    w.WriteLine("  recompiles. The generated body raises a distinctive error naming itself as a");
+    w.WriteLine("  generated stub, so the test runs up to that point and fails there — a genuine");
+    w.WriteLine("  RED test, for the reason you intended, instead of a compile failure:");
+    w.WriteLine("    al-runner --tdd MyApp MyApp.Test");
+    w.WriteLine();
+    w.WriteLine("  Where nothing anchors a confident guess (a bare-statement call — no way to");
+    w.WriteLine("  tell a void procedure from a discarded return value — or both sides of an");
+    w.WriteLine("  assignment unresolved), --tdd REFUSES rather than invents: that test is still");
+    w.WriteLine("  reported FAILED, naming the missing symbol, exactly as before generation");
+    w.WriteLine("  existed. A wrong guess that compiled cleanly would be worse than no guess —");
+    w.WriteLine("  a test red for the wrong reason. At the end of the run, --tdd prints every");
+    w.WriteLine("  member it actually generated: that list is the API surface the implementing");
+    w.WriteLine("  app still has to hand-write to replace the stubs.");
+    w.WriteLine();
+    w.WriteLine("  Exit code is 1 (a test failed), not 3 (compile failed) — --tdd's whole point");
+    w.WriteLine("  is turning that 3 into a 1 you can iterate against.");
+    w.WriteLine();
+    w.WriteLine("  --tdd disables the AL-output cache for the run (its generated members and");
+    w.WriteLine("  synthetic results are derived fresh from source every time; a cache HIT would");
+    w.WriteLine("  silently skip generation and serve stale or missing results).");
+    w.WriteLine();
+    w.WriteLine("  --tdd works with --watch. While an object remains excluded, that app stays on");
+    w.WriteLine("  the diagnosed full-compile path so its synthetic failed tests remain visible;");
+    w.WriteLine("  once healthy, later edits can use the normal delta path. --tdd + --server is");
+    w.WriteLine("  not yet supported.");
+    w.WriteLine();
+    w.WriteLine("  Scope: source-compiled implementing apps only. A precompiled .app dependency's");
+    w.WriteLine("  missing member is not generated — precompiled-dll-respect.md forbids rewriting");
+    w.WriteLine("  compiled bodies, and that diagnostic falls through to the same refuse path.");
     w.WriteLine();
 
     w.WriteLine("REPORTING A RUNNER GAP");
@@ -3967,27 +5468,50 @@ static void PrintGuide(TextWriter w)
     w.WriteLine("  A report that names a cause the evidence does not support is worse than none:");
     w.WriteLine("  it sends someone to fix a subsystem that was never involved.");
     w.WriteLine();
+    w.WriteLine("  Where to file: https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues");
+    w.WriteLine("  Gap reports are welcome — this is the replacement for the telemetry channel");
+    w.WriteLine("  that used to exist (#1643, closed not-planned); nothing is sent anywhere");
+    w.WriteLine("  automatically, and no report happens without a human reading it first.");
+    w.WriteLine();
+    w.WriteLine("  Before posting anything: ask the person you are working with for permission,");
+    w.WriteLine("  and show them the report text first. Do not open the issue on your own, and");
+    w.WriteLine("  do not silently work around the gap instead — both are wrong. Filing without");
+    w.WriteLine("  asking treats someone else's repository as yours to post to; working around it");
+    w.WriteLine("  silently is exactly what runner-gap tracking exists to prevent.");
+    w.WriteLine();
+    w.WriteLine("  An uncertain report is still worth offering, as long as the uncertainty is");
+    w.WriteLine("  stated plainly. \"I do not know what caused this, here is the reproducer\" is a");
+    w.WriteLine("  good report. \"This is a metadata cache bug\", offered with no evidence for");
+    w.WriteLine("  that specific mechanism, is not — that is the cause-without-support problem");
+    w.WriteLine("  above, just stated with more confidence than the evidence supports.");
+    w.WriteLine();
 
     w.WriteLine("FURTHER READING");
     w.WriteLine("  --help                       full flag reference");
     w.WriteLine("  docs/limitations.md          the real architectural limits");
     w.WriteLine("  docs/scope.md                in-scope vs out-of-scope-by-design surfaces");
     w.WriteLine("  docs/server-mode.md          the --server JSON-RPC protocol");
+    w.WriteLine("  docs/dap-mode.md             the --dap Debug Adapter Protocol server");
     w.WriteLine("  docs/subsystems.md           subsystem map");
 }
 
 static void PrintHelp(TextWriter w)
 {
+    // First line so a build carries its own version wherever --help output gets
+    // pasted (e.g. into a gap report) without asking separately for --version's
+    // output too (#2072).
+    w.WriteLine(VersionString());
     w.WriteLine("al-runner — run Business Central AL unit tests in-process.");
     w.WriteLine();
     w.WriteLine("USAGE");
     w.WriteLine("  al-runner [OPTIONS] <bundle-dir>...");
     w.WriteLine("  al-runner provision [<bundle-dir>]");
     w.WriteLine("  al-runner --server [--package-cache PATH ...] [--cache DIR]");
+    w.WriteLine("  al-runner --dap [PORT|stdio] <bundle-dir>");
     w.WriteLine("  al-runner --precompile <input.app> --out <output.dll> [--package-cache PATH ...]");
     w.WriteLine("  al-runner --emit-app <bundleDir> <outPath> [--package-cache PATH ...]");
     w.WriteLine("  al-runner --guide      (operating manual for automated callers)");
-    w.WriteLine("  al-runner --version");
+    w.WriteLine("  al-runner --version   (also: -v, -V, version)");
     w.WriteLine("  al-runner --help");
     w.WriteLine();
     w.WriteLine("Agents and scripted callers should start with --guide: it covers correct");
@@ -4021,24 +5545,32 @@ static void PrintHelp(TextWriter w)
     w.WriteLine();
     w.WriteLine("EXECUTION");
     w.WriteLine("  --bc-version X          Select the BC artifact version (e.g. \"28.1\" or a full");
-    w.WriteLine("                          version). Without an override, a normal run selects the exact");
-    w.WriteLine("                          cached build, else the highest cached build of its built minor,");
-    w.WriteLine("                          else its built major. Under provisioning, the exact build is");
-    w.WriteLine("                          targeted and never substituted. A prefix selects the highest");
-    w.WriteLine("                          matching cache. Normal runs never auto-download.");
+    w.WriteLine("                          version). Without an override, default provisioning targets");
+    w.WriteLine("                          the exact build compiled into a single-engine runner and it");
+    w.WriteLine("                          is never substituted. With --no-auto-provision, selection");
+    w.WriteLine("                          tries that exact cached build, then the highest cached build");
+    w.WriteLine("                          in its built minor/major with a warning. A prefix selects the");
+    w.WriteLine("                          highest matching cache. Engine variants select the variant");
+    w.WriteLine("                          matching the chosen artifact. Missing artifacts provision");
+    w.WriteLine("                          automatically by default.");
     w.WriteLine("                          Mutually exclusive with --artifact-path.");
     w.WriteLine("  --artifact-path DIR     Use an explicit BC artifact root (the dir containing");
     w.WriteLine("                          platform/ + w1/), bypassing the cache scan. Its version");
     w.WriteLine("                          is read from the dir name or the contained Ncl.dll.");
     w.WriteLine("                          Mutually exclusive with --bc-version.");
-    w.WriteLine("  --auto-provision        Download the selected BC engine plus manifest-required Microsoft");
-    w.WriteLine("                          platform and test apps, then continue the run. Versioned runner-");
-    w.WriteLine("                          owned caches are checked first, including with empty .alpackages.");
+    w.WriteLine("  --auto-provision        Download the selected BC engine plus manifest-required");
+    w.WriteLine("                          platform and test apps, then continue the run. Versioned");
+    w.WriteLine("                          runner-owned caches are checked first, including with empty .alpackages.");
     w.WriteLine("                          With no explicit version/path, the exact BC build compiled");
-    w.WriteLine("                          into this runner is selected and never substituted.");
-    w.WriteLine("                          No --package-cache or --artifact-path is required. The runner");
-    w.WriteLine("                          never downloads without this flag (or the `provision` subcommand)");
-    w.WriteLine("                          — a missing artifact otherwise fails loud.");
+    w.WriteLine("                          into this runner is selected and never substituted. No --package-cache");
+    w.WriteLine("                          or --artifact-path is required. ON BY DEFAULT since issue");
+    w.WriteLine("                          #2024; this flag remains for scripts/back-compat. See");
+    w.WriteLine("                          --no-auto-provision to turn it off (or the `provision`");
+    w.WriteLine("                          subcommand to provision without running tests).");
+    w.WriteLine("  --no-auto-provision     Disable automatic provisioning: a missing/incomplete BC");
+    w.WriteLine("                          artifact fails loud instead of downloading it. Use this");
+    w.WriteLine("                          on offline/air-gapped machines, or anywhere reaching the");
+    w.WriteLine("                          network unasked for gigabyte-scale artifacts is unwanted.");
     w.WriteLine("  --package-cache PATH    Extra directory to scan for .app dependencies");
     w.WriteLine("                          (repeatable). Default scan: ~/.bcartifacts.cache,");
     w.WriteLine("                          ~/.local/share/al-runner/artifacts, and bundle .alpackages/.");
@@ -4070,8 +5602,37 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("                          deps + BC patches loaded once; ~19s->~4s per run). One");
     w.WriteLine("                          JSON request/response per line. stdout carries ONLY the");
     w.WriteLine("                          protocol; all logs go to stderr. Used by the VS Code");
-    w.WriteLine("                          extension. Commands: runTests, shutdown (execute: TODO).");
-    w.WriteLine("                          See docs/server-mode.md. Mutually exclusive with --watch.");
+    w.WriteLine("                          extension. Commands: runTests (streaming per-test results),");
+    w.WriteLine("                          execute (compile+run inline AL source; one response with");
+    w.WriteLine("                          tests, Message() output, coverage and captured values),");
+    w.WriteLine("                          shutdown. Full wire schema: docs/server-mode.md. Mutually");
+    w.WriteLine("                          exclusive with --watch.");
+    w.WriteLine("  --dap [PORT]            Debug Adapter Protocol server (default port 4711):");
+    w.WriteLine("                          set AL breakpoints, pause execution, inspect locals over a");
+    w.WriteLine("                          real DAP TCP connection. Requires exactly one bundle path.");
+    w.WriteLine("                          Compiles on `launch`, pauses AL execution at StmtHit for");
+    w.WriteLine("                          any breakpointed statement once `configurationDone` starts");
+    w.WriteLine("                          the run. next/stepIn/stepOut pause at a real qualifying");
+    w.WriteLine("                          statement (step-over/into/out of the current call), not");
+    w.WriteLine("                          just at the next breakpoint. See docs/dap-mode.md.");
+    w.WriteLine("                          Mutually exclusive with --server.");
+    w.WriteLine("  --dap stdio             Same DAP session, over this process's own stdin/stdout");
+    w.WriteLine("                          instead of a TCP socket — for a client that launches");
+    w.WriteLine("                          al-runner directly (e.g. VS Code's DebugAdapterExecutable),");
+    w.WriteLine("                          no port to pick, no readiness race. stdout carries ONLY the");
+    w.WriteLine("                          DAP protocol; all logs go to stderr. See docs/dap-mode.md.");
+    w.WriteLine("  --tdd                   Local-development flag (not for CI). A test referencing a");
+    w.WriteLine("                          table field / procedure / enum value the implementing app");
+    w.WriteLine("                          doesn't have yet normally drops the whole app group with a");
+    w.WriteLine("                          compile failure (exit 3, zero test results). --tdd keeps");
+    w.WriteLine("                          every object that DID compile and reports each [Test]");
+    w.WriteLine("                          procedure in an object that could NOT be recovered as a");
+    w.WriteLine("                          FAILED test naming the missing symbol, so a red-green TDD");
+    w.WriteLine("                          cycle can start with an honestly red test (exit 1). Works");
+    w.WriteLine("                          together with --watch (a cycle with a missing symbol falls");
+    w.WriteLine("                          back to a full rebuild instead of the fast incremental");
+    w.WriteLine("                          path — the console names the reason). Not yet supported");
+    w.WriteLine("                          together with --server.");
     w.WriteLine("  --per-suite             Legacy per-Compilation path. Default is bundled mode");
     w.WriteLine("                          (5-7x faster, parity-verified).");
     w.WriteLine("  --bundled               No-op alias for the default bundled mode (deprecated).");
@@ -4147,7 +5708,22 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("  provision [<bundle-dir>] Download and install the BC artifacts matching the");
     w.WriteLine("                          project's version, then exit without running tests.");
     w.WriteLine("                          This is the supported way to obtain artifacts on a");
-    w.WriteLine("                          fresh machine.");
+    w.WriteLine("                          fresh machine — including a plain `dotnet tool install`");
+    w.WriteLine("                          with no source checkout. Run `al-runner provision --help`");
+    w.WriteLine("                          for its full flag list, or use one of:");
+    w.WriteLine("                            --platform-apps [--bc-version V] [--force]");
+    w.WriteLine("                                          Force-download Microsoft's platform .app");
+    w.WriteLine("                                          set into the canonical dir, bypassing");
+    w.WriteLine("                                          need-detection.");
+    w.WriteLine("                            --test-apps [--bc-version V] [--force]");
+    w.WriteLine("                                          Same, for the Microsoft test-toolkit set.");
+    w.WriteLine("                            --service-tier [--bc-version V] [--force]");
+    w.WriteLine("                                          Same, for the BC engine's service-tier DLLs.");
+    w.WriteLine("                            --resolve-version PREFIX");
+    w.WriteLine("                                          Print the latest full BC version for a");
+    w.WriteLine("                                          prefix (e.g. \"28.4\") to stdout.");
+    w.WriteLine("                          --force re-downloads even when the target directory");
+    w.WriteLine("                          already looks populated (default: leave it alone).");
     w.WriteLine("  --precompile <input.app> --out <output.dll> [--package-cache PATH ...]");
     w.WriteLine("                          Compile a single .app to a managed DLL without running");
     w.WriteLine("                          tests. Useful for pre-warming caches.");
@@ -4208,10 +5784,6 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("NOT YET IMPLEMENTED (see docs/v1-to-v2-migration.md)");
     w.WriteLine("  Nothing in this section is accepted as a flag. Everything documented above IS");
     w.WriteLine("  implemented.");
-    w.WriteLine("  (debug adapter)         v1's DAP debug server (DapServer.cs). Needs an AL→C#");
-    w.WriteLine("                          source map the compile pipeline does not currently");
-    w.WriteLine("                          expose; tracked as a separate workstream. Distinct from");
-    w.WriteLine("                          the JSON-RPC daemon in EXECUTION above, which IS supported.");
     w.WriteLine("  --stubs DIR             v1's stub-merge path. Real MS DLLs load in-process so the");
     w.WriteLine("                          original use case mostly evaporated; still possible to");
     w.WriteLine("                          add as an extra source-root merge if needed.");
@@ -4227,6 +5799,58 @@ static void PrintHelp(TextWriter w)
     w.WriteLine("  docs/limitations.md          architectural limits");
     w.WriteLine("  docs/cecil-migration.md      Cecil rewrite strategy");
     w.WriteLine("  docs/subsystems.md           subsystem map");
+}
+
+// Issue #2085: `provision --help` used to fall through to the generic arg-parser's
+// unknown-flag error ("Unknown option '--help'. Run with --help for the supported
+// flags.") — telling the caller to run the exact thing it just ran. Every subcommand
+// must answer --help, not just the top level.
+static void PrintProvisionHelp(TextWriter w)
+{
+    w.WriteLine("al-runner provision — download and install BC artifacts. Every form below works");
+    w.WriteLine("from a plain `dotnet tool install -g msdyn365bc.al.runner`; none require a source");
+    w.WriteLine("checkout of this repository.");
+    w.WriteLine();
+    w.WriteLine("USAGE");
+    w.WriteLine("  al-runner provision [<bundle-dir>]");
+    w.WriteLine("  al-runner provision --platform-apps [--bc-version V] [--force]");
+    w.WriteLine("  al-runner provision --test-apps [--bc-version V] [--force]");
+    w.WriteLine("  al-runner provision --service-tier [--bc-version V] [--force]");
+    w.WriteLine("  al-runner provision --resolve-version PREFIX");
+    w.WriteLine("  al-runner provision --help");
+    w.WriteLine();
+    w.WriteLine("OPTIONS");
+    w.WriteLine("  [<bundle-dir>]          With no mode flag: provision everything the named");
+    w.WriteLine("                          bundle's app.json needs (engine closure + platform apps");
+    w.WriteLine("                          + test toolkit, whichever are missing) and exit. This is");
+    w.WriteLine("                          the default `provision` behavior and what a provisioning-");
+    w.WriteLine("                          gap error's \"(a) One command (recommended)\" fix means.");
+    w.WriteLine("  --bc-version V          Target BC version (a prefix like \"28.4\" or a full");
+    w.WriteLine("                          4-part version). Default: this binary's own built");
+    w.WriteLine("                          engine version, or the target bundle's app.json.");
+    w.WriteLine("  --platform-apps         Force-download Microsoft's platform .app set (Base");
+    w.WriteLine("                          Application / System Application / Business Foundation /");
+    w.WriteLine("                          Application / Application Test Library) into the");
+    w.WriteLine("                          canonical <artifacts>/<version>/platform-apps directory,");
+    w.WriteLine("                          bypassing need-detection entirely.");
+    w.WriteLine("  --test-apps             Force-download the Microsoft test-toolkit .app set");
+    w.WriteLine("                          (Library Assert, Test Runner, Any, Tests-TestLibraries, …)");
+    w.WriteLine("                          into <artifacts>/<version>/test-apps, bypassing");
+    w.WriteLine("                          need-detection entirely.");
+    w.WriteLine("  --service-tier          Force-download the BC engine's ~55-DLL service-tier");
+    w.WriteLine("                          closure into <artifacts>/<version>, bypassing");
+    w.WriteLine("                          need-detection entirely.");
+    w.WriteLine("  --force                 With --platform-apps/--test-apps/--service-tier: re-run");
+    w.WriteLine("                          the download even if the canonical directory already");
+    w.WriteLine("                          contains files. Without it, a populated directory is");
+    w.WriteLine("                          left alone and nothing is re-downloaded.");
+    w.WriteLine("  --resolve-version PREFIX");
+    w.WriteLine("                          Resolve a BC version prefix (e.g. \"28.4\") to the latest");
+    w.WriteLine("                          full version published on the CDN and print it to stdout.");
+    w.WriteLine("  --help, -h              Print this text and exit 0.");
+    w.WriteLine();
+    w.WriteLine("--platform-apps/--test-apps/--service-tier/--resolve-version may be combined in");
+    w.WriteLine("one invocation (each named set is fetched); --force applies to all of them.");
 }
 
 static int RunPrecompile(string[] subArgs)
@@ -5147,6 +6771,8 @@ static string? SelectVersionDirOrNull(string root, string versionPrefix)
     }
 }
 
+// Walks up from <bundlePath> until it finds a dir containing app.json.
+// Returns null if none found before /tests/ or filesystem root.
 /// <summary>
 /// One app's AL → C# step, incremental when a RAD workspace is available.
 ///
@@ -5420,6 +7046,40 @@ static List<string> CollectBundleManifests(string? bucketRoot, string bundleAbs)
 }
 
 /// <summary>
+/// Issue #1996: the manifest-driven provisioning pre-scan. Unlike <see
+/// cref="ReadBundleDependencyRoots"/> (used for the REAL dependency-resolution closure),
+/// this is deliberately per-manifest fault-tolerant — a malformed/non-object app.json is a
+/// PRE-SCAN MISS here (logged, skipped), never a crash: the normal bundle loader reaches
+/// the same file moments later and owns the real diagnostic for it (acceptance criterion
+/// #9). Returns every Microsoft dependency root across all target <paramref name="bundles"/>
+/// (not deduped/sibling-filtered — <see cref="AlRunner.Infrastructure.ProvisioningCheck.DetermineManifestNeeds"/>
+/// only cares whether ANY root names a known app, so dedup buys nothing here).
+/// </summary>
+static List<DependencyRef> ScanManifestDependencyRoots(List<string> bundles)
+{
+    var allRoots = new List<DependencyRef>();
+    foreach (var bundle in bundles)
+    {
+        List<string> manifests;
+        try
+        {
+            var abs = Path.GetFullPath(bundle);
+            var bucketRoot = FindBucketRoot(abs);
+            manifests = CollectBundleManifests(bucketRoot, abs);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[provision] manifest pre-scan: skipping '{bundle}': {ex.Message}");
+            continue;
+        }
+        var roots = AlRunner.Infrastructure.ProvisioningCheck.TryReadManifestDependencyRoots(
+            manifests, ReadDependencies, m => Console.Error.WriteLine(m));
+        allRoots.AddRange(roots);
+    }
+    return allRoots;
+}
+
+/// <summary>
 /// Union the dependency roots declared across <paramref name="manifests"/>, keeping the
 /// highest version when two manifests name the same dependency.
 ///
@@ -5521,23 +7181,164 @@ static string? TryDeriveBcMajorFromProject(IEnumerable<string> bundlePaths)
     return null;
 }
 
+// Issue #2085: `al-runner provision --platform-apps|--test-apps|--service-tier [--force]`
+// — a tool-install-valid replacement for `dotnet run --project tools/DownloadArtifacts --
+// <mode> <ver> <dir>`, whose whole body is a switch over the same
+// AlRunner.Provisioning.ArtifactDownloader methods this calls. That project ships only as
+// source (never part of a packaged `dotnet tool install`), so a user without a checkout had
+// no way to reach it. Downloads straight into the canonical directory each mode already
+// resolves to at runtime (BcArtifacts.ArtifactDirFor / ProvisioningCheck.PlatformAppsDirFor /
+// TestAppsDirFor) — no need-detection, no bundle scan, just "fetch this set for this
+// version." `--force` re-downloads even when the directory already looks populated;
+// without it, a populated directory is left alone (mirrors EnsureTestToolkitProvisioned's
+// existing "already present" short-circuit).
+static int RunExplicitProvisionModes(string? bcVersionArg, List<string> bundles,
+    bool platformApps, bool testApps, bool serviceTier, bool force, string? resolveVersionPrefix)
+{
+    if (resolveVersionPrefix != null)
+    {
+        var resolved = AlRunner.Provisioning.ArtifactDownloader.ResolveVersion(
+            resolveVersionPrefix, m => Console.Error.WriteLine($"[provision] {m}"));
+        if (resolved == null)
+        {
+            Console.Error.WriteLine($"[provision] could not resolve a full BC version for prefix '{resolveVersionPrefix}'.");
+            return 1;
+        }
+        Console.WriteLine(resolved); // stdout for script/agent consumption, mirrors tools/DownloadArtifacts
+        return 0;
+    }
+
+    var full = ResolveFullVersionForExplicitProvision(bcVersionArg, bundles);
+    if (full == null)
+        return 1; // the resolver already printed a loud, named reason
+
+    bool anyFailed = false;
+    if (serviceTier)
+    {
+        var dir = AlRunner.Infrastructure.BcArtifacts.ArtifactDirFor(full);
+        anyFailed |= ForceProvisionMode("BC service-tier engine DLLs", dir, full, force, "*.dll",
+            (v, d, log) => AlRunner.Provisioning.ArtifactDownloader.ServiceTier(v, d, log)) != 0;
+    }
+    if (platformApps)
+    {
+        var dir = AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsDirFor(
+            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, full);
+        anyFailed |= ForceProvisionMode("Microsoft platform apps", dir, full, force, "*.app",
+            (v, d, log) => AlRunner.Provisioning.ArtifactDownloader.PlatformApps(v, d, log)) != 0;
+    }
+    if (testApps)
+    {
+        var dir = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
+            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, full);
+        anyFailed |= ForceProvisionMode("Microsoft test-toolkit apps", dir, full, force, "*.app",
+            (v, d, log) => AlRunner.Provisioning.ArtifactDownloader.TestApps(v, d, log)) != 0;
+    }
+    return anyFailed ? 1 : 0;
+}
+
+// Shared by every explicit provision mode: skip the download when the canonical directory
+// already contains at least one file matching <paramref name="expectedGlob"/> (unless
+// --force), otherwise run <paramref name="download"/> and report success/failure. Named
+// per-mode so the log lines read like the rest of `[provision]` output, not a generic
+// "done"/"failed".
+static int ForceProvisionMode(string label, string outputDir, string fullVersion, bool force,
+    string expectedGlob, Func<string, string, Action<string>, int> download)
+{
+    if (!force && Directory.Exists(outputDir) && Directory.EnumerateFiles(outputDir, expectedGlob).Any())
+    {
+        Console.Error.WriteLine($"[provision] {label} already present at {outputDir} for BC {fullVersion} — skipping (pass --force to re-download).");
+        return 0;
+    }
+    Console.Error.WriteLine($"[provision] fetching {label} for BC {fullVersion} → {outputDir}");
+    try
+    {
+        var rc = download(fullVersion, outputDir, m => Console.Error.WriteLine($"[provision] {m}"));
+        if (rc != 0)
+            Console.Error.WriteLine($"[provision] warning: {label} download failed for BC {fullVersion}.");
+        return rc;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[provision] warning: {label} download failed for BC {fullVersion}: {ex.Message}");
+        return 1;
+    }
+}
+
+// Resolves the full 4-part BC version to target for an EXPLICIT provision mode
+// (--platform-apps/--test-apps/--service-tier). Deliberately mirrors RunProvisioning's own
+// resolution (explicit --bc-version, else the engine's own major, else the target bundle's
+// app.json major; prefer an already-cached matching version, else resolve the latest full
+// version from the CDN) — kept as a separate small function rather than sharing
+// RunProvisioning's inline block because that block's own success message ("verifying
+// completeness") describes what RunProvisioning does NEXT (an engine-closure completeness
+// check), which does not apply here.
+static string? ResolveFullVersionForExplicitProvision(string? bcVersionArg, List<string> bundles)
+{
+    if (bcVersionArg != null && System.Version.TryParse(bcVersionArg, out var maybeFull) && maybeFull.Revision >= 0
+        && bcVersionArg.Split('.').Length == 4)
+        return bcVersionArg; // an explicit 4-part version — target exactly that
+
+    var prefix = bcVersionArg
+        ?? AlRunner.Infrastructure.BcArtifacts.EngineMajor(AppContext.BaseDirectory)?.ToString()
+        ?? TryDeriveBcMajorFromProject(bundles);
+    if (prefix == null)
+    {
+        Console.Error.WriteLine("[provision] cannot determine which BC version to provision — pass " +
+            "--bc-version <ver> (no --bc-version, no engine in bin, and no readable project app.json).");
+        return null;
+    }
+    try
+    {
+        var cachedDir = AlRunner.Infrastructure.BcArtifacts.SelectArtifactVersionDir(
+            AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, prefix);
+        var full = Path.GetFileName(cachedDir);
+        Console.Error.WriteLine($"[provision] found cached BC {full} for prefix '{prefix}'.");
+        return full;
+    }
+    catch (InvalidOperationException)
+    {
+        Console.Error.WriteLine($"[provision] no cached BC {prefix}.x — resolving latest full version from the CDN...");
+        var full = AlRunner.Provisioning.ArtifactDownloader.ResolveVersion(prefix);
+        if (full == null)
+            Console.Error.WriteLine($"[provision] could not resolve a full BC version for prefix '{prefix}'.");
+        return full;
+    }
+}
+
 // Provisioning driver for the `provision` subcommand / --auto-provision. Resolves the
 // target BC version (explicit/defaulted exact build, else the engine/project major),
 // prefers an already-cached matching version (completing a partial one) and otherwise
 // resolves the latest full version from the CDN, then downloads the engine service-tier
 // closure if it is missing/incomplete. Returns 0 on success (already-complete counts) and
-// sets provisionedVersion to the full version to run against; 1 on failure. This is opt-in
-// — the only path in the runner that downloads.
+// sets provisionedVersion to the full version to run against; 1 on failure. This is the
+// only path in the runner that downloads — on by default since issue #2024, refusable
+// with --no-auto-provision.
+//
+// <paramref name="provisionManifestApps"/> (issue #1996, AC #6): whether THIS call should
+// also provision platform-apps/test-apps. Pass true only for the `provision` subcommand,
+// which never reaches the post-SelectVersion gate in Program's top-level flow (it returns
+// immediately after this call) — for a continuing --auto-provision run, that gate is the
+// sole owner instead, so passing true there would attempt the SAME download twice in one
+// invocation (once here, pre-selection; once there, post-selection).
 static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
-    List<string> bundles, bool provisionManifestApps, out string? provisionedVersion,
-    out bool engineProvisioningFailed)
+    List<string> bundles, bool provisionManifestApps, List<Action>? deferredLines,
+    out string? provisionedVersion, out bool engineProvisioningFailed)
 {
     provisionedVersion = null;
     engineProvisioningFailed = false;
 
     if (artifactPathArg != null)
     {
-        Console.Error.WriteLine("[provision] --artifact-path points at an explicit dir; nothing to provision.");
+        // #2041/#2066: `deferredLines` null means print immediately (the `provision`
+        // subcommand call — see the call site's comment for why); non-null means queue
+        // this STEADY-STATE success line onto it instead, never an error path. The
+        // caller flushes the queue once IT has confirmed no further re-exec follows —
+        // see `deferredStartupLines`'s declaration in Program's top-level flow.
+        if (deferredLines == null)
+            Console.Error.WriteLine("[provision] --artifact-path points at an explicit dir; nothing to provision.");
+        else
+            deferredLines.Add(() => Console.Error.WriteLine(
+                "[provision] --artifact-path points at an explicit dir; nothing to provision."));
         return 0;
     }
 
@@ -5566,6 +7367,12 @@ static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
             var cachedDir = AlRunner.Infrastructure.BcArtifacts.SelectArtifactVersionDir(
                 AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, prefix);
             full = Path.GetFileName(cachedDir);
+            // Not gated on `quiet`: unlike the two lines below, a re-exec'd child sees a
+            // DIFFERENT resolution outcome here than the parent did whenever the parent
+            // itself just downloaded (parent: "no cached ... resolving from the CDN",
+            // child: "found cached ... verifying completeness") — the two lines are not
+            // literal duplicates of each other, so suppressing either risks hiding a
+            // real state transition rather than a genuine repeat.
             Console.Error.WriteLine($"[provision] found cached BC {full} for prefix '{prefix}' — verifying completeness.");
         }
         catch (InvalidOperationException)
@@ -5583,7 +7390,21 @@ static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
     var serviceTierDir = AlRunner.Infrastructure.BcArtifacts.ArtifactDirFor(full);
     var report = AlRunner.Infrastructure.ProvisioningCheck.Check(full, serviceTierDir);
     if (report.Ok)
-        Console.Error.WriteLine($"[provision] BC {full} engine artifacts already complete at {serviceTierDir}.");
+    {
+        // #2041/#2066: the steady-state "nothing to do" line — deferred, same reasoning
+        // as the --artifact-path branch above. AutoProvision's own download progress
+        // messages below are NOT gated/deferred: they only fire once regardless (by the
+        // time a shadow-re-exec child gets here the download already completed, so IT
+        // takes this same Ok branch instead), and a download in progress is exactly the
+        // kind of "real one-time work" .claude/rules/loud-failures.md means to stay loud.
+        var fullForPrint = full;
+        var serviceTierDirForPrint = serviceTierDir;
+        if (deferredLines == null)
+            Console.Error.WriteLine($"[provision] BC {fullForPrint} engine artifacts already complete at {serviceTierDirForPrint}.");
+        else
+            deferredLines.Add(() => Console.Error.WriteLine(
+                $"[provision] BC {fullForPrint} engine artifacts already complete at {serviceTierDirForPrint}."));
+    }
     else if (!AlRunner.Infrastructure.ProvisioningCheck.AutoProvision(full, serviceTierDir))
     {
         engineProvisioningFailed = true;
@@ -5592,170 +7413,168 @@ static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
 
     if (provisionManifestApps)
     {
-        var requirements =
-            AlRunner.Infrastructure.ProvisioningCheck.DeriveMicrosoftRequirements(bundles);
-        if (requirements.PlatformAppsRequired
-            && !EnsurePlatformAppsProvisioned(full, requirements))
+        if (!EnsurePlatformAppsProvisioned(full, bundles))
             return 1;
-
-        // Preserve `al-runner provision` with no target: historically it provisioned the
-        // toolkit alongside the engine. With a target, app.json decides whether test-apps
-        // are needed; an application-only bundle no longer pays for irrelevant packages.
-        if (requirements.TestAppsRequired
-            && !EnsureTestToolkitProvisioned(full, requirements))
+        if (!EnsureTestToolkitProvisioned(full, bundles))
             return 1;
-        if (requirements.ManifestPaths.Count == 0)
-        {
-            var toolkitOnly = new AlRunner.Infrastructure.ProvisioningCheck.MicrosoftProvisioningRequirements(
-                PlatformAppsRequired: false,
-                TestAppsRequired: true,
-                MinimumVersion: null,
-                RequiredTestAppNames: Array.Empty<string>(),
-                ManifestPaths: Array.Empty<string>());
-            if (!EnsureTestToolkitProvisioned(full, toolkitOnly))
-                return 1;
-        }
     }
     provisionedVersion = full;
     return 0;
 }
 
-// Ensure the manifest-required platform set for the selected full BC version. app.json
-// versions are compatibility floors, not download pins: a BC 27 project can run on the
-// selected BC 28 engine, and must receive BC 28 runtime packages. The exact versioned
-// destination is checked first; compatible warm builds from the same minor are reusable.
-static bool EnsurePlatformAppsProvisioned(
-    string selectedFullVersion,
-    AlRunner.Infrastructure.ProvisioningCheck.MicrosoftProvisioningRequirements requirements)
+// Ensure the manifest-required platform set for the selected full BC version. A warm
+// same-minor set is reused only after the same manifest decision that triggered the
+// provision has adjudicated it.
+static bool EnsurePlatformAppsProvisioned(string selectedFullVersion, List<string> bundles)
 {
     var artifactsRoot = AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir;
-    var selectedDir = AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsDirFor(
-        artifactsRoot, selectedFullVersion);
-    if (AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
-            selectedDir, selectedFullVersion, requirements))
+    var bundleDirs = AlRunner.Infrastructure.ProvisioningCheck.CollectBundleAlpackagesDirs(bundles);
+    var roots = ScanManifestDependencyRoots(bundles);
+    var initialReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+        selectedFullVersion, bundleDirs);
+    var initialDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+        roots, initialReport, bundleDirs);
+
+    if (!initialDecision.ShouldDownloadPlatform)
     {
-        Console.Error.WriteLine(
-            $"[provision] platform apps already complete at {selectedDir} (no download).");
+        Console.Error.WriteLine(initialDecision.NeedsPlatformApps
+            ? "[provision] platform R2R apps already present for the target bundle(s)."
+            : "[provision] target bundle(s) do not need the platform R2R apps set — nothing to provision.");
         return true;
     }
 
-    var selected = System.Version.Parse(selectedFullVersion);
-    var mm = $"{selected.Major}.{selected.Minor}";
+    var selected = Version.Parse(selectedFullVersion);
+    var majorMinor = $"{selected.Major}.{selected.Minor}";
+    var floors = AlRunner.Infrastructure.ProvisioningCheck.DetermineVersionFloors(roots);
+    var candidateFloor = AlRunner.Infrastructure.ProvisioningCheck.MinimumUsefulR2RVersion(initialReport);
+    foreach (var floor in floors.Values)
+        if (candidateFloor == null || floor > candidateFloor)
+            candidateFloor = floor;
+
     foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedPlatformAppsDirs(
-                 artifactsRoot, mm, requirements.MinimumVersion))
+                 artifactsRoot, majorMinor, candidateFloor))
     {
-        if (string.Equals(candidate, selectedDir, StringComparison.OrdinalIgnoreCase))
-            continue;
-        if (AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
-                candidate, selectedFullVersion, requirements))
+        var searchDirs = bundleDirs.Append(candidate).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var candidateReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+            selectedFullVersion, searchDirs);
+        var candidateDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+            roots, candidateReport, searchDirs);
+        if (!candidateDecision.ShouldDownloadPlatform)
         {
-            Console.Error.WriteLine($"[provision] platform apps for BC {mm} already provisioned " +
-                $"at {candidate} — reusing (no download).");
+            Console.Error.WriteLine($"[provision] platform apps already complete at {candidate}; " +
+                $"reusing already-provisioned platform apps for selected BC {majorMinor} (no download).");
             return true;
         }
-        Console.Error.WriteLine(
-            $"[provision] {candidate} is incomplete for the target manifests — trying the next candidate.");
+
+        foreach (var violation in AlRunner.Infrastructure.ProvisioningCheck.FindVersionFloorViolations(
+                     new[] { candidate }, floors))
+            Console.Error.WriteLine(
+                $"[provision] warm set '{candidate}' rejected: '{violation.AppName}' found at " +
+                $"v{violation.FoundVersion}, but app.json requires >= v{violation.RequiredVersion}.");
     }
 
+    var destination = AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsDirFor(
+        artifactsRoot, selectedFullVersion);
     Console.Error.WriteLine(
-        $"[provision] fetching Microsoft platform R2R apps for BC {selectedFullVersion} → {selectedDir}");
+        $"[provision] fetching Microsoft platform R2R apps for BC {selectedFullVersion} → {destination}");
     try
     {
         var rc = AlRunner.Provisioning.ArtifactDownloader.PlatformApps(
-            selectedFullVersion, selectedDir, m => Console.Error.WriteLine($"[provision] {m}"));
+            selectedFullVersion, destination, m => Console.Error.WriteLine($"[provision] {m}"));
         if (rc != 0)
         {
             Console.Error.WriteLine(
                 $"[provision] could not fetch platform apps for BC {selectedFullVersion}; cannot continue.");
             return false;
         }
-        if (!AlRunner.Infrastructure.ProvisioningCheck.PlatformAppsPresent(
-                selectedDir, selectedFullVersion, requirements))
-        {
-            Console.Error.WriteLine(
-                $"[provision] platform-apps download completed but {selectedDir} is still incomplete " +
-                "for the target app.json requirements; cannot continue.");
-            return false;
-        }
-        return true;
     }
     catch (Exception ex)
     {
         Console.Error.WriteLine($"[provision] platform-apps download failed: {ex.Message}");
         return false;
     }
+
+    var finalDirs = bundleDirs.Append(destination).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    var finalReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
+        selectedFullVersion, finalDirs);
+    var finalDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+        roots, finalReport, finalDirs);
+    if (finalDecision.ShouldDownloadPlatform)
+    {
+        Console.Error.WriteLine(
+            $"[provision] platform-apps download completed but {destination} is still incomplete " +
+            "for the target app.json requirements; cannot continue.");
+        return false;
+    }
+    return true;
 }
 
-// The MS test toolkit (Any, Library Assert, Library Variable Storage, Test Runner,
-// Tests-TestLibraries, Permissions Mock, System Application Test Library) is what every
-// test bundle's app.json actually depends on, but it ships in the platform artifact rather
-// than with the engine closure. Without it a test app resolves those deps to whatever
-// symbols-only copies its own .alpackages happen to hold and dies at runtime — so the user
-// had to hand-assemble a package dir with no command that could produce one.
-// Provisioned into <artifacts>/<version>/test-apps/, which DefaultPackageCacheDirs scans,
-// so a provisioned machine needs no --package-cache for the toolkit at all.
-static bool EnsureTestToolkitProvisioned(
-    string fullVersion,
-    AlRunner.Infrastructure.ProvisioningCheck.MicrosoftProvisioningRequirements requirements)
+// Provision the Microsoft test toolkit only when a target manifest needs it. With no target,
+// preserve the subcommand's historical "prepare a complete runner" behavior.
+static bool EnsureTestToolkitProvisioned(string fullVersion, List<string> bundles)
 {
-    var artifactsRoot = AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir;
-    var dir = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(artifactsRoot, fullVersion);
-    // The real toolkit predicate, not "the dir has some .app files in it". An interrupted
-    // download leaves a dir full of country test apps without Business Foundation Test
-    // Libraries — the one app every test bundle transitively needs — and the old presence
-    // test reported that as provisioned, so the gap resurfaced later as an unresolvable
-    // dependency instead of being finished here. The exact requested destination wins;
-    // compatible warm builds from the selected minor are considered before a download.
-    if (AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(dir, requirements))
+    var roots = ScanManifestDependencyRoots(bundles);
+    var needsTestApps = bundles.Count == 0
+        || AlRunner.Infrastructure.ProvisioningCheck.DetermineManifestNeeds(roots).NeedsTestApps;
+    if (!needsTestApps)
     {
-        Console.Error.WriteLine($"[provision] test toolkit already present at {dir}.");
+        Console.Error.WriteLine(
+            "[provision] target bundle(s) do not need the Microsoft test toolkit — nothing to provision.");
         return true;
     }
 
-    var selected = System.Version.Parse(fullVersion);
-    var mm = $"{selected.Major}.{selected.Minor}";
-    foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
-                 artifactsRoot, mm, requirements.MinimumVersion))
+    var artifactsRoot = AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir;
+    var floors = AlRunner.Infrastructure.ProvisioningCheck.DetermineVersionFloors(roots);
+    var destination = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
+        artifactsRoot, fullVersion);
+    if (AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(new[] { destination }, floors))
     {
-        if (string.Equals(candidate, dir, StringComparison.OrdinalIgnoreCase)) continue;
-        if (!AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(candidate, requirements)) continue;
-        Console.Error.WriteLine($"[provision] test toolkit for BC {mm} already provisioned " +
+        Console.Error.WriteLine($"[provision] test toolkit already present at {destination}.");
+        return true;
+    }
+
+    var selected = Version.Parse(fullVersion);
+    var majorMinor = $"{selected.Major}.{selected.Minor}";
+    Version? candidateFloor = null;
+    foreach (var floor in floors.Values)
+        if (candidateFloor == null || floor > candidateFloor)
+            candidateFloor = floor;
+    foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
+                 artifactsRoot, majorMinor, candidateFloor))
+    {
+        if (!AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(new[] { candidate }, floors))
+            continue;
+        Console.Error.WriteLine($"[provision] test toolkit for BC {majorMinor} already provisioned " +
             $"at {candidate} — reusing (no download).");
         return true;
     }
 
-    Console.Error.WriteLine($"[provision] fetching the MS test toolkit for BC {fullVersion} → {dir}");
+    Console.Error.WriteLine($"[provision] fetching the MS test toolkit for BC {fullVersion} → {destination}");
     try
     {
         var rc = AlRunner.Provisioning.ArtifactDownloader.TestApps(
-            fullVersion, dir, m => Console.Error.WriteLine($"[provision] {m}"));
+            fullVersion, destination, m => Console.Error.WriteLine($"[provision] {m}"));
         if (rc != 0)
         {
             Console.Error.WriteLine(
                 $"[provision] could not fetch the test toolkit for BC {fullVersion}; cannot continue.");
             return false;
         }
-        // Re-check, mirroring the startup gate: ArtifactDownloader.TestApps reports success on
-        // ANY non-zero extraction count and skips individual entries silently, so rc == 0 does
-        // NOT mean the sentinel landed. Without this, a partial extraction (or a BC version
-        // whose platform artifact genuinely lacks the sentinel app) re-downloads the whole
-        // toolkit on every single invocation and says nothing about why — a silent loop, which
-        // is exactly what .claude/rules/loud-failures.md forbids. The old `any *.app` guard
-        // stopped after one download precisely because it asked a weaker question.
-        if (!AlRunner.Infrastructure.ProvisioningCheck.TestAppsPresent(dir, requirements))
-        {
-            Console.Error.WriteLine(
-                $"[provision] test-apps download completed but {dir} is still incomplete for " +
-                "the target app.json requirements; cannot continue.");
-            return false;
-        }
-        return true;
     }
     catch (Exception ex)
     {
         Console.Error.WriteLine($"[provision] test-toolkit download failed: {ex.Message}");
         return false;
     }
+
+    if (!AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(new[] { destination }, floors))
+    {
+        Console.Error.WriteLine(
+            $"[provision] test-apps download completed but {destination} is still incomplete " +
+            "for the target app.json requirements; cannot continue.");
+        return false;
+    }
+    return true;
 }
 
 static void SetBundleInfoFromAppJson(string appJsonPath)
@@ -6009,7 +7828,17 @@ static string ComputeAlCacheKey(
     //        branch, missing NoImplicitWith, stale contextSensitiveHelpUrl) forever, until
     //        something else in the key happened to change. v10 entries never hashed the
     //        manifest at all and must not be served under the new key shape.
-    WriteLine("schema:v11");
+    //    v12 (issue #1997): added a tdd:<0|1> line. --tdd keeps recovered sources for
+    //        objects a normal run drops entirely and can (in a follow-up) inject
+    //        generated members into the in-memory compile — a --tdd assembly and a
+    //        normal-mode assembly for the SAME source bytes are not the same output.
+    //        Without this line a bare run and a --tdd run over identical sources hash
+    //        identically, and whichever compiled first would silently serve the other:
+    //        a normal run reusing a --tdd-generated DLL, or (just as bad) a later --tdd
+    //        run reusing a normal-mode DLL and reporting the excluded tests' vanished
+    //        instead of failed. v11 entries never hashed this and must not be served.
+    WriteLine("schema:v12");
+    WriteLine($"tdd:{(AlRunner.BcCompiler.IsTddMode() ? "1" : "0")}");
 
     // 1. Runner assembly fingerprint (content hash, not mtime — see v10 note above) +
     //    the selected BC version, so any rewriter/polyfill/patch change in the runner,

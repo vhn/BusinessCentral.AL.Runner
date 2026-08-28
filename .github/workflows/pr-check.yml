@@ -64,6 +64,140 @@ jobs:
           echo ""
           echo "Test presence check passed. Copilot review will assess test quality."
 
+  release-workflow-script-tests:
+    name: Release workflow script tests
+    runs-on: ubuntu-latest
+    # The actual test run is gated inside the job (see the "Check whether..."
+    # step below) on whether publish.yml's extracted scripts or their tests
+    # changed -- they're plain bash unrelated to the rest of a typical PR.
+    # #2060: resolve_release_ref.sh is a new extraction of publish.yml's
+    # resolve/validate logic (which ref gets pushed to, and whether the
+    # dispatch can be released at all), specifically so it's provable
+    # without dispatching the real release workflow.
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check whether the scripts or their tests changed
+        id: changed
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          CHANGED=$(git diff --name-only "$BASE"..."$HEAD")
+          if echo "$CHANGED" | grep -qE '^\.github/scripts/(resolve_release_ref\.sh|test_resolve_release_ref\.sh)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run resolve_release_ref.sh tests
+        if: steps.changed.outputs.run == 'true'
+        run: bash .github/scripts/test_resolve_release_ref.sh
+
+  changelog-generator-tests:
+    name: CHANGELOG generator tests
+    runs-on: ubuntu-latest
+    # Gated inside the job (see "Check whether..." below) on whether the
+    # generator or its tests changed -- plain Python unrelated to most PRs.
+    # #2109: the classifier now shells out to git for --unreleased mode
+    # (git describe / git log), where it used to be a pure string-classifier
+    # driven entirely by caller-supplied env vars.
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check whether the generator or its tests changed
+        id: changed
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          CHANGED=$(git diff --name-only "$BASE"..."$HEAD")
+          if echo "$CHANGED" | grep -qE '^\.github/scripts/(generate_changelog\.py|test_generate_changelog\.py)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run generate_changelog.py tests
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          git config --global user.email "test@example.com"
+          git config --global user.name "Test"
+          python3 .github/scripts/test_generate_changelog.py
+
+  reject-ci-skip-directives:
+    name: PR title/body must not contain a CI-skip directive
+    runs-on: ubuntu-latest
+    # #2116: this repo squash-merges, and GitHub's default squash commit
+    # message is "<title> (#N)" followed by the PR body (see
+    # .claude/rules/branch-and-pr.md). GitHub matches several skip-CI
+    # spellings ANYWHERE in a commit message, not just in a dedicated
+    # trailer -- so a directive appearing in EITHER the title or the body,
+    # even just describing it in prose, lands in the merge commit and
+    # silently skips every workflow on that commit. This happened for real:
+    # #2115's own PR body explained sync-changelog-unreleased.yml's use of
+    # "[skip ci]" in its own commit, and that explanation -- once squashed
+    # into 7a3c3535's commit message -- skipped the one required check on
+    # main, along with the sync workflow's own first run. Nothing enforced
+    # this at write time; this job catches it before merge, the only point
+    # where it's still cheap. No label bypasses this one -- unlike
+    # require-tests, there's no legitimate reason for a PR to actually ship
+    # a live skip directive in its title or body, only to WRITE ABOUT one,
+    # which the escape hatch in check_ci_skip_directives.sh's failure
+    # message covers.
+    #
+    # The actual check logic lives in check_ci_skip_directives.sh, extracted
+    # specifically so it's unit-tested (test_check_ci_skip_directives.sh)
+    # rather than provable only by opening a real PR against it.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run check_ci_skip_directives.sh's own unit tests
+        run: bash .github/scripts/test_check_ci_skip_directives.sh
+
+      - name: Check PR title and body for CI-skip directives
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash .github/scripts/check_ci_skip_directives.sh
+
+  reject-bad-closing-references:
+    name: PR body closing references must be correct, both directions
+    runs-on: ubuntu-latest
+    # #2121 (missing) and #2128 (unintended): this repo squash-merges, and
+    # GitHub folds the PR title + body into the squash commit message (see
+    # .claude/rules/branch-and-pr.md). GitHub's closing-reference parser
+    # (Closes/Fixes/Resolves + #N, case-insensitive, optionally repo-prefixed)
+    # fires on that pattern ANYWHERE in the message, and does not understand
+    # surrounding prose -- negation, qualification, none of it changes what
+    # closes on merge. Two failure modes follow:
+    #
+    #   - Missing: the PR body has no closing reference at all, so the linked
+    #     issue never auto-closes and is left labeled in-progress forever.
+    #     Real instances: #2046, #1642, #1640.
+    #   - Unintended: the PR body has a closing keyword next to an issue
+    #     number the PR does NOT intend to close, often written to explicitly
+    #     say it does NOT close that issue. GitHub closes it anyway. Real
+    #     instance: PR #2127's body said "This does not close #2125" and
+    #     merge commit fe789a13 closed #2125 regardless.
+    #
+    # The actual check logic lives in check_closing_reference.sh, extracted
+    # specifically so it's unit-tested (test_check_closing_reference.sh)
+    # rather than provable only by opening a real PR against it.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run check_closing_reference.sh's own unit tests
+        run: bash .github/scripts/test_check_closing_reference.sh
+
+      - name: Check PR body for a correct closing reference
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash .github/scripts/check_closing_reference.sh
+
   # validate-coverage (docs/coverage.yaml) removed at the v1->v2 cutover: v1 tracked
   # AL-language coverage in a hand-curated YAML the orchestrator validated on every PR.
   # v2's spec is the tests/al-language/ corpus itself -- every AL surface that needs

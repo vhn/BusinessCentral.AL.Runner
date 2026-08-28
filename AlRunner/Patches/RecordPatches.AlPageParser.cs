@@ -84,7 +84,8 @@ public static partial class RecordPatches
                 // none", which Page Metadata reports as CardPageID = 0 (a real, meaningful
                 // value: Base App "Page Management".GetDefaultCardPageID reads it to decide
                 // whether a table has a card page at all).
-                CardPageName: PageRefText(PropValue(props, "CardPageId"))));
+                CardPageName: PageRefText(PropValue(props, "CardPageId")),
+                MemberIdToName: ParseMemberNames(id, p)));
         }
 
         foreach (var obj in objects)
@@ -104,7 +105,8 @@ public static partial class RecordPatches
                 ControlIdToFieldName: extFieldMap,
                 InsertAllowed: !PropIs(pe.PropertyList, "InsertAllowed", "false"),
                 BaseName: Unquote(pe.BaseObject?.ToString()?.Trim() ?? ""),
-                Controls: extControls));
+                Controls: extControls,
+                MemberIdToName: ParseMemberNames(id, pe)));
         }
 
         return (pages, pageExtensions);
@@ -118,12 +120,70 @@ public static partial class RecordPatches
     }
 
     /// <summary>
+    /// Member id → declared AL NAME for every named field control and action of one page or
+    /// pageextension, in the DECLARING object's own id space. This is the reverse index
+    /// trigger dispatch needs (issue #1968): the emitted C# trigger method carries the name
+    /// only in MANGLED form (<c>"Spaced Stamp"</c> → <c>Spaced_Stamp_a45_OnAction</c>), and
+    /// un-mangling is ambiguous — <c>Spaced_Stamp</c> reads back identically for the AL names
+    /// <c>"Spaced Stamp"</c> and <c>Spaced_Stamp</c>, which hash to DIFFERENT member ids. The
+    /// AL source is the one place the true name still exists, so the id is derived from it
+    /// here, forward, the same way BC's own IdSpace does.
+    /// <para>Unlike <see cref="ParsePageControls"/> this walk keeps every NAMED control —
+    /// non-Rec-bound and compound-expression fields included — because a trigger can hang off
+    /// any of them; the Rec.-bound scope limit over there is about field BINDING, not naming.
+    /// </para>
+    /// </summary>
+    private static Dictionary<int, string> ParseMemberNames(int declaringObjectId, SyntaxNode obj)
+    {
+        var map = new Dictionary<int, string>();
+        void Add(string name)
+        {
+            if (name.Length == 0) return;
+            // TryAdd, not indexer: a field and an action of the SAME name hash to the same
+            // member id and carry the same name — first writer wins, the value is identical.
+            map.TryAdd(IdSpace.GetMemberId(declaringObjectId, name), name);
+        }
+
+        foreach (var field in obj.DescendantNodes().OfType<NavSyntax.PageFieldSyntax>())
+            Add(IdentText(field.Name));
+        foreach (var action in obj.DescendantNodes().OfType<NavSyntax.PageActionSyntax>())
+            Add(IdentText(action.Name));
+        return map;
+    }
+
+    /// <summary>
+    /// The declared AL name of member <paramref name="memberId"/> on the page or
+    /// pageextension <paramref name="declaringObjectId"/>, or null when the object was never
+    /// AL-source-parsed here (a page that ships precompiled in a dependency .app) or does not
+    /// declare the member. <paramref name="isExtension"/> picks the id namespace — a page and
+    /// a pageextension may share an object number (#1710), and the caller always knows which
+    /// one it is dispatching against.
+    /// </summary>
+    internal static string? TryGetPageMemberName(int declaringObjectId, int memberId, bool isExtension)
+    {
+        var dict = isExtension ? _parsedPageExtensions : _parsedPages;
+        return dict.TryGetValue(declaringObjectId, out var parsed)
+               && parsed.MemberIdToName.TryGetValue(memberId, out var name)
+            ? name
+            : null;
+    }
+
+    /// <summary>
     /// Whether the page permits inserts (AL's <c>InsertAllowed</c>, default TRUE when the
     /// property is absent). Drives ITestPage.Creatable, which BC's NavTestPageBase.New()
-    /// checks before inserting. Unknown pages default to true — same as AL.
+    /// checks before inserting.
+    /// <para>Checks the runner's own AL-source-parsed pages first, then (issue #2088's sibling
+    /// defect — this method had the SAME "_parsedPages only" gap as
+    /// <see cref="GetPageControlFieldMap"/>, called right alongside it at every TestPage/part
+    /// construction site) a loaded dependency .app's SymbolReference.json, which already
+    /// carries InsertAllowed for the "Page Metadata" virtual table (#1769). A page unknown to
+    /// either source defaults to true — AL's own default.</para>
     /// </summary>
     internal static bool GetInsertAllowedForPage(int pageId)
-        => !_parsedPages.TryGetValue(pageId, out var page) || page.InsertAllowed;
+    {
+        if (_parsedPages.TryGetValue(pageId, out var page)) return page.InsertAllowed;
+        return TryGetDependencyPageSymbol(pageId)?.InsertAllowed ?? true;
+    }
 
     /// <summary>
     /// Whether the AL source parser has seen this PAGE at all. Lets callers tell
@@ -201,25 +261,62 @@ public static partial class RecordPatches
     /// `field(NoteField; Rec."Note")` made BC ask LiveNavTestPage.GetField for control
     /// 788108655 == GetMemberId(64301, "NoteField"); GetMemberId(64300, "NoteField") is
     /// 321499490 and never appears.</para>
+    /// <para><b>Precompiled-dependency fallback (issue #2088):</b> a page that ships
+    /// precompiled in a dependency .app (Base Application, System Application, an ISV
+    /// extension) is never AL-source-parsed here, so it is never in <c>_parsedPages</c> —
+    /// that used to mean this method answered an empty map for it regardless of what its
+    /// controls are actually bound to, and every field control read on such a page refused
+    /// with <c>testpage-control-binding</c>, even ones the dependency's own
+    /// SymbolReference.json states are plain <c>Rec.Field</c> bindings. That file is the
+    /// SAME source the "Page Control Field" virtual table (#1779) already reads for exactly
+    /// this data, so a page miss here now falls back to it via the shared
+    /// <see cref="ResolveDependencyControlField"/> resolver — one control resolution rule for
+    /// both consumers, not a second hand-rolled one. Pageextensions are not folded into this
+    /// fallback: a pageextension that extends a dependency-only base page is itself
+    /// AL-source-parsed (or it too ships precompiled and gets its own dependency-symbol
+    /// entry), and <see cref="GetPageExtensionIdsForPage"/> already resolves the base page's
+    /// name through the same dependency fallback for that separate, existing path.</para>
     /// </summary>
     internal static IReadOnlyDictionary<int, int> GetPageControlFieldMap(int pageId)
     {
-        if (!_parsedPages.TryGetValue(pageId, out var page) || string.IsNullOrWhiteSpace(page.SourceTableName))
+        if (_parsedPages.TryGetValue(pageId, out var page))
+        {
+            if (string.IsNullOrWhiteSpace(page.SourceTableName))
+                return new Dictionary<int, int>();
+
+            var table = _parsedTables.Values.FirstOrDefault(t => NamesEqual(t.TableName, page.SourceTableName));
+            if (table == null) return new Dictionary<int, int>();
+
+            var result = new Dictionary<int, int>();
+            BindControls(page.ControlIdToFieldName, table, result);
+            // Only extensions of THIS page. Binding every extension's controls onto every page
+            // would fabricate bindings that the AL never declared.
+            foreach (var ext in _parsedPageExtensions.Values)
+                if (NamesEqual(ext.BaseName, page.Name))
+                    BindControls(ext.ControlIdToFieldName, table, result);
+            return result;
+        }
+
+        var symbol = TryGetDependencyPageSymbol(pageId);
+        if (symbol == null || symbol.SourceTableId == 0 || symbol.Controls == null || symbol.Controls.Count == 0)
             return new Dictionary<int, int>();
 
-        var table = _parsedTables.Values.FirstOrDefault(t => NamesEqual(t.TableName, page.SourceTableName));
-        if (table == null) return new Dictionary<int, int>();
+        if (!_parsedTables.TryGetValue(symbol.SourceTableId, out var depTable))
+        {
+            TryPopulateParsedTableFromBcApps(symbol.SourceTableId);
+            _parsedTables.TryGetValue(symbol.SourceTableId, out depTable);
+        }
+        if (depTable == null) return new Dictionary<int, int>();
 
-        var result = new Dictionary<int, int>();
-        BindControls(page.ControlIdToFieldName);
-        // Only extensions of THIS page. Binding every extension's controls onto every page
-        // would fabricate bindings that the AL never declared.
-        foreach (var ext in _parsedPageExtensions.Values)
-            if (NamesEqual(ext.BaseName, page.Name))
-                BindControls(ext.ControlIdToFieldName);
-        return result;
+        var depResult = new Dictionary<int, int>();
+        foreach (var control in symbol.Controls)
+        {
+            var (_, fieldNo) = ResolveDependencyControlField(control.SourceExpression, symbol.SourceTableId, depTable);
+            if (fieldNo != 0) depResult[control.Id] = fieldNo;
+        }
+        return depResult;
 
-        void BindControls(IReadOnlyDictionary<int, string> controls)
+        static void BindControls(IReadOnlyDictionary<int, string> controls, ParsedTable table, Dictionary<int, int> result)
         {
             foreach (var kvp in controls)
             {
@@ -372,10 +469,15 @@ internal record ParsedPage(
     /// <summary>AL's <c>CardPageId</c> property, as the last name segment of the page
     /// reference (unresolved — see <see cref="RecordPatches"/>.PageMetadataVirtualTable.cs).
     /// Null when the page declares none.</summary>
-    string? CardPageName = null)
+    string? CardPageName = null,
+    /// <summary>Member id → declared AL name for every named field control and action of this
+    /// object, in its own id space — see <see cref="RecordPatches"/>.ParseMemberNames (#1968).</summary>
+    IReadOnlyDictionary<int, string>? MemberIdToName = null)
 {
     // Positional records can't give a collection parameter a literal default that isn't a
     // constant, so a null Controls (constructed via the shorter historical call sites/tests,
     // if any ever appear) is normalized to empty rather than NRE-ing every consumer.
     public IReadOnlyList<PageControlRow> Controls { get; init; } = Controls ?? Array.Empty<PageControlRow>();
+    public IReadOnlyDictionary<int, string> MemberIdToName { get; init; }
+        = MemberIdToName ?? new Dictionary<int, string>();
 }

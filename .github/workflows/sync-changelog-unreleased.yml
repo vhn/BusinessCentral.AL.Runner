@@ -1,0 +1,85 @@
+name: Sync CHANGELOG [Unreleased]
+
+# Keeps CHANGELOG.md's "## [Unreleased]" section a live answer to "what's
+# about to ship", recomputed from every commit since the last release tag
+# (#2109). Before this workflow, generate_changelog.py only ran inside
+# publish.yml at release time, so [Unreleased] sat empty between releases —
+# right when it was filed, empty with 11 merged PRs already sitting on main.
+#
+# generate_changelog.py --unreleased recomputes the section from
+# `git describe --tags --abbrev=0`..HEAD every time this runs and reports
+# whether the text actually changed (`changed=true`/`false`), so a run that
+# finds nothing new commits nothing. That also makes this workflow safe
+# against re-triggering itself: pushing the sync commit onto main fires this
+# workflow again, but by then HEAD already reflects the state the sync
+# computed, so the second run is a no-op. The sync commit's message carries
+# "[skip ci]" as well, so GitHub does not even schedule that second run (or
+# the full bc-tests.yml matrix test-matrix.yml would otherwise trigger for a
+# CHANGELOG-only commit) in the first place.
+#
+# A release itself (publish.yml) also pushes its own CHANGELOG commit
+# straight to main and would otherwise re-trigger this workflow on THAT push.
+# This is deliberately made race-proof, not just probably-fine: publish.yml
+# pushes the release commit BEFORE its next command creates and pushes the
+# release tag, so a sync run triggered by that same push could be checked out
+# on the release commit while the tag still isn't visible on origin.
+# generate_changelog.py's update_unreleased() handles this by recognizing the
+# checked-out commit as a release commit FROM ITS OWN MESSAGE ("chore:
+# release vX.Y.Z") and refusing to run at all in that case — it never
+# consults `git describe`, so it never depends on whether the tag has landed.
+# See that function's docstring for the full reasoning. The complementary
+# half of the fix lives in generate_release_section() (also in
+# generate_changelog.py, called by publish.yml): it WIPES whatever this
+# workflow last wrote into [Unreleased] before inserting the new version's
+# own section, rather than leaving that content dangling underneath it.
+#
+# This is the ONE place besides a release itself that CHANGELOG.md changes
+# outside a pull request. It has to be that way: no PR may touch
+# CHANGELOG.md at all (.claude/rules/no-changelog-edits.md), specifically so
+# merges never conflict on it. Pushes here bypass the branch ruleset the same
+# documented way publish.yml's release job does — via RELEASE_DEPLOY_KEY, a
+# deploy key with "Always allow" set for it.
+
+on:
+  push:
+    branches: [main]
+  # #2116: a push whose commit message trips one of GitHub's CI-skip
+  # spellings never triggers this workflow at all -- it isn't "this run
+  # failed", it's "GitHub never scheduled a run", so there's nothing to
+  # retry from the Actions UI. workflow_dispatch lets a human recover by
+  # hand once that's noticed; schedule means it self-heals without anyone
+  # noticing, since a run against unchanged content is a genuine no-op
+  # (generate_changelog.py --unreleased reports changed=false and nothing
+  # is committed) -- this costs nothing beyond a few seconds of compute on
+  # every day nothing was missed.
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'  # once daily; the exact time doesn't matter
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Recompute [Unreleased] from commits since the last tag
+        id: sync
+        run: python3 .github/scripts/generate_changelog.py --unreleased >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push if it changed
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          git add CHANGELOG.md
+          git commit -m "chore: update changelog [skip ci]"
+          git push origin HEAD:main

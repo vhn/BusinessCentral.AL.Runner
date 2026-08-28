@@ -28,10 +28,31 @@ namespace AlRunner.Infrastructure;
 public static class BcArtifacts
 {
     public const string ArtifactsRoot_Rel = ".local/share/al-runner/artifacts";
+    public const string ArtifactsRootEnvVar = "AL_RUNNER_ARTIFACTS_ROOT";
 
-    /// <summary>The explicit download command users must run (no auto-download).</summary>
-    public static string DownloadCommand(System.Version ver, string dir)
-        => $"dotnet run --project tools/DownloadArtifacts -- service-tier {ver} \"{dir}\"";
+    /// <summary>
+    /// The tool-install-valid, one-command fix — works identically whether the runner
+    /// came from `dotnet tool install` or a source checkout. This is the PRIMARY
+    /// recommendation in every provisioning-gap message: unlike the old
+    /// `tools/DownloadArtifacts` fallback, it names no path that only exists in this
+    /// repo's own source tree.
+    /// </summary>
+    public static string ProvisionHint(string? versionPrefix = null)
+        => versionPrefix == null
+            ? "al-runner provision   (or re-run your command with --auto-provision)"
+            : $"al-runner provision --bc-version {versionPrefix}   (or re-run your command with --auto-provision)";
+
+    /// <summary>
+    /// The explicit, force-a-specific-download fallback: `provision --service-tier`
+    /// (issue #2085). Unlike the old `dotnet run --project tools/DownloadArtifacts --
+    /// service-tier` this replaced — which required a source checkout of this repo, so it
+    /// was a dead end for anyone who reached it via `dotnet tool install` — this is a
+    /// subcommand on the SAME binary printing the message, so it always works. Bypasses
+    /// need-detection and resolves its own canonical output directory, so no directory
+    /// argument is needed here (kept as a parameter for the version only).
+    /// </summary>
+    public static string DownloadCommand(System.Version ver)
+        => $"al-runner provision --service-tier --bc-version {ver} --force";
 
     private static System.Version? _selectedVersion;
     private static string? _selectedRoot;
@@ -61,48 +82,30 @@ public static class BcArtifacts
     private static readonly object _lock = new();
 
     /// <summary>
-    /// Env var that relocates the whole artifacts root. Set it to a directory holding
-    /// version-named subdirs and every artifact path the runner derives — version
-    /// selection, the engine closure, and the runner-owned <c>platform-apps</c> /
-    /// <c>test-apps</c> provisioning destinations — moves with it.
-    ///
-    /// <para>Distinct from <c>--artifact-path</c>, which pins ONE version's engine dir.
-    /// This names the root the version scan and the provisioning destinations live under,
-    /// which <c>--artifact-path</c> cannot express.</para>
-    ///
-    /// <para>Exists because the root was otherwise only reachable by moving <c>HOME</c>,
-    /// which relocates every other home-rooted path too (caches, default package caches)
-    /// and forces anything wanting an isolated artifacts root to reconstruct the
-    /// <c>.local/share/al-runner/artifacts</c> layout by hand — a second spelling of a
-    /// path this class is supposed to own.</para>
+    /// Pure resolution used by tests. A nonblank override relocates the entire versioned
+    /// artifact tree; otherwise the normal home-rooted location is used.
     /// </summary>
-    public const string ArtifactsRootEnvVar = "AL_RUNNER_ARTIFACTS_ROOT";
-
-    /// <summary>
-    /// Pure resolution of the artifacts root: <paramref name="envOverride"/> when set to
-    /// something non-blank, else the home-rooted default under
-    /// <paramref name="userHome"/>. Separated from the property so both directions are
-    /// testable WITHOUT mutating the process environment — an in-process env-var test would
-    /// race every other test that reads this root, and this root is what decides where the
-    /// runner looks for a multi-GB engine.
-    /// </summary>
-    /// <para>Absolutised: <see cref="TryTranslateArtifactPathToVersion"/> compares a
-    /// <c>Path.GetFullPath</c>'d <c>--artifact-path</c> against this root with an ordinal
-    /// string compare, so a RELATIVE override would never match and would silently route the
-    /// run onto the explicit-root selection branch instead of normal version selection.</para>
     internal static string ResolveArtifactsRoot(string? envOverride, string userHome)
         => !string.IsNullOrWhiteSpace(envOverride)
             ? Path.GetFullPath(envOverride.Trim())
             : Path.Combine(userHome, ArtifactsRoot_Rel);
 
-    private static string ArtifactsRoot => ResolveArtifactsRoot(
-        Environment.GetEnvironmentVariable(ArtifactsRootEnvVar),
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+    private static string ArtifactsRoot
+    {
+        get
+        {
+            var envOverride = Environment.GetEnvironmentVariable(ArtifactsRootEnvVar);
+            // Resolve a deliberate override without touching HOME. With no override,
+            // AlRunnerPaths.UserHome supplies upstream's loud invalid-HOME validation.
+            return !string.IsNullOrWhiteSpace(envOverride)
+                ? ResolveArtifactsRoot(envOverride, "")
+                : ResolveArtifactsRoot(null, AlRunnerPaths.UserHome);
+        }
+    }
 
-    /// <summary>The per-user artifacts root (<c>~/.local/share/al-runner/artifacts</c>, or
-    /// <see cref="ArtifactsRootEnvVar"/> when set), where each BC version lives in a
-    /// version-named subdir. Public for the provisioning flow, which downloads into
-    /// <see cref="ArtifactDirFor"/> before selection runs.</summary>
+    /// <summary>The per-user artifacts root (<c>~/.local/share/al-runner/artifacts</c>),
+    /// where each BC version lives in a version-named subdir. Public for the provisioning
+    /// flow, which downloads into <see cref="ArtifactDirFor"/> before selection runs.</summary>
     public static string ArtifactsRootDir => ArtifactsRoot;
 
     /// <summary>The artifact directory for a specific full version string.</summary>
@@ -181,8 +184,9 @@ public static class BcArtifacts
     {
         if (!Directory.Exists(rootDir))
             throw new InvalidOperationException(
-                $"BC artifact root not found: {rootDir}. No artifacts are downloaded — " +
-                $"download one explicitly, e.g.: {DownloadCommand(new System.Version(28, 1), rootDir)}");
+                $"BC artifact root not found: {rootDir}. No artifacts are downloaded — resolve it ONE of these ways: " +
+                $"(a) {ProvisionHint()}; " +
+                $"(b) {DownloadCommand(new System.Version(28, 1))}");
 
         var candidates = Directory.EnumerateDirectories(rootDir)
             .Select(d => (Dir: d, Name: Path.GetFileName(d),
@@ -193,8 +197,9 @@ public static class BcArtifacts
 
         if (candidates.Count == 0)
             throw new InvalidOperationException(
-                $"BC artifact root {rootDir} contains no version-named directories. " +
-                $"Download one explicitly, e.g.: {DownloadCommand(new System.Version(28, 1), rootDir)}");
+                $"BC artifact root {rootDir} contains no version-named directories. Resolve it ONE of these ways: " +
+                $"(a) {ProvisionHint()}; " +
+                $"(b) {DownloadCommand(new System.Version(28, 1))}");
 
         if (requestedVersionOrNull == null)
             return candidates[0].Dir;
@@ -208,18 +213,15 @@ public static class BcArtifacts
             var available = string.Join(", ", candidates.Select(t => t.Name));
             throw new InvalidOperationException(
                 $"No BC artifact under {rootDir} matches version '{requestedVersionOrNull}'. " +
-                $"Available: {available}. Download it explicitly, e.g.: " +
-                $"{DownloadCommand(System.Version.TryParse(EnsureFourPart(prefix), out var pv) ? pv : new System.Version(28, 1), rootDir)}");
+                $"Available: {available}. Resolve it ONE of these ways: " +
+                $"(a) {ProvisionHint(prefix)}; " +
+                $"(b) {DownloadCommand(System.Version.TryParse(EnsureFourPart(prefix), out var pv) ? pv : new System.Version(28, 1))}");
         }
         return match.Dir;
     }
 
     // "27.5" matches "27.5.46862.48827"; "28.1.49838.50794" matches itself; "27.50"
     // does NOT match "27.5.x". Segment-wise prefix on the dotted name.
-    //
-    // Public because ProvisioningCheck's provisioned-set discovery needs exactly this
-    // semantic when it asks "is there already a provisioned set for this major.minor?".
-    // A second copy of a matcher this subtle is how "27.50" starts matching "27.5.x".
     public static bool VersionNameMatchesPrefix(string name, string prefix)
     {
         if (string.Equals(name, prefix, StringComparison.Ordinal)) return true;
@@ -278,6 +280,16 @@ public static class BcArtifacts
     }
 
     /// <summary>
+    /// Startup consistency check: the engine DLL (Ncl) baked into bin/ is built for a
+    /// specific BC version. If the selected artifact/dependency version has a different
+    /// MAJOR, the dependency symbols and the engine disagree at the API level — fail loud.
+    ///
+    /// We compare MAJOR only: BC pins its assembly version at <c>MAJOR.0.0.0</c>
+    /// regardless of the product/file version (the 28.1.x artifact ships Ncl with
+    /// AssemblyName.Version = 28.0.0.0), so minor/patch skew (28.1.x build vs 28.1.y
+    /// cache, or a 28.0-stamped assembly inside a 28.1 artifact) is expected and tolerated.
+    /// </summary>
+    /// <summary>
     /// The BC MAJOR version the engine (bin Ncl.dll) was built for, or null when the
     /// engine DLL is absent / unversioned. This is the only major this binary can run
     /// (cross-major needs a matching engine build); used to default artifact selection.
@@ -300,8 +312,7 @@ public static class BcArtifacts
     /// The full 4-part BC version this binary was BUILT against, baked in at compile time
     /// from the csproj `_BCVersion` property (see the AssemblyMetadata item there). This is
     /// the only place the built MINOR survives into the shipped binary — Ncl.dll's own
-    /// assembly version is major.0.0.0. Null if the attribute is missing, unparseable, or
-    /// not a full four-part build (a prefix cannot prove exact compatibility).
+    /// assembly version is major.0.0.0. Null if the attribute is missing or unparseable.
     /// </summary>
     public static Version? EngineBuiltVersion()
     {
@@ -375,15 +386,82 @@ public static class BcArtifacts
     }
 
     /// <summary>
-    /// Startup consistency check: the engine DLL (Ncl) baked into bin/ is built for a
-    /// specific BC version. If the selected artifact/dependency version has a different
-    /// MAJOR, the dependency symbols and the engine disagree at the API level — fail loud.
+    /// Pure core of <see cref="DefaultProvisionTarget"/>, network-injectable for testing
+    /// (see AlRunner.Tests.DefaultProvisionTargetTests) — same shape as
+    /// <see cref="DescribeExplicitEngineMinorMismatch"/>/<see cref="WarnIfExplicitEngineMinorMismatch"/>:
+    /// a provable pure function plus a thin real-network wrapper.
     ///
-    /// We compare MAJOR only: BC pins its assembly version at <c>MAJOR.0.0.0</c>
-    /// regardless of the product/file version (the 28.1.x artifact ships Ncl with
-    /// AssemblyName.Version = 28.0.0.0), so minor/patch skew cannot be detected here.
-    /// Implicit provisioning avoids that skew by targeting the baked four-part version.
+    /// Issue #2033: <see cref="DefaultVersionPrefix"/> answers "what does the LOCAL CACHE
+    /// already have" — the right question when there is no provisioning step coming (offline
+    /// / --no-auto-provision), but the wrong one when auto-provisioning is about to run
+    /// anyway. On a genuinely empty cache it collapses straight to "major only" before a
+    /// single byte has been fetched, and the caller then asked provisioning for "the newest
+    /// build of major 28" instead of "BC 28.1, the engine's own minor" — landing on 28.4 while
+    /// the engine was built for 28.1. This variant tries the SAME three tiers (exact build,
+    /// then minor, then major) but at each tier also asks whether the CDN can fetch it before
+    /// giving up and falling looser, so auto-provisioning downloads what version selection
+    /// actually wants instead of "whatever happens to already be cached."
     /// </summary>
+    /// <param name="tier">
+    /// Which tier won: "cached-exact"/"cached-minor" (already local, nothing to fetch,
+    /// identical to <see cref="DefaultVersionPrefix"/>'s outcome), "cdn-exact"/"cdn-minor"
+    /// (not cached but the CDN has it — provisioning will fetch exactly this), or
+    /// "major-fallback" (neither the engine's exact build nor its minor is available from
+    /// either source — genuinely degraded; the caller must warn, per issue #2020).
+    /// </param>
+    public static string ResolveProvisionTargetCore(Version engineVersion, string artifactsRoot,
+        Func<string, bool> cdnHasExactVersion, Func<string, string?> cdnResolvePrefix, out string tier)
+    {
+        // Tier 1: the exact 4-part build — cached, or fetchable from the CDN.
+        var exact = engineVersion.ToString();
+        try
+        {
+            SelectArtifactVersionDir(artifactsRoot, exact);
+            tier = "cached-exact";
+            return exact;
+        }
+        catch (InvalidOperationException) { /* not cached — try the CDN, then fall through */ }
+        if (cdnHasExactVersion(exact))
+        {
+            tier = "cdn-exact";
+            return exact;
+        }
+
+        // Tier 2: the engine's own minor — cached, or resolvable to a full build via the CDN.
+        var majorMinor = $"{engineVersion.Major}.{engineVersion.Minor}";
+        try
+        {
+            SelectArtifactVersionDir(artifactsRoot, majorMinor);
+            tier = "cached-minor";
+            return majorMinor;
+        }
+        catch (InvalidOperationException) { /* not cached — try the CDN, then fall through */ }
+        var minorResolved = cdnResolvePrefix(majorMinor);
+        if (minorResolved != null)
+        {
+            tier = "cdn-minor";
+            return minorResolved;
+        }
+
+        // Tier 3: neither the exact build nor the engine's own minor is available from
+        // either source (e.g. Microsoft withdrew the build — #2010). Fall back to the bare
+        // major; the caller resolves+downloads the latest build of it and must warn loud —
+        // this is the one genuinely degraded outcome, not the default-path norm.
+        tier = "major-fallback";
+        return engineVersion.Major.ToString();
+    }
+
+    /// <summary>
+    /// Real-network wrapper around <see cref="ResolveProvisionTargetCore"/> — the one
+    /// Program.cs calls on the auto-provision default path (issue #2033).
+    /// </summary>
+    public static string DefaultProvisionTarget(Version engineVersion, string artifactsRoot, out string tier,
+        Action<string>? log = null)
+        => ResolveProvisionTargetCore(engineVersion, artifactsRoot,
+            v => AlRunner.Provisioning.ArtifactDownloader.VersionExists(v, log),
+            p => AlRunner.Provisioning.ArtifactDownloader.ResolveVersion(p, log),
+            out tier);
+
     public static void VerifyEngineConsistency(string binDir)
     {
         var ncl = Path.Combine(binDir, "Microsoft.Dynamics.Nav.Ncl.dll");
@@ -402,4 +480,71 @@ public static class BcArtifacts
                 $"(--bc-version {engineVer.Major}).");
         }
     }
+
+    /// <summary>
+    /// Pure core of <see cref="WarnIfExplicitEngineMinorMismatch"/>, split out for direct unit
+    /// testing (see AlRunner.Tests.EngineMinorMismatchWarningTests) — mirrors the
+    /// BcEngineReadinessGuard.AssertReadyOnCi(bool,string?,bool) shape: a pure function over
+    /// explicit values is provable with no BC engine or CLI invocation involved.
+    ///
+    /// #2008's actual root cause: a shipped al-runner binary's engine (Ncl.dll etc.) is built
+    /// for one BC MINOR (the release pipeline pins BC 28.1 as `required-version` — see
+    /// bc-tests.yml), but Ncl.dll's own AssemblyVersion is always MAJOR.0.0.0, so
+    /// VerifyEngineConsistency (which only compares Major) cannot see a same-major
+    /// different-minor selection at all. Running that binary with `--bc-version 28.3`
+    /// silently ran BC 28.1's engine against BC 28.3 artifacts and threw a
+    /// NullReferenceException deep inside BC's own FieldDataProvider ctor
+    /// (NavGlobal.get_SystemTenant → get_NCLMetadata) with nothing pointing at the real
+    /// cause. The runner ALREADY had this exact warning — Program.cs's auto-select default
+    /// path prints it when the user passes neither --bc-version nor --artifact-path — but it
+    /// was unreachable in precisely the case that needed it: an EXPLICIT --bc-version/
+    /// --artifact-path skips the auto-select branch entirely. This is the same warning,
+    /// reachable from the explicit-selection path too.
+    /// </summary>
+    internal static string? DescribeExplicitEngineMinorMismatch(System.Version? builtVersion, System.Version selectedVersion)
+    {
+        if (builtVersion == null) return null; // older/unstamped binary — nothing to compare
+        if (builtVersion.Major == selectedVersion.Major && builtVersion.Minor == selectedVersion.Minor)
+            return null; // matched minor, or patch-level skew within it — tolerated, same as VerifyEngineConsistency
+
+        return $"[bc] warning: this binary's engine was built for BC {builtVersion} but BC {selectedVersion} was " +
+            $"explicitly selected (--bc-version/--artifact-path) — different minor is a KNOWN-DEGRADED " +
+            $"configuration (measured: dozens of extra failures from engine/artifact minor skew, see #2008). " +
+            $"Fix with one of: drop --bc-version so the runner auto-selects its own engine's minor " +
+            $"({builtVersion.Major}.{builtVersion.Minor}), or rebuild with -p:_BCVersion={selectedVersion}.";
+    }
+
+    /// <summary>
+    /// Called ONLY when the user explicitly chose the BC version (--bc-version or
+    /// --artifact-path) — never from the auto-select default path, which already prints its
+    /// own equivalent warning inside Program.cs and must not be double-warned. See
+    /// DescribeExplicitEngineMinorMismatch for the full rationale.
+    /// </summary>
+    public static void WarnIfExplicitEngineMinorMismatch()
+    {
+        var msg = DescribeExplicitEngineMinorMismatch(EngineBuiltVersion(), SelectedVersion);
+        if (msg != null) Console.Error.WriteLine(msg);
+    }
+
+    /// <summary>
+    /// Issue #2037: whether Program.cs should even CALL <see cref="WarnIfExplicitEngineMinorMismatch"/>
+    /// at all, given how many per-BC-minor engine variants this install ships (see
+    /// <see cref="EngineVariants.Discover"/>, called just before the variant-swap block in
+    /// Program.cs — the same input, so no rediscovery is needed at the call site).
+    ///
+    /// The warning compares THIS PROCESS's own compiled-in engine minor against the
+    /// selected version — a comparison that stopped being meaningful the moment a packaged
+    /// install started shipping more than one engine (#2027 / #2035): once <em>any</em>
+    /// variant is shipped, the variant-selection block downstream is the sole authority —
+    /// either a matching variant is found (this process is about to swap into the right
+    /// engine, making the warning's claim false, as reported live against the published
+    /// 2.5.0 package with `--bc-version 27.5.46862.53931`) or none matches (that block itself
+    /// exits with a sharper, version-naming error before a generic warning would even help).
+    /// So the warning has nothing correct left to say once <paramref name="shippedVariantCount"/>
+    /// is nonzero. It is only still true for a single-build install with no variants/
+    /// directory at all (shippedVariantCount == 0) — the case #2008 was filed against, which
+    /// must stay reachable.
+    /// </summary>
+    public static bool ShouldWarnExplicitEngineMinorMismatch(bool bcVersionAutoSelected, int shippedVariantCount)
+        => !bcVersionAutoSelected && shippedVariantCount == 0;
 }

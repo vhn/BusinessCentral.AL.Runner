@@ -19,7 +19,7 @@ namespace AlRunner.Infrastructure;
 
 public static class NclCecilRewrite
 {
-    private const int CACHE_VERSION = 127;
+    private const int CACHE_VERSION = 128;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Cecil-owned skip registry (JmpHook→Cecil migration enabler).
@@ -54,6 +54,10 @@ public static class NclCecilRewrite
         // once the JmpHook layer went off by default — so BC's SQL body ran and NRE'd.
         "Microsoft.Dynamics.Nav.Runtime.ALDatabase::ALLastUsedRowVersion/0",
         "Microsoft.Dynamics.Nav.Runtime.ALDatabase::ALMinimumActiveRowVersion/0",
+        // ALDatabase.get_ALSerialNumber (#1883 follow-up) — genuinely NREs standalone
+        // (NavSession.get_License() chain), confirmed empirically. Cecil-migrated onto the
+        // ReturnStandalone_0Args sentinel; legacy JmpHook registration deleted from BcRuntime.cs.
+        "Microsoft.Dynamics.Nav.Runtime.ALDatabase::get_ALSerialNumber/0",
         // ALSystemEncryption AL-facing statics (Cecil-migrated onto the in-process
         // AES envelope) — legacy JmpHooks must no-op.
         "Microsoft.Dynamics.Nav.Runtime.ALSystemEncryption::ALEncrypt/1",
@@ -244,6 +248,19 @@ public static class NclCecilRewrite
         // body runs (rename propagation to validated TableRelation fields, issue #1730).
         // RecordLink / management
         "Microsoft.Dynamics.Nav.Runtime.RecordLink::MoveLinksAsync/2",
+        // RecordLink::HasLinks/1 is ALSO Cecil-rewritten (ReplaceWithStaticHelper below, "RecordLink
+        // — rewrite all link-management methods") but was missing from this list (#1883 follow-up).
+        // RecordLinkPatches.cs separately JmpHook's the same static with its own replacement
+        // (RecordLink_HasLinks) — kept as defense-in-depth (same precedent as NavXmlPort::Run
+        // below), but the missing key here meant the audit misclassified it as "orphaned" instead
+        // of "redundant", and — more importantly — meant JmpHook.Apply would have actually
+        // installed the native patch on top of the Cecil-rewritten body if AL_RUNNER_ENABLE_JMPHOOK=1
+        // ever re-enabled the JmpHook layer: the exact JmpHook+Cecil COEXISTENCE double-dispatch
+        // spin this registry exists to prevent (see NCLEnumMetadata::Create/1 above). Registering
+        // the key here makes JmpHook.Apply skip installing the native patch entirely (see
+        // JmpHook.Apply's CecilOwned check) — the redundant registration becomes provably inert
+        // under BOTH JmpHook-enabled and JmpHook-disabled configurations, not just the default.
+        "Microsoft.Dynamics.Nav.Runtime.RecordLink::HasLinks/1",
         "Microsoft.Dynamics.Nav.Runtime.NavManagementTasks::CopyCompany/2",
         // NCLMetaApplicationObject
         "Microsoft.Dynamics.Nav.Runtime.NCLMetaApplicationObject::CheckApplicationObjectIsValid/1",
@@ -295,6 +312,17 @@ public static class NclCecilRewrite
         "Microsoft.Dynamics.Nav.Runtime.NavSession::get_ExecutionContext/0",
         "Microsoft.Dynamics.Nav.Runtime.RecordImplementation::GetActiveCompany/0",
         "Microsoft.Dynamics.Nav.Runtime.NavStream::get_Target/0",
+        // NavHttpClient/NavHttpResponseMessageBase/NavHttpRequestMessage.get_Target — same
+        // skeleton-parented delegation shape as NavRecordRef/NavStream.get_Target above (see
+        // RewriteNcl, "NavHttpClient egress" block). NavHttpClient and NavHttpResponseMessageBase
+        // were already Cecil-rewritten there but missing from this list (#1883 follow-up) — their
+        // BcRuntime.cs JmpHook registrations were kept as defense-in-depth (same precedent as
+        // NavXmlPort::Run below) but the audit misclassified them as "orphaned" instead of
+        // "redundant" for want of this key. NavHttpRequestMessage.get_Target was a genuine gap
+        // (no Cecil rewrite existed at all) — added alongside this key in the same commit.
+        "Microsoft.Dynamics.Nav.Runtime.NavHttpClient::get_Target/0",
+        "Microsoft.Dynamics.Nav.Runtime.NavHttpResponseMessageBase::get_Target/0",
+        "Microsoft.Dynamics.Nav.Runtime.NavHttpRequestMessage::get_Target/0",
         // FlowField CalcFieldsAsync — body already Cecil-rewritten upstream; register
         // keys so FlowFieldPatches.Register's JmpHook.Apply fallback becomes a no-op.
         "Microsoft.Dynamics.Nav.Runtime.RecordImplementation::CalcFieldsAsync/2",
@@ -2313,6 +2341,45 @@ public static class NclCecilRewrite
                     Console.Error.WriteLine("[Cecil] Rewrote NavHttpResponseMessageBase.get_Target → BcRuntime helper (skeleton-parented)");
                 }
             }
+
+            // NavHttpRequestMessage.get_Target — same skeleton-parented delegation as
+            // NavHttpClient.get_Target / NavHttpResponseMessageBase.get_Target above, but this
+            // one was MISSING here (#1883 follow-up): its BcRuntime.cs JmpHook registration
+            // (BcRuntime.NavHttpRequestMessage_get_Target, unchanged, already correct) never
+            // fires under Cecil-only mode, so BC's real body ran instead and genuinely NREs —
+            // confirmed empirically: `var Req: HttpRequestMessage;` alone throws
+            // ArgumentNullException(parent) out of TreeObject..ctor, because
+            // NavHttpRequestMessage's own ctor eagerly calls Target.SetMessage(...) during
+            // scope-ctor field setup, and the real get_Target body constructs
+            // `new SharedNavHttpRequestMessage(base.Tree.Session.Company.SharedObjects)` with a
+            // null container on the headless skeleton. Unlike the sibling two, this is not a
+            // "same shape, already safe" case — it is the one-in-eight genuine bug #1883 asks
+            // each cluster to check for. Delegate to the existing BcRuntime helper (identical
+            // shape to the sibling two, just never wired into Cecil).
+            var httpReqType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.NavHttpRequestMessage");
+            if (httpReqType != null)
+            {
+                var getTarget = httpReqType.Methods.FirstOrDefault(mm => mm.Name == "get_Target");
+                var sharedReqType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.SharedNavHttpRequestMessage");
+                var helperMI = typeof(AlRunner.BcRuntime).GetMethod(
+                    nameof(AlRunner.BcRuntime.NavHttpRequestMessage_get_Target),
+                    BindingFlags.Public | BindingFlags.Static);
+                if (getTarget != null && getTarget.HasBody && sharedReqType != null && helperMI != null)
+                {
+                    var helperRef = asm.MainModule.ImportReference(helperMI);
+                    var body = getTarget.Body;
+                    body.Instructions.Clear();
+                    body.Variables.Clear();
+                    body.ExceptionHandlers.Clear();
+                    var il = body.GetILProcessor();
+                    il.Append(il.Create(OpCodes.Ldarg_0));
+                    il.Append(il.Create(OpCodes.Call, helperRef));
+                    il.Append(il.Create(OpCodes.Castclass, sharedReqType));
+                    il.Append(il.Create(OpCodes.Ret));
+                    body.MaxStackSize = 1;
+                    Console.Error.WriteLine("[Cecil] Rewrote NavHttpRequestMessage.get_Target → BcRuntime helper (skeleton-parented)");
+                }
+            }
         }
 
         // ALDatabase.ALSetDefaultTableConnection / ALHasTableConnection — both NRE
@@ -2365,6 +2432,24 @@ public static class NclCecilRewrite
                     il.Append(il.Create(OpCodes.Ret));
                     body.MaxStackSize = 1;
                     Console.Error.WriteLine($"[Cecil] Rewrote ALDatabase.{m.Name} → return false");
+                }
+
+                // ALDatabase.get_ALSerialNumber (#1883 follow-up) — genuinely NREs standalone,
+                // confirmed empirically (not just from the pre-existing comment, per #2004/#2014's
+                // discipline): NavSession.get_License() reads Database.SecurityAndLicense.License,
+                // which chains into skeleton-null service-tier state and throws
+                // NullReferenceException at Microsoft.Dynamics.Nav.Runtime.NavSession.get_License()
+                // before ALSerialNumber's own body even runs. The prior JmpHook registration for
+                // this (BcRuntime.cs, deleted in this same change) targeted this exact method and
+                // is provably orphaned now that JmpHook is off by default — Cecil must own it
+                // instead. Reuses the existing ReturnStandalone_0Args "STANDALONE" sentinel
+                // (same one Database.TenantId/318-navtext-string-rewrite already return) rather
+                // than inventing a new placeholder.
+                foreach (var m in alDatabaseType.Methods.Where(x =>
+                    x.Name == "get_ALSerialNumber" && x.Parameters.Count == 0 && x.HasBody))
+                {
+                    ReplaceBodyWithHelper(asm.MainModule, m, nameof(AlRunner.BcRuntime.ReturnStandalone_0Args));
+                    Console.Error.WriteLine("[Cecil] Rewrote ALDatabase.get_ALSerialNumber → STANDALONE sentinel");
                 }
             }
         }
@@ -6533,6 +6618,101 @@ public static class NclCecilRewrite
         }
 
         // ─────────────────────────────────────────────────────────────────────
+        // NavMethodScope.Exit() — --capture-values hook (issue #1640, second slice;
+        // --coverage above was the first, #1922).
+        //
+        // NOT a StmtHit hook, despite the coverage block right above being the obvious
+        // template — see AlValueCapture.cs's file header for why a StmtHit-based "keep
+        // overwriting the latest hit" design is provably one statement stale (BC calls
+        // StmtHit(N) BEFORE statement N's own side effect, so the LAST hit never sees the
+        // LAST statement's result). Exit() is decompiled as:
+        //   internal void Exit() { statementNumber = int.MaxValue; ...; Dispose(); }
+        // called from Run()'s `finally` — i.e. exactly once per scope, unconditionally
+        // (success or AL error), strictly AFTER every OnRun() statement has completed and
+        // strictly BEFORE Dispose() (confirmed by decompile: Dispose() only touches
+        // Tree/session bookkeeping, never AL-declared fields). Prepending BEFORE Exit()'s
+        // own first instruction means AlValueCapture.OnExit sees both the true final field
+        // values AND the real last-executed statementNumber (not yet stomped to
+        // int.MaxValue).
+        //
+        // #2074 later ALSO fed AlValueCapture from the StmtHit hook above (via
+        // AlCoverageTracker.OnStmtHit -> AlValueCapture.OnStmtHit — no new Cecil rewrite,
+        // it reuses the same call site), for every INTERMEDIATE execution. This Exit()
+        // hook stays exactly as it was: it is still the only observation point for
+        // whatever the TRUE FINAL statement changed, since there is no StmtHit call after
+        // it — the "one statement stale" problem this comment describes for a naive
+        // overwrite-on-every-hit design still applies to that one, unavoidable case.
+        {
+            var nclMod = asm.MainModule;
+            const string MsType = "Microsoft.Dynamics.Nav.Runtime.NavMethodScope";
+            var hookMi = typeof(AlRunner.Infrastructure.AlValueCapture).GetMethod(
+                nameof(AlRunner.Infrastructure.AlValueCapture.OnExit), BindingFlags.Public | BindingFlags.Static)
+                ?? throw new InvalidOperationException(
+                    "[Cecil] AlValueCapture.OnExit not found — runner-side rename?");
+            var hookRef = nclMod.ImportReference(hookMi);
+
+            var target = FindNclMethod(nclMod, MsType, "Exit", 0);
+            if (target.ReturnType.FullName != "System.Void")
+                throw new InvalidOperationException(
+                    $"[Cecil] NavMethodScope.Exit()'s return type is {target.ReturnType.FullName}, "
+                    + "expected void — Ncl shape changed; do not commit");
+
+            var body = target.Body;
+            var il = body.GetILProcessor();
+            var first = body.Instructions[0];
+            il.InsertBefore(first, il.Create(OpCodes.Ldarg_0));
+            il.InsertBefore(first, il.Create(OpCodes.Call, hookRef));
+            if (body.MaxStackSize < 1) body.MaxStackSize = 1;
+            Console.Error.WriteLine("[Cecil] Prepended AlValueCapture.OnExit to NavMethodScope.Exit()");
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // NavMethodScope.StmtHit(int) / CStmtHit(int[, bool]) — --dap breakpoint hook
+        // (issue #1642). A THIRD unconditional prepend on the exact same methods the
+        // --coverage block above already hooks — same shape (`ldarg.0; ldarg.1; call`,
+        // int unboxed), same reasoning for why it's safe to add a second prepend to an
+        // already-once-rewritten method: each rewrite only ever prepends before the
+        // CURRENT first instruction, so this call runs AFTER AlCoverageTracker.OnStmtHit
+        // (inserted first, above) but still strictly BEFORE StmtHit's own body — the
+        // `statementNumber = currentStatementNumber` assignment AlCallStackCapture
+        // depends on is untouched either way.
+        //
+        // AlDapSession.OnStmtHit may BLOCK the calling thread (a breakpoint pause) —
+        // unlike AlCoverageTracker.OnStmtHit and AlValueCapture.OnExit, which are both
+        // side-effect-free beyond recording. That is intentional and safe: a normal
+        // (non-paused) StmtHit still returns immediately (Enabled gate, or the
+        // breakpoint-set lookup misses), so the added cost on every AL statement of
+        // every test — --dap or not — is one more near-zero-cost volatile read plus a
+        // dictionary lookup, not a block.
+        {
+            var nclMod = asm.MainModule;
+            const string MsType = "Microsoft.Dynamics.Nav.Runtime.NavMethodScope";
+            var hookMi = typeof(AlRunner.Infrastructure.AlDapSession).GetMethod(
+                nameof(AlRunner.Infrastructure.AlDapSession.OnStmtHit), BindingFlags.Public | BindingFlags.Static)
+                ?? throw new InvalidOperationException(
+                    "[Cecil] AlDapSession.OnStmtHit not found — runner-side rename?");
+            var hookRef = nclMod.ImportReference(hookMi);
+
+            foreach (var (name, paramCount) in new[] { ("StmtHit", 1), ("CStmtHit", 1), ("CStmtHit", 2) })
+            {
+                var target = FindNclMethod(nclMod, MsType, name, paramCount);
+                if (target.Parameters[0].ParameterType.FullName != "System.Int32")
+                    throw new InvalidOperationException(
+                        $"[Cecil] NavMethodScope.{name}/{paramCount}'s first parameter is "
+                        + $"{target.Parameters[0].ParameterType.FullName}, expected System.Int32 — Ncl shape changed; do not commit");
+
+                var body = target.Body;
+                var il = body.GetILProcessor();
+                var first = body.Instructions[0];
+                il.InsertBefore(first, il.Create(OpCodes.Ldarg_0));
+                il.InsertBefore(first, il.Create(OpCodes.Ldarg_1));
+                il.InsertBefore(first, il.Create(OpCodes.Call, hookRef));
+                if (body.MaxStackSize < 2) body.MaxStackSize = 2;
+                Console.Error.WriteLine($"[Cecil] Prepended AlDapSession.OnStmtHit to NavMethodScope.{name}/{paramCount}");
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         // ALFunctionTimingExecutionListener cluster — JmpHook→Cecil (Batch 2).
         //
         // Telemetry/diagnostic-only listener reached during AL method execution via
@@ -6826,6 +7006,28 @@ public static class NclCecilRewrite
                     ByParams(Rt + "TempTableRecordBuffer", "CloneBlobs", "MutableRecordBuffer"),
                     H(blobIsolation, "DetachStoredBlobs"),
                     argSlots: 1); // `this` — the freshly stored row
+
+                // ── Rowversion stamping (issue #1980) ────────────────────────────────
+                // SQL assigns a rowversion on every insert/update; the SQL stand-in never
+                // did, so NavRecord.HasBeenInserted (== "timestamp field is non-zero") was
+                // false for every stored row and NavForm.SaveRecordAsync always chose
+                // Insert — CurrPage.SaveRecord() in a field OnValidate dup-keyed on rows
+                // reached via GoToRecord. Stamp the record buffer before Insert/Modify run;
+                // the guard inside the helper keeps `temporary` records at timestamp 0,
+                // exactly like real BC. See Patches/RowVersionPatches.cs for the audit.
+                var rowVersion = typeof(AlRunner.Patches.RowVersionPatches);
+
+                PrependStaticCall(nclMod,
+                    ByParams(Rt + "TempTableDataProvider", "Insert",
+                        "Int32", "MutableRecordBuffer", "InsertOptions", "ReadOnlyRecordBuffer&"),
+                    H(rowVersion, "OnBeforeInsert"),
+                    argSlots: 3); // this, companyToken, recordBuffer
+
+                PrependStaticCall(nclMod,
+                    ByParams(Rt + "TempTableDataProvider", "Modify",
+                        "Int32", "MutableRecordBuffer", "Boolean", "ReadOnlyRecordBuffer&"),
+                    H(rowVersion, "OnBeforeModify"),
+                    argSlots: 3); // this, companyToken, recordBuffer
 
                 // ── Rename store-aliasing boundary for `temporary` records (issue #1765) ──
                 // A temporary record's BLOB committed with Modify() is LOST across a

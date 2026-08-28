@@ -1,5 +1,4 @@
 using AlRunner.Provisioning;
-using System.Text.Json;
 
 namespace AlRunner.Infrastructure;
 
@@ -110,12 +109,12 @@ public static class ProvisioningCheck
             lines.Add("        al-runner provision");
             lines.Add("      or re-run with --auto-provision.");
             lines.Add("");
-            lines.Add("  (b) Download Microsoft platform apps only:");
+            lines.Add("  (b) Force-download Microsoft platform apps only:");
             // Use the FIRST missing app's own real version — not a truncation of Version
             // (the engine version), which can be a different minor and would 404 against
             // the artifact CDN (it needs a FULL artifact version, e.g. 28.2.50931.52786).
             var suggestVer = Issues.Count > 0 ? Issues[0].AppVersion : "<full-version, e.g. 28.2.50931.52786>";
-            lines.Add($"        dotnet run --project tools/DownloadArtifacts -- platform-apps {suggestVer} \"<package-cache-dir>\"");
+            lines.Add($"        al-runner provision --platform-apps --bc-version {suggestVer}");
             return string.Join(Environment.NewLine, lines);
         }
     }
@@ -154,277 +153,6 @@ public static class ProvisioningCheck
                     result.Add(dir);
         }
         return result;
-    }
-
-    // ── Manifest-derived Microsoft provisioning requirements ────────────────
-    // Package-cache contents cannot answer what an empty cache needs. app.json can: its
-    // application/platform roots require the curated platform-app set, while explicit
-    // Microsoft test dependencies require both that set and the platform artifact's test
-    // apps. The declared versions are floors, not pins; callers use the BC version selected
-    // for the run as the download target.
-
-    public sealed record MicrosoftProvisioningRequirements(
-        bool PlatformAppsRequired,
-        bool TestAppsRequired,
-        System.Version? MinimumVersion,
-        IReadOnlyList<string> RequiredTestAppNames,
-        IReadOnlyList<string> ManifestPaths);
-
-    // Direct roots used by Microsoft test apps. The platform artifact's test-app stream can
-    // provide these (and their transitive test closure); it cannot provide arbitrary
-    // Microsoft application extensions. Treating every non-platform Microsoft dependency as
-    // a test root makes e.g. Sales and Inventory Forecast trigger a 100-app download that can
-    // never satisfy the manifest, forever. Keep this bounded to the stable framework roots
-    // external test apps actually declare.
-    private static readonly HashSet<string> KnownMicrosoftTestAppRoots = new(
-        StringComparer.OrdinalIgnoreCase)
-    {
-        "Any",
-        "Application Test Library",
-        "Business Foundation Test Libraries",
-        "Library Assert",
-        "Library Variable Storage",
-        "Permissions Mock",
-        "System Application Test Library",
-        "Test Runner",
-        "Tests-TestLibraries",
-    };
-
-    /// <summary>
-    /// Derives the Microsoft artifact sets required by the target bundle manifests without
-    /// consulting <c>.alpackages</c>. A bundle root with no manifest of its own is walked like
-    /// suite enumeration: stop at the first <c>app.json</c> on each branch, and ignore hidden
-    /// workspace metadata plus build-output directories.
-    /// </summary>
-    public static MicrosoftProvisioningRequirements DeriveMicrosoftRequirements(
-        IEnumerable<string> bundlePaths)
-    {
-        var manifests = CollectTargetManifestPaths(bundlePaths);
-        var platformRequired = false;
-        var testAppsRequired = false;
-        System.Version? minimumVersion = null;
-        var requiredTestApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        void RaiseFloor(string? value)
-        {
-            if (!System.Version.TryParse(value, out var parsed)) return;
-            if (minimumVersion == null || parsed > minimumVersion)
-                minimumVersion = parsed;
-        }
-
-        static string? StringProperty(JsonElement element, string name)
-            => element.ValueKind == JsonValueKind.Object
-               && element.TryGetProperty(name, out var value)
-               && value.ValueKind == JsonValueKind.String
-                ? value.GetString()
-                : null;
-
-        foreach (var manifest in manifests)
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(File.ReadAllText(manifest));
-                var root = doc.RootElement;
-                if (root.ValueKind != JsonValueKind.Object)
-                    continue;
-                foreach (var field in new[] { "application", "platform" })
-                {
-                    if (!root.TryGetProperty(field, out var value)
-                        || value.ValueKind != JsonValueKind.String
-                        || string.IsNullOrWhiteSpace(value.GetString()))
-                        continue;
-                    platformRequired = true;
-                    RaiseFloor(value.GetString());
-                }
-
-                if (!root.TryGetProperty("dependencies", out var dependencies)
-                    || dependencies.ValueKind != JsonValueKind.Array)
-                    continue;
-
-                foreach (var dependency in dependencies.EnumerateArray())
-                {
-                    var publisher = StringProperty(dependency, "publisher") ?? "";
-                    if (!string.Equals(publisher, "Microsoft", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    var name = StringProperty(dependency, "name") ?? "";
-                    var version = StringProperty(dependency, "version");
-                    platformRequired = true;
-                    RaiseFloor(version);
-
-                    if (AlRunner.DependencyResolver.IsMicrosoftPlatformApp(name, publisher))
-                        continue;
-
-                    if (!KnownMicrosoftTestAppRoots.Contains(name))
-                        continue;
-
-                    // Microsoft's test packages depend on both artifact sets. Application
-                    // Test Library itself lives in platform-apps; every other explicitly
-                    // named test app must also be present in test-apps.
-                    testAppsRequired = true;
-                    if (!string.Equals(name, "Application Test Library", StringComparison.OrdinalIgnoreCase)
-                        && !string.IsNullOrWhiteSpace(name))
-                        requiredTestApps.Add(name);
-                }
-            }
-            catch (JsonException)
-            {
-                // Normal bundle loading owns malformed-manifest diagnostics. Provisioning
-                // must not invent requirements from a document it cannot read.
-            }
-            catch (IOException)
-            {
-                // A manifest can disappear between discovery and read in watch mode.
-            }
-        }
-
-        return new MicrosoftProvisioningRequirements(
-            platformRequired,
-            testAppsRequired,
-            minimumVersion,
-            requiredTestApps.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList(),
-            manifests);
-    }
-
-    private static IReadOnlyList<string> CollectTargetManifestPaths(IEnumerable<string> bundlePaths)
-    {
-        var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var bundlePath in bundlePaths)
-        {
-            if (string.IsNullOrWhiteSpace(bundlePath)) continue;
-            string path;
-            try { path = Path.GetFullPath(bundlePath); }
-            catch { continue; }
-
-            if (File.Exists(path)
-                && string.Equals(Path.GetFileName(path), "app.json", StringComparison.OrdinalIgnoreCase))
-            {
-                found.Add(path);
-                continue;
-            }
-
-            var start = File.Exists(path) ? Path.GetDirectoryName(path) : path;
-            if (string.IsNullOrEmpty(start) || !Directory.Exists(start)) continue;
-
-            string? current = start;
-            var enclosing = false;
-            while (!string.IsNullOrEmpty(current))
-            {
-                var candidate = Path.Combine(current, "app.json");
-                if (File.Exists(candidate))
-                {
-                    found.Add(Path.GetFullPath(candidate));
-                    enclosing = true;
-                    break;
-                }
-                current = Directory.GetParent(current)?.FullName;
-            }
-            if (enclosing) continue;
-
-            Walk(start);
-        }
-
-        return found.OrderBy(p => p, StringComparer.Ordinal).ToList();
-
-        void Walk(string dir)
-        {
-            var manifest = Path.Combine(dir, "app.json");
-            if (File.Exists(manifest))
-            {
-                found.Add(Path.GetFullPath(manifest));
-                return;
-            }
-
-            IEnumerable<string> children;
-            try { children = Directory.EnumerateDirectories(dir).OrderBy(p => p, StringComparer.Ordinal); }
-            catch { return; }
-
-            foreach (var child in children)
-            {
-                var name = Path.GetFileName(child);
-                if (name.StartsWith(".", StringComparison.Ordinal)
-                    || name.Equals("bin", StringComparison.OrdinalIgnoreCase)
-                    || name.Equals("obj", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                Walk(child);
-            }
-        }
-    }
-
-    /// <summary>
-    /// True when the supplied directories contain the complete curated platform set needed
-    /// by <paramref name="requirements"/>. BC 28+ test dependencies additionally require
-    /// Application Test Library, which is delivered by <c>platform-apps</c>, not
-    /// <c>test-apps</c>.
-    /// </summary>
-    public static bool PlatformAppsPresent(
-        string dir, string fullVersion, MicrosoftProvisioningRequirements requirements)
-        => PlatformAppsPresent(new[] { dir }, fullVersion, requirements);
-
-    public static bool PlatformAppsPresent(
-        IEnumerable<string> dirs, string fullVersion, MicrosoftProvisioningRequirements requirements)
-    {
-        if (!requirements.PlatformAppsRequired) return true;
-
-        var packages = ReadMicrosoftPackages(dirs);
-        foreach (var runtimeApp in KnownPlatformRuntimeApps)
-            if (!packages.TryGetValue(runtimeApp, out var candidates)
-                || !candidates.Any(candidate => candidate.IsR2R))
-                return false;
-
-        foreach (var app in new[] { "Application", "System" })
-            if (!packages.ContainsKey(app))
-                return false;
-
-        if (requirements.TestAppsRequired
-            && System.Version.TryParse(fullVersion, out var selected)
-            && selected.Major >= 28
-            && (!packages.TryGetValue("Application Test Library", out var testLibraries)
-                || !testLibraries.Any(candidate => candidate.IsR2R)))
-            return false;
-
-        return true;
-    }
-
-    public static bool TestAppsPresent(
-        string dir, MicrosoftProvisioningRequirements requirements)
-        => TestAppsPresent(new[] { dir }, requirements);
-
-    public static bool TestAppsPresent(
-        IEnumerable<string> dirs, MicrosoftProvisioningRequirements requirements)
-    {
-        if (!requirements.TestAppsRequired) return true;
-        var packages = ReadMicrosoftPackages(dirs);
-        if (!packages.ContainsKey(TestToolkitSentinelApp)) return false;
-        return requirements.RequiredTestAppNames.All(packages.ContainsKey);
-    }
-
-    private sealed record ProvisionedPackage(bool IsR2R);
-
-    private static Dictionary<string, List<ProvisionedPackage>> ReadMicrosoftPackages(
-        IEnumerable<string> dirs)
-    {
-        var packages = new Dictionary<string, List<ProvisionedPackage>>(
-            StringComparer.OrdinalIgnoreCase);
-        foreach (var dir in dirs.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            if (!Directory.Exists(dir)) continue;
-            IEnumerable<string> files;
-            try { files = Directory.EnumerateFiles(dir, "*.app", SearchOption.AllDirectories); }
-            catch { continue; }
-            foreach (var file in files)
-            {
-                var manifest = AlRunner.AppLoader.ReadManifest(file);
-                if (manifest == null
-                    || !string.Equals(manifest.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                if (!packages.TryGetValue(manifest.Name, out var candidates))
-                    packages[manifest.Name] = candidates = new List<ProvisionedPackage>();
-                candidates.Add(new ProvisionedPackage(AlRunner.AppLoader.IsR2R(file)));
-            }
-        }
-        return packages;
     }
 
     /// <summary>
@@ -469,20 +197,63 @@ public static class ProvisioningCheck
     }
 
     /// <summary>
-    /// Derives the BC major.minor to auto-provision platform apps for. The engine is
-    /// version-agnostic w.r.t. the R2R apps it dispatches to at runtime, so the minor to
-    /// download is the one the MISSING apps actually need (carried in
-    /// <paramref name="report"/>.Issues[0].AppVersion) — NOT the engine's own
-    /// <paramref name="fallbackVersion"/> (SelectedVersion), which can be a different minor
-    /// (e.g. engine 28.1 running 28.2 R2R business logic). Falls back to
-    /// <paramref name="fallbackVersion"/>'s major.minor when there are no issues. Pure —
-    /// does no I/O.
+    /// Derives the BC major.minor a symbol-only platform app already in the cache would
+    /// suggest for auto-provisioning. Carried in <paramref name="report"/>.Issues[0]
+    /// .AppVersion when one exists; falls back to <paramref name="fallbackVersion"/>'s
+    /// major.minor otherwise. Pure — does no I/O.
+    ///
+    /// Issue #2077: this used to be the value callers actually downloaded — "the engine is
+    /// version-agnostic w.r.t. the R2R apps it dispatches to, so download whatever the
+    /// on-disk symbol-only app needs" sounds reasonable until the app already in the cache
+    /// is simply a STALE artifact (a project's committed `.alpackages`, an old warm run) at
+    /// a DIFFERENT minor than the BC version the caller explicitly selected — then this
+    /// silently redirected the whole provisioning pass to that stale minor instead. Once a
+    /// BC version has been selected, provisioning MUST target that version — see
+    /// <see cref="ResolveProvisionMajorMinor"/>, the function callers now use for the
+    /// actual decision. This one is kept only as a pure cache-inspection signal, e.g. to
+    /// build the loud mismatch note <see cref="BuildProvisionVersionSkewNote"/> emits when
+    /// the cache disagrees with the selection.
     /// </summary>
     public static string DeriveProvisionMajorMinor(PlatformAppsReport report, string fallbackVersion)
     {
         var source = report.Issues.Count > 0 ? report.Issues[0].AppVersion : fallbackVersion;
-        var parts = source.Split('.');
-        return parts.Length >= 2 ? string.Join(".", parts.Take(2)) : source;
+        return MajorMinorOf(source);
+    }
+
+    /// <summary>
+    /// The BC major.minor to actually auto-provision platform apps/the test toolkit for:
+    /// always <paramref name="selectedVersion"/>'s own major.minor (issue #2077 — once a BC
+    /// version is selected, provisioning targets THAT version, never one derived from cache
+    /// contents, a symbol-only closure, or a project's vendored `.alpackages`). Pure — does
+    /// no I/O.
+    /// </summary>
+    public static string ResolveProvisionMajorMinor(string selectedVersion) => MajorMinorOf(selectedVersion);
+
+    /// <summary>Shared major.minor extraction used by the Derive*/Resolve* helpers above.</summary>
+    private static string MajorMinorOf(string version)
+    {
+        var parts = version.Split('.');
+        return parts.Length >= 2 ? string.Join(".", parts.Take(2)) : version;
+    }
+
+    /// <summary>
+    /// Issue #2077 acceptance criterion: "if the runner ever compiles against platform apps
+    /// whose build differs from the selected engine build, it says so explicitly." Returns
+    /// a loud one-line note when <paramref name="cacheDerivedMajorMinor"/> — what the
+    /// package cache alone would have suggested (<see cref="DeriveProvisionMajorMinor"/> /
+    /// <see cref="DerivePresentPlatformMajorMinor"/>) — disagrees with
+    /// <paramref name="selectedMajorMinor"/> (what <see cref="ResolveProvisionMajorMinor"/>
+    /// actually provisions). Null when they agree, so callers can
+    /// `if (note != null) Console.Error.WriteLine(note);` unconditionally. Pure.
+    /// </summary>
+    public static string? BuildProvisionVersionSkewNote(
+        string selectedMajorMinor, string cacheDerivedMajorMinor, string cacheSource)
+    {
+        if (string.Equals(selectedMajorMinor, cacheDerivedMajorMinor, StringComparison.OrdinalIgnoreCase))
+            return null;
+        return $"[provision] note: {cacheSource} suggest(s) BC {cacheDerivedMajorMinor}.x, which differs from " +
+               $"the selected BC {selectedMajorMinor}.x — provisioning platform R2R apps for the SELECTED " +
+               $"version, not the cache's.";
     }
 
     /// <summary>
@@ -508,7 +279,7 @@ public static class ProvisioningCheck
             // Suggest the APP's own version, not bcVersion (the engine's) — the engine is
             // version-agnostic w.r.t. the R2R apps it dispatches to, so these can differ
             // (e.g. engine 28.1 running 28.2 R2R apps); using bcVersion here would 404.
-            $"    dotnet run --project tools/DownloadArtifacts -- platform-apps {appVersion} \"<package-cache-dir>\"",
+            $"    al-runner provision --platform-apps --bc-version {appVersion}",
         });
     }
 
@@ -541,9 +312,35 @@ public static class ProvisioningCheck
     /// True if the Microsoft test toolkit is provisioned in <paramref name="packageCacheDirs"/>,
     /// detected via <see cref="TestToolkitSentinelApp"/> (a Microsoft-published .app of that
     /// name). Missing/nonexistent dirs are skipped. Pure filesystem scan — no network.
+    ///
+    /// Issue #2003: <paramref name="versionFloors"/> is the manifest-declared minimum
+    /// version, if any, for <see cref="TestToolkitSentinelApp"/> (see
+    /// <see cref="DetermineVersionFloors"/>). A sentinel app found below its floor does NOT
+    /// count as present — presence alone used to be sufficient, which let a warm-but-stale
+    /// toolkit satisfy this check and get silently reused past the version the bundle's own
+    /// app.json actually requires. Null/empty (the default) preserves the old presence-only
+    /// behavior — a bundle whose manifests declare no floor is unaffected (AC #4).
     /// </summary>
-    public static bool TestToolkitPresent(IReadOnlyList<string> packageCacheDirs)
+    public static bool TestToolkitPresent(
+        IReadOnlyList<string> packageCacheDirs,
+        IReadOnlyDictionary<string, Version>? versionFloors = null)
     {
+        var required = new Dictionary<string, Version?>(StringComparer.OrdinalIgnoreCase)
+        {
+            [TestToolkitSentinelApp] = versionFloors != null
+                && versionFloors.TryGetValue(TestToolkitSentinelApp, out var sentinelFloor)
+                    ? sentinelFloor
+                    : null,
+        };
+        if (versionFloors != null)
+        {
+            foreach (var (name, floor) in versionFloors)
+                if (KnownTestFrameworkAppNames.Any(candidate =>
+                        string.Equals(candidate, name, StringComparison.OrdinalIgnoreCase)))
+                    required[name] = floor;
+        }
+
+        var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var dir in packageCacheDirs)
         {
             if (!Directory.Exists(dir)) continue;
@@ -552,22 +349,33 @@ public static class ProvisioningCheck
                 var m = AlRunner.AppLoader.ReadManifest(appFile);
                 if (m == null) continue;
                 if (!string.Equals(m.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase)) continue;
-                if (string.Equals(TestToolkitSentinelApp, m.Name, StringComparison.OrdinalIgnoreCase))
-                    return true;
+                if (!required.TryGetValue(m.Name, out var floor)) continue;
+                if (floor != null && m.Version < floor) continue;
+                found.Add(m.Name);
             }
         }
-        return false;
+        return required.Keys.All(found.Contains);
     }
 
     /// <summary>
-    /// Derives the BC major.minor to auto-provision FROM WHAT'S ALREADY IN THE CACHE: scans
-    /// <paramref name="packageCacheDirs"/> for a Microsoft "Base Application" or "System
-    /// Application" .app and returns its major.minor. Used when there's no
-    /// <see cref="PlatformAppsReport"/> issue to derive from (e.g. platform apps are already
-    /// R2R-complete but the test toolkit is still missing) — we still need SOME minor to
-    /// resolve a full artifact version for the test-toolkit download, and the platform apps
-    /// already in the cache are the most reliable signal of which minor this project targets.
-    /// Falls back to <paramref name="fallbackVersion"/>'s major.minor when no such app is found.
+    /// The BC major.minor a Microsoft "Base Application"/"System Application" .app already
+    /// present in <paramref name="packageCacheDirs"/> would suggest for auto-provisioning.
+    /// Falls back to <paramref name="fallbackVersion"/>'s major.minor when no such app is
+    /// found. Pure filesystem scan — no network.
+    ///
+    /// Issue #2077: this used to be the value callers actually downloaded whenever no
+    /// symbol-only-R2R issue existed — "the platform apps already in the cache are the most
+    /// reliable signal of which minor this project targets" sounds reasonable until the
+    /// apps already in the cache are simply a committed `.alpackages` symbol closure at a
+    /// DIFFERENT minor than the BC version the caller explicitly selected (e.g. `--bc-
+    /// version 28.4` with a project-vendored 28.1 closure) — then this silently redirected
+    /// the whole provisioning pass to that unrelated minor instead, and the run went on to
+    /// compile against it while reporting `[bc] selected BC 28.4...`. Once a BC version has
+    /// been selected, provisioning MUST target that version — see
+    /// <see cref="ResolveProvisionMajorMinor"/>, the function callers now use for the
+    /// actual decision. This one is kept only as a pure cache-inspection signal, e.g. to
+    /// build the loud mismatch note <see cref="BuildProvisionVersionSkewNote"/> emits when
+    /// the cache disagrees with the selection.
     /// </summary>
     public static string DerivePresentPlatformMajorMinor(
         IReadOnlyList<string> packageCacheDirs, string fallbackVersion)
@@ -583,13 +391,10 @@ public static class ProvisioningCheck
                 if (!string.Equals(m.Name, "Base Application", StringComparison.OrdinalIgnoreCase)
                     && !string.Equals(m.Name, "System Application", StringComparison.OrdinalIgnoreCase))
                     continue;
-                var v = m.Version.ToString();
-                var vparts = v.Split('.');
-                return vparts.Length >= 2 ? string.Join(".", vparts.Take(2)) : v;
+                return MajorMinorOf(m.Version.ToString());
             }
         }
-        var parts = fallbackVersion.Split('.');
-        return parts.Length >= 2 ? string.Join(".", parts.Take(2)) : fallbackVersion;
+        return MajorMinorOf(fallbackVersion);
     }
 
     // ── Auto-provision download destination (issue #1653) ────────────────────
@@ -617,95 +422,461 @@ public static class ProvisioningCheck
     public static string TestAppsDirFor(string artifactsRootDir, string fullVersion)
         => Path.Combine(artifactsRootDir, fullVersion, "test-apps");
 
-    // ── Reusing an already-provisioned set instead of re-downloading it ───────
-    // The download destinations above were write-only: nothing ever asked whether they
-    // were ALREADY populated before fetching into them again. `EnsurePlatformAppsProvisioned`
-    // decided "there is a gap" from the target bundle's own `.alpackages`, which vendors
-    // symbol-only packages permanently (the runner must never write into the user's
-    // project — #1653), so its check was unsatisfiable by construction and it re-downloaded
-    // ~106 MB on every single invocation. The startup gate had the same hole one step over:
-    // it scans the DEFAULT package caches, which compose these two dirs from the SELECTED
-    // version only, so a set provisioned for any other version — the common case, since the
-    // version the download targets is derived from the project's vendored symbols, not from
-    // the engine — was invisible on the next run.
+    // ── Issue #1996: manifest-driven need detection ──────────────────────────
+    // CheckPlatformApps / TestToolkitPresent above are REACTIVE: they can only report a
+    // gap for an app that is already PRESENT (as symbol-only) in the cache. An empty
+    // cache — no .alpackages at all, or a --package-cache dir that doesn't exist yet —
+    // therefore reads as vacuously "Ok": nothing was found, so nothing looks broken, so
+    // --auto-provision never fires and the run limps to a cryptic "Missing:" error deep
+    // in dependency resolution instead. The bundle's OWN app.json manifests are an
+    // independent source of truth for what's actually required, regardless of what
+    // currently exists on disk — these functions consult THAT instead.
     //
-    // These two helpers are DISCOVERY, deliberately not adjudication: they answer "is there
-    // a plausible already-provisioned set for this major.minor?" with a pure filesystem
-    // scan. Callers fold the hit into the dirs they scan and then re-run the authoritative
-    // predicate (CheckPlatformApps / TestToolkitPresent) over the combined set. That split
-    // matters: a discovery predicate strict enough to be authoritative on its own would
-    // re-download forever the moment a BC version shipped one fewer platform app than we
-    // expect, which is the very failure being fixed here.
-    //
-    // No network, by design. Resolving major.minor → a full version costs a CDN index
-    // fetch and returns null when offline, so checking the destination only AFTER that
-    // resolve would still pay a round-trip on every warm run and would fail outright on a
-    // fully provisioned but offline machine.
+    // Two curated, ATOMIC download sets exist (see ArtifactDownloader.PlatformApps /
+    // .TestApps): a project either needs the whole platform-apps set or none of it (same
+    // for test-apps) — there is no per-app partial download. So a DOWNLOAD, once triggered,
+    // always fetches the full set. But "is it already satisfied" must NOT require every
+    // member of that set to be individually present on disk: System/Base Application and
+    // Business Foundation have a service-tier DLL dispatch fallback (the runner runs their
+    // codeunits even with no .app vendored at all — see KnownPlatformRuntimeApps' doc
+    // comment; only PRESENT-but-symbol-only is a gap for them, unchanged, via
+    // CheckPlatformApps). Application Test Library has NO such fallback (see
+    // ArtifactDownloader.PlatformApps' comment on it) — a bundle that needs it is
+    // unresolvable without a real .app in cache. So the "must be literally present" check
+    // is scoped to KnownNoFallbackPlatformApps, not the whole downloadable set — requiring
+    // the whole set would regress nearly every bundle in the corpus (virtually all of them
+    // carry implicit `application`/`platform` roots) into a spurious "needs download".
 
     /// <summary>
-    /// Every already-provisioned <c>platform-apps</c> directory matching
-    /// <paramref name="majorMinor"/> that carries at least one Microsoft platform runtime app
-    /// as an R2R package, newest version first. Empty when there is none.
+    /// Real Microsoft app names whose absence from the package cache is ALWAYS a genuine
+    /// gap — they have no service-tier DLL dispatch fallback the way System/Base
+    /// Application and Business Foundation do, so a bundle needing one is unresolvable
+    /// without a real (R2R or source-compilable) .app on disk. Application Test Library
+    /// ships in the w1 `platform-apps` set (see ArtifactDownloader.PlatformApps), not the
+    /// `test-apps` set — the specific miss issue #1996 is about.
+    /// </summary>
+    public static readonly IReadOnlyList<string> KnownNoFallbackPlatformApps = new[]
+    {
+        "Application Test Library",
+    };
+
+    /// <summary>
+    /// Known DIRECT dependency edges among Microsoft apps that participate in the
+    /// platform-apps / test-apps provisioning sets, each one extracted from that app's own
+    /// real NavxManifest.xml &lt;Dependencies&gt; block (BC 28.3.52162.53954, verified against
+    /// the actual downloaded .app files — see the per-entry comment; not invented). This is
+    /// the smallest fact <see cref="DetermineManifestNeeds"/> cannot avoid recording ahead of
+    /// time: it only ever sees a BUNDLE's own declared roots, and it can't download a
+    /// not-yet-fetched dependency's manifest just to learn what THAT app depends on — the
+    /// same chicken-and-egg <see cref="KnownNoFallbackPlatformApps"/>' own doc comment
+    /// describes (issue #2073).
     ///
-    /// <para><paramref name="minVersion"/> is a hard floor and is the load-bearing parameter:
-    /// <c>DependencyResolver.SelectBestVersion</c> discards any candidate below the declared
-    /// dependency minimum, so an R2R set OLDER than the symbols a project vendors is worse
-    /// than useless — it satisfies <see cref="CheckPlatformApps"/> (which compares only
-    /// publisher, name and R2R-ness) while resolution rejects it and falls back to the
-    /// symbol-only copy, ending in the "object with ID 0 does not have a member with that ID"
-    /// failure that DependencyResolver has a dedicated diagnostic for. Pass the highest
-    /// version among the gap's own issues (<see cref="MinimumUsefulR2RVersion"/>): an R2R set
-    /// at least as new as the vendored symbols is exactly the condition under which
-    /// SelectBestVersion prefers it.</para>
+    /// Issue #2087: a PRIOR fix recorded this as a one-entry "known transitive dependents of
+    /// Application Test Library" list — correct for the one app it named
+    /// ("Tests-TestLibraries"), but shaped as a lookup table, not detection: the next
+    /// Microsoft app that reaches "Application Test Library" (directly or through another
+    /// app) would fail exactly the same silent way. Recording actual per-app EDGES here
+    /// instead, and walking them with <see cref="ReachesAnyOf"/>, generalizes: an app that
+    /// reaches a <see cref="KnownNoFallbackPlatformApps"/> member through ANY number of hops
+    /// is caught the moment its OWN direct edge is added here — no second per-shape list to
+    /// keep in sync, and a multi-hop chain composes automatically instead of needing its own
+    /// hand-written entry.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, IReadOnlyList<string>> KnownMicrosoftAppDependencyEdges =
+        new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            // Microsoft_Tests-TestLibraries.app NavxManifest.xml <Dependencies>: depends
+            // directly on "Application Test Library" (the exact edge issues #2073/#2086
+            // needed — AppId d852d5d2-a39d-4179-baeb-f99a19e32510, the one the "Missing:"
+            // error names), plus "System Application Test Library" and "Permissions Mock".
+            ["Tests-TestLibraries"] = new[]
+            {
+                "System Application Test Library", "Permissions Mock", "Application Test Library",
+            },
+            // Microsoft_System Application Test Library.app NavxManifest.xml: depends on
+            // "System Application" and "Any". Neither reaches a KnownNoFallbackPlatformApps
+            // member today, but recording the real edge means a FUTURE app naming only
+            // "System Application Test Library" still gets the right answer via the same
+            // walk, instead of needing its own bespoke check.
+            ["System Application Test Library"] = new[] { "System Application", "Any" },
+            // Microsoft_Business Foundation Test Libraries.app NavxManifest.xml: depends on
+            // "System Application" and "Business Foundation".
+            ["Business Foundation Test Libraries"] = new[] { "System Application", "Business Foundation" },
+        };
+
+    /// <summary>
+    /// True iff <paramref name="appName"/> itself is in <paramref name="targets"/>, or
+    /// reaches a member of it by following <paramref name="edges"/> through any number of
+    /// hops. Pure graph BFS — the general closure-walk mechanism issue #2087 asked for,
+    /// exposed separately from <see cref="DetermineManifestNeeds"/> so the WALK itself (not
+    /// just the specific apps <see cref="KnownMicrosoftAppDependencyEdges"/> happens to
+    /// record today) can be proven against synthetic data. Cycle-safe — a malformed or
+    /// future edge table with a loop terminates instead of hanging — and case-insensitive on
+    /// names, matching every other Microsoft-app-name comparison in this file.
+    /// </summary>
+    public static bool ReachesAnyOf(
+        string appName,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> edges,
+        IReadOnlyList<string> targets)
+    {
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { appName };
+        var queue = new Queue<string>();
+        queue.Enqueue(appName);
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            if (targets.Any(t => string.Equals(t, current, StringComparison.OrdinalIgnoreCase)))
+                return true;
+            if (!edges.TryGetValue(current, out var deps)) continue;
+            foreach (var dep in deps)
+                if (visited.Add(dep))
+                    queue.Enqueue(dep);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Real Microsoft app names supplied by the curated `test-apps` download (platform
+    /// artifact's Applications/&lt;area&gt;/Test + TestFramework trees — see
+    /// ArtifactDownloader.TestApps). Deliberately a closed allowlist, NOT "any Microsoft
+    /// app whose name contains Test" — an arbitrary Microsoft application extension (e.g.
+    /// a first-party ISV-style app) must never trigger a test-toolkit download it doesn't
+    /// need and the curated set can't satisfy anyway (issue #1996 acceptance criterion:
+    /// apps outside the known test-framework roots must not trigger test-apps provisioning).
+    /// </summary>
+    public static readonly IReadOnlyList<string> KnownTestFrameworkAppNames = new[]
+    {
+        "Business Foundation Test Libraries",
+        "System Application Test Library",
+        "Tests-TestLibraries",
+        "Library Assert",
+        "Library Variable Storage",
+        "Test Runner",
+        "Any",
+        "Permissions Mock",
+    };
+
+    /// <summary>Manifest-derived provisioning need, independent of what's currently on disk.</summary>
+    public sealed record ManifestNeeds(bool NeedsPlatformApps, bool NeedsTestApps);
+
+    /// <summary>
+    /// Classifies a bundle's unioned dependency roots (see Program.ReadBundleDependencyRoots)
+    /// into which curated download set(s) — if any — the bundle needs. Pure — does no I/O.
+    /// </summary>
+    /// <param name="roots">The bundle's own unioned dependency roots.</param>
+    /// <param name="dependencyEdges">
+    /// Known Microsoft app dependency edges to walk via <see cref="ReachesAnyOf"/> when
+    /// deciding whether a root transitively needs <see cref="KnownNoFallbackPlatformApps"/>.
+    /// Defaults to <see cref="KnownMicrosoftAppDependencyEdges"/>; overridable so tests can
+    /// prove the WALK against synthetic graphs (issue #2087) without needing a real
+    /// not-yet-discovered Microsoft app to exist first.
+    /// </param>
+    public static ManifestNeeds DetermineManifestNeeds(
+        IEnumerable<AlRunner.DependencyRef> roots,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? dependencyEdges = null)
+    {
+        var edges = dependencyEdges ?? KnownMicrosoftAppDependencyEdges;
+        bool needsPlatform = false, needsTest = false;
+        foreach (var d in roots)
+        {
+            if (!string.Equals(d.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase)) continue;
+            // Issue #2087: ONE closure walk replaces what used to be two separate checks —
+            // a direct KnownNoFallbackPlatformApps membership test, and a second hardcoded
+            // list of names known (by hand) to transitively reach one. ReachesAnyOf treats
+            // "d.Name IS a no-fallback app" and "d.Name REACHES one through recorded edges"
+            // as the same question, so a future multi-hop chain is caught the moment its own
+            // edge is recorded — no new list, no per-shape entry.
+            if (ReachesAnyOf(d.Name, edges, KnownNoFallbackPlatformApps))
+            {
+                needsPlatform = true;
+                // Confirmed via a live BC 28.1 platform-apps download (issue #1996): App
+                // Test Library's OWN manifest transitively depends on the MS test toolkit
+                // (Any, and from there Library Assert/Business Foundation Test Libraries)
+                // — invisible to this pre-scan, which only reads the BUNDLE's app.json, not
+                // a downloaded dependency's OWN manifest. Needing the no-fallback platform
+                // app therefore always implies needing the test toolkit too.
+                needsTest = true;
+            }
+            if (KnownTestFrameworkAppNames.Any(n => string.Equals(n, d.Name, StringComparison.OrdinalIgnoreCase)))
+                needsTest = true;
+        }
+        return new ManifestNeeds(needsPlatform, needsTest);
+    }
+
+    // ── Issue #2003: manifest-driven version floors ──────────────────────────
+    // DetermineManifestNeeds above answers "is this app needed at all". It says nothing
+    // about WHICH version satisfies that need — a bundle's app.json can declare a
+    // dependency at a specific minimum version (e.g. Application Test Library 28.1.0.0),
+    // and a warm-provisioned set at the same major/minor but an OLDER patch used to satisfy
+    // every presence check unconditionally. The failure wasn't loud: the apps resolved,
+    // compilation proceeded, and the run failed later on whatever the missing symbol or
+    // changed signature produced — pointing at the test code instead of the stale
+    // provisioning. These helpers make the floor visible to the same presence checks that
+    // already decide "is this app already provisioned", so a stale warm set stops looking
+    // complete.
+
+    /// <summary>
+    /// The version floor (minimum acceptable version) each Microsoft dependency name
+    /// declares across <paramref name="roots"/> — the SAME roots
+    /// <see cref="DetermineManifestNeeds"/> reads. When multiple manifests (or bundles)
+    /// declare different floors for the same app name, the HIGHER one wins: a looser
+    /// dependency declared elsewhere can never relax what the strictest manifest requires.
+    /// Case-insensitive on name. Non-Microsoft roots are ignored (floors are only meaningful
+    /// for the curated platform-apps/test-apps sets, which are Microsoft-only). Pure — does
+    /// no I/O. Returns an empty (never null) map when no root declares a Microsoft
+    /// dependency, so callers can pass the result straight through without a null check —
+    /// which is also exactly AC #4: a bundle whose manifests declare no floor gets an empty
+    /// map, and every floor-aware lookup below then behaves identically to the old
+    /// presence-only check.
+    /// </summary>
+    public static IReadOnlyDictionary<string, Version> DetermineVersionFloors(IEnumerable<AlRunner.DependencyRef> roots)
+    {
+        var floors = new Dictionary<string, Version>(StringComparer.OrdinalIgnoreCase);
+        foreach (var d in roots)
+        {
+            if (!string.Equals(d.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!floors.TryGetValue(d.Name, out var existing) || d.Version > existing)
+                floors[d.Name] = d.Version;
+        }
+        return floors;
+    }
+
+    /// <summary>One app found below the version floor its manifests declared for it.</summary>
+    public sealed record VersionFloorViolation(string AppName, Version FoundVersion, Version RequiredVersion);
+
+    /// <summary>
+    /// Scans <paramref name="packageCacheDirs"/> for every Microsoft app named in
+    /// <paramref name="versionFloors"/> and reports the ones whose highest found version is
+    /// BELOW its declared floor. An app entirely absent from <paramref name="packageCacheDirs"/>
+    /// is not a violation here (that's plain absence, already handled by the presence
+    /// checks) — this only flags "found, but too old", which is the specific silent gap
+    /// issue #2003 is about: a warm set that resolves as present yet doesn't meet what the
+    /// manifest actually requires. Pure filesystem scan — no network.
+    /// </summary>
+    public static IReadOnlyList<VersionFloorViolation> FindVersionFloorViolations(
+        IReadOnlyList<string> packageCacheDirs,
+        IReadOnlyDictionary<string, Version> versionFloors)
+    {
+        var violations = new List<VersionFloorViolation>();
+        foreach (var (appName, floor) in versionFloors)
+        {
+            Version? best = null;
+            foreach (var dir in packageCacheDirs)
+            {
+                if (!Directory.Exists(dir)) continue;
+                foreach (var appFile in Directory.EnumerateFiles(dir, "*.app", SearchOption.AllDirectories))
+                {
+                    var m = AlRunner.AppLoader.ReadManifest(appFile);
+                    if (m == null) continue;
+                    if (!string.Equals(m.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!string.Equals(m.Name, appName, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (best == null || m.Version > best) best = m.Version;
+                }
+            }
+            if (best != null && best < floor)
+                violations.Add(new VersionFloorViolation(appName, best, floor));
+        }
+        return violations;
+    }
+
+    /// <summary>
+    /// True iff EVERY app in <see cref="KnownNoFallbackPlatformApps"/> is found (any
+    /// R2R-ness — this only asks "is it there", not "is it runnable"; that's
+    /// CheckPlatformApps' job) somewhere across <paramref name="packageCacheDirs"/>, AT OR
+    /// ABOVE the version floor <paramref name="versionFloors"/> declares for it (issue
+    /// #2003). A found-but-below-floor app does NOT count as present. Null/empty
+    /// <paramref name="versionFloors"/> (the default) preserves the old any-version
+    /// presence-only behavior.
+    /// </summary>
+    public static bool NoFallbackPlatformAppsPresent(
+        IReadOnlyList<string> packageCacheDirs,
+        IReadOnlyDictionary<string, Version>? versionFloors = null)
+    {
+        foreach (var required in KnownNoFallbackPlatformApps)
+        {
+            var floor = versionFloors != null && versionFloors.TryGetValue(required, out var f) ? f : null;
+            bool found = false;
+            foreach (var dir in packageCacheDirs)
+            {
+                if (!Directory.Exists(dir)) continue;
+                foreach (var appFile in Directory.EnumerateFiles(dir, "*.app", SearchOption.AllDirectories))
+                {
+                    var m = AlRunner.AppLoader.ReadManifest(appFile);
+                    if (m == null) continue;
+                    if (!string.Equals(m.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!string.Equals(m.Name, required, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (floor != null && m.Version < floor) continue;
+                    found = true;
+                    break;
+                }
+                if (found) break;
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// The full provisioning decision for one invocation: what the manifest needs, what's
+    /// already complete in <paramref name="searchDirs"/>, and — combined with the legacy
+    /// symbol-only-R2R finding — whether a download should actually happen. Pure — does no I/O.
+    /// </summary>
+    public sealed record ManifestProvisionDecision(
+        bool NeedsPlatformApps,
+        bool NeedsTestApps,
+        bool PlatformComplete,
+        bool TestComplete,
+        bool ShouldDownloadPlatform,
+        bool ShouldDownloadTest)
+    {
+        public bool ShouldDownloadAny => ShouldDownloadPlatform || ShouldDownloadTest;
+    }
+
+    /// <summary>
+    /// Combines manifest-derived need with the legacy symbol-only-R2R finding
+    /// (<paramref name="legacySymbolOnlyReport"/> — CheckPlatformApps) to decide whether a
+    /// download is actually warranted, given what's already present in
+    /// <paramref name="searchDirs"/>. A found-but-symbol-only app is ALWAYS a gap (backward
+    /// compatible with issue #1678, even absent a manifest need — e.g. no app.json was
+    /// readable). A manifest need with nothing found anywhere is issue #1996's gap:
+    /// CheckPlatformApps alone reports that case vacuously "Ok".
     ///
-    /// <para>A LIST rather than the single best candidate, because the caller adjudicates:
-    /// returning only the newest would let a partial set (an interrupted download that landed
-    /// one app) mask a complete older one, and the download would fire anyway — the very
-    /// failure this exists to prevent, one version narrower. The prefix match is segment-wise
-    /// (<see cref="BcArtifacts.VersionNameMatchesPrefix"/>), so "27.5" never matches
-    /// "27.50.x".</para>
+    /// Issue #2003: "present" is no longer presence-alone. <paramref name="manifestRoots"/>
+    /// also carries each dependency's declared version, so PlatformComplete/TestComplete
+    /// (via NoFallbackPlatformAppsPresent/TestToolkitPresent) now require the found app to
+    /// meet that floor too — a warm-but-stale app in <paramref name="searchDirs"/> no longer
+    /// reads as complete, which was true here (the initial gate, before any
+    /// --auto-provision download decision) just as much as it was in the warm-reuse scan
+    /// this issue's repro pointed at.
+    /// </summary>
+    public static ManifestProvisionDecision DecideManifestProvisioning(
+        IEnumerable<AlRunner.DependencyRef> manifestRoots,
+        PlatformAppsReport legacySymbolOnlyReport,
+        IReadOnlyList<string> searchDirs)
+    {
+        var rootsList = manifestRoots as ICollection<AlRunner.DependencyRef> ?? manifestRoots.ToList();
+        var needs = DetermineManifestNeeds(rootsList);
+        var versionFloors = DetermineVersionFloors(rootsList);
+        var platformComplete = NoFallbackPlatformAppsPresent(searchDirs, versionFloors);
+        var testComplete = TestToolkitPresent(searchDirs, versionFloors);
+        var shouldDownloadPlatform = !legacySymbolOnlyReport.Ok || (needs.NeedsPlatformApps && !platformComplete);
+        var shouldDownloadTest = needs.NeedsTestApps && !testComplete;
+        return new ManifestProvisionDecision(
+            needs.NeedsPlatformApps, needs.NeedsTestApps, platformComplete, testComplete,
+            shouldDownloadPlatform, shouldDownloadTest);
+    }
+
+    /// <summary>
+    /// Reads dependency roots from every path in <paramref name="appJsonPaths"/> via
+    /// <paramref name="reader"/> (the caller's own app.json parser — kept as a delegate so
+    /// this stays a pure I/O-free helper with no duplicate JSON-parsing logic), swallowing
+    /// per-manifest read failures instead of throwing. This is a PRE-SCAN: the normal bundle
+    /// loader reaches the same manifest moments later and is the one responsible for the
+    /// real diagnostic on a malformed/non-object app.json (issue #1996 acceptance criterion
+    /// #9) — this pre-scan must never crash the whole invocation over it, it just treats an
+    /// unreadable manifest as "nothing declared" and lets the loader speak.
+    /// </summary>
+    public static IReadOnlyList<AlRunner.DependencyRef> TryReadManifestDependencyRoots(
+        IEnumerable<string> appJsonPaths,
+        Func<string, IEnumerable<AlRunner.DependencyRef>> reader,
+        Action<string>? onError = null)
+    {
+        var result = new List<AlRunner.DependencyRef>();
+        foreach (var path in appJsonPaths)
+        {
+            try
+            {
+                result.AddRange(reader(path));
+            }
+            catch (Exception ex)
+            {
+                onError?.Invoke($"[provision] manifest pre-scan: skipping unreadable '{path}': {ex.Message}");
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Loud message for the case DecideManifestProvisioning identifies: the manifest
+    /// declares a need, nothing satisfying it was found anywhere, and --auto-provision
+    /// was NOT given (issue #1996 acceptance criterion #10: no download without opt-in).
+    /// </summary>
+    public static string BuildManifestNeedsMissingMessage(
+        bool needsPlatform, bool needsTest, IReadOnlyList<string> searchedDirs)
+    {
+        var lines = new List<string>
+        {
+            "This bundle's app.json declares Microsoft dependencies that were not found in",
+            "any searched package cache — an empty/incomplete cache is not evidence they're unneeded.",
+            "",
+        };
+        if (needsPlatform)
+            lines.Add("  Needs: the Microsoft platform-app set (Base Application / System Application / " +
+                "Business Foundation / Application / Application Test Library).");
+        if (needsTest)
+            lines.Add("  Needs: the Microsoft test-toolkit set (Business Foundation Test Libraries / " +
+                "Library Assert / Test Runner / …).");
+        lines.Add("");
+        lines.Add($"  Searched: {string.Join(", ", searchedDirs)}");
+        lines.Add("");
+        lines.Add("  Resolve it ONE of these ways:");
+        lines.Add("");
+        lines.Add("  (a) One command (recommended):");
+        lines.Add("        al-runner provision");
+        lines.Add("      or re-run with --auto-provision.");
+        lines.Add("");
+        lines.Add("  (b) Force-download a specific set:");
+        if (needsPlatform)
+            lines.Add("        al-runner provision --platform-apps --bc-version <full-version>");
+        if (needsTest)
+            lines.Add("        al-runner provision --test-apps --bc-version <full-version>");
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    /// <summary>
+    /// Finds plausible runner-owned platform-app sets for a BC major/minor, newest first.
+    /// Callers must still run the authoritative manifest decision over each candidate.
     /// </summary>
     public static IReadOnlyList<string> FindProvisionedPlatformAppsDirs(
-        string artifactsRootDir, string majorMinor, System.Version? minVersion)
+        string artifactsRootDir, string majorMinor, Version? minVersion)
         => FindProvisionedDirs(artifactsRootDir, majorMinor, minVersion,
             PlatformAppsDirFor, HasAnyR2RPlatformApp);
 
     /// <summary>
-    /// Every already-provisioned <c>test-apps</c> directory matching
-    /// <paramref name="majorMinor"/> in which the Microsoft test toolkit is actually present
-    /// (<see cref="TestToolkitPresent"/>), newest first. A directory holding some toolkit apps
-    /// but not the sentinel is a partial download and is deliberately excluded.
+    /// Finds plausible runner-owned test-toolkit sets for a BC major/minor, newest first.
     /// </summary>
     public static IReadOnlyList<string> FindProvisionedTestAppsDirs(
-        string artifactsRootDir, string majorMinor, System.Version? minVersion)
+        string artifactsRootDir, string majorMinor, Version? minVersion)
         => FindProvisionedDirs(artifactsRootDir, majorMinor, minVersion, TestAppsDirFor,
             dir => TestToolkitPresent(new[] { dir }));
 
     /// <summary>
-    /// The lowest R2R version that could actually close <paramref name="report"/>'s gap: the
-    /// HIGHEST version among the symbol-only apps it names. Anything below that loses to the
-    /// symbol copy it is meant to replace (see
-    /// <see cref="FindProvisionedPlatformAppsDirs"/>). Null when there is no issue to close
-    /// or no issue version parses.
+    /// The newest symbol-only platform package involved in a legacy R2R gap. An older R2R
+    /// set would lose dependency resolution to the symbol package and cannot close the gap.
     /// </summary>
-    public static System.Version? MinimumUsefulR2RVersion(PlatformAppsReport report)
+    public static Version? MinimumUsefulR2RVersion(PlatformAppsReport report)
     {
-        System.Version? floor = null;
+        Version? floor = null;
         foreach (var (_, appVersion, _) in report.Issues)
         {
-            if (!System.Version.TryParse(appVersion, out var v)) continue;
-            if (floor == null || v > floor) floor = v;
+            if (!Version.TryParse(appVersion, out var candidate)) continue;
+            if (floor == null || candidate > floor) floor = candidate;
         }
         return floor;
     }
 
     private static IReadOnlyList<string> FindProvisionedDirs(
-        string artifactsRootDir, string majorMinor, System.Version? minVersion,
-        Func<string, string, string> dirFor, Func<string, bool> plausible)
+        string artifactsRootDir,
+        string majorMinor,
+        Version? minVersion,
+        Func<string, string, string> dirFor,
+        Func<string, bool> plausible)
     {
         var result = new List<string>();
-        if (string.IsNullOrEmpty(artifactsRootDir) || string.IsNullOrEmpty(majorMinor)) return result;
-        if (!Directory.Exists(artifactsRootDir)) return result;
+        if (string.IsNullOrEmpty(artifactsRootDir)
+            || string.IsNullOrEmpty(majorMinor)
+            || !Directory.Exists(artifactsRootDir))
+            return result;
 
         IEnumerable<string> children;
         try { children = Directory.EnumerateDirectories(artifactsRootDir); }
@@ -715,36 +886,37 @@ public static class ProvisioningCheck
             .Select(d => Path.GetFileName(
                 d.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)))
             .Where(name => BcArtifacts.VersionNameMatchesPrefix(name, majorMinor))
-            .Select(name => (Name: name, Ver: System.Version.TryParse(name, out var v) ? v : null))
-            .Where(t => t.Ver != null && (minVersion == null || t.Ver >= minVersion))
-            .OrderByDescending(t => t.Ver)
+            .Select(name => (Name: name, Parsed: Version.TryParse(name, out var parsed) ? parsed : null))
+            .Where(candidate => candidate.Parsed != null
+                && (minVersion == null || candidate.Parsed >= minVersion))
+            .OrderByDescending(candidate => candidate.Parsed)
             .ToList();
 
         foreach (var (name, _) in candidates)
         {
             var dir = dirFor(artifactsRootDir, name);
             if (!Directory.Exists(dir)) continue;
-            try { if (plausible(dir)) result.Add(dir); }
-            catch { /* unreadable candidate — skip it rather than failing the run */ }
+            try
+            {
+                if (plausible(dir)) result.Add(dir);
+            }
+            catch
+            {
+                // A partial or unreadable warm candidate must not mask an older complete one.
+            }
         }
         return result;
     }
 
-    /// <summary>
-    /// True if <paramref name="dir"/> holds at least one Microsoft platform runtime app
-    /// (<see cref="KnownPlatformRuntimeApps"/>) as an R2R package. Non-empty-ness alone is
-    /// not enough: a directory of symbol-only packages cannot execute anything, and treating
-    /// it as provisioned would bury the provisioning gap one layer deeper instead of
-    /// reporting it.
-    /// </summary>
     private static bool HasAnyR2RPlatformApp(string dir)
     {
         foreach (var appFile in Directory.EnumerateFiles(dir, "*.app", SearchOption.AllDirectories))
         {
-            var m = AlRunner.AppLoader.ReadManifest(appFile);
-            if (m == null) continue;
-            if (!string.Equals(m.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!IsKnownPlatformRuntimeApp(m.Name)) continue;
+            var manifest = AlRunner.AppLoader.ReadManifest(appFile);
+            if (manifest == null
+                || !string.Equals(manifest.Publisher, "Microsoft", StringComparison.OrdinalIgnoreCase)
+                || !IsKnownPlatformRuntimeApp(manifest.Name))
+                continue;
             if (AlRunner.AppLoader.IsR2R(appFile)) return true;
         }
         return false;
@@ -780,8 +952,8 @@ public static class ProvisioningCheck
             lines.Add($"        al-runner provision{provisionTarget}");
             lines.Add($"      or re-run your command with --auto-provision.");
             lines.Add("");
-            lines.Add("  (b) Manually — fetch the full service-tier closure for this version:");
-            lines.Add($"        dotnet run --project tools/DownloadArtifacts -- service-tier {Version} \"{ServiceTierDir}\"");
+            lines.Add("  (b) Force-download the full service-tier closure for this version:");
+            lines.Add($"        al-runner provision --service-tier --bc-version {Version}");
             lines.Add("");
             lines.Add("  (c) Point the runner at an existing artifact dir with --artifact-path <dir>,");
             lines.Add("      or select a different cached version with --bc-version <ver>.");

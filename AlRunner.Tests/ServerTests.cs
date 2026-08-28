@@ -184,18 +184,89 @@ public class ServerTests : IClassFixture<SharedCliServer>
         Assert.Contains("executed-onrun-boom", tests[0].GetProperty("message").GetString());
     }
 
-    // #1917: 'captureValues' still needs the Cecil instrumentation pass tracked
-    // on #1640 — that half of v1 parity stays a loud, structured error.
+    // #1640/#2074 (second slice; --coverage was the first, #1922): 'captureValues:true'
+    // on `execute` reports ONE entry per statement EXECUTION that changed a top-level
+    // OnRun local's value, in execution order — not a single end-of-test snapshot (see
+    // AlValueCapture's file header for the #2074 redesign). Four assignment statements,
+    // two variables, no loop: Counter is assigned twice (41, then 42) and Msg is assigned
+    // twice ('before', then 'after'), interleaved. Asserting the FULL ordered series
+    // (not just each variable's final value) is what proves this is a per-execution
+    // series and not a snapshot — a snapshot-based implementation would collapse this to
+    // two entries, both attributed to statement 3 (see AlStatementTableTests's corollary
+    // fix for the OLD, coarser attribution this replaces).
     [SkippableFact]
-    public async Task Execute_CaptureValues_NotSupported_ReturnsError()
+    public async Task Execute_CaptureValues_True_ReportsOneEntryPerStatementExecutionInOrder()
     {
         TestArtifacts.SkipIfMissing();
         var server = await _fixture.GetAsync();
-        var r = await server.SendAsync(
-            "{\"command\":\"execute\",\"code\":\"Message('hi');\",\"captureValues\":true}");
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            captureValues = true,
+            code = "codeunit 60171 \"CV Capture SX\" { trigger OnRun() var Counter: Integer; " +
+                   "Msg: Text; begin Counter := 41; Msg := 'before'; Counter := 42; " +
+                   "Msg := 'after'; end; }"
+        }));
         var d = JsonSerializer.Deserialize<JsonElement>(r);
-        Assert.True(d.TryGetProperty("error", out var err));
-        Assert.Contains("captureValues", err.GetString());
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        Assert.Equal(0, d.GetProperty("exitCode").GetInt32());
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("pass", tests[0].GetProperty("status").GetString());
+
+        Assert.True(tests[0].TryGetProperty("capturedValues", out var captured),
+            $"expected capturedValues on the response: {r}");
+        var entries = captured.EnumerateArray()
+            .Select(e => (
+                Name: e.GetProperty("variableName").GetString(),
+                Value: e.GetProperty("value"),
+                StatementId: e.GetProperty("statementId").GetInt32(),
+                ScopeName: e.GetProperty("scopeName").GetString()))
+            .ToList();
+
+        // The whole point of #2074: FOUR executions, not two collapsed final values —
+        // Counter's FIRST assignment (41) is now visible, which the old single-snapshot
+        // shape could never report.
+        Assert.Equal(4, entries.Count);
+        Assert.Equal(new[] { "Counter", "Msg", "Counter", "Msg" }, entries.Select(e => e.Name).ToArray());
+        Assert.Equal(41, entries[0].Value.GetInt32());
+        Assert.Equal("before", entries[1].Value.GetString());
+        Assert.Equal(42, entries[2].Value.GetInt32());
+        Assert.Equal("after", entries[3].Value.GetString());
+        Assert.All(entries, e => Assert.Equal("OnRun", e.ScopeName));
+
+        // statementId is attributed to the ACTUAL producing statement (0-based, 4
+        // statements total) — Counter's SECOND assignment is statement 2, NOT the
+        // scope's last statement (3), which is what the pre-#2074 design always
+        // reported regardless of which variable or which assignment produced it.
+        Assert.Equal(0, entries[0].StatementId);
+        Assert.Equal(1, entries[1].StatementId);
+        Assert.Equal(2, entries[2].StatementId);
+        Assert.Equal(3, entries[3].StatementId);
+    }
+
+    // Negative direction: the SAME codeunit shape, but captureValues omitted (false by
+    // default). capturedValues must be ABSENT — not an empty array, not present with
+    // stale/default data — proving the flag actually gates the feature rather than it
+    // being always-on (which the positive test alone could not distinguish).
+    [SkippableFact]
+    public async Task Execute_CaptureValues_Omitted_NoCapturedValuesField()
+    {
+        TestArtifacts.SkipIfMissing();
+        var server = await _fixture.GetAsync();
+        var r = await server.SendAsync(JsonSerializer.Serialize(new
+        {
+            command = "execute",
+            code = "codeunit 60172 \"CV NoCapture SX\" { trigger OnRun() var Counter: Integer; " +
+                   "begin Counter := 42; end; }"
+        }));
+        var d = JsonSerializer.Deserialize<JsonElement>(r);
+        Assert.False(d.TryGetProperty("error", out _), $"unexpected error response: {r}");
+        var tests = d.GetProperty("tests");
+        Assert.Equal(1, tests.GetArrayLength());
+        Assert.Equal("pass", tests[0].GetProperty("status").GetString());
+        Assert.False(tests[0].TryGetProperty("capturedValues", out _),
+            $"capturedValues must be absent when captureValues wasn't requested: {r}");
     }
 
     // #1917: inline `code` that is a bare statement list (no leading `codeunit`/

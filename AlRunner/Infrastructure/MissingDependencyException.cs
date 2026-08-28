@@ -17,7 +17,7 @@ namespace AlRunner.Infrastructure;
 /// emit ONE loud, actionable "provisioning gap" message (not a misleading "your code is wrong"
 /// message).
 /// </summary>
-public sealed class MissingDependencyException : Exception
+public sealed class MissingDependencyException : Exception, IDependencyProvisioningDiagnostic
 {
     public string DepPublisher { get; }
     public string DepName { get; }
@@ -80,16 +80,21 @@ public sealed class MissingDependencyException : Exception
             lines.Add("        al-runner provision");
             lines.Add("      or re-run with --auto-provision.");
             lines.Add("");
-            lines.Add("  (b) Download Microsoft test-toolkit apps:");
-            lines.Add($"        dotnet run --project tools/DownloadArtifacts -- test-apps {versionHint} \"<package-cache-dir>\"");
+            lines.Add("  (b) Force-download Microsoft test-toolkit apps only:");
+            lines.Add($"        al-runner provision --test-apps --bc-version {versionHint}");
             lines.Add("");
-            lines.Add("  (c) Download Microsoft platform apps:");
-            lines.Add($"        dotnet run --project tools/DownloadArtifacts -- platform-apps {versionHint} \"<package-cache-dir>\"");
+            lines.Add("  (c) Force-download Microsoft platform apps only:");
+            lines.Add($"        al-runner provision --platform-apps --bc-version {versionHint}");
         }
         else
         {
-            lines.Add("  Add the missing package to your --package-cache directory.");
-            lines.Add("  Verify the package version satisfies the minimum declared in app.json.");
+            // Third-party (non-Microsoft) dep: the runner cannot download this from
+            // anywhere, so the fix is entirely on the reader — name the flag concretely
+            // (with an example dir) so an agent that has never used this tool can act
+            // without guessing what "--package-cache" means or where that dir usually is.
+            lines.Add("  Add the missing package to your --package-cache <dir> (usually your");
+            lines.Add("  project's .alpackages). Verify the package version satisfies the");
+            lines.Add("  minimum declared in app.json.");
         }
 
         return string.Join(Environment.NewLine, lines);

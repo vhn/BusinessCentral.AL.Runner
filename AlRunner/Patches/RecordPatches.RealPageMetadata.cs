@@ -42,33 +42,36 @@ public static partial class RecordPatches
     private static readonly object _realPageMetadataLock = new();
 
     /// <summary>
-    /// Forget which pages have been loaded (or have failed to load), because the NCLMetaForm
-    /// instances those answers were about are gone.
-    ///
-    /// <para>Both sets are keyed on page id but are statements about ONE
-    /// <c>NCLMetaForm</c> instance: "this object's metadataLoaded flag has been cleared and
-    /// LoadMetadata() has run on it". <see cref="ResetForReload"/> empties
-    /// <c>_metaFormCache</c>, so the next <see cref="EnsureRealPageMetadata"/> builds a BRAND
-    /// NEW skeleton — with <c>metadataLoaded</c> force-set to true and no control tree — and
-    /// the stale "already loaded" entry then short-circuits the load for it. The caller
-    /// receives a skeleton it is told is fully loaded, and BC dereferences the page
-    /// definition that was never parsed — <c>NullReferenceException</c> out of
-    /// <c>NCLMetaForm.GetFrozenPageDefinitionWithExtensionWithoutMergedMultiLanguage()</c>.</para>
-    ///
-    /// <para>Which is a silent wrong answer, not a crash the developer sees: TryCreate
-    /// catches it and TestPage falls back to record-only access, so the page's OnOpenPage
-    /// never runs. On the npcore corpus that turned seventeen passing tests into failures on
-    /// every warm <c>--watch</c> cycle — nine reporting the raw NRE and the rest reporting
-    /// whatever their page trigger was supposed to have done ("Discount not created", "Cross
-    /// Reference not registered"), which points at the AL rather than at the runner. Cold runs
-    /// were unaffected because nothing had populated these sets yet, so the same bundle
-    /// answered differently on cycle 1 and cycle 2. See WatchInstallDiscoveryTests.</para>
-    ///
-    /// <para>The failure set is cleared for the same reason in the other direction: a page
-    /// that could not load against the previous generation must get a fresh attempt against
-    /// this one, or an edit that fixes it can never be observed to have fixed it.</para>
+    /// Clear the "already loaded" / "already failed" bookkeeping alongside
+    /// <c>_metaFormCache</c> on a <c>--watch</c> reload (#1957).
+    /// <para>
+    /// Both sets are statements about ONE specific <c>NCLMetaForm</c> instance — "this
+    /// object's <c>metadataLoaded</c> flag has been cleared and <c>LoadMetadata()</c> has
+    /// run on it" (or "was attempted and threw"). <see cref="ResetForReload"/> discards
+    /// exactly those instances via <c>_metaFormCache.Clear()</c>; leaving either set
+    /// populated makes <see cref="EnsureRealPageMetadata"/> answer questions about a
+    /// generation of <c>NCLMetaForm</c> objects that no longer exist.
+    /// </para>
+    /// <para>
+    /// The success set surviving meant the NEXT lookup short-circuited past a brand-new,
+    /// never-loaded skeleton as "already loaded" — BC then dereferenced a page definition
+    /// that was never parsed (NRE out of
+    /// <c>GetFrozenPageDefinitionWithExtensionWithoutMergedMultiLanguage</c>), and
+    /// <c>TestPage</c>'s catch-and-fall-back silently downgraded to record-only access, so
+    /// <c>OnOpenPage</c> quietly stopped running from the second cycle onward.
+    /// </para>
+    /// <para>
+    /// The failure set is cleared for the mirror reason, not merely for symmetry: a page
+    /// that could not load against the previous generation must get a fresh attempt
+    /// against this one, or an edit that fixes the underlying cause could never be
+    /// observed to have fixed it. This runs once per <c>--watch</c> cycle, so a page whose
+    /// metadata load genuinely, repeatedly fails pays for one retry per cycle — not a
+    /// retry storm — and still logs loudly on every failed attempt
+    /// (<see cref="EnsureRealPageMetadata"/>'s catch block), so a real gap stays visible
+    /// rather than being silently swallowed by either generation's cache.
+    /// </para>
     /// </summary>
-    private static void ResetRealPageMetadataForReload()
+    internal static void ResetPageMetadataForReload()
     {
         lock (_realPageMetadataLock)
         {
@@ -82,7 +85,8 @@ public static partial class RecordPatches
     /// definition, and return it. Returns null when the runner has no emit-captured
     /// metadata XML for the page (a precompiled dependency's page) or when the load
     /// failed — in both cases the caller must not pretend it has a control tree.
-    /// Idempotent: the load runs at most once per page per run.
+    /// Idempotent: the load runs at most once per page per run (per --watch cycle — see
+    /// <see cref="ResetForReload"/>).
     /// </summary>
     internal static object? EnsureRealPageMetadata(int pageId)
     {

@@ -102,6 +102,55 @@ public static partial class RecordPatches
     // dispatch). See RecordPatches.CreateObjectInstance.cs / WireFieldTriggerHandlers.
     internal static readonly Dictionary<string, List<int>> _extensionIdsByBaseTable = new();
 
+    /// <summary>
+    /// Merge <paramref name="fields"/> into <c>_parsedExtensionFields[baseTableName]</c>,
+    /// record <paramref name="extensionId"/> in <c>_extensionIdsByBaseTable</c>, and evict
+    /// any already-built NCLMetaTable for the base table so the next lookup rebuilds it with
+    /// these fields merged in.
+    ///
+    /// This is the single writer both tableextension-field sources funnel through — the
+    /// AL-source parser (<c>TryParseTableExtensionFile</c> in
+    /// RecordPatches.AlSourceParser.cs) and the precompiled-.app symbol merge
+    /// (<c>EnsureBcSymbolExtensionIndex</c> in RecordPatches.BcAppFallback.cs) — so the
+    /// eviction happens exactly once, in one place, and any future third writer inherits it
+    /// automatically instead of needing to remember to call it. See #2126: before this,
+    /// only the AL-source path evicted, so a base table whose NCLMetaTable had already been
+    /// materialized (e.g. referenced by AL source parsed earlier in the dependency graph)
+    /// before EnsureBcSymbolExtensionIndex ran stayed frozen forever without the precompiled
+    /// extension's fields.
+    /// </summary>
+    private static void MergeExtensionFields(string baseTableName, int extensionId, IEnumerable<ParsedField> fields)
+    {
+        if (string.IsNullOrEmpty(baseTableName)) return;
+        var key = baseTableName.ToLowerInvariant();
+
+        // De-dup by field id: the same extension can legitimately be scanned/merged more than
+        // once (a dependency app's source dir registered both by its own suite AND by
+        // sibling-source discovery, or a precompiled SymbolReference.json listing the same
+        // field in both the base table's Tables[] entry and TableExtensions[].Fields — see
+        // #1686 / #1711). A duplicated field id corrupts NCLMetaTable's positional field-count
+        // arithmetic.
+        if (!_parsedExtensionFields.TryGetValue(key, out var existing))
+            _parsedExtensionFields[key] = new List<ParsedField>(fields);
+        else
+        {
+            var existingIds = new HashSet<int>(existing.Select(f => f.FieldId));
+            foreach (var f in fields)
+                if (existingIds.Add(f.FieldId))
+                    existing.Add(f);
+        }
+
+        if (extensionId > 0)
+        {
+            if (!_extensionIdsByBaseTable.TryGetValue(key, out var extIds))
+                _extensionIdsByBaseTable[key] = extIds = new List<int>();
+            if (!extIds.Contains(extensionId))
+                extIds.Add(extensionId);
+        }
+
+        EvictCachedMetaTableForBaseTable(baseTableName);
+    }
+
     // Set to true once Register() has been called.
     private static bool _registered;
 
@@ -133,8 +182,12 @@ public static partial class RecordPatches
         _parsedObjectDecls.Clear();
         _parsedObjectCaptions.Clear();
         _metaFormCache.Clear();
-        // Must go with _metaFormCache, never without it — see ResetRealPageMetadataForReload.
-        ResetRealPageMetadataForReload();
+        // #1957: the "already (successfully|un-)loaded" bookkeeping is a statement about
+        // the NCLMetaForm instances _metaFormCache.Clear() just discarded — it must go
+        // with them, or the next lookup short-circuits a brand-new skeleton as
+        // "already loaded" and silently serves a control-less page. See
+        // ResetPageMetadataForReload's doc comment for the full reasoning.
+        ResetPageMetadataForReload();
         _metaReportCache.Clear();
         _metaQueryCache.Clear();
         _metaXmlPortCache.Clear();
@@ -1786,20 +1839,4 @@ public static partial class RecordPatches
         throw (Exception)CreateNavTestFieldException_MustBeEqualTo(metaField, shouldBeValue ?? string.Empty, current);
     }
 
-    // NCLMetaField.get_FieldCaption — original computes via captionStrings →
-    // NavCurrentThread.ResolveAppGroup(Session) → MetaField.GetMergedCaptionMultiLanguage,
-    // which dereferences LanguageProvider.Provider / NavCurrentThread.Session state that
-    // the skeleton runtime hasn't populated. Per HANDOFF §5.2 this is the sync underbelly
-    // the async ALFieldCaptionAsync wrapper falls through to — populating a stable value
-    // here lights up Rec.TestField error formatting (~40+ tests) without touching the
-    // async surface. AL doesn't ship per-language captions to v2 anyway, so FieldName
-    // is the same string the real getter produces under FieldIsNotFromMetadata.
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static string NCLMetaField_get_FieldCaption(object self)
-    {
-        if (self == null) return string.Empty;
-        var fieldNameProp = self.GetType().GetProperty("FieldName",
-            BindingFlags.Public | BindingFlags.Instance);
-        return (string?)fieldNameProp?.GetValue(self) ?? string.Empty;
-    }
 }

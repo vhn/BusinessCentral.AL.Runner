@@ -50,6 +50,20 @@ internal sealed class RunnerPageInstance
     // reused after that. See FindTrigger/GetOrCreateExtensionInstance.
     private readonly Dictionary<int, object?> _extensionInstances = new();
 
+    // NavFormExtension.ParentObject ("protected internal NavForm ParentObject { get;
+    // private set; }") — resolved from its DECLARING type, never from a derived
+    // PageExtension{id} instance's own Type. Issue #1966: PropertyInfo.SetValue against a
+    // PropertyInfo obtained via instance.GetType().GetProperty(...) throws "Property set
+    // method not found." for an inherited property whose SETTER is `private` — .NET
+    // reflection only exposes a private accessor through the type that actually declares
+    // it, even though the property's GETTER is `protected internal` and freely visible on
+    // the derived type. GetCallerRecordPatches.cs's _pFormExtensionParentObject already
+    // resolves this same property the correct way (via typeof(NavFormExtension)); this
+    // mirrors that, so both call sites use one working pattern instead of two, one broken.
+    private static readonly PropertyInfo? _pFormExtensionParentObject =
+        typeof(Microsoft.Dynamics.Nav.Runtime.Extensions.NavFormExtension).GetProperty(
+            "ParentObject", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+
     private RunnerPageInstance(object form, object owner, NavRecord? record, int pageId, System.Collections.IDictionary sourceExpressions)
     {
         _form = form;
@@ -886,14 +900,16 @@ internal sealed class RunnerPageInstance
     /// </summary>
     private TriggerMatch? FindTrigger(int memberId, string suffix, string surface, int arity = 0)
     {
-        var own = FindTriggerOnTarget(_form, _pageId, memberId, suffix, surface, arity);
+        var own = FindTriggerOnTarget(_form, _pageId, memberId, suffix, surface, arity,
+            RecordPatches.TryGetPageMemberName(_pageId, memberId, isExtension: false));
         if (own != null) return own;
 
         foreach (var extensionId in RecordPatches.GetPageExtensionIdsForPage(_pageId))
         {
             var extInstance = GetOrCreateExtensionInstance(extensionId);
             if (extInstance == null) continue;
-            var extMatch = FindTriggerOnTarget(extInstance, extensionId, memberId, suffix, surface, arity);
+            var extMatch = FindTriggerOnTarget(extInstance, extensionId, memberId, suffix, surface, arity,
+                RecordPatches.TryGetPageMemberName(extensionId, memberId, isExtension: true));
             if (extMatch != null) return extMatch;
         }
         return null;
@@ -902,10 +918,23 @@ internal sealed class RunnerPageInstance
     /// <summary>
     /// FindTrigger's inner scan, over ONE declaring object (the base page or one
     /// pageextension instance) and its own id space (<paramref name="declaringObjectId"/>).
+    ///
+    /// Issue #1968: matching used to work backwards only — un-mangle each candidate method's
+    /// name and re-derive its member id. The emitted method name is LOSSY for any member whose
+    /// AL name needed mangling: <c>action("Spaced Stamp")</c> emits
+    /// <c>Spaced_Stamp_a45_OnAction</c>, which un-mangles to <c>Spaced_Stamp</c> and hashes to
+    /// a different id than <c>Spaced Stamp</c> — so every spaced-name trigger read as
+    /// "declares no trigger". When the AL source parser knows the member's TRUE declared name
+    /// (<paramref name="declaredName"/>, from RecordPatches.TryGetPageMemberName), the match
+    /// now runs FORWARD instead: mangle the true name exactly the way BC's C# emitter does and
+    /// compare against the method-name skeleton. The backward scan remains the fallback for
+    /// declaring objects the parser never saw (a precompiled dependency page's own members).
     /// </summary>
     private static TriggerMatch? FindTriggerOnTarget(
-        object target, int declaringObjectId, int memberId, string suffix, string surface, int arity)
+        object target, int declaringObjectId, int memberId, string suffix, string surface, int arity,
+        string? declaredName = null)
     {
+        var mangled = declaredName == null ? null : EmittedIdentifier(declaredName);
         MethodInfo? match = null;
         foreach (var m in target.GetType()
             .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
@@ -915,7 +944,11 @@ internal sealed class RunnerPageInstance
 
             var memberName = MemberNameFromTriggerMethod(m.Name, suffix);
             if (memberName == null) continue;
-            if (MemberId(declaringObjectId, memberName) != memberId) continue;
+            if (mangled != null)
+            {
+                if (!string.Equals(memberName, mangled, StringComparison.Ordinal)) continue;
+            }
+            else if (MemberId(declaringObjectId, memberName) != memberId) continue;
 
             if (match != null)
                 throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
@@ -937,16 +970,31 @@ internal sealed class RunnerPageInstance
     /// Constructed the same way <see cref="TryCreate"/> constructs the base page itself: the
     /// AL-compiler-emitted <c>(ITreeObject, NavRecord)</c> ctor (verified via IL: it just
     /// forwards to <c>NavFormExtension(ITreeObject, int extId, NavRecord, NCLStaticMetadata)</c>
-    /// with the extension's own object id baked in) — then <c>ParentObject</c> is set to this
-    /// page's own <c>_form</c>, because the extension's OWN <c>get_Rec</c>/<c>get_CurrPage</c>
-    /// overrides route through <c>ParentObject</c> (also verified via IL), not through the
-    /// record the ctor was handed. Real BC wires this by adding the extension to the page's
-    /// own <c>PageExtensions</c> list during metadata load; the runner's skeleton always keeps
-    /// that list empty (see NclCecilRewrite.cs's <c>get_PageExtensions</c> rewrite), so this
-    /// is the runner-owned substitute for that step — the trigger DISPATCH here has always
-    /// been the runner's own reflection scheme (see FindTrigger's remarks), never BC's real
-    /// action-invoke machinery, so this is consistent with the existing architecture, not a
-    /// new shortcut.
+    /// with the extension's own object id baked in), <b>passed this page's own <c>_form</c> as
+    /// the <c>ITreeObject parent</c> argument</b> — <c>NavFormExtension</c>'s own ctor does
+    /// <c>ParentObject = parent as NavForm</c> as its very first statement, and the extension's
+    /// <c>get_Rec</c>/<c>get_CurrPage</c> overrides route through <c>ParentObject</c> (verified
+    /// via IL), not through the record the ctor was handed. Real BC wires this by adding the
+    /// extension to the page's own <c>PageExtensions</c> list during metadata load; the
+    /// runner's skeleton always keeps that list empty (see NclCecilRewrite.cs's
+    /// <c>get_PageExtensions</c> rewrite), so this is the runner-owned substitute for that step
+    /// — the trigger DISPATCH here has always been the runner's own reflection scheme (see
+    /// FindTrigger's remarks), never BC's real action-invoke machinery, so this is consistent
+    /// with the existing architecture, not a new shortcut.
+    ///
+    /// Issue #1995: passing <c>_owner</c> (the TestPage's original caller, essentially never a
+    /// NavForm) here used to leave <c>ParentObject</c> null for the ENTIRE constructor body,
+    /// papered over afterward with a reflection <c>SetValue(instance, _form)</c> once
+    /// <c>ctor.Invoke</c> returned. That is too late for any AL-compiler-emitted constructor
+    /// code that touches <c>ParentObject</c> itself — a pageextension that adds a <c>part()</c>
+    /// to the page layout emits an <c>InitializeComponent()</c> override that calls
+    /// <c>ParentObject.RegisterUIPart(...)</c> from inside the ctor, which NREs on the still-null
+    /// property and aborts construction entirely. <c>GetOrCreateExtensionInstance</c> then
+    /// caches a null instance for that extension id, so EVERY trigger the extension declares —
+    /// not just ones near the part — reads as "extension not found", which surfaces up through
+    /// FindTrigger as the extension's actions "declaring no OnAction trigger". Passing <c>_form</c>
+    /// as the ctor's <c>parent</c> argument sets <c>ParentObject</c> correctly from the extension's
+    /// own base-class ctor, before any AL-emitted code runs.
     /// </summary>
     private object? GetOrCreateExtensionInstance(int extensionId)
     {
@@ -963,10 +1011,12 @@ internal sealed class RunnerPageInstance
             {
                 try
                 {
-                    instance = ctor.Invoke(new object?[] { _owner, _record });
-                    var parentObjectProp = instance.GetType().GetProperty("ParentObject",
-                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    parentObjectProp?.SetValue(instance, _form);
+                    instance = ctor.Invoke(new object?[] { _form, _record });
+                    // Defensive, not load-bearing: the ctor argument above already sets
+                    // ParentObject correctly (see remarks). Kept in case some future
+                    // extension ctor overload does not run NavFormExtension's own base ctor
+                    // first.
+                    _pFormExtensionParentObject?.SetValue(instance, _form);
                 }
                 catch (Exception ex)
                 {
@@ -1047,7 +1097,8 @@ internal sealed class RunnerPageInstance
             // this path) — an OnAction trigger that only touches its own locals still runs
             // faithfully; one that reads Rec/CurrPage NREs, which surfaces as a genuine
             // runner-internal error rather than a silently wrong answer.
-            var match = FindTriggerOnTarget(instance, extensionId, actionId, "_OnAction", "OnAction", arity: 0);
+            var match = FindTriggerOnTarget(instance, extensionId, actionId, "_OnAction", "OnAction", arity: 0,
+                RecordPatches.TryGetPageMemberName(extensionId, actionId, isExtension: true));
             if (match == null) continue;
 
             try { match.Value.Method.Invoke(match.Value.Target, null); }
@@ -1069,6 +1120,31 @@ internal sealed class RunnerPageInstance
             // failure — rethrow it unwrapped so the AL stack survives.
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
         }
+    }
+
+    /// <summary>
+    /// The identifier BC's C# emitter gives an AL member name — the FORWARD half of the
+    /// trigger-method naming scheme, empirically pinned against BC's own emit (probe page with
+    /// one action per character class, decompiled): a space becomes <c>_</c>
+    /// (<c>"Spaced Stamp"</c> → <c>Spaced_Stamp</c>, each space separately: <c>"A  C"</c> →
+    /// <c>A__C</c>); letters (Unicode included: <c>"Ærø Løb"</c> → <c>Ærø_Løb</c>), digits and
+    /// <c>_</c> pass through; any other character becomes <c>a</c> + its decimal code point
+    /// (<c>-</c>→<c>a45</c>, <c>.</c>→<c>a46</c>, <c>&amp;</c>→<c>a38</c>, <c>%</c>→<c>a37</c>,
+    /// <c>/</c>→<c>a47</c>); a leading digit gets a <c>_</c> prefix (<c>"2Start"</c> →
+    /// <c>_2Start</c>). This is deliberately NOT invertible — that irreversibility is exactly
+    /// why FindTriggerOnTarget mangles forward instead of un-mangling (#1968).
+    /// </summary>
+    internal static string EmittedIdentifier(string name)
+    {
+        var sb = new System.Text.StringBuilder(name.Length);
+        foreach (var c in name)
+        {
+            if (char.IsLetterOrDigit(c) || c == '_') sb.Append(c);
+            else if (c == ' ') sb.Append('_');
+            else sb.Append('a').Append(((int)c).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+        if (sb.Length > 0 && char.IsDigit(sb[0])) sb.Insert(0, '_');
+        return sb.ToString();
     }
 
     /// <summary>

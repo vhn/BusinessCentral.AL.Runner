@@ -55,6 +55,17 @@ public sealed class LogUserFacingTagsTests
     [InlineData("[layered] building")]   // already exempt; pinned so it stays that way
     [InlineData("[provision] downloading")]
     [InlineData("[watch] waiting")]
+    // #2034: NclShadowRuntime's re-exec explanation was tagged [Cecil] (suppressed by
+    // default, same class of bug as the [bc] swallow above) so a process silently
+    // launching a child had no explanation at default verbosity. re-exec explanations
+    // now use their own exempted tag.
+    [InlineData("[reexec] Ncl.dll not shipped in this install — re-execing into a shadow runtime dir that has it")]
+    // #1642: --dap's "listening on" line is the only readiness signal a DAP client (or
+    // a human at a terminal) has that the runner will accept a connection — caught by
+    // DapClient's own test harness timing out waiting for a line that was actually
+    // printed, just silently dropped before reaching stdout (same failure shape as the
+    // [bc] swallow above).
+    [InlineData("[dap] listening on 127.0.0.1:4711 — waiting for a debug client to connect...")]
     public void UserFacingTags_SurviveTheDefaultFilter(string line)
     {
         Assert.Contains(line, FilterOnce(line, verbose: false));

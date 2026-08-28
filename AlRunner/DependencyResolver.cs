@@ -108,12 +108,13 @@ public sealed class DependencyResolver
             if (nearMissVersions != null)
             {
                 // Dep IS in the cache, but every candidate is below the declared minimum version.
-                // This is a version-mismatch problem, not a provisioning gap.
-                throw new InvalidOperationException(
-                    $"Dependency not found: {dep.Publisher}/{dep.Name} v{dep.Version} " +
-                    $"(found same-named package at {nearMissVersions} — all below minimum v{dep.Version}). " +
-                    $"Searched: {string.Join(", ", _cacheDirs)}. " +
-                    $"Stack: {string.Join(" -> ", stack.Reverse())}");
+                // This is a version-mismatch problem, not a provisioning gap — throw a distinct
+                // exception (not MissingDependencyException) so Program.cs can give the right
+                // advice ("get a newer build") instead of "add the missing package" (#2095).
+                throw new AlRunner.Infrastructure.DependencyVersionMismatchException(
+                    dep.Publisher, dep.Name, dep.Version.ToString(), dep.AppId,
+                    _cacheDirs.ToList(), nearMissVersions,
+                    stack.Count > 0 ? string.Join(" → ", stack.Reverse()) : null);
             }
             // Dep is completely absent from every searched directory — this is a provisioning gap.
             // Throw MissingDependencyException (not InvalidOperationException) so Program.cs can
@@ -281,7 +282,7 @@ public sealed class DependencyResolver
                         + "\n      have a member with that ID\". Provision a package that carries an"
                         + "\n      implementation — `al-runner provision`, or re-run with --auto-provision;"
                         + "\n      for the Microsoft test toolkit specifically:"
-                        + $"\n        dotnet run --project tools/DownloadArtifacts -- test-apps {best.Manifest.Version} \"<dir>\"");
+                        + $"\n        al-runner provision --test-apps --bc-version {best.Manifest.Version}");
                 }
                 else
                     _diagnostics.Add(

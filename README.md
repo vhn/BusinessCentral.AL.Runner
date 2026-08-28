@@ -465,7 +465,7 @@ What the runner does **not** do:
 
 What the runner **does** modify:
 
-- `Microsoft.Dynamics.Nav.Ncl.dll` — rewritten once via Cecil at startup and cached at `~/.cache/al-runner/ncl-cecil/<key>.dll`. This is the runtime-engine layer. See `AlRunner/Infrastructure/NclCecilRewrite.cs`.
+- `Microsoft.Dynamics.Nav.Ncl.dll` — rewritten once via Cecil at startup and cached at `~/.cache/al-runner/ncl-cecil/<key>.dll`. This is the runtime-engine layer. See `AlRunner/Infrastructure/NclCecilRewrite.cs`. The tool package does **not** ship this DLL (it's Microsoft's, resolved from your own BC artifact cache at runtime, same as the rest of the BC service-tier closure) — on first run for a given install + BC version, `AlRunner/Infrastructure/NclShadowRuntime.cs` builds a small shadow runtime directory containing the rewritten copy and re-execs into it once; that shadow dir is then reused on every later run.
 - Remaining R2R-reachable entry points — patched via JMP-hooks installed by `BcRuntime.EnsureApplied()` (`AlRunner/BcRuntime.cs`, `AlRunner/Patches/*.cs`).
 
 This is the **precompiled-DLL contract** described in `.claude/rules/precompiled-dll-respect.md`. AL output the runner emits is governed by the same contract once finalised — it is meant to be cacheable on disk and reusable like any MS or ISV DLL.
@@ -510,7 +510,7 @@ al-runner tests/al-language/tests/al-language
 al-runner ./app1 ./app2
 
 # Specify package caches for dependency resolution (repeatable)
-al-runner --package-cache ~/.local/share/al-runner/packages tests/al-language/tests/al-language
+al-runner --package-cache "$HOME/.al-runner/platform-apps" tests/al-language/tests/al-language
 
 # Choose test isolation (matches BC's "Test Runner - Isol. Codeunit" by default)
 al-runner --isolation codeunit ./my-bundle
@@ -602,6 +602,14 @@ al-runner --server [--package-cache PATH ...] [--cache DIR]
 
 A long-running JSON-RPC daemon over stdin/stdout. Dependencies and BC patches load once; each `runTests` request re-emits the bundle warm and runs it in-process (~19s→~4s). stdout carries only the newline-delimited JSON protocol; logs go to stderr. The VS Code extension uses this. Full protocol + the same-bundle reload contract: [docs/server-mode.md](docs/server-mode.md).
 
+### Debug adapter mode (breakpoints + stepping)
+
+```bash
+al-runner --dap [PORT] <bundle-dir>
+```
+
+A real Debug Adapter Protocol server (default port 4711) over a TCP socket: set AL breakpoints, pause execution, step through the paused code (`next`/`stepIn`/`stepOut`), inspect locals. No new AL→source mapping — it reuses BC's own `StmtHit`/`[SourceSpans]` instrumentation, the same mechanism `--coverage` and `--capture-values` already consume. Full protocol + current limitations (no VS Code launch configuration in this repo): [docs/dap-mode.md](docs/dap-mode.md).
+
 ### Precompile a single `.app` to a DLL
 
 ```bash
@@ -635,6 +643,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#dev-loop) for provisioning them as a separ
 | `--isolation codeunit\|test\|disabled` | Test isolation mode. Default `codeunit`. |
 | `--watch` | Stay resident with warm dependencies; on `.al` or `app.json` changes, recompile only the AL objects that changed and run **in-process**. Debounces on quiescence (default 250ms of no further event, capped at 10s) so a bulk multi-file rewrite — a branch switch, a rebase, a formatter run — settles before a cycle starts, instead of firing mid-checkout. Tune with `AL_RUNNER_WATCH_QUIET_MS` / `AL_RUNNER_WATCH_MAX_WAIT_MS`. |
 | `--server` | Long-running JSON-RPC daemon over stdin/stdout (warm deps → ~19s→~4s/run). See [docs/server-mode.md](docs/server-mode.md). |
+| `--dap [PORT]` | Debug Adapter Protocol server (default port 4711): set AL breakpoints, pause execution, inspect locals. Requires exactly one bundle path. See [docs/dap-mode.md](docs/dap-mode.md). |
 | `--per-suite` | Legacy per-suite compile mode (diagnostic). Default is bundled-per-bucket. |
 | `--bundled` | No-op alias for backwards compatibility. |
 | `--verbose` | Show internal `[Component]` diagnostic logs. Equivalent to `AL_RUNNER_VERBOSE=1`. |
