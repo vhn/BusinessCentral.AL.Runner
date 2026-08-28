@@ -1678,9 +1678,9 @@ public sealed partial class BcCompiler
     /// When true and this Emit succeeds cleanly (no excluded objects), record a RAD baseline
     /// for <paramref name="moduleName"/> so a LATER call to <see cref="TryEmitIncremental"/> can
     /// recompile a single changed file's worth of work instead of the whole module (issue
-    /// #1902). Only <c>--watch</c> passes true — every other caller keeps Emit's existing cost
-    /// profile unchanged (the extra ModuleDefinition conversion + file hashing this does is
-    /// wasted work for a one-shot run that will never call TryEmitIncremental).
+    /// #1902). No production caller passes true; <c>BcCompilerIncrementalTests</c> exercises
+    /// the retained fallback directly. This keeps the extra ModuleDefinition conversion and
+    /// file hashing off the production path that uses the resident RAD workspace instead.
     /// </param>
     public BcEmitOutput Emit(
         IEnumerable<string> alFolders, string moduleName, string? appRootDir = null,

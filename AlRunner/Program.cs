@@ -513,6 +513,12 @@ if (!provisionSubcommand && provisionForce)
     Console.Error.WriteLine("--force is only valid with `provision --platform-apps` / `--test-apps` / `--service-tier`.");
     return 2;
 }
+if (provisionSubcommand && provisionForce
+    && !provisionPlatformApps && !provisionTestApps && !provisionServiceTier)
+{
+    Console.Error.WriteLine("--force requires --platform-apps, --test-apps, or --service-tier.");
+    return 2;
+}
 // `al-runner provision --help`: subcommands must accept --help like everything else —
 // previously this fell through to the generic arg-parser and answered "Unknown option
 // '--help'. Run with --help for the supported flags.", which tells the caller to run the
@@ -7195,20 +7201,22 @@ static string? TryDeriveBcMajorFromProject(IEnumerable<string> bundlePaths)
 static int RunExplicitProvisionModes(string? bcVersionArg, List<string> bundles,
     bool platformApps, bool testApps, bool serviceTier, bool force, string? resolveVersionPrefix)
 {
+    string? full = null;
     if (resolveVersionPrefix != null)
     {
-        var resolved = AlRunner.Provisioning.ArtifactDownloader.ResolveVersion(
+        full = AlRunner.Provisioning.ArtifactDownloader.ResolveVersion(
             resolveVersionPrefix, m => Console.Error.WriteLine($"[provision] {m}"));
-        if (resolved == null)
+        if (full == null)
         {
             Console.Error.WriteLine($"[provision] could not resolve a full BC version for prefix '{resolveVersionPrefix}'.");
             return 1;
         }
-        Console.WriteLine(resolved); // stdout for script/agent consumption, mirrors tools/DownloadArtifacts
-        return 0;
+        Console.WriteLine(full); // stdout for script/agent consumption, mirrors tools/DownloadArtifacts
+        if (!platformApps && !testApps && !serviceTier)
+            return 0;
     }
 
-    var full = ResolveFullVersionForExplicitProvision(bcVersionArg, bundles);
+    full ??= ResolveFullVersionForExplicitProvision(bcVersionArg, bundles);
     if (full == null)
         return 1; // the resolver already printed a loud, named reason
 
@@ -7277,6 +7285,10 @@ static string? ResolveFullVersionForExplicitProvision(string? bcVersionArg, List
     if (bcVersionArg != null && System.Version.TryParse(bcVersionArg, out var maybeFull) && maybeFull.Revision >= 0
         && bcVersionArg.Split('.').Length == 4)
         return bcVersionArg; // an explicit 4-part version — target exactly that
+
+    if (bcVersionArg == null
+        && AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion() is { } builtVersion)
+        return builtVersion.ToString();
 
     var prefix = bcVersionArg
         ?? AlRunner.Infrastructure.BcArtifacts.EngineMajor(AppContext.BaseDirectory)?.ToString()
@@ -7348,6 +7360,11 @@ static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
         && bcVersionArg.Split('.').Length == 4)
     {
         full = bcVersionArg; // an explicit 4-part version — provision exactly that
+    }
+    else if (bcVersionArg == null
+        && AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion() is { } builtVersion)
+    {
+        full = builtVersion.ToString();
     }
     else
     {
@@ -7610,10 +7627,16 @@ static IEnumerable<DependencyRef> ReadDependencies(string appJsonPath)
     {
         foreach (var d in deps.EnumerateArray())
         {
-            var idStr = d.TryGetProperty("id", out var pid) ? pid.GetString() : null;
-            var name = d.TryGetProperty("name", out var pn) ? pn.GetString() ?? "" : "";
-            var pub = d.TryGetProperty("publisher", out var pp) ? pp.GetString() ?? "" : "";
-            var ver = d.TryGetProperty("version", out var pv) ? pv.GetString() ?? "0.0.0.0" : "0.0.0.0";
+            if (d.ValueKind != System.Text.Json.JsonValueKind.Object
+                || !TryReadStringProperty(d, "id", out var idStr)
+                || !TryReadStringProperty(d, "name", out var nameValue)
+                || !TryReadStringProperty(d, "publisher", out var publisherValue)
+                || !TryReadStringProperty(d, "version", out var versionValue))
+                continue;
+
+            var name = nameValue ?? "";
+            var pub = publisherValue ?? "";
+            var ver = versionValue ?? "0.0.0.0";
             Guid id = Guid.Empty;
             if (!string.IsNullOrEmpty(idStr)) Guid.TryParse(idStr, out id);
             if (!Version.TryParse(ver, out var v)) v = new Version(0, 0, 0, 0);
@@ -7647,6 +7670,16 @@ static IEnumerable<DependencyRef> ReadDependencies(string appJsonPath)
             if (!Version.TryParse(fv.GetString(), out var iv)) iv = new Version(0, 0, 0, 0);
             yield return new DependencyRef(Guid.Empty, implName, "Microsoft", iv, Optional: true);
         }
+    }
+
+    static bool TryReadStringProperty(
+        System.Text.Json.JsonElement element, string propertyName, out string? value)
+    {
+        value = null;
+        if (!element.TryGetProperty(propertyName, out var property)) return true;
+        if (property.ValueKind != System.Text.Json.JsonValueKind.String) return false;
+        value = property.GetString();
+        return true;
     }
 }
 

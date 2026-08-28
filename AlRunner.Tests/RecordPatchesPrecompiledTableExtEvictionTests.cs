@@ -110,7 +110,7 @@ public sealed class RecordPatchesPrecompiledTableExtEvictionTests : IDisposable
         Assert.NotNull(skeleton);
 
         // ── STEP 1: materialize the base table's NCLMetaTable FIRST ─────────────────────
-        // Nothing about tableextension 93902 is known to the runner yet.
+        // Nothing about tableextension 94902 is known to the runner yet.
         var before = RecordPatches.NCLMetadata_GetMetaTableById(skeleton!, baseTableId, false, 0);
         Assert.NotNull(before);
         Assert.Equal(baseTableId, before.TableId);

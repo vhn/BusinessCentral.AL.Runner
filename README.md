@@ -54,7 +54,8 @@ tree hashing, the dashboard, and the harness's one-second polling granularity.
 Nothing here changes *what* is compiled — only how the work is scheduled, how often the same
 bytes are read, and how much of the heap is live at the peak.
 
-- **Run under Server GC** (`AlRunner.csproj:73`) — the single biggest lever. A cold AL compile
+- **Run under Server GC** (`AlRunner.csproj` → `ServerGarbageCollection`) — the single biggest
+  lever. A cold AL compile
   is GC-throughput-bound: the Application module's emit produces 165 MB of C# that becomes
   ~330 MB of UTF-16 and stays reachable until Roslyn finishes. Upstream sets no GC property and
   ships no `System.GC.Server` in `runtimeconfig.json`, so every user runs Workstation GC.
@@ -64,52 +65,56 @@ bytes are read, and how much of the heap is live at the peak.
   difference thrashing. Regression cover: `AlRunner.Tests/ServerGcConfigTests` — asserting the
   *shipped* `runtimeconfig`, because a behavioural check passes for the wrong reason on any box
   already exporting `DOTNET_gcServer=1`.
-- **Stop binding every tree twice** (`BcAssembler.cs:152`). Upstream's `CallSiteArgWrap.Apply`
+- **Stop binding every tree twice** (`BcAssembler` → `CallSiteArgWrap.TryRewrite`). Upstream's
+  `CallSiteArgWrap.Apply`
   builds its own `CSharpCompilation` and calls `GetDiagnostics()` over every tree purely to
   harvest the CS1503 `ByRef<T>` gaps BC's emitter leaves, then the real emit binds the identical
   trees again. On npcore that first bind costs **79.8 s over 6,947 trees and 139,495
   diagnostics, and performs 0 rewrites.** `CallSiteArgWrap.TryRewrite` now consumes the real
   emit's diagnostics and returns `null` when there is nothing to do, so the pass only costs
   anything on the compiles that actually need it.
-- **Run BC's emit across threads** (`BcCompiler.cs:1469-1515`, `:1571`). `ConcurrentEmit`
+- **Run BC's emit across threads** (`BcCompiler.ConcurrentEmitEnabled`). `ConcurrentEmit`
   defaults to false on both `CompilationOptions` and `EmitOptions`, so every one of npcore's
   objects reaches `AddApplicationObject` on one thread while the bind phase beside it uses the
   whole machine. With the arms interleaved under Server GC, the worst on-leg beats the best
   off-leg by **1.45x** (median 1.8x) with no heap penalty. `AL_RUNNER_BC_CONCURRENT_EMIT=0` is
   the escape hatch. The determinism this costs is stated in the code: object arrival order —
   hence the emitted assembly's member layout — is no longer fixed, so
-  `OrderCapturesDeterministically` (`:1493-1498`) sorts captures by (Name, Code) before use.
-- **Parallelise the AL source-tree parse** (`ParseSourceFilesIntoAllExtractors`,
-  `RecordPatches.AlSourceParser.cs:289-308`). Registering the source tree is the largest wholly
+  `BcCompiler.OrderCapturesDeterministically` sorts captures by (Name, Code) before use.
+- **Parallelise the AL source-tree parse** (`RecordPatches.ParseSourceFilesIntoAllExtractors`).
+  Registering the source tree is the largest wholly
   serial pass left, CPU-bound in the AL parser. Only the parse moves off the calling thread:
   reads stay serial so an unreadable file throws exactly the exception it always threw rather
   than an `AggregateException`, and the eight metadata extractors still run serially in file
   order, so every de-dup and last-writer-wins rule sees the identical sequence. Batched at 256
-  files (`RecordPatches.cs:174`), so the extra live set is bounded by the batch, not the tree.
-  Alongside it, the **declared-object census** runs in parallel (`Program.cs:1805-1813`), and a
-  parse that throws is **memoized as an answer** (`RecordPatches.AlSourceParser.cs:282-308`)
+  files (`RecordPatches.SourceFileBatchSize`), so the extra live set is bounded by the batch,
+  not the tree.
+  Alongside it, the **declared-object census** runs in parallel (`Program.RunEmit`), and a
+  parse that throws is **memoized as an answer** (`RecordPatches.AlSourceParser`)
   so one doomed file costs one attempt instead of one per extractor.
-- **Parallelise the Roslyn half** (`BcAssembler.cs`): per-source parse inside a `Parallel.For`
-  with `DocumentationMode.None` (`:107-115`), one `MetadataReference` per
-  (path, mtime, length) shared process-wide (`:173-210`) — upstream creates them per compile, so
+- **Parallelise the Roslyn half** (`BcAssembler`): per-source parse inside a `Parallel.For`
+  with `DocumentationMode.None`, one `MetadataReference` per
+  (path, mtime, length) shared process-wide — upstream creates them per compile, so
   ~80 unchanging assemblies were re-indexed per app group *and* on every watch cycle — and
-  `ApplyPolyfillRedirects` as one left-to-right walk (`:425-465`) instead of 35 `String.Replace`
+  `ApplyPolyfillRedirects` as one left-to-right walk instead of 35 `String.Replace`
   sweeps per source.
 - **One `.app` read answers both metadata questions, and the package scan fans out**
-  (`AppLoader.cs:118`, `:310`; `BcCompiler.cs:849`). `ReadManifest` and `HasSymbolReference` are
+  (`AppLoader.ReadPackageMeta`; the `BcCompiler` package scan). `ReadManifest` and
+  `HasSymbolReference` are
   answered from the same central directory but asked separately — 226 reads per scan of the
   113-package / 138 MB platform-apps directory. `HasSymbolReference` also stopped pulling the
   whole package into a `byte[]` to look for one entry: per read of
   `Microsoft_Base Application`, 439 MB allocated before, 45 MB after. That is what makes the
   scan safe to parallelise — reads fan out, dedup decisions stay serial and in the original
   sequence.
-- **Release BC's compilation before the Roslyn compile** (`Program.cs:1843`, `:1858`). The bound
+- **Release BC's compilation before the Roslyn compile** (`Program.RunEmit` →
+  `BcCompiler.ReleaseLastCompilation`). The bound
   AL compilation and Roslyn's compilation of the C# it produced are consecutive, not concurrent,
   so holding the first reachable through the second doubles the peak on the phase that already
   sets it. The delta baseline is built as plain data immediately after the emit; only the
   *write* stays after the load, which is all the "a rejected candidate must not become a cache
   entry" invariant needs. **Ships with the next item or not at all** — see below.
-- **Drop the emit-phase deadline and `AL_RUNNER_EMIT_TIMEOUT_SEC`** (`Program.cs:1708`) — the
+- **Drop the emit-phase deadline and `AL_RUNNER_EMIT_TIMEOUT_SEC`** (`Program.RunEmit`) — the
   change that decides whether an app this size runs at all. How long an emit takes is a function
   of app size and host speed, and the runner can predict neither: npcore's Application group
   emits in 89 s on an idle machine and 333 s on a loaded one, so any fixed budget either aborts
@@ -120,25 +125,26 @@ bytes are read, and how much of the heap is live at the peak.
   also abandons the wait without cancelling, so the emit keeps burning cores and re-pins its
   bound compilation through a late `LastCompilation` assignment — which is why this and the
   release above are one change, not two.
-- **`--no-cache` disables every on-disk cache, not just `al-out`** (`CacheRoots.cs:87`).
+- **`--no-cache` disables every on-disk cache, not just `al-out`** (`CacheRoots.DisableForRun`).
   Upstream leaves compiled dependency DLLs, the Cecil-rewritten `Ncl`, parsed `.app` symbol
   tables, extracted R2R chunks and the manifest index in place — worth tens of seconds in
   exactly the situation the flag is reached for. It redirects to a throwaway per-run directory
   rather than deleting anything, so it cannot erase `~/.cache/al-runner` or sabotage a
   concurrent run, and `--cache` / `--no-cache` are now last-wins.
-- **Two whole-tree questions per cycle are deferred** (`Program.cs:1400-1404`, gate at `:1545`).
+- **Two whole-tree questions per cycle are deferred** (`GetOrderedDepIds` and
+  `BcCompiler.BundleDeclaresQuery`, behind the AL-output cache gate).
   `GetOrderedDepIds` and `BundleDeclaresQuery` each feed one consumer, and both consumers sit
   behind the AL-output cache gate — yet both ran ahead of it, every cycle. One rebuilt a second
   `DependencyResolver` index by re-reading every `.app` manifest out of its zip; the other read
   the whole tree to prove an app declares no query (12.7 MB on npcore, and the common case).
 - **Diagnostics and platform fixes that made the rest measurable.** The phase log reports a real
-  peak RSS on macOS via `getrusage` (`PhaseLog.cs:566-597`) instead of the silent zero
+  peak RSS on macOS via `getrusage` (`PhaseLog.PeakRssBytes`) instead of the silent zero
   `Process.PeakWorkingSet64` returns there, plus a `server_gc` field on the process row — which
   is what makes "which phase costs seconds", "which phase holds gigabytes" and "which GC was
-  this subprocess" separately answerable. `EXEC-FAIL` now names the app group
-  (`Program.cs:2232`); before, an app's entire test set could vanish from a run with the
-  exec-fail counter still reading 0. Bundle discovery no longer collapses `Application` and
-  `Test` into one module on case-insensitive filesystems (`Program.cs:6194-6207`). Two CI gate
+  this subprocess" separately answerable. `EXEC-FAIL` now names the app group in `Program.cs`;
+  before, an app's entire test set could vanish from a run with the exec-fail counter still
+  reading 0. Bundle discovery no longer collapses `Application` and `Test` into one module on
+  case-insensitive filesystems. Two CI gate
   scripts parse VSTest's timestamps on Python 3.9 and hold the server-mode FIFO open without
   GNU `sleep infinity`, so they run on macOS at all.
 
@@ -146,9 +152,9 @@ bytes are read, and how much of the heap is live at the peak.
 
 This is not a set of optimisations on upstream's watch loop — it is a different architecture.
 
-Upstream keeps a per-`BcCompiler`-instance, in-memory dictionary as its baseline
-(`BcCompiler.Incremental.cs:111`). On its happy path it swaps the changed object's generated C#
-into the baseline's C# for **every** object and hands that whole union to Roslyn (`:343-347`),
+Upstream keeps a per-`BcCompiler`-instance, in-memory `_radBaselines` dictionary as its baseline
+(`BcCompiler.Incremental.cs`). On its happy path `TryEmitIncremental` swaps the changed object's
+generated C# into the baseline's C# for **every** object and hands that whole union to Roslyn,
 producing a new whole-module assembly per save. Its unit of change is one content-edited `.al`
 file declaring exactly one id-bearing object whose `(Kind, Id, Name)` is unchanged; outside
 that it has **14 distinct fallback triggers** to a full whole-module compile — an added, removed
@@ -201,7 +207,7 @@ drive BC's own `Compilation.CreateForRad`; what differs is what surrounds it.
 
 Two properties of that flow carry most of the difference. The overlay is loaded *beside* the
 previous generations, not instead of them: `Rad/AlObjectResolution` resolves each AL object to
-the generation that owns it in O(1) (`AlObjectResolution.cs:31-32`) and tombstones the CLR names
+the generation that owns it in O(1) (`AlObjectResolution.FindOwned`) and tombstones the CLR names
 a delta removed (`AlObjectResolution.IsTombstoned`), so there is no whole-module reload and no
 bound on how many saves can accumulate. And `Commit` is the only thing that advances the
 workspace, running **after** the assembly loads (`RadEmitResult.Commit` →
@@ -211,23 +217,23 @@ the next save re-diffs against it.
 
 Because .NET cannot unload an assembly, "loaded beside" has to be enforced at every point that
 maps an AL id to a CLR type or scans loaded assemblies. Superseded-generation checks are
-threaded through six runtime surfaces: event subscription (`EventSubscriberPatches.cs:479`,
-`:941` — without it every `[EventSubscriber]` on a replaced codeunit fires twice), test
-discovery (`TestExecutor.cs:436`), install triggers (`InstallTriggerRunner.cs:149`), the
-id→type lookups for query/report/page/TestPage/codeunit (`CodeunitPatches.cs:968-1166`), and
+threaded through six runtime surfaces: event subscription
+(`AlObjectResolution.IsSuperseded` — without it every `[EventSubscriber]` on a replaced
+codeunit fires twice), test discovery (`TestExecutor`), install triggers (`InstallTriggerRunner`), the
+id→type lookups for query/report/page/TestPage/codeunit (`CodeunitPatches`), and
 the live-report set BC reads to decide a report exists
-(`RecordPatches.ReportMetadataVirtualTable.cs:531`).
+(`RecordPatches.ReportMetadataVirtualTable`).
 
 Noteworthy changes, in the order they matter:
 
 - **`--watch` is object-granular.** Delta compilation is what `--watch` does; `AL_RUNNER_RAD=0`
-  (`Program.cs:761-762`) forces every cycle to full-compile as a bisect switch. Runtime metadata
+  (`RadWorkspaceStore.Enabled`) forces every cycle to full-compile as a bisect switch. Runtime metadata
   registered by an AL emit — page, report, xmlport and enum-registry writes that happen *before*
   Roslyn and before `Assembly.Load` — is buffered in `RadMetadataCapture`
-  (`Rad/RadMetadataCapture.cs`, deferred from `BcCompiler.cs:2626`) and applied only once the
+  (`Rad/RadMetadataCapture.cs`, deferred from `BcCompiler`) and applied only once the
   generation loads, so a candidate the C# backend rejects cannot leave the live runtime
   describing objects whose code never loaded.
-- **The baseline is persisted beside the cached AL output** (`Infrastructure/AlCacheSidecars.cs:38-39`).
+- **The baseline is persisted beside the cached AL output** (`Infrastructure/AlCacheSidecars`).
   An in-memory baseline cannot escape this trap: a cache HIT skips Emit+Compile entirely, so
   there is no compile left to build a baseline *from*, and the first edit of every session pays
   a full compile just to establish one. Two sidecars carry the state — `<key>.rad-symbols.json`
@@ -244,17 +250,17 @@ Noteworthy changes, in the order they matter:
   dictionaries and re-derives all of them, re-reading and re-parsing the whole tree to service
   an edit to one file. That is the largest single line item in a warm cycle, several times the
   AL delta emit it exists to serve. Each of the eight extractors is split into a pure
-  `Extract*(text)` half and a stateful `Apply*(records)` half (`:163-192`), memoized on
+  `Extract*(text)` half and a stateful `Apply*(records)` half, memoized on
   (path, content hash, preprocessor symbols), and the unchanged files' records are **replayed**
   in enumeration order — the `tableextension` dictionaries accumulate by base-table name in AL
   declaration order, so one file's contribution cannot be subtracted, only re-applied. On the
   corpus and host the table above was measured on, the stage goes **1.3–1.9 s → 0.24–0.61 s**
   per warm cycle.
-- **Id-less object kinds delta instead of rebuilding the module** (`Rad/RadObjectKey.cs:103-105`).
+- **Id-less object kinds delta instead of rebuilding the module** (`RadObjectKey.IsIdlessKind`).
   `interface`, `controladdin`, `profile`, `pagecustomization`, `profileextension` and
   `entitlement` have no object id. On NP Retail that is 84 files where any edit — a comment
   included — is a guaranteed whole-module rebuild upstream. `RadObjectKey` carries a `Name`
-  (`RadObjectKey.cs:20`) used as the discriminator when the *kind* is id-less. They are binding
+  used as the discriminator when the *kind* is id-less. They are binding
   contracts too, so the reverse dependency graph records edges onto them: widening an interface
   without touching its implementer must not report success, emit nothing, and leave the
   implementer bound to the old contract.
@@ -287,11 +293,11 @@ Noteworthy changes, in the order they matter:
   (app identity, `RadObjectKey`), and the generation watermark is published only from a committed
   emit (`RadEmitResult.Commit`) so a generation the C# backend rejects announces nothing. A
   bundle whose apps would compile under one `AppId` is refused outright
-  (`RadAppCohort.cs:81`) — the reference graph could not tell their objects apart, so
+  (`RadAppCohort.Build`) — the reference graph could not tell their objects apart, so
   rebinding would silently bind one app's callers to the other's surface.
-- **States that no longer cost a whole-module compile.** The overlay chain is unbounded
-  (`Program.cs:5064-5072`), so no save is silently the expensive one. `app.json` is hashed by
-  *content* (`RadWorkspace.cs:735-842`), so a branch switch, a checkout, an editor autosave —
+- **States that no longer cost a whole-module compile.** The overlay chain is unbounded in the
+  `Program.cs` watch loop, so no save is silently the expensive one. `app.json` is hashed by
+  *content* (`RadWorkspace.HashSourceTree`), so a branch switch, a checkout, an editor autosave —
   and on macOS/APFS even reading the tree with `File.Copy` — no longer charges the whole bundle
   a rebuild for a byte-identical manifest. And a **duplicate declaration** now emits `AL0264`
   for an id-keyed kind or `AL0197` for a name-keyed one, instead of surrendering the module:
@@ -301,7 +307,7 @@ Noteworthy changes, in the order they matter:
   object, copying an existing `.al` file.
 - **A file that declares nothing costs nothing.** Creating an empty `.al` file, editing a
   comment-only one, or deleting it again compiles nothing at all. "Declares nothing" is read
-  positively off BC's parser (`Program.cs:3063-3115`) — `ObjectSyntax`
+  positively off BC's `ObjectSyntax` parser in `Program.cs` — `ObjectSyntax`
   is the base type of every AL top-level declaration — rather than as the absence of a symbol,
   which is equally what an unidentifiable declaration looks like.
 - **The delta gets the app's file system** (`AppFileSystem`, passed to `CreateForRad`) so
@@ -310,25 +316,25 @@ Noteworthy changes, in the order they matter:
   **constructor parameter**, because attaching it afterwards with `.WithFileSystem(...)` returns
   a compilation that has lost the packaged module.
 - **Every fallback names its cause where the developer is looking.** The dashboard redirects
-  both console streams while the bundle loop runs (`Program.cs:1013-1014`), so reasons written
+  both console streams while the `Program.cs` watch loop runs, so reasons written
   to stderr were being discarded in the one mode they exist for. `FullCompileBecause`
   (**18 call sites**) now writes to `RadCycleNotes` as well as the log, and the dashboard renders
   two panels above the test tree — yellow for a full recompile, blue for a delta rebind
   (`WatchDashboard.cs`, `FullCompileNotes` / `RebindNotes`).
 - **The file watcher feeds the delta rather than just waking it.** `WatchSource` queues every
-  changed path on a concurrent `ChangedPaths` queue (`WatchSource.cs:130`) instead of raising a
-  bare signal, watches `app.json` alongside `*.al` (`:203`), enqueues **both** ends of a rename,
+  changed path on a concurrent `ChangedPaths` queue instead of raising a
+  bare signal, watches `app.json` alongside `*.al`, enqueues **both** ends of a rename,
   and arms its watchers once per process rather than per idle wait — a save landing while
   watchers are torn down is lost outright, since inotify has no backlog.
 - **A warm cycle reports the same run as the cold one.** Four defects outside the delta path
   made the same unedited bundle report different test sets cold and warm: event dispatch armed
-  after the install seed (`TestExecutor.cs:310-311`), a table publisher's `IncludeSender`
-  argument passed as null (`CodeunitEventDispatcher.cs:424`, `:503-505`), page and xmlport
-  metadata cleared by neither branch of the reload (`BcRuntime.cs:547-548`), and manual event
+  after the install seed (`TestExecutor`), a table publisher's `IncludeSender`
+  argument passed as null (`CodeunitEventDispatcher.IsNonCodeunitSenderParameter`), page and xmlport
+  metadata cleared by neither branch of the reload (`BcRuntime.ResetForNewBundleReload`), and manual event
   bindings owned by a `SingleInstance` codeunit surviving its reset
-  (`CodeunitEventDispatcher.cs:334`, called from `RecordPatches.cs:1199`). The last two also
+  (`CodeunitEventDispatcher.ResetManualBindingCacheForReload`). The last two also
   affect non-watch runs. Separately, the enum registry is now keyed by extension name with
-  `Remove` / `RemoveExtension` (`EnumMetadataPatches.cs:111-137`); appending left a base enum
+  `EnumMetadataPatches.Remove` / `RemoveExtension`; appending left a base enum
   carrying pre-edit *and* post-edit values after a warm cycle re-emitted an `enumextension`.
 - **The reference-graph walk no longer swallows its own faults** (`MapObjectReferences`).
   A per-node `catch { }` absorbs any fault the walk's own `Parallel.For` introduces, and a lost
@@ -339,7 +345,8 @@ Noteworthy changes, in the order they matter:
   `GetSymbolInfo` and got 168 answers.
 - **The suites were made to prove things.** Thirty RAD tests reported `Passed` while asserting
   nothing, and the drift guard meant to catch exactly that
-  (`AlRunner.Tests/TestArtifactsGateTests.cs:295`) could not see them — its `[^\n]*` could not
+  (`TestArtifactsGateTests.NoTestSilentlyReturnsWhenItsEnvironmentIsUnavailable`) could not see
+  them — its `[^\n]*` could not
   cross the newline between the `WriteLine` and the `return`. The cross-app rebind claims, the
   by-name property shapes, the two symbol producers' member-for-member equivalence and the
   silent same-app overload hazard are each now pinned by a test verified to fail without its fix.
@@ -363,10 +370,10 @@ Open, and deliberately not presented as solved:
   the one-shot publishes its symbols in a pre-pass whose reference set the watch path cannot
   reproduce.
 - **Watcher-buffer overflow is detected but not acted on.** `WatchSource.Overflowed`
-  (`WatchSource.cs:98`) is computed and never read, so a cycle can still run against a
+  is computed and never read, so a cycle can still run against a
   partially-reported tree without forcing a full pass.
 - **The dispatch weights for the five new watch/RAD test collections are local, not CI**
-  (`AlRunner.Tests/CollectionCostOrderer.cs:141-156`), and local and CI disagree by up to 3x on
+  (`CollectionCostOrderer`), and local and CI disagree by up to 3x on
   the same class.
 
 ### CLI provisioning
@@ -385,34 +392,20 @@ Open, and deliberately not presented as solved:
   `al-runner <bundle> --watch --auto-provision --test 123456` provisions once and then stays
   resident.
 
-### Upstreaming status
+### Upstream integration status
 
-The fork is **11 commits behind** upstream, and two of those already fix bugs fixed here
-independently. `git merge-tree` against upstream `main` reports 5 conflicting files and 6 hunks,
-all of them traceable to upstream's `d9b4c0e6` and `40c9be25`.
+StefanMaron upstream through `b904dc73` is merged. Where both repositories fixed the same bug,
+the merged tree uses upstream's broader implementation for stack-preserving rethrows, real-page
+metadata reload, and call-stack capture. It keeps the fork's `IncludeSender` classification
+because `ParameterType.IsInstanceOfType(publisher)` also handles page, report, query, and xmlport
+publishers.
 
-**Drop from the fork — upstream's version is equivalent or better:** the strict
-`AlCallStackCapture.GetCapturedFor` and its `InstallTriggerRunner` switch (upstream #1958,
-character-identical), the `_pagesWithRealMetadata` reload clear (#1957, identical body and
-insertion point), and the dispatcher's bare-rethrow fix (#1955 — upstream extracts one
-`RethrowPreservingStack` helper covering *both* rethrow sites where this fork fixed one).
+Upstream's narrower `BcCompiler.TryEmitIncremental` implementation and its tests remain in the
+tree, but it has no production call sites. Production watch routing stays with the persistent
+`RadWorkspace`; the two engines cannot both own the baseline. Any upstream PR for `AlRunner/Rad/`
+must either keep `TryEmitIncremental` test-only or remove it with its tests.
 
-**Keep the fork's, it strictly supersedes:** the `IncludeSender` sender classification. Both
-sides fix the table-publisher null. Upstream tests
-`typeof(INavRecordHandle).IsAssignableFrom(p.ParameterType)`, which covers table publishers
-only; this fork tests `p.ParameterType.IsInstanceOfType(publisher)`, which also covers page,
-report, query and xmlport publishers — still null upstream. Resolve toward the fork and port
-upstream's test.
-
-**One decision blocks the delta core.** Upstream landed its own narrower incremental path
-(`BcCompiler.Incremental.cs`) whose hook was exactly where this fork's delta path now runs. The
-file is still in the tree here, byte-identical, with its eight-test suite — and
-deliberately **not wired**: `TryEmitIncremental` has zero production call sites, because the two
-cannot both own the baseline and the workspace is a strict superset (`Program.cs:1681-1693`).
-Any upstream PR for `AlRunner/Rad/` has to settle that file's fate — keep it dead with its
-tests, or delete both. Shipping both live is not an option.
-
-Everything else is independently landable, in three tiers:
+The remaining fork-specific work is independently upstreamable in three tiers:
 
 | Tier | Unit |
 |---|---|
@@ -423,7 +416,7 @@ Everything else is independently landable, in three tiers:
 Two items are worth sending upstream ahead of the core, because they fix upstream's *own*
 incremental path: `app.json` content-hashing (upstream falls back on any manifest write, even a
 byte-identical one), and the `CreateForRad` `fileSystem`-constructor-vs-`WithFileSystem`
-distinction, which upstream currently gets wrong at `BcCompiler.Incremental.cs:307-308`. The
+distinction, which upstream currently gets wrong in `TryEmitIncremental`. The
 reason-reporting channel is portable too — upstream computes a `fallbackReason` and only shows
 it under `--verbose`.
 

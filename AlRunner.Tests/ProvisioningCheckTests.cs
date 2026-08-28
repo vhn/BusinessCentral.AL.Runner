@@ -1006,14 +1006,15 @@ public sealed class ProvisioningCheckTests : IDisposable
     }
 
     // ── Issue #2003: manifest-driven version floors ───────────────────────────
-    // FindWarmProvisionedVersion used to decide "reuse this warm set" on presence alone,
+    // The platform/test-app reuse scans used to accept a warm set on presence alone,
     // ignoring the version floor the bundle's app.json manifests declare. A warm set at the
     // same major.minor but an OLDER patch than the manifest requires was reused
     // unconditionally, and the run failed later on a compile diagnostic pointing at the test
     // code rather than a message naming the stale provisioning. These tests drive the shared
     // primitives (DetermineVersionFloors / FindVersionFloorViolations / the floor-aware
     // NoFallbackPlatformAppsPresent+TestToolkitPresent overloads / DecideManifestProvisioning)
-    // that both the initial gate and FindWarmProvisionedVersion's warm-reuse scan consult.
+    // used by the initial gate and the FindProvisionedPlatformAppsDirs /
+    // FindProvisionedTestAppsDirs reuse scans in Program.cs.
 
     [Fact]
     public void DetermineVersionFloors_TwoRootsSameApp_KeepsHigherVersion()

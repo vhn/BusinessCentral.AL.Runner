@@ -630,6 +630,49 @@ public sealed class ProvisioningReuseTests : IDisposable
         Assert.NotEqual(0, exit);
     }
 
+    [Theory]
+    [InlineData("42")]
+    [InlineData("{ \"id\": \"b4ce1b39-0e85-4d79-b960-0f55b72597b6\", \"publisher\": 123, \"name\": [\"invalid\"], \"version\": false }")]
+    public void Provision_MalformedDependencyEntry_DoesNotHideValidManifestRequirements(
+        string malformedDependency)
+    {
+        var fx = WriteEmptyMicrosoftFixture(withProvisionedSets: false);
+        WriteSyntheticEngine(fx, SyntheticEngineVersion);
+        File.WriteAllText(Path.Combine(fx.Bundle, "app.json"), $$"""
+        {
+          "id": "c8796af3-7753-4884-b600-f3e4ab85159b",
+          "name": "Malformed Dependency Fixture",
+          "publisher": "AL Runner",
+          "version": "1.0.0.0",
+          "dependencies": [
+            {{malformedDependency}},
+            {
+              "id": "b4ce1b39-0e85-4d79-b960-0f55b72597b6",
+              "publisher": "Microsoft",
+              "name": "Application Test Library",
+              "version": "28.0.0.0"
+            }
+          ],
+          "platform": "28.0.0.0",
+          "application": "28.0.0.0",
+          "idRanges": [ { "from": 62150, "to": 62159 } ],
+          "runtime": "17.0"
+        }
+        """);
+
+        var (output, exit) = RunRunner(fx,
+            $"provision \"{fx.Bundle}\" --bc-version {SyntheticEngineVersion}",
+            blockNetwork: true);
+
+        Assert.True(
+            output.Contains(
+                $"fetching Microsoft platform R2R apps for BC {SyntheticEngineVersion}",
+                StringComparison.Ordinal),
+            output);
+        Assert.DoesNotContain("target bundle(s) do not need Microsoft platform apps", output);
+        Assert.NotEqual(0, exit);
+    }
+
     [Fact]
     public void Provision_EmptyAlpackages_WarmSelectedVersionCacheAvoidsTheCdn()
     {
@@ -844,6 +887,40 @@ public sealed class ProvisioningReuseTests : IDisposable
 
         Assert.Contains("reusing already-provisioned MS test toolkit", output);
         Assert.DoesNotContain("fetching the MS test toolkit", output);
+    }
+
+    [SkippableFact]
+    public void Run_WithoutAutoProvision_ReusesWarmPlatformAppsWithoutDownloading()
+    {
+        TestArtifacts.SkipIfMissing();
+        var built = BcArtifacts.EngineBuiltVersion();
+        TestArtifacts.SkipIf(built == null, "engine built version is not baked into this build");
+        var engineDir = BcArtifacts.ArtifactDirFor(built!.ToString());
+        TestArtifacts.SkipIfDirectoryMissing(engineDir, "the built engine's artifact dir");
+        var selectedVersion = built.ToString();
+        var warmVersion = $"{built.Major}.{built.Minor}.1.2";
+        var fx = WriteEmptyMicrosoftFixture(withProvisionedSets: false);
+        try
+        {
+            LinkRealEngineClosure(fx, selectedVersion, engineDir);
+        }
+        catch (Exception ex)
+        {
+            throw new SkipException($"engine-closure symlinks unavailable: {ex.Message}");
+        }
+        WriteCompleteSelectedPlatformSet(
+            ProvisioningCheck.PlatformAppsDirFor(fx.ArtifactsRoot, warmVersion),
+            warmVersion,
+            includeApplicationTestLibrary: true);
+        WriteApp(ProvisioningCheck.TestAppsDirFor(fx.ArtifactsRoot, selectedVersion),
+            ProvisioningCheck.TestToolkitSentinelApp, selectedVersion, r2r: false);
+
+        var (output, _) = RunRunner(fx,
+            $"\"{fx.Bundle}\" --bc-version {selectedVersion} " +
+            $"--package-cache \"{fx.EmptyPackageCache}\" --no-auto-provision");
+
+        Assert.Contains("reusing already-provisioned platform apps for selected BC", output);
+        Assert.DoesNotContain("fetching Microsoft platform R2R apps", output);
     }
 
     /// <summary>

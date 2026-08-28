@@ -39,6 +39,13 @@ public sealed class ProvisionExplicitModesTests
 
     private static (int ExitCode, string StdErr) Run(string isolatedHome, params string[] args)
     {
+        var result = RunWithOutput(isolatedHome, args);
+        return (result.ExitCode, result.StdErr);
+    }
+
+    private static (int ExitCode, string StdOut, string StdErr) RunWithOutput(
+        string isolatedHome, params string[] args)
+    {
         var argLine = TestBuildConfig.RunArgs(Path.Combine(RepoRoot, "AlRunner")) + " " + string.Join(' ', args);
         var psi = new ProcessStartInfo
         {
@@ -55,9 +62,10 @@ public sealed class ProvisionExplicitModesTests
         // independent of whatever the machine actually running this test has cached.
         psi.Environment["HOME"] = isolatedHome;
 
+        var outSb = new StringBuilder();
         var errSb = new StringBuilder();
         using var proc = Process.Start(psi)!;
-        proc.OutputDataReceived += (_, e) => { };
+        proc.OutputDataReceived += (_, e) => { if (e.Data != null) lock (outSb) outSb.AppendLine(e.Data); };
         proc.ErrorDataReceived += (_, e) => { if (e.Data != null) lock (errSb) errSb.AppendLine(e.Data); };
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
@@ -70,7 +78,9 @@ public sealed class ProvisionExplicitModesTests
                 "of failing fast.");
         }
         proc.WaitForExit();
-        lock (errSb) return (proc.ExitCode, errSb.ToString());
+        lock (outSb)
+        lock (errSb)
+            return (proc.ExitCode, outSb.ToString(), errSb.ToString());
     }
 
     private static string NewIsolatedHome()
@@ -218,6 +228,117 @@ public sealed class ProvisionExplicitModesTests
         var resolved = stdout.Trim();
         Assert.StartsWith("28.1.", resolved);
         Assert.Equal(4, resolved.Split('.').Length);
+    }
+
+    [Fact]
+    public void ResolveVersion_WithTestApps_UsesResolvedVersionForRequestedMode()
+    {
+        var home = NewIsolatedHome();
+        try
+        {
+            var resolved = AlRunner.Provisioning.ArtifactDownloader.ResolveVersion("28.1");
+            Assert.NotNull(resolved);
+            var testAppsDir = Path.Combine(
+                TestArtifacts.StandardCacheDir(home), resolved!, "test-apps");
+            Directory.CreateDirectory(testAppsDir);
+            File.WriteAllText(Path.Combine(testAppsDir, "already-present.app"), "fixture");
+
+            var (exit, stdout, stderr) = RunWithOutput(
+                home, "provision", "--resolve-version", "28.1", "--test-apps");
+
+            Assert.Equal(0, exit);
+            Assert.Equal(resolved, stdout.Trim());
+            Assert.Contains("Microsoft test-toolkit apps already present", stderr);
+            Assert.Contains(testAppsDir, stderr);
+        }
+        finally
+        {
+            try { Directory.Delete(home, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Force_WithoutDownloadMode_IsRejected()
+    {
+        var home = NewIsolatedHome();
+        try
+        {
+            var (exit, stderr) = Run(
+                home, "provision", "--force", "--artifact-path", home);
+
+            Assert.Equal(2, exit);
+            Assert.Contains(
+                "--force requires --platform-apps, --test-apps, or --service-tier", stderr);
+        }
+        finally
+        {
+            try { Directory.Delete(home, recursive: true); } catch { }
+        }
+    }
+
+    [SkippableFact]
+    public void PackagedProvision_FreshCache_TargetsTheBakedEngineVersion()
+    {
+        var built = AlRunner.Infrastructure.BcArtifacts.EngineBuiltVersion();
+        TestArtifacts.SkipIf(built == null, "no baked-in BcEngineVersion on this build");
+        var home = NewIsolatedHome();
+        var packageRoot = Path.Combine(
+            Path.GetTempPath(), "al-runner-packaged-provision", Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(packageRoot);
+            var sourceDir = Path.Combine(
+                RepoRoot, "AlRunner", "bin", TestBuildConfig.Configuration, TestBuildConfig.Framework);
+            foreach (var source in Directory.EnumerateFiles(sourceDir))
+            {
+                if (string.Equals(
+                    Path.GetFileName(source), "Microsoft.Dynamics.Nav.Ncl.dll",
+                    StringComparison.OrdinalIgnoreCase))
+                    continue;
+                File.Copy(source, Path.Combine(packageRoot, Path.GetFileName(source)));
+            }
+            var variantDir = Path.Combine(packageRoot, "variants", built!.ToString());
+            Directory.CreateDirectory(variantDir);
+            File.Copy(
+                Path.Combine(packageRoot, "al-runner.dll"),
+                Path.Combine(variantDir, "al-runner.dll"));
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                Arguments = $"\"{Path.Combine(packageRoot, "al-runner.dll")}\" provision",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = packageRoot,
+            };
+            psi.Environment["HOME"] = home;
+            const string closedProxy = "http://127.0.0.1:1";
+            foreach (var name in new[]
+            {
+                "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
+                "all_proxy", "ALL_PROXY",
+            }) psi.Environment[name] = closedProxy;
+            psi.Environment.Remove("no_proxy");
+            psi.Environment.Remove("NO_PROXY");
+
+            using var proc = Process.Start(psi)!;
+            var stdout = proc.StandardOutput.ReadToEnd();
+            var stderr = proc.StandardError.ReadToEnd();
+            Assert.True(proc.WaitForExit(30_000),
+                $"packaged provision did not fail its blocked download promptly\n{stdout}\n{stderr}");
+
+            Assert.NotEqual(0, proc.ExitCode);
+            Assert.Contains(
+                $"downloading BC {built} engine service-tier closure", stderr);
+            Assert.DoesNotContain("cannot determine which BC version to provision", stderr);
+        }
+        finally
+        {
+            try { Directory.Delete(packageRoot, recursive: true); } catch { }
+            try { Directory.Delete(home, recursive: true); } catch { }
+        }
     }
 
     /// <summary>
