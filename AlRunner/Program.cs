@@ -1864,6 +1864,9 @@ var cycleChangedPaths = new List<string>();
 if (sourceWatch != null)
     while (sourceWatch.Value.ChangedPaths.TryDequeue(out var changedPath))
         cycleChangedPaths.Add(changedPath);
+// A watch rerun is a new execution even though it reuses the process. NumberSequence
+// values deliberately survive bundle and test boundaries within this cycle.
+AlRunner.Patches.NumberSequencePatches.ResetForNewExecution();
 results.Clear();
 fullCompileNotes.Clear();
 rebindNotes.Clear();
@@ -3694,6 +3697,10 @@ return strictExitCode ? computedExitCode : 0;
         Func<Assembly, IReadOnlyList<TestResult>> runStep,
         System.Threading.CancellationToken cancellationToken = default)
     {
+        // Server requests share a process, so give each request the same fresh
+        // NumberSequence lifetime as a standalone CLI/watch execution.
+        AlRunner.Patches.NumberSequencePatches.ResetForNewExecution();
+
         // Drop the previous REQUEST's bundle-derived caches so a reloaded same-named
         // bundle resolves the freshly-emitted Record/Codeunit types and starts with
         // empty in-memory tables. Once per request, NOT per bundle: the CLI bucket
@@ -5878,7 +5885,44 @@ static int RunPrecompile(string[] subArgs)
     var manifest = AppLoader.ReadManifest(input);
     if (manifest == null) { Console.Error.WriteLine($"Failed to read manifest from {input}"); return 2; }
 
+    // #2131: select the BC version that matches the app being precompiled (its own
+    // manifest Version — Microsoft test-apps/platform-apps are versioned identically to
+    // the BC build they ship with, e.g. "Library Assert" v28.1.49838.50794 lives under
+    // artifacts/28.1.49838.50794/) BEFORE computing the package-cache search dirs below.
+    // Without this, DefaultPackageCacheDirs() falls back to ITS OWN lazy "latest version
+    // in the artifacts cache" default (BcArtifacts.EnsureSelected), which is almost never
+    // the version whose test-apps/platform-apps directories actually hold this app's
+    // dependencies — exactly the "search path is too narrow" symptom #2131 reports
+    // (AL1022 for System Application / Application Test Library / PEPPOL, none of which
+    // exist under whatever version happened to be "latest"). Best-effort: an app whose
+    // version does not correspond to any provisioned BC artifact directory (e.g. a
+    // non-Microsoft or hand-versioned .app) falls through to the pre-existing lazy-default
+    // behavior unchanged. A caller who already selected a version explicitly (a normal
+    // bundle run reaching this helper, or a future --bc-version on --precompile) is left
+    // alone — SelectVersion is call-once, so this never overrides that choice.
+    if (!AlRunner.Infrastructure.BcArtifacts.IsSelected)
+    {
+        try { AlRunner.Infrastructure.BcArtifacts.SelectVersion(manifest.Version.ToString(), null); }
+        catch
+        {
+            // No artifacts dir named exactly after this app's version — fall through to
+            // the pre-existing lazy "latest in cache" default (triggered the first time
+            // DefaultPackageCacheDirs() below reads BcArtifacts.SelectedVersion).
+        }
+    }
+
     var packageCacheDirs = caches.Count > 0 ? ExpandPackageCacheDirs(caches).ToList() : DefaultPackageCacheDirs().ToList();
+    // Mirror the main bundle-run flow's runnerOwnedPlatformAppsDir/runnerOwnedTestAppsDir
+    // fold-in (issue #1996) — always include the SELECTED version's own runner-owned
+    // platform-apps/test-apps dirs when present on disk, even when the caller passed an
+    // EXPLICIT --package-cache that doesn't happen to include them. System Application
+    // (needed to compile Microsoft test-toolkit apps like Library Assert, whose own
+    // NavxManifest.xml <Dependencies> is empty — the need is via the implicit `Platform=`
+    // root, not an explicit dependency edge) lives in platform-apps, not test-apps.
+    packageCacheDirs = AlRunner.PrecompileSupport.WidenPackageCacheDirs(
+        packageCacheDirs,
+        AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir,
+        AlRunner.Infrastructure.BcArtifacts.SelectedVersion.ToString());
 
     // Apply BC patches before any BC type is touched (BcCompiler uses BC types).
     BcRuntime.EnsureApplied();
