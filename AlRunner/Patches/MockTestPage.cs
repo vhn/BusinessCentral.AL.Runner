@@ -124,6 +124,10 @@ internal class LiveNavTestPage : MockITestPage
     private readonly object? _owner;
     private readonly int _pageId;
     private readonly Dictionary<int, ITestPart> _parts = new();
+    private Action? _closeOnRelease;
+    // A TestPage created from a live NavForm must leave OnClosePage to NavForm.CloseForm.
+    // Raising it here as well would run the AL trigger twice.
+    private bool _clientFormOwnsCloseTriggers;
 
     public LiveNavTestPage(NavRecord? record, IReadOnlyDictionary<int, int> controlIdToFieldNo)
         : this(record, controlIdToFieldNo, creatable: true, page: null) { }
@@ -147,6 +151,15 @@ internal class LiveNavTestPage : MockITestPage
     }
 
     internal NavRecord? Record => _record;
+
+    internal void SetClientFormClose(Action? closeOnRelease)
+    {
+        _clientFormOwnsCloseTriggers = true;
+        if (closeOnRelease == null) return;
+        if (System.Threading.Interlocked.CompareExchange(
+                ref _closeOnRelease, closeOnRelease, comparand: null) != null)
+            throw new InvalidOperationException("TestPage close ownership was assigned more than once");
+    }
 
     /// <summary>
     /// The record this operation genuinely needs, or a loud, named refusal instead of an NRE
@@ -896,14 +909,51 @@ internal class LiveNavTestPage : MockITestPage
         // model: BC would leave the page open and hand control back to the user, which has no
         // meaning in a test that has already asked for the close. Refusing by name beats both
         // alternatives — closing anyway hides that the page objected, and hanging is worse.
-        if (_page != null && !_page.RaiseOnClosePage(_formResult))
+        if (_page != null && !_page.RaiseOnQueryClosePage(_formResult))
             throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
                 $"TestPage page {_pageId} — OnQueryClosePage",
                 "testpage-close-veto — the page's OnQueryClosePage returned false, which in BC "
                 + "leaves the page open awaiting the user. See docs/scope.md");
-        FlushParts(); FlushRow(); _opened = false;
+        if (!_clientFormOwnsCloseTriggers)
+            _page?.RaiseOnClosePage();
+
+        var completed = false;
+        try
+        {
+            FlushParts();
+            FlushRow();
+            completed = true;
+        }
+        finally
+        {
+            _opened = false;
+            ReleaseClientForm(suppressErrors: !completed);
+        }
     }
-    public override void Dispose() { FlushParts(); FlushRow(); }
+    public override void Dispose()
+    {
+        var completed = false;
+        try
+        {
+            FlushParts();
+            FlushRow();
+            completed = true;
+        }
+        finally { ReleaseClientForm(suppressErrors: !completed); }
+    }
+
+    private void ReleaseClientForm(bool suppressErrors)
+    {
+        var close = System.Threading.Interlocked.Exchange(ref _closeOnRelease, null);
+        if (close == null) return;
+        try { close(); }
+        catch (Exception ex) when (suppressErrors)
+        {
+            Console.Error.WriteLine(
+                $"[LiveNavTestPage] Client form close failed during cleanup: "
+                + $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
 
     private void FlushParts()
     {

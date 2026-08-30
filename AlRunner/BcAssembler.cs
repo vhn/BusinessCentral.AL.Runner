@@ -301,10 +301,9 @@ public sealed class BcAssembler
         // session id, and return true. Missing codeunit → return false (DataError.TrapError
         // pathway). See BcRuntime.AlRunnerStartSession for the dispatch logic.
         ("ALSession.ALStartSession(", "global::AlRunnerShim.NavRuntimeHelpersShim.ALSession_ALStartSession("),
-        // NavForm.Run (static, non-modal) — OOS §3.11. BC emits the [Obsolete] sync wrapper
-        // NavForm.Run(...) (not RunAsync) for Page.Run calls. The real body calls
-        // RunAsync().AsTask().GetAwaiter().GetResult() which NREs deep in NavForm/NCLMetaForm
-        // because the skeleton has no live session.  JmpHook.Apply() cannot intercept this
+        // NavForm.Run (static, non-modal) — handler or trap dispatch during test execution.
+        // BC emits the [Obsolete] sync wrapper NavForm.Run(...) (not RunAsync) for Page.Run
+        // calls. JmpHook.Apply() cannot intercept this reliably
         // because the JIT resolves the call from freshly compiled AL code to a different
         // address than what the hook patches (R2R vs JIT code layout mismatch on .NET 8).
         // Source-level redirect is the reliable alternative: "NavForm.Run(" cannot be a
@@ -618,36 +617,38 @@ namespace AlRunnerShim
                 errorLevel, sessionId, objectId, companyName, record);
 
         // ───────────────────────────────────────────────────────────────────────
-        // NavForm.Run (static, non-modal) — OOS §3.11 #ui.
+        // NavForm.Run (static, non-modal) — handler dispatch during test execution.
         // BC emits NavForm.Run(...) (the [Obsolete] sync wrapper around RunAsync)
         // for all Page.Run call sites. JmpHook.Apply cannot reliably intercept
         // these on .NET 8 R2R (code-layout mismatch); source-level redirect is safe.
-        // All overloads throw RunnerOutOfScopeException when OosHooksActive (i.e.
-        // inside a test run); calls during BC SA init pass through harmlessly.
+        // During a test, delegate to BC so NavTestExecution can invoke a registered
+        // [PageHandler]. Calls during BC SA init remain harmless no-ops.
         public static void NavForm_Run(int formId)
         {
             if (global::AlRunner.BcRuntime.OosHooksActive)
-                global::AlRunner.Infrastructure.RunnerScope.ThrowOutOfScope(""NavForm.RunAsync"", ""non-modal-ui"", ""ui"");
+                Microsoft.Dynamics.Nav.Runtime.NavForm.Run(formId);
         }
         public static void NavForm_Run(int formId, Microsoft.Dynamics.Nav.Runtime.NavRecord record)
         {
             if (global::AlRunner.BcRuntime.OosHooksActive)
-                global::AlRunner.Infrastructure.RunnerScope.ThrowOutOfScope(""NavForm.RunAsync"", ""non-modal-ui"", ""ui"");
+                Microsoft.Dynamics.Nav.Runtime.NavForm.Run(formId, record);
         }
         public static void NavForm_Run(int formId, Microsoft.Dynamics.Nav.Runtime.NavRecord record, int fieldNo)
         {
             if (global::AlRunner.BcRuntime.OosHooksActive)
-                global::AlRunner.Infrastructure.RunnerScope.ThrowOutOfScope(""NavForm.RunAsync"", ""non-modal-ui"", ""ui"");
+                Microsoft.Dynamics.Nav.Runtime.NavForm.Run(formId, record, fieldNo);
         }
         public static void NavForm_Run(string fullName, Microsoft.Dynamics.Nav.Runtime.NavRecord record)
         {
             if (global::AlRunner.BcRuntime.OosHooksActive)
-                global::AlRunner.Infrastructure.RunnerScope.ThrowOutOfScope(""NavForm.RunAsync"", ""non-modal-ui"", ""ui"");
+                Microsoft.Dynamics.Nav.Runtime.NavForm.RunAsync(fullName, record)
+                    .AsTask().GetAwaiter().GetResult();
         }
         public static void NavForm_Run(string fullName, Microsoft.Dynamics.Nav.Runtime.NavRecord record, int fieldNo)
         {
             if (global::AlRunner.BcRuntime.OosHooksActive)
-                global::AlRunner.Infrastructure.RunnerScope.ThrowOutOfScope(""NavForm.RunAsync"", ""non-modal-ui"", ""ui"");
+                Microsoft.Dynamics.Nav.Runtime.NavForm.RunAsync(fullName, record, fieldNo)
+                    .AsTask().GetAwaiter().GetResult();
         }
 
         // ─── Text method polyfills ────────────────────────────────────────────────

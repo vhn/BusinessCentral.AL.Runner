@@ -1,9 +1,8 @@
-// RunnerModalDispatch — stand in for the CLIENT half of BC's modal-page handler round-trip.
+// RunnerModalDispatch — stand in for the CLIENT half of BC's page-handler round-trips.
 //
 // HOW BC DOES IT
-//   NavTestExecution.TestHandleModalForm finds the test's [ModalPageHandler], pushes a
-//   delegate that will build a NavTestPage and invoke that handler onto dialogHandlerStack,
-//   and then asks the CLIENT to run the form modally:
+//   NavTestExecution finds the test's page handler or trap, then asks the CLIENT to run the
+//   form. The modal path pushes a delegate onto dialogHandlerStack before calling:
 //       TestClientProxy<IClientCallbackHandler>.Proxy(ServiceConnection.CallbackHandler)
 //           .FormRunModal(runRequest);
 //   A real client opens the page and calls back into the server, which lands in
@@ -16,16 +15,139 @@
 //   real IService/IClientCallbackHandler surface to satisfy one call means ~130 members that
 //   exist only to throw, so NclCecilRewrite instead redirects that single call site here.
 //
-//   This is not a shortcut around BC's logic — it performs exactly the step the client would
-//   have caused, using BC's own methods: pop the dialog handler, record its result. Every
-//   decision that matters (which handler, what it does, what OK/Cancel means) stays in BC's
-//   code and in the AL handler.
+//   This is not a shortcut around BC's logic — it performs the callback the client would have
+//   caused through BC's own ShowForm/ShowDialog methods. Handler selection, trap attachment,
+//   AL invocation, and modal results remain in BC's code.
 using System.Reflection;
+using System.Threading;
 
 namespace AlRunner.Patches;
 
 public static class RunnerModalDispatch
 {
+    private static readonly AsyncLocal<NonModalCloseTransfer?> PendingNonModalClose = new();
+
+    /// <summary>
+    /// Called from the rewritten NavTestExecution.TestHandleForm in place of the client
+    /// callback. BC's ShowForm performs the non-modal PageHandler/TestPage dispatch.
+    /// </summary>
+    public static void FormRun(object testExecution, object runRequest)
+    {
+        if (testExecution == null || runRequest == null)
+            throw new InvalidOperationException(
+                "TestPage non-modal dispatch requires a test-execution context and request");
+
+        var handle = FormHandleOf(runRequest);
+        var form = RegisteredForm(handle)
+            ?? throw new InvalidOperationException(
+                $"No form is registered under non-modal handle {handle} — Ncl shape changed; do not commit");
+        var showForm = testExecution.GetType().GetMethod(
+            "ShowForm",
+            BindingFlags.NonPublic | BindingFlags.Instance,
+            binder: null,
+            types: new[] { typeof(Guid) },
+            modifiers: null)
+            ?? throw new InvalidOperationException(
+                "NavTestExecution.ShowForm(Guid) not found — Ncl shape changed; do not commit");
+        using var closeTransfer = HasTrap(testExecution, form)
+            ? BeginTrappedFormClose(handle, form)
+            : null;
+        DispatchNonModalPage(
+            form,
+            () => Invoke(showForm, testExecution, new object?[] { handle }),
+            () => closeTransfer?.OwnershipTransferred == true);
+    }
+
+    /// <summary>
+    /// Open the server form before BC builds the TestPage and invokes its PageHandler, then
+    /// close only the registration created here. A real client's TestPage proxy performs this
+    /// close after the handler returns; without it the form remains registered with NavCompany.
+    /// </summary>
+    internal static void DispatchNonModalPage(
+        object form,
+        Action dispatch,
+        Func<bool>? keepOpenAfterDispatch = null)
+    {
+        ArgumentNullException.ThrowIfNull(form);
+        ArgumentNullException.ThrowIfNull(dispatch);
+
+        var opened = TryOpenForm(form);
+        var completed = false;
+        try
+        {
+            dispatch();
+            completed = true;
+        }
+        finally
+        {
+            if (opened && (!completed || keepOpenAfterDispatch?.Invoke() != true))
+                CloseForm(form, result: null, suppressErrors: !completed);
+        }
+    }
+
+    /// <summary>
+    /// Marks a trapped non-modal page so the ITestPage created during ShowForm can take over
+    /// closing it. The marker follows the synchronous client callback and nests safely when an
+    /// OnOpenPage trigger opens another trapped page.
+    /// </summary>
+    internal static NonModalCloseTransfer BeginTrappedFormClose(Guid handle, object form)
+    {
+        ArgumentNullException.ThrowIfNull(form);
+        return new NonModalCloseTransfer(handle, form, PendingNonModalClose.Value);
+    }
+
+    /// <summary>
+    /// Transfers closing the trapped form to the LiveNavTestPage that BC attaches to the AL
+    /// TestPage variable. Returning null means this GetPage call is not the trapped non-modal
+    /// callback currently being dispatched.
+    /// </summary>
+    internal static Action? TakeTrappedFormClose(Guid handle)
+    {
+        for (var transfer = PendingNonModalClose.Value; transfer != null; transfer = transfer.Parent)
+        {
+            if (transfer.Handle != handle) continue;
+            if (transfer.OwnershipTransferred)
+                throw new InvalidOperationException(
+                    $"Non-modal form handle {handle} transferred close ownership more than once");
+
+            transfer.OwnershipTransferred = true;
+            return () => CloseForm(transfer.Form, result: null, suppressErrors: false);
+        }
+
+        return null;
+    }
+
+    internal sealed class NonModalCloseTransfer : IDisposable
+    {
+        private bool _disposed;
+
+        internal NonModalCloseTransfer(Guid handle, object form, NonModalCloseTransfer? parent)
+        {
+            Handle = handle;
+            Form = form;
+            Parent = parent;
+            PendingNonModalClose.Value = this;
+        }
+
+        internal Guid Handle { get; }
+        internal object Form { get; }
+        internal NonModalCloseTransfer? Parent { get; }
+        internal bool OwnershipTransferred { get; set; }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (ReferenceEquals(PendingNonModalClose.Value, this))
+                PendingNonModalClose.Value = Parent;
+        }
+    }
+
+    /// <summary>Preserves the existing loud boundary for Page.Run without a handler.</summary>
+    public static void ThrowUnhandledNonModalForm()
+        => AlRunner.Infrastructure.RunnerScope.ThrowOutOfScope(
+            "NavForm.RunAsync", "non-modal-ui", "ui");
+
     /// <summary>
     /// Called from the rewritten NavTestExecution.TestHandleModalForm in place of the client
     /// callback. Signature matches the call site's stack shape: the NavTestExecution (left by
@@ -58,16 +180,18 @@ public static class RunnerModalDispatch
         var showDialog = type.GetMethod("ShowDialog", BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new InvalidOperationException(
                 "NavTestExecution.ShowDialog not found — Ncl shape changed; do not commit");
-        object? result;
+        object? result = null;
+        var completed = false;
         try
         {
             result = Invoke(showDialog, testExecution, new object?[] { handle });
+            completed = true;
         }
         finally
         {
             // Close only what this method opened, and only through BC's own CloseForm, so the
             // form leaves the company's registry exactly the way BC would have left it.
-            if (opened) TryCloseForm(form!, result: null);
+            if (opened) CloseForm(form!, result: null, suppressErrors: !completed);
         }
 
         // The handler's outcome (OK/Cancel) is what the AL that called RunModal receives.
@@ -145,17 +269,55 @@ public static class RunnerModalDispatch
         return true;
     }
 
-    private static void TryCloseForm(object form, object? result)
+    private static bool HasTrap(object testExecution, object form)
     {
-        var closeForm = form.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .FirstOrDefault(m => m.Name == "CloseForm" && m.GetParameters().Length == 1);
-        if (closeForm == null) return;
-        var formResultType = closeForm.GetParameters()[0].ParameterType;
-        var arg = result != null && formResultType.IsInstanceOfType(result)
-            ? result
-            : Enum.ToObject(formResultType, 0);
-        try { Invoke(closeForm, form, new[] { arg }); }
-        catch (Exception ex)
+        var hasTrap = testExecution.GetType().GetMethod(
+            "HasTrap",
+            BindingFlags.NonPublic | BindingFlags.Instance,
+            binder: null,
+            types: new[] { typeof(int) },
+            modifiers: null)
+            ?? throw new InvalidOperationException(
+                "NavTestExecution.HasTrap(Int32) not found — Ncl shape changed; do not commit");
+        return Invoke(hasTrap, testExecution, new object?[] { PageIdOf(form) }) is true;
+    }
+
+    private static int PageIdOf(object form)
+    {
+        var objectId = form.GetType()
+            .GetProperty("ObjectId", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?
+            .GetValue(form)
+            ?? throw new InvalidOperationException(
+                "NavForm.ObjectId not found — Ncl shape changed; do not commit");
+        return objectId.GetType()
+            .GetProperty("ObjectNumber", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?
+            .GetValue(objectId) is int pageId
+            ? pageId
+            : throw new InvalidOperationException(
+                "NavForm.ObjectId.ObjectNumber not found — Ncl shape changed; do not commit");
+    }
+
+    private static void CloseForm(object form, object? result, bool suppressErrors)
+    {
+        try
+        {
+            var isOpen = form.GetType().GetProperty(
+                "IsOpen", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (isOpen?.GetValue(form) is false) return;
+
+            var closeForm = form.GetType().GetMethods(
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "CloseForm" && m.GetParameters().Length == 1);
+            if (closeForm == null)
+                throw new InvalidOperationException(
+                    "NavForm.CloseForm(FormResult) not found — Ncl shape changed; do not commit");
+            var formResultType = closeForm.GetParameters()[0].ParameterType;
+            var arg = result != null && formResultType.IsInstanceOfType(result)
+                ? result
+                : Enum.ToObject(formResultType, 0);
+            Invoke(closeForm, form, new[] { arg });
+        }
+        catch (Exception ex) when (suppressErrors)
         {
             // Closing is cleanup, not the test's subject: a failure here must not replace the
             // handler's own outcome, but it must not vanish either.
@@ -169,7 +331,7 @@ public static class RunnerModalDispatch
             .GetProperty("Data", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?
             .GetValue(runRequest)
             ?? throw new InvalidOperationException(
-                "FormRunModalRequest.Data not found — Ncl shape changed; do not commit");
+                "FormRunRequest.Data not found — Ncl shape changed; do not commit");
         return data.GetType()
             .GetProperty("FormHandle", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?
             .GetValue(data) is Guid handle
