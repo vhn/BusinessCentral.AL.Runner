@@ -224,17 +224,20 @@ These are classified `out-of-scope` because supporting them requires the BC clie
 ### HTTP — partial support
 
 HTTP types (`HttpClient`, `HttpRequestMessage`, `HttpResponseMessage`, `HttpContent`,
-`HttpHeaders`) are replaced with in-memory mocks. The following works:
+`HttpHeaders`) can be constructed and inspected in-process. The following works:
 
 - `HttpContent.WriteFrom(Text)` / `ReadAs(var Text)` — text round-trip
 - `HttpContent.WriteFrom(InStream)` / `ReadAs(var InStream)` — stream round-trip
 - `HttpResponseMessage.HttpStatusCode()` (default 200), `IsSuccessStatusCode()`
 - `HttpHeaders.Add()`, `Contains()`, `Remove()`
 - `HttpRequestMessage.Method()`, `SetRequestUri()`, `Content()`
+- `[HttpClientHandler]` dispatch during a test. A handler that returns `false` supplies
+  the mocked response to the original `HttpClient` call.
 
-**Not supported:** `HttpClient.Send()`, `Get()`, `Post()`, `Put()`, `Delete()`,
-`Patch()` — these throw `NotSupportedException`. Inject HTTP dependencies via an
-AL interface if you want to unit test the logic around HTTP calls.
+**Not supported:** real outbound delivery from `HttpClient.Send()`, `Get()`, `Post()`,
+`Put()`, `Delete()`, or `Patch()`. Calls without a matching handler throw the documented
+`external-http` out-of-scope error. A handler that returns `true` also throws because that
+return value asks Business Central to fall through to the real endpoint.
 
 ---
 

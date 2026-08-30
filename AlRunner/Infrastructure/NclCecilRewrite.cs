@@ -20,6 +20,8 @@ namespace AlRunner.Infrastructure;
 public static class NclCecilRewrite
 {
     private const int CACHE_VERSION = 135;
+    private const string ExternalHttpOosMessage =
+        "out-of-scope: HttpClient.Send — external-http — see docs/scope.md#external-http";
 
     // ─────────────────────────────────────────────────────────────────────────
     // Cecil-owned skip registry (JmpHook→Cecil migration enabler).
@@ -2325,87 +2327,33 @@ public static class NclCecilRewrite
             Console.Error.WriteLine("[Cecil] Rewrote ALCompiler DotNet-to-stream bridges → BcRuntime helpers (skeleton SharedObjects fallback)");
         }
 
-        // NavHttpClient egress (ALGet/ALPost/ALPut/ALDelete/ALPatch + their *Async and
-        // *Send variants) — external HTTP is permanently out of scope (docs/scope.md §3.2,
-        // anchor external-http). On the headless skeleton these NRE deep inside
-        // NavHttpClient.get_Target() (no real HttpClient/network), which surfaces as a raw
-        // NullReferenceException — a silent-ish failure that does NOT name the unsupported
-        // surface. loud-failures.md requires we throw loudly, naming the API + reason AT THE
-        // CALL SITE. Rewrite each egress body to throw the "out-of-scope: <api> — external-http
-        // — see docs/scope.md#external-http" InvalidOperationException (same message contract +
-        // memberRef as the NavReport.SaveAs OOS rewrite above; reusing the existing memberRef
-        // keeps R2R token offsets stable). Header / base-address configuration methods
-        // (ALSetBaseAddress, ALDefaultRequestHeaders, …) are deliberately left intact — only
-        // the methods that actually egress are rewritten.
+        // NavHttpClient dispatch — preserve BC's [HttpClientHandler] path and stop only the
+        // paths that would leave the process. Every AL verb reaches the five-parameter
+        // NavTestExecution.TestHandleHttpClientRequest dispatcher before the private network
+        // overload. Its real body refuses to invoke a discovered handler when the service is
+        // not running locally, which is always true on the standalone skeleton. Rewrite that
+        // one synchronous dispatcher so a handler returning false supplies its mock response,
+        // while no handler, non-test use, and handler fall-through throw the existing
+        // external-http OOS message. Keeping the throw above TrappableHttpOperationExecutor
+        // preserves its message instead of translating it into a message-less Nav exception.
         {
-            var httpType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.NavHttpClient");
-            if (httpType != null)
-            {
-                // Reuse the InvalidOperationException(string) `oosCtor` imported above (same
-                // pattern as NavReport.SaveAs). The "out-of-scope: <api> — <reason> — see
-                // docs/scope.md#<anchor>" message format is the loud-failures contract that AL
-                // `asserterror`/`Assert.ExpectedError('out-of-scope:')` matches. Using the
-                // already-imported memberRef avoids adding a new typeRef/memberRef to Ncl
-                // (R2R token-shift safety — see feedback_r2r_cecil_token_shift).
-                var egressVerbs = new[] { "ALGet", "ALPost", "ALPut", "ALDelete", "ALPatch", "ALSend" };
-                int httpRewritten = 0;
-                foreach (var method in httpType.Methods)
-                {
-                    if (!method.HasBody) continue;
-                    var verb = egressVerbs.FirstOrDefault(v =>
-                        method.Name == v || method.Name == v + "Async");
-                    if (verb == null) continue;
+            var httpType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.NavHttpClient")
+                ?? throw new InvalidOperationException(
+                    "NavHttpClient type not found — Ncl shape changed; do not commit");
+            var dispatcher = RewriteTestHandleHttpClientRequest(asm.MainModule, oosCtor);
+            ValidateNavHttpClientEgressCallGraph(asm.MainModule, httpType, dispatcher);
+            Console.Error.WriteLine(
+                "[Cecil] Rewrote NavTestExecution.TestHandleHttpClientRequest → mocked handler or OOS (external-http)");
 
-                    var apiLabel = "HttpClient." + verb.Substring(2); // "HttpClient.Get"
-                    var body = method.Body;
-                    body.Instructions.Clear();
-                    body.Variables.Clear();
-                    body.ExceptionHandlers.Clear();
-                    var il = body.GetILProcessor();
-                    il.Append(il.Create(OpCodes.Ldstr,
-                        $"out-of-scope: {apiLabel} — external-http — see docs/scope.md#external-http"));
-                    il.Append(il.Create(OpCodes.Newobj, oosCtor));
-                    il.Append(il.Create(OpCodes.Throw));
-                    body.MaxStackSize = 1;
-                    httpRewritten++;
-                }
-                if (httpRewritten > 0)
-                    Console.Error.WriteLine($"[Cecil] Rewrote {httpRewritten} NavHttpClient egress method(s) → throw OOS (external-http)");
-
-                // NavHttpClient.get_Target — must NOT throw: the AL `HttpClient` value type
-                // lazily materialises its backing SharedNavHttpClient via get_Target during
-                // FIELD SETUP (scope ctor), before any verb call. The real body NREs on the
-                // headless skeleton (base.Tree.Session.Company.SharedObjects is null). Delegate
-                // to the existing helper that constructs a SharedNavHttpClient parented to the
-                // skeleton container (no HTTP infra in that ctor) — same Cecil-delegation shape
-                // as NavObjectList`1.get_Target. With construction succeeding, the egress verbs
-                // above are what throw OOS, so `asserterror HttpClient.Get(...)` observes the
-                // named failure at the call site. (The prior JmpHook for this getter no longer
-                // fires under Cecil-only mode, which is why the raw NRE was surfacing.)
-                var getTarget = httpType.Methods.FirstOrDefault(mm => mm.Name == "get_Target");
-                if (getTarget != null && getTarget.HasBody)
-                {
-                    var sharedHttpType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.SharedNavHttpClient");
-                    var helperMI = typeof(AlRunner.BcRuntime).GetMethod(
-                        nameof(AlRunner.BcRuntime.NavHttpClient_get_Target),
-                        BindingFlags.Public | BindingFlags.Static);
-                    if (sharedHttpType != null && helperMI != null)
-                    {
-                        var helperRef = asm.MainModule.ImportReference(helperMI);
-                        var body = getTarget.Body;
-                        body.Instructions.Clear();
-                        body.Variables.Clear();
-                        body.ExceptionHandlers.Clear();
-                        var il = body.GetILProcessor();
-                        il.Append(il.Create(OpCodes.Ldarg_0));
-                        il.Append(il.Create(OpCodes.Call, helperRef));
-                        il.Append(il.Create(OpCodes.Castclass, sharedHttpType));
-                        il.Append(il.Create(OpCodes.Ret));
-                        body.MaxStackSize = 1;
-                        Console.Error.WriteLine("[Cecil] Rewrote NavHttpClient.get_Target → BcRuntime helper (skeleton-parented)");
-                    }
-                }
-            }
+            // NavHttpClient.get_Target — the AL `HttpClient` value type lazily materialises
+            // its SharedNavHttpClient during field setup, before any verb call. The real body
+            // NREs on the headless skeleton. Delegate to the existing helper that constructs
+            // the value against the skeleton container; the dispatcher above owns egress.
+            RewriteRequiredHttpTargetGetter(
+                asm.MainModule,
+                httpType,
+                "Microsoft.Dynamics.Nav.Runtime.SharedNavHttpClient",
+                nameof(AlRunner.BcRuntime.NavHttpClient_get_Target));
 
             // NavHttpResponseMessageBase.get_Target — same skeleton-parented delegation as
             // NavHttpClient.get_Target above. The AL `HttpResponseMessage` value type also
@@ -2413,30 +2361,15 @@ public static class NclCecilRewrite
             // setup and NREs on the headless skeleton; its JmpHook no longer fires under
             // Cecil-only mode. Delegate to the existing BcRuntime helper so the response value
             // constructs cleanly (the HTTP egress that would populate it throws OOS first).
-            var httpRespType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.NavHttpResponseMessageBase");
-            if (httpRespType != null)
-            {
-                var getTarget = httpRespType.Methods.FirstOrDefault(mm => mm.Name == "get_Target");
-                var sharedRespType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.SharedNavHttpResponseMessage");
-                var helperMI = typeof(AlRunner.BcRuntime).GetMethod(
-                    nameof(AlRunner.BcRuntime.NavHttpResponseMessageBase_get_Target),
-                    BindingFlags.Public | BindingFlags.Static);
-                if (getTarget != null && getTarget.HasBody && sharedRespType != null && helperMI != null)
-                {
-                    var helperRef = asm.MainModule.ImportReference(helperMI);
-                    var body = getTarget.Body;
-                    body.Instructions.Clear();
-                    body.Variables.Clear();
-                    body.ExceptionHandlers.Clear();
-                    var il = body.GetILProcessor();
-                    il.Append(il.Create(OpCodes.Ldarg_0));
-                    il.Append(il.Create(OpCodes.Call, helperRef));
-                    il.Append(il.Create(OpCodes.Castclass, sharedRespType));
-                    il.Append(il.Create(OpCodes.Ret));
-                    body.MaxStackSize = 1;
-                    Console.Error.WriteLine("[Cecil] Rewrote NavHttpResponseMessageBase.get_Target → BcRuntime helper (skeleton-parented)");
-                }
-            }
+            RewriteRequiredHttpTargetGetter(
+                asm.MainModule,
+                asm.MainModule.GetType(
+                    "Microsoft.Dynamics.Nav.Runtime.NavHttpResponseMessageBase")
+                    ?? throw new InvalidOperationException(
+                        "NavHttpResponseMessageBase type not found — Ncl shape changed; "
+                        + "do not commit"),
+                "Microsoft.Dynamics.Nav.Runtime.SharedNavHttpResponseMessage",
+                nameof(AlRunner.BcRuntime.NavHttpResponseMessageBase_get_Target));
 
             // NavHttpRequestMessage.get_Target — same skeleton-parented delegation as
             // NavHttpClient.get_Target / NavHttpResponseMessageBase.get_Target above, but this
@@ -2452,30 +2385,13 @@ public static class NclCecilRewrite
             // "same shape, already safe" case — it is the one-in-eight genuine bug #1883 asks
             // each cluster to check for. Delegate to the existing BcRuntime helper (identical
             // shape to the sibling two, just never wired into Cecil).
-            var httpReqType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.NavHttpRequestMessage");
-            if (httpReqType != null)
-            {
-                var getTarget = httpReqType.Methods.FirstOrDefault(mm => mm.Name == "get_Target");
-                var sharedReqType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.SharedNavHttpRequestMessage");
-                var helperMI = typeof(AlRunner.BcRuntime).GetMethod(
-                    nameof(AlRunner.BcRuntime.NavHttpRequestMessage_get_Target),
-                    BindingFlags.Public | BindingFlags.Static);
-                if (getTarget != null && getTarget.HasBody && sharedReqType != null && helperMI != null)
-                {
-                    var helperRef = asm.MainModule.ImportReference(helperMI);
-                    var body = getTarget.Body;
-                    body.Instructions.Clear();
-                    body.Variables.Clear();
-                    body.ExceptionHandlers.Clear();
-                    var il = body.GetILProcessor();
-                    il.Append(il.Create(OpCodes.Ldarg_0));
-                    il.Append(il.Create(OpCodes.Call, helperRef));
-                    il.Append(il.Create(OpCodes.Castclass, sharedReqType));
-                    il.Append(il.Create(OpCodes.Ret));
-                    body.MaxStackSize = 1;
-                    Console.Error.WriteLine("[Cecil] Rewrote NavHttpRequestMessage.get_Target → BcRuntime helper (skeleton-parented)");
-                }
-            }
+            RewriteRequiredHttpTargetGetter(
+                asm.MainModule,
+                asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.NavHttpRequestMessage")
+                    ?? throw new InvalidOperationException(
+                        "NavHttpRequestMessage type not found — Ncl shape changed; do not commit"),
+                "Microsoft.Dynamics.Nav.Runtime.SharedNavHttpRequestMessage",
+                nameof(AlRunner.BcRuntime.NavHttpRequestMessage_get_Target));
         }
 
         // ALDatabase.ALSetDefaultTableConnection / ALHasTableConnection — both NRE
@@ -8139,6 +8055,689 @@ public static class NclCecilRewrite
 
         return 2;
     }
+
+    internal static void RewriteRequiredHttpTargetGetter(
+        ModuleDefinition module,
+        TypeDefinition ownerType,
+        string sharedTypeFullName,
+        string helperName)
+    {
+        var sharedType = module.GetType(sharedTypeFullName)
+            ?? throw new InvalidOperationException(
+                $"{sharedTypeFullName} type not found — Ncl shape changed; do not commit");
+        var getters = ownerType.Methods.Where(method =>
+            method.Name == "get_Target"
+            && method.Parameters.Count == 0
+            && !method.IsStatic
+            && method.HasBody
+            && method.ReturnType.FullName == sharedTypeFullName).ToList();
+        if (getters.Count != 1)
+            throw new InvalidOperationException(
+                $"{ownerType.Name}.get_Target returning {sharedType.Name}: found "
+                + $"{getters.Count}, expected exactly 1 — Ncl shape changed; do not commit");
+
+        var helpers = typeof(AlRunner.BcRuntime).GetMethods(
+                BindingFlags.Public | BindingFlags.Static)
+            .Where(method =>
+                method.Name == helperName
+                && method.ReturnType == typeof(object)
+                && method.GetParameters() is [{ ParameterType: not null } parameter]
+                && parameter.ParameterType == typeof(object))
+            .ToList();
+        if (helpers.Count != 1)
+            throw new InvalidOperationException(
+                $"BcRuntime.{helperName}(object): found {helpers.Count}, expected exactly 1 — "
+                + "runner helper shape changed; do not commit");
+
+        var body = getters[0].Body;
+        body.Instructions.Clear();
+        body.Variables.Clear();
+        body.ExceptionHandlers.Clear();
+        var il = body.GetILProcessor();
+        il.Append(il.Create(OpCodes.Ldarg_0));
+        il.Append(il.Create(OpCodes.Call, module.ImportReference(helpers[0])));
+        il.Append(il.Create(OpCodes.Castclass, sharedType));
+        il.Append(il.Create(OpCodes.Ret));
+        body.MaxStackSize = 1;
+        Console.Error.WriteLine(
+            $"[Cecil] Rewrote {ownerType.Name}.get_Target → BcRuntime helper "
+            + "(skeleton-parented)");
+    }
+
+    internal static MethodDefinition RewriteTestHandleHttpClientRequest(
+        ModuleDefinition module,
+        MethodReference oosCtor)
+    {
+        var navTestExecutionType = module.GetType(
+            "Microsoft.Dynamics.Nav.Runtime.NavTestExecution")
+            ?? throw new InvalidOperationException(
+                "NavTestExecution type not found — Ncl shape changed; do not commit");
+        var methods = navTestExecutionType.Methods.Where(method =>
+            method.Name == "TestHandleHttpClientRequest"
+            && method.Parameters.Count == 5
+            && method.Parameters[0].ParameterType.FullName
+                == "Microsoft.Dynamics.Nav.Runtime.NavHttpClient"
+            && method.Parameters[1].ParameterType.FullName == "System.String"
+            && method.Parameters[2].ParameterType.FullName == "System.String"
+            && method.Parameters[3].ParameterType.FullName == "System.Boolean"
+            && method.Parameters[4].ParameterType.FullName
+                == "Microsoft.Dynamics.Nav.Runtime.NavTestHttpResponseMessage&"
+            && method.ReturnType.MetadataType == MetadataType.Boolean
+            && method.IsAssembly
+            && !method.IsStatic
+            && method.HasBody).ToList();
+        if (methods.Count != 1)
+            throw new InvalidOperationException(
+                "NavTestExecution.TestHandleHttpClientRequest(NavHttpClient, string, string, "
+                + $"bool, out response): found {methods.Count}, expected exactly 1 — "
+                + "Ncl shape changed; do not commit");
+        var method = methods[0];
+        if (method.Body.ExceptionHandlers.Count != 0)
+            throw new InvalidOperationException(
+                "TestHandleHttpClientRequest gained exception handlers — Ncl shape changed; "
+                + "do not commit");
+
+        var inTestCalls = method.Body.Instructions.Where(instruction =>
+            IsCallTo(instruction, "get_InTest", 0)).ToList();
+        if (inTestCalls.Count != 1)
+            throw new InvalidOperationException(
+                $"TestHandleHttpClientRequest has {inTestCalls.Count} get_InTest calls, "
+                + "expected exactly 1 — Ncl shape changed; do not commit");
+        var inTestBranch = inTestCalls[0].Next;
+        var notInTestValue = inTestBranch?.Next;
+        var notInTestReturn = notInTestValue?.Next;
+        if (!IsConditionalBranch(inTestBranch, Code.Brtrue, Code.Brtrue_S)
+            || inTestBranch!.Operand is not Instruction inTestTarget
+            || !IsInt32Constant(notInTestValue, 0)
+            || notInTestReturn?.OpCode != OpCodes.Ret
+            || method.Body.Instructions.IndexOf(inTestTarget)
+                <= method.Body.Instructions.IndexOf(notInTestReturn))
+        {
+            throw new InvalidOperationException(
+                "TestHandleHttpClientRequest non-test return shape changed — Ncl shape "
+                + "changed; do not commit");
+        }
+
+        var findHandlerCalls = method.Body.Instructions.Where(instruction =>
+            IsCallTo(instruction, "FindHandler", 4)).ToList();
+        if (findHandlerCalls.Count != 1)
+            throw new InvalidOperationException(
+                $"TestHandleHttpClientRequest has {findHandlerCalls.Count} FindHandler(4) "
+                + "calls, expected exactly 1 — Ncl shape changed; do not commit");
+        var findHandler = findHandlerCalls[0];
+        var storeHandler = findHandler.Next;
+        var loadHandler = storeHandler?.Next;
+        var loadNull = loadHandler?.Next;
+        var equality = loadNull?.Next;
+        var branchWhenNull = equality?.Next;
+        var storedHandlerLocal = LocalIndex(storeHandler);
+        if (!IsStoreLocal(storeHandler)
+            || !IsLoadLocal(loadHandler)
+            || storedHandlerLocal == null
+            || storedHandlerLocal != LocalIndex(loadHandler)
+            || loadNull?.OpCode != OpCodes.Ldnull
+            || equality?.Operand is not MethodReference
+                {
+                    Name: "op_Equality",
+                    DeclaringType.FullName: "System.Reflection.MethodInfo",
+                }
+            || !IsConditionalBranch(branchWhenNull, Code.Brtrue, Code.Brtrue_S)
+            || branchWhenNull!.Operand is not Instruction noHandlerTarget)
+        {
+            throw new InvalidOperationException(
+                "TestHandleHttpClientRequest handler-null branch shape changed — Ncl shape "
+                + "changed; do not commit");
+        }
+
+        var topologyChecks = method.Body.Instructions.Where(instruction =>
+            IsCallTo(instruction, "get_IsServiceRunningInLocalEnvironment", 0)).ToList();
+        if (topologyChecks.Count != 1)
+            throw new InvalidOperationException(
+                $"TestHandleHttpClientRequest has {topologyChecks.Count} local-environment "
+                + "checks, expected exactly 1 — Ncl shape changed; do not commit");
+        var topologyCheck = topologyChecks[0];
+        var topologyGetter = topologyCheck.Previous;
+        var topologyBranch = topologyCheck.Next;
+        if (branchWhenNull.Next != topologyGetter
+            || !IsCallTo(topologyGetter, "get_Topology", 0)
+            || !IsConditionalBranch(topologyBranch, Code.Brtrue, Code.Brtrue_S)
+            || topologyBranch!.Operand is not Instruction handlerStart
+            || noHandlerTarget == handlerStart
+            || method.Body.Instructions.IndexOf(noHandlerTarget)
+                >= method.Body.Instructions.IndexOf(handlerStart))
+        {
+            throw new InvalidOperationException(
+                "TestHandleHttpClientRequest topology gate shape changed — Ncl shape changed; "
+                + "do not commit");
+        }
+
+        var invokeHandlerCalls = method.Body.Instructions.Where(instruction =>
+            IsCallTo(instruction, "InvokeHandler", 2)).ToList();
+        if (invokeHandlerCalls.Count != 1)
+            throw new InvalidOperationException(
+                $"TestHandleHttpClientRequest has {invokeHandlerCalls.Count} InvokeHandler(2) "
+                + "calls, expected exactly 1 — Ncl shape changed; do not commit");
+        var invokeHandler = invokeHandlerCalls[0];
+        var unboxResult = invokeHandler.Next;
+        var branchOnMockedResult = unboxResult?.Next;
+        if (unboxResult?.OpCode != OpCodes.Unbox_Any
+            || unboxResult.Operand is not TypeReference
+                { MetadataType: MetadataType.Boolean }
+            || !IsConditionalBranch(branchOnMockedResult, Code.Brfalse, Code.Brfalse_S)
+            || branchOnMockedResult!.Operand is not Instruction mockedResponseStart
+            || !IsMockedResponseSuccessPath(
+                method,
+                mockedResponseStart,
+                method.Parameters[4]))
+        {
+            throw new InvalidOperationException(
+                "TestHandleHttpClientRequest mocked-response branch shape changed — Ncl shape "
+                + "changed; do not commit");
+        }
+
+        var il = method.Body.GetILProcessor();
+        notInTestValue!.OpCode = OpCodes.Ldstr;
+        notInTestValue.Operand = ExternalHttpOosMessage;
+        var constructOos = il.Create(OpCodes.Newobj, oosCtor);
+        var throwOos = il.Create(OpCodes.Throw);
+        il.InsertAfter(notInTestValue, constructOos);
+        il.InsertAfter(constructOos, throwOos);
+
+        branchWhenNull.OpCode = OpCodes.Brfalse;
+        branchWhenNull.Operand = handlerStart;
+        il.InsertAfter(branchWhenNull, il.Create(OpCodes.Br, notInTestValue));
+
+        branchOnMockedResult.OpCode = OpCodes.Brfalse;
+        branchOnMockedResult.Operand = mockedResponseStart;
+        il.InsertAfter(branchOnMockedResult, il.Create(OpCodes.Br, notInTestValue));
+        method.Body.MaxStackSize = Math.Max(method.Body.MaxStackSize, 1);
+
+        var reachable = ReachableInstructions(method);
+        var reachableReturns = reachable
+            .Where(instruction => instruction.OpCode == OpCodes.Ret)
+            .ToArray();
+        if (reachableReturns.Length != 1
+            || !IsInt32Constant(reachableReturns[0].Previous, 1)
+            || reachable.Any(instruction =>
+                IsInt32Constant(instruction, 0)
+                && instruction.Next?.OpCode == OpCodes.Ret)
+            || reachable.Contains(topologyGetter!)
+            || !reachable.Contains(invokeHandler)
+            || !reachable.Contains(notInTestValue))
+        {
+            throw new InvalidOperationException(
+                "TestHandleHttpClientRequest post-condition failed: expected mocked response "
+                + "or OOS with no reachable false return or topology gate — Ncl shape changed; "
+                + "do not commit");
+        }
+
+        return method;
+    }
+
+    internal static void ValidateNavHttpClientEgressCallGraph(
+        ModuleDefinition module,
+        TypeDefinition httpClient,
+        MethodDefinition centralDispatcher)
+    {
+        var expectedAlEntries = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["ALGet"] = "Get",
+            ["ALGetAsync"] = "GetAsync",
+            ["ALPost"] = "Post",
+            ["ALPostAsync"] = "PostAsync",
+            ["ALPut"] = "Put",
+            ["ALPutAsync"] = "PutAsync",
+            ["ALDelete"] = "Delete",
+            ["ALDeleteAsync"] = "DeleteAsync",
+            ["ALPatch"] = "Patch",
+            ["ALPatchAsync"] = "PatchAsync",
+            ["ALSend"] = "Send",
+            ["ALSendAsync"] = "SendAsync",
+        };
+
+        var centralCallers = FindCallers(module, centralDispatcher);
+        var sendRequest = centralCallers.SingleOrDefault(method =>
+            method.DeclaringType == httpClient
+            && method.Name == "SendRequestAsync"
+            && method.Parameters.Count == 5);
+        var requestWrapper = centralCallers.SingleOrDefault(method =>
+            method.DeclaringType.FullName
+                == "Microsoft.Dynamics.Nav.Runtime.NavTestExecution"
+            && method.Name == "TestHandleHttpClientRequest"
+            && method.Parameters.Count == 3);
+        if (centralCallers.Count != 2
+            || sendRequest == null
+            || requestWrapper == null)
+        {
+            throw new InvalidOperationException(
+                "TestHandleHttpClientRequest central dispatcher caller set changed "
+                + $"(found {centralCallers.Count}, expected SendRequestAsync and the request "
+                + "wrapper) — Ncl shape changed; do not commit");
+        }
+        ValidateDirectDispatcherWrapper(requestWrapper, centralDispatcher);
+
+        var networkOverloads = httpClient.Methods.Where(method =>
+            method.Name == "SendAsync"
+            && method.IsPrivate
+            && !method.IsStatic
+            && method.HasBody
+            && method.Parameters.Count == 3
+            && method.Parameters[0].ParameterType.FullName
+                == "Microsoft.Dynamics.Nav.Types.DataError"
+            && method.Parameters[1].ParameterType.FullName
+                == "System.Net.Http.HttpRequestMessage"
+            && method.Parameters[2].ParameterType.FullName
+                == "Microsoft.Dynamics.Nav.Runtime.ByRef`1<Microsoft.Dynamics.Nav.Runtime.NavHttpResponseMessage>")
+            .ToList();
+        if (networkOverloads.Count != 1)
+            throw new InvalidOperationException(
+                "NavHttpClient private network SendAsync overload: found "
+                + $"{networkOverloads.Count}, expected exactly 1 — Ncl shape changed; do not commit");
+        var networkOverload = networkOverloads[0];
+        var networkCallers = FindCallers(
+            module,
+            networkOverload,
+            includeFunctionPointers: true);
+        var navRequestSend = networkCallers.SingleOrDefault(method =>
+            method.DeclaringType == httpClient
+            && method.Name == "Send"
+            && method.Parameters.Count == 3
+            && method.Parameters[1].ParameterType.FullName
+                == "Microsoft.Dynamics.Nav.Runtime.NavHttpRequestMessage");
+        var navRequestSendAsync = networkCallers.SingleOrDefault(method =>
+            method.DeclaringType == httpClient
+            && method.Name == "SendAsync"
+            && method.Parameters.Count == 3
+            && method.Parameters[1].ParameterType.FullName
+                == "Microsoft.Dynamics.Nav.Runtime.NavHttpRequestMessage");
+        var verbClosure = networkCallers.SingleOrDefault(method =>
+            method.Name == "<SendRequestAsync>b__0"
+            && method.DeclaringType.DeclaringType == httpClient);
+        if (networkCallers.Count != 3
+            || navRequestSend == null
+            || navRequestSendAsync == null
+            || verbClosure == null)
+        {
+            throw new InvalidOperationException(
+                "NavHttpClient private network SendAsync caller set changed — Ncl shape "
+                + "changed; do not commit");
+        }
+
+        ValidateHandledResultGuardsEgress(
+            sendRequest,
+            centralDispatcher,
+            verbClosure,
+            functionPointerEgress: true);
+        ValidateHandledResultGuardsEgress(
+            navRequestSend,
+            requestWrapper,
+            networkOverload,
+            functionPointerEgress: false);
+        ValidateHandledResultGuardsEgress(
+            navRequestSendAsync,
+            requestWrapper,
+            networkOverload,
+            functionPointerEgress: false);
+
+        var entryTargets = new Dictionary<string, MethodDefinition>(StringComparer.Ordinal);
+        foreach (var expected in expectedAlEntries)
+        {
+            var entries = httpClient.Methods.Where(method =>
+                method.Name == expected.Key
+                && method.IsPublic
+                && !method.IsStatic
+                && method.HasBody).ToList();
+            if (entries.Count != 1)
+                throw new InvalidOperationException(
+                    $"NavHttpClient.{expected.Key}: found {entries.Count}, expected exactly 1 "
+                    + "public AL entry point — Ncl shape changed; do not commit");
+
+            var entry = entries[0];
+            if (entry.Body.Instructions.Any(instruction =>
+                    instruction.OpCode == OpCodes.Ldstr
+                    && Equals(instruction.Operand, ExternalHttpOosMessage)))
+            {
+                throw new InvalidOperationException(
+                    $"NavHttpClient.{expected.Key} was replaced wholesale — Ncl shape "
+                    + "changed; do not commit");
+            }
+
+            var calls = entry.Body.Instructions.Where(instruction =>
+                IsDirectCall(instruction)
+                && instruction.Operand is MethodReference target
+                && target.DeclaringType.FullName == httpClient.FullName).ToList();
+            if (calls.Count != 1
+                || calls[0].Operand is not MethodReference called
+                || called.Name != expected.Value
+                || !IsStraightLineAlForwarder(entry, calls[0]))
+            {
+                throw new InvalidOperationException(
+                    $"NavHttpClient.{expected.Key} no longer forwards directly to "
+                    + $"{expected.Value} — Ncl shape changed; do not commit");
+            }
+
+            var targets = httpClient.Methods.Where(method =>
+                method.FullName == called.FullName
+                && method.HasBody).ToList();
+            if (targets.Count != 1)
+                throw new InvalidOperationException(
+                    $"NavHttpClient.{expected.Key} target {called.FullName}: found "
+                    + $"{targets.Count}, expected exactly 1 — Ncl shape changed; do not commit");
+            entryTargets.Add(expected.Key, targets[0]);
+        }
+
+        foreach (var entry in expectedAlEntries.Keys.Where(name =>
+                     name is not "ALSend" and not "ALSendAsync"))
+        {
+            ValidateStraightLineFunnel(
+                entryTargets[entry],
+                sendRequest,
+                $"NavHttpClient.{entry}");
+        }
+
+        if (entryTargets["ALSend"] != navRequestSend
+            || entryTargets["ALSendAsync"] != navRequestSendAsync)
+        {
+            throw new InvalidOperationException(
+                "NavHttpClient ALSend entry points no longer use the guarded NavRequest "
+                + "funnels — Ncl shape changed; do not commit");
+        }
+    }
+
+    private static List<MethodDefinition> FindCallers(
+        ModuleDefinition module,
+        MethodReference target,
+        bool includeFunctionPointers = false)
+        => EnumerateTypes(module.Types)
+            .SelectMany(type => type.Methods)
+            .Where(method => ReferencesMethod(method, target, includeFunctionPointers))
+            .ToList();
+
+    private static bool ReferencesMethod(
+        MethodDefinition method,
+        MethodReference target,
+        bool includeFunctionPointers)
+        => method.HasBody && method.Body.Instructions.Any(instruction =>
+            (IsDirectCall(instruction)
+                || includeFunctionPointers
+                    && instruction.OpCode.Code is Code.Ldftn or Code.Ldvirtftn)
+            && instruction.Operand is MethodReference call
+            && call.FullName == target.FullName);
+
+    private static void ValidateDirectDispatcherWrapper(
+        MethodDefinition wrapper,
+        MethodReference centralDispatcher)
+    {
+        var calls = wrapper.Body.Instructions.Where(instruction =>
+            IsDirectCallTo(instruction, centralDispatcher)).ToList();
+        var reachable = ReachableInstructions(wrapper);
+        if (wrapper.Body.ExceptionHandlers.Count != 0
+            || calls.Count != 1
+            || calls[0].Next?.OpCode != OpCodes.Ret
+            || !HasStraightLinePrefix(wrapper, calls[0])
+            || wrapper.Body.Instructions.Any(instruction =>
+                instruction.OpCode.FlowControl is FlowControl.Branch
+                    or FlowControl.Cond_Branch)
+            || wrapper.Body.Instructions.Any(instruction =>
+                IsCallTo(instruction, "get_IsServiceRunningInLocalEnvironment", 0))
+            || reachable.Count != wrapper.Body.Instructions.Count)
+        {
+            throw new InvalidOperationException(
+                "TestHandleHttpClientRequest request wrapper no longer tail-calls the central "
+                + "dispatcher — Ncl shape changed; do not commit");
+        }
+    }
+
+    private static void ValidateHandledResultGuardsEgress(
+        MethodDefinition method,
+        MethodReference dispatcher,
+        MethodReference egress,
+        bool functionPointerEgress)
+    {
+        var dispatcherCalls = method.Body.Instructions.Where(instruction =>
+            IsDirectCallTo(instruction, dispatcher)).ToList();
+        if (method.Body.ExceptionHandlers.Count != 0
+            || dispatcherCalls.Count != 1
+            || !HasStraightLinePrefix(method, dispatcherCalls.SingleOrDefault()))
+        {
+            throw new InvalidOperationException(
+                $"{method.FullName} no longer reaches the test dispatcher before any branch — "
+                + "Ncl shape changed; do not commit");
+        }
+
+        var handledBranch = dispatcherCalls[0].Next;
+        if (!IsConditionalBranch(handledBranch, Code.Brfalse, Code.Brfalse_S)
+            || handledBranch!.Operand is not Instruction egressStart
+            || method.Body.Instructions.IndexOf(egressStart)
+                <= method.Body.Instructions.IndexOf(handledBranch)
+            || !HasStraightLineSuccessReturn(handledBranch.Next, egressStart))
+        {
+            throw new InvalidOperationException(
+                $"{method.FullName} no longer uses a false-result branch to guard network "
+                + "delivery — Ncl shape changed; do not commit");
+        }
+
+        var egressReferences = method.Body.Instructions.Where(instruction =>
+            instruction.Operand is MethodReference reference
+            && reference.FullName == egress.FullName
+            && (functionPointerEgress
+                ? instruction.OpCode.Code == Code.Ldftn
+                : IsDirectCall(instruction))).ToList();
+        var egressReachable = ReachableInstructions(method, egressStart);
+        if (egressReferences.Count != 1
+            || !egressReachable.Contains(egressReferences[0]))
+        {
+            throw new InvalidOperationException(
+                $"{method.FullName} network-delivery path no longer contains exactly one "
+                + $"guarded reference to {egress.FullName} — Ncl shape changed; do not commit");
+        }
+    }
+
+    private static bool HasStraightLinePrefix(
+        MethodDefinition method,
+        Instruction? finalInstruction)
+    {
+        if (finalInstruction == null)
+            return false;
+
+        for (var instruction = method.Body.Instructions[0];
+             instruction != finalInstruction;
+             instruction = instruction.Next)
+        {
+            if (instruction == null
+                || instruction.OpCode.FlowControl is FlowControl.Branch
+                    or FlowControl.Cond_Branch
+                    or FlowControl.Return
+                    or FlowControl.Throw)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool HasStraightLineSuccessReturn(
+        Instruction? start,
+        Instruction egressStart)
+    {
+        for (var instruction = start;
+             instruction != egressStart;
+             instruction = instruction?.Next)
+        {
+            if (instruction == null)
+                return false;
+            if (instruction.OpCode == OpCodes.Ret)
+                return instruction.Next == egressStart;
+            if (instruction.OpCode.FlowControl is FlowControl.Branch
+                or FlowControl.Cond_Branch
+                or FlowControl.Throw)
+                return false;
+        }
+
+        return false;
+    }
+
+    private static bool IsStraightLineAlForwarder(
+        MethodDefinition method,
+        Instruction call)
+    {
+        if (method.Body.ExceptionHandlers.Count != 0
+            || call.Next?.OpCode != OpCodes.Ret
+            || !HasStraightLinePrefix(method, call))
+            return false;
+
+        for (var instruction = method.Body.Instructions[0];
+             instruction != call;
+             instruction = instruction.Next)
+        {
+            if (!IsLoadArgument(instruction))
+                return false;
+        }
+
+        return call.Next == method.Body.Instructions[^1];
+    }
+
+    private static void ValidateStraightLineFunnel(
+        MethodDefinition method,
+        MethodReference sendRequest,
+        string entryPoint)
+    {
+        var calls = method.Body.Instructions.Where(instruction =>
+            IsDirectCallTo(instruction, sendRequest)).ToList();
+        var reachable = ReachableInstructions(method);
+        if (method.Body.ExceptionHandlers.Count != 0
+            || calls.Count != 1
+            || !HasStraightLinePrefix(method, calls[0])
+            || method.Body.Instructions.Any(instruction =>
+                instruction.OpCode.FlowControl is FlowControl.Branch
+                    or FlowControl.Cond_Branch)
+            || reachable.Count != method.Body.Instructions.Count
+            || reachable.Count(instruction => instruction.OpCode == OpCodes.Ret) != 1)
+        {
+            throw new InvalidOperationException(
+                $"{entryPoint} no longer reaches SendRequestAsync on every path — Ncl shape "
+                + "changed; do not commit");
+        }
+    }
+
+    private static bool IsDirectCall(Instruction instruction)
+        => instruction.OpCode.Code is Code.Call or Code.Callvirt;
+
+    private static bool IsDirectCallTo(
+        Instruction instruction,
+        MethodReference target)
+        => IsDirectCall(instruction)
+            && instruction.Operand is MethodReference call
+            && call.FullName == target.FullName;
+
+    private static bool IsLoadArgument(Instruction instruction)
+        => instruction.OpCode.Code is Code.Ldarg or Code.Ldarg_S
+            or Code.Ldarg_0 or Code.Ldarg_1 or Code.Ldarg_2 or Code.Ldarg_3;
+
+    private static IEnumerable<TypeDefinition> EnumerateTypes(
+        IEnumerable<TypeDefinition> types)
+    {
+        foreach (var type in types)
+        {
+            yield return type;
+            foreach (var nested in EnumerateTypes(type.NestedTypes))
+                yield return nested;
+        }
+    }
+
+    private static HashSet<Instruction> ReachableInstructions(MethodDefinition method)
+        => ReachableInstructions(method, method.Body.Instructions[0]);
+
+    private static HashSet<Instruction> ReachableInstructions(
+        MethodDefinition method,
+        Instruction start)
+    {
+        var reachable = new HashSet<Instruction>();
+        var pending = new Stack<Instruction>();
+        pending.Push(start);
+        while (pending.TryPop(out var instruction))
+        {
+            if (!reachable.Add(instruction))
+                continue;
+
+            if (instruction.OpCode.FlowControl == FlowControl.Branch)
+            {
+                pending.Push((Instruction)instruction.Operand);
+                continue;
+            }
+
+            if (instruction.OpCode.FlowControl == FlowControl.Cond_Branch)
+            {
+                if (instruction.Operand is Instruction target)
+                    pending.Push(target);
+                else if (instruction.Operand is Instruction[] targets)
+                    foreach (var branchTarget in targets)
+                        pending.Push(branchTarget);
+            }
+
+            if (instruction.OpCode.FlowControl is not FlowControl.Return
+                and not FlowControl.Throw
+                && instruction.Next != null)
+                pending.Push(instruction.Next);
+        }
+
+        return reachable;
+    }
+
+    private static bool IsMockedResponseSuccessPath(
+        MethodDefinition method,
+        Instruction start,
+        ParameterDefinition mockedResponse)
+    {
+        var closureLoad = start.Next;
+        var closureLocal = LocalIndex(closureLoad);
+        return start.OpCode.Code is Code.Ldarg or Code.Ldarg_S
+            && start.Operand == mockedResponse
+            && IsLoadLocal(closureLoad)
+            && closureLocal is >= 0
+            && closureLocal < method.Body.Variables.Count
+            && start.Next?.Next?.OpCode == OpCodes.Ldfld
+            && start.Next.Next.Operand is FieldReference
+            {
+                Name: "testResponse",
+                FieldType.FullName:
+                    "Microsoft.Dynamics.Nav.Runtime.NavTestHttpResponseMessage",
+            } responseField
+            && method.Body.Variables[closureLocal.Value].VariableType.FullName
+                == responseField.DeclaringType.FullName
+            && start.Next.Next.Next?.OpCode == OpCodes.Stind_Ref
+            && IsInt32Constant(start.Next.Next.Next.Next, 1)
+            && start.Next.Next.Next.Next.Next?.OpCode == OpCodes.Ret;
+    }
+
+    private static bool IsCallTo(Instruction? instruction, string name, int parameterCount)
+        => instruction?.OpCode.Code is Code.Call or Code.Callvirt
+            && instruction.Operand is MethodReference method
+            && method.Name == name
+            && method.Parameters.Count == parameterCount;
+
+    private static bool IsConditionalBranch(
+        Instruction? instruction,
+        Code longCode,
+        Code shortCode)
+        => instruction?.OpCode.Code == longCode
+            || instruction?.OpCode.Code == shortCode;
+
+    private static bool IsInt32Constant(Instruction? instruction, int expected)
+        => instruction?.OpCode.Code switch
+        {
+            Code.Ldc_I4_M1 => expected == -1,
+            Code.Ldc_I4_0 => expected == 0,
+            Code.Ldc_I4_1 => expected == 1,
+            Code.Ldc_I4_2 => expected == 2,
+            Code.Ldc_I4_3 => expected == 3,
+            Code.Ldc_I4_4 => expected == 4,
+            Code.Ldc_I4_5 => expected == 5,
+            Code.Ldc_I4_6 => expected == 6,
+            Code.Ldc_I4_7 => expected == 7,
+            Code.Ldc_I4_8 => expected == 8,
+            Code.Ldc_I4 or Code.Ldc_I4_S => Convert.ToInt32(instruction.Operand) == expected,
+            _ => false,
+        };
 
     internal static void RewriteTestHandleFormClientCallback(
         ModuleDefinition module,
