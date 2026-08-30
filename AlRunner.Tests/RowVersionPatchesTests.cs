@@ -38,7 +38,11 @@ public sealed class RowVersionPatchesTests
     private static void ResetReflectionCache()
     {
         var t = typeof(RowVersionPatches);
-        foreach (var name in new[] { "_pMetaTable", "_pTimestampField", "_pFieldIndex", "_pItem", "_mCreate" })
+        foreach (var name in new[]
+                 {
+                     "_pMetaTable", "_pTimestampField", "_pSystemIdField", "_pFieldIndex", "_pItem",
+                     "_mCreate", "_mGetOriginalValue"
+                 })
         {
             var f = t.GetField(name, BindingFlags.NonPublic | BindingFlags.Static)
                 ?? throw new InvalidOperationException($"test setup: RowVersionPatches.{name} not found");
@@ -74,7 +78,12 @@ public sealed class RowVersionPatchesTests
     private sealed class FakeMetaTable
     {
         public FakeMetaField? TimestampField { get; }
-        public FakeMetaTable(FakeMetaField? timestampField) => TimestampField = timestampField;
+        public FakeMetaField? SystemIdField { get; }
+        public FakeMetaTable(FakeMetaField? timestampField, FakeMetaField? systemIdField = null)
+        {
+            TimestampField = timestampField;
+            SystemIdField = systemIdField;
+        }
     }
 
     private sealed class FakeBuffer
@@ -85,12 +94,19 @@ public sealed class RowVersionPatchesTests
         {
             MetaTable = metaTable;
             _slots = new object?[slotCount];
+            _originalSlots = new object?[slotCount];
         }
         public object? this[int index]
         {
             get => _slots[index];
             set => _slots[index] = value;
         }
+
+        private readonly object?[] _originalSlots;
+
+        public object? GetOriginalValue(int index) => _originalSlots[index];
+
+        public void SetOriginalValue(int index, object? value) => _originalSlots[index] = value;
     }
 
     // ── RED case: a failed lookup must throw loudly, not disappear ────────────────
@@ -170,6 +186,26 @@ public sealed class RowVersionPatchesTests
 
         var stamped = Assert.IsType<Microsoft.Dynamics.Nav.Runtime.NavBigInteger>(buffer[timestampSlot]);
         Assert.False(stamped.IsZeroOrEmpty);
+    }
+
+    [Fact]
+    public void OnBeforeModify_SystemIdWasReset_RestoresStoredSystemId()
+    {
+        ResetReflectionCache();
+        var provider = MarkDatabaseBackedProvider();
+        const int timestampSlot = 0;
+        const int systemIdSlot = 1;
+        var storedSystemId = Guid.NewGuid();
+        var metaTable = new FakeMetaTable(
+            new FakeMetaField(timestampSlot),
+            new FakeMetaField(systemIdSlot));
+        var buffer = new FakeBuffer(metaTable, slotCount: 2);
+        buffer.SetOriginalValue(systemIdSlot, storedSystemId);
+        buffer[systemIdSlot] = Guid.Empty;
+
+        RowVersionPatches.OnBeforeModify(provider, CompanyToken, buffer);
+
+        Assert.Equal(storedSystemId, buffer[systemIdSlot]);
     }
 
     // ── Guard clauses stay quiet: nothing to stamp, no reflection even attempted ──

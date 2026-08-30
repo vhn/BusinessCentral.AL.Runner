@@ -134,10 +134,14 @@ public static partial class RecordPatches
             _parsedExtensionFields[key] = new List<ParsedField>(fields);
         else
         {
-            var existingIds = new HashSet<int>(existing.Select(f => f.FieldId));
             foreach (var f in fields)
-                if (existingIds.Add(f.FieldId))
+            {
+                var existingIndex = existing.FindIndex(candidate => candidate.FieldId == f.FieldId);
+                if (existingIndex < 0)
                     existing.Add(f);
+                else if (existing[existingIndex].CalcFormula == null && f.CalcFormula != null)
+                    existing[existingIndex] = f;
+            }
         }
 
         if (extensionId > 0)
@@ -172,7 +176,7 @@ public static partial class RecordPatches
         _parsedExtensionFields.Clear();
         _extensionIdsByBaseTable.Clear();
         _bcSymbolExtensionIndexBuilt = false; // re-merge BC precompiled extensions on next build
-        _fieldTriggersWiredTables.Clear();
+        _fieldTriggerWiring.Clear();
         _parsedPages.Clear();
         _parsedPageExtensions.Clear();
         _parsedReports.Clear();
@@ -194,7 +198,6 @@ public static partial class RecordPatches
         _sourceDirs.Clear();
         _installBaseline = null;
         _isolatedStorageBaseline = null;
-        _recordLinkBaseline = null;
         _autoIncrementBaseline = null;
         // Drop the in-memory table rows so an edited re-run starts clean instead of
         // seeing Inserts from the previous run (which would e.g. throw "already exists").
@@ -1074,6 +1077,7 @@ public static partial class RecordPatches
         // wiring its OnValidate body never runs (e.g. Purchase Header."Buy-from Vendor No." copying the
         // vendor name), without the subscriber injection an ISV's OnAfterValidateEvent never fires.
         WireFieldTriggerHandlersForTable(id, metaTable);
+        AlRunner.Patches.EventSubscriberPatches.InjectTableTriggerSubsForTable(id, metaTable);
         AlRunner.Patches.EventSubscriberPatches.InjectValidateSubsForTable(id, metaTable);
         return rec;
     }
@@ -1207,10 +1211,6 @@ public static partial class RecordPatches
         foreach (var (_, perTable) in _dataAccessByTable)
             perTable.Clear();
 
-        // RecordLink polyfill store is also per-test — BC's RecordLink table is part
-        // of the per-test transaction (records' links go away on rollback).
-        AlRunner.Patches.RecordLinkPatches.ResetForTest();
-
         // IsolatedStorage in-memory store — per-test reset matches BC semantics where
         // a test's writes are rolled back on completion.
         AlRunner.Patches.TenantStoragePatches.ResetForTest();
@@ -1236,19 +1236,23 @@ public static partial class RecordPatches
         // at the same per-test boundary.
         AlRunner.BcRuntime.DisposeSkeletonSharedObjectContainerChildren();
 
+        // NavSession caches ApplicationAreas independently of the setup table rows. Directly
+        // restoring the install baseline bypasses the table events that normally invalidate
+        // that cache, so reset it at the same boundary as the rows themselves.
+        AlRunner.BcRuntime.ResetSkeletonApplicationAreaCache();
+
         // SingleInstance=true codeunit instances are session-scoped in real BC and get reset
         // on the same per-test transaction rollback boundary as everything else above — without
         // this a SingleInstance codeunit's instance-variable state would leak from one test into
         // the next. See BcRuntime._singleInstanceCache / BcRuntime.ResetSingleInstanceCache.
         AlRunner.BcRuntime.ResetSingleInstanceCache();
 
-        // Manual BindSubscriptions still recorded on the session. BC unbinds on its own as a
-        // bound instance's tree is disposed, which covers a subscriber bound by a test
-        // codeunit (TestExecutor disposes those). It does not cover one owned by an instance
-        // the line above only FORGETS — a SingleInstance codeunit stays alive in the session's
-        // tree, so a subscriber it bound outlived every boundary and every --watch cycle. See
-        // BcRuntime.ClearManualEventBindings for why the list is swept rather than those
-        // instances destroyed.
+        // Manual BindSubscriptions still recorded on the session. Method-scope disposal clears
+        // bindings owned by method-local variables, and TestExecutor disposal covers test-codeunit
+        // globals. It does not cover one owned by an instance the line above only FORGETS — a
+        // SingleInstance codeunit stays alive in the session's tree, so a subscriber it bound
+        // outlived every boundary and every --watch cycle. See BcRuntime.ClearManualEventBindings
+        // for why the list is swept rather than those instances destroyed.
         AlRunner.BcRuntime.ClearManualEventBindings();
     }
 
@@ -1271,6 +1275,7 @@ public static partial class RecordPatches
     {
         try
         {
+            var tableId = table.TableId;
             if (isTemporary)
                 return _mCreateTempDataAccess!.Invoke(self, new object[] { table })!;
 
@@ -1278,7 +1283,95 @@ public static partial class RecordPatches
             // share storage.
             var perTable = _dataAccessByTable.GetValue(self,
                 static _ => new ConcurrentDictionary<int, object>());
-            var tableId = table.TableId;
+
+            // The standalone session has one company, but the runtime's native Company
+            // provider expects a tenant database. Materialise the current company so AL
+            // reads and TableRelation validation see the same company as CompanyName().
+            if (IsCompanyVirtualTable(table))
+            {
+                if (!perTable.TryGetValue(tableId, out var companyDa))
+                {
+                    var createdCompany = _mCreateTempDataAccess!.Invoke(self, new object[] { table })!;
+                    companyDa = perTable.GetOrAdd(tableId, createdCompany);
+                }
+                var session = _fDasSession?.GetValue(self)
+                    ?? throw new RunnerOutOfScopeException(
+                        "Company (virtual table 2000000006)",
+                        "company-virtual-table — DataAccessSource has no skeleton session; see docs/scope.md");
+                PopulateCompanyVirtualTable(companyDa, table, session);
+                return companyDa;
+            }
+
+            // Feature Management reads this tenant-wide system table to choose the pricing
+            // implementation. A newly provisioned BC company enables the modern pricing
+            // experience, while the runner's otherwise-empty provider made it fall back to
+            // the legacy V15 implementation.
+            if (IsFeatureKeySystemTable(table))
+            {
+                if (!perTable.TryGetValue(tableId, out var featureKeyDa))
+                {
+                    var createdFeatureKey = _mCreateTempDataAccess!.Invoke(self, new object[] { table })!;
+                    featureKeyDa = perTable.GetOrAdd(tableId, createdFeatureKey);
+                }
+                PopulateFeatureKeySystemTable(featureKeyDa, table);
+                return featureKeyDa;
+            }
+
+            // CodeUnit Metadata is derived from the installed application inventory. Keep
+            // TableRelation validation and AL reflection aligned with the same source and
+            // precompiled object inventory used by AllObj.
+            if (IsCodeunitMetadataVirtualTable(table))
+            {
+                if (!perTable.TryGetValue(tableId, out var codeunitMetadataDa))
+                {
+                    var createdCodeunitMetadata = _mCreateTempDataAccess!.Invoke(self, new object[] { table })!;
+                    codeunitMetadataDa = perTable.GetOrAdd(tableId, createdCodeunitMetadata);
+                }
+                PopulateCodeunitMetadataVirtualTable(codeunitMetadataDa, table);
+                return codeunitMetadataDa;
+            }
+
+            // Date is self-contained in the runtime. Time Zone is too on Windows, where
+            // TimeZoneInfo exposes the Windows IDs expected by BC. Keep those native
+            // providers rather than routing them to an empty temp store.
+            if (IsNativeDateTimeVirtualTable(table))
+            {
+                if (perTable.TryGetValue(tableId, out var virtualDataAccess))
+                    return virtualDataAccess;
+                if (_mGetVirtualDataAccess == null)
+                    throw new InvalidOperationException(
+                        "DataAccessSource.GetVirtualDataAccess(NCLMetaTable) not found — BC runtime shape changed");
+
+                var createdVirtual = _mGetVirtualDataAccess.Invoke(self, new object[] { table })
+                    ?? throw new InvalidOperationException(
+                        $"BC returned no virtual data access for table {tableId} ({table.TableName})");
+                return perTable.GetOrAdd(tableId, createdVirtual);
+            }
+
+            // Unix TimeZoneInfo enumerates IANA IDs, while the BC table and application
+            // data use Windows IDs and their sequence numbers. Materialise the Windows
+            // compatibility list into the regular temp provider on non-Windows hosts.
+            if (IsManagedTimeZoneVirtualTable(table))
+            {
+                if (!perTable.TryGetValue(tableId, out var timeZoneDa))
+                {
+                    var createdTimeZone = _mCreateTempDataAccess!.Invoke(self, new object[] { table })!;
+                    timeZoneDa = perTable.GetOrAdd(tableId, createdTimeZone);
+                }
+                PopulateWindowsTimeZoneVirtualTable(timeZoneDa, table);
+                return timeZoneDa;
+            }
+
+            if (IsWindowsLanguageVirtualTable(table))
+            {
+                if (!perTable.TryGetValue(tableId, out var languageDa))
+                {
+                    var createdLanguage = _mCreateTempDataAccess!.Invoke(self, new object[] { table })!;
+                    languageDa = perTable.GetOrAdd(tableId, createdLanguage);
+                }
+                PopulateWindowsLanguageVirtualTable(languageDa, table);
+                return languageDa;
+            }
 
             // ── Virtual Field system table (2000000041) ──────────────────────────────────
             // The Field table is virtual: the service tier computes its rows on the fly from
@@ -1320,6 +1413,7 @@ public static partial class RecordPatches
                     ?? throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
                         "Field (virtual table 2000000041)",
                         "field-virtual-table — DataAccessSource has no skeleton session; see docs/scope.md");
+                MarkManagedFieldDataAccess(fieldDa);
                 PopulateFieldVirtualTable(fieldDa, table, session);
                 return fieldDa;
             }
@@ -1475,13 +1569,10 @@ public static partial class RecordPatches
             }
 
             if (perTable.TryGetValue(tableId, out var cached))
-            {
                 return cached;
-            }
             var result = _mCreateTempDataAccess!.Invoke(self, new object[] { table })!;
             // Race: keep first winner.
-            var added = perTable.GetOrAdd(tableId, result);
-            return added;
+            return perTable.GetOrAdd(tableId, result);
         }
         catch (Exception ex)
         {

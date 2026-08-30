@@ -28,6 +28,8 @@ public static partial class RecordPatches
     private static Type? _tMetaQuery;
     private static Type? _tMetaQueryDataItem;
     private static Type? _tMetaQueryColumn;
+    private static Type? _tMetaQueryColumnFilter;
+    private static Type? _tMetaQueryFieldFilter;
     private static Type? _tMetaQueryOrderBy;
     private static Type? _tMetaQueryDataItemLink;
     private static MethodInfo? _mCreateDynamicQuery;
@@ -48,6 +50,8 @@ public static partial class RecordPatches
         _tMetaQuery = typesAsm?.GetType(md + "MetaQuery");
         _tMetaQueryDataItem = typesAsm?.GetType(md + "MetaQueryDataItem");
         _tMetaQueryColumn = typesAsm?.GetType(md + "MetaQueryColumn");
+        _tMetaQueryColumnFilter = typesAsm?.GetType(md + "MetaQueryColumnFilter");
+        _tMetaQueryFieldFilter = typesAsm?.GetType(md + "MetaQueryFieldFilter");
         _tMetaQueryOrderBy = typesAsm?.GetType(md + "MetaQueryOrderBy");
         _tMetaQueryDataItemLink = typesAsm?.GetType(md + "MetaQueryDataItemLink");
 
@@ -177,14 +181,37 @@ public static partial class RecordPatches
             // Result columns.
             foreach (var col in diSym.Columns)
             {
-                int fieldNo = ResolveFieldNo(fieldNoByName, col.SourceColumn);
+                var sourceLessCount = string.IsNullOrEmpty(col.SourceColumn)
+                    && string.Equals(col.Method, "Count", StringComparison.OrdinalIgnoreCase);
+                int fieldNo = sourceLessCount ? 0 : ResolveFieldNo(fieldNoByName, col.SourceColumn);
                 if (fieldNo < 0)
                 {
                     QLog($"BuildMetaQueryDesign({queryId}): field '{col.SourceColumn}' not found on table {tableNo} ('{diSym.RelatedTable}') — abandoning build");
                     return null;
                 }
-                AddColumn(di, id: col.Id, name: col.Name, fieldNo: fieldNo, index: resultColumnIndex++, caption: col.Caption);
+                AddColumn(
+                    di,
+                    id: col.Id,
+                    name: col.Name,
+                    fieldNo: fieldNo,
+                    index: resultColumnIndex++,
+                    caption: col.Caption,
+                    aggregation: col.Method,
+                    reverseSign: col.ReverseSign);
                 columnIdByName[col.Name] = col.Id;
+
+                if (!string.IsNullOrWhiteSpace(col.ColumnFilter))
+                {
+                    var staticFilters = ParseStaticQueryFilters(col.ColumnFilter!);
+                    if (staticFilters.Count != 1
+                        || !string.Equals(staticFilters[0].FieldOrColumnName, col.Name,
+                            StringComparison.OrdinalIgnoreCase)
+                        || !AddColumnFilter(mq, col.Id, staticFilters[0]))
+                    {
+                        QLog($"BuildMetaQueryDesign({queryId}): could not parse ColumnFilter '{col.ColumnFilter}' for column '{col.Name}' — abandoning build");
+                        return null;
+                    }
+                }
             }
 
             // Filter-only columns (dataitem filter(...) elements). They carry a real BC
@@ -201,19 +228,35 @@ public static partial class RecordPatches
                 columnIdByName[filt.Name] = filt.Id;
             }
 
+            if (!string.IsNullOrWhiteSpace(diSym.DataItemTableFilter)
+                && !AddDataItemTableFilters(di, diSym.DataItemTableFilter!, fieldNoByName))
+            {
+                QLog($"BuildMetaQueryDesign({queryId}): could not parse DataItemTableFilter '{diSym.DataItemTableFilter}' for '{diSym.Name}' — abandoning build");
+                return null;
+            }
+
             // DataItemLink: "<thisField> = <SourceDataItem>.<sourceField>". The engine builds
             // CreateFieldEqualsField(SourceDataItemName, SourceFieldNo, DestinationFieldNo):
             //   DestinationFieldNo = field on THIS (child) table, SourceFieldNo = field on the
             //   referenced (parent) dataitem's table.
             if (!isRoot && !string.IsNullOrEmpty(diSym.DataItemLink))
             {
-                var link = ParseDataItemLink(diSym.DataItemLink!, fieldNoByName);
-                if (link == null)
+                var clauses = ParseDataItemLinkClauses(diSym.DataItemLink!);
+                if (clauses.Count == 0)
                 {
                     QLog($"BuildMetaQueryDesign({queryId}): could not parse DataItemLink '{diSym.DataItemLink}' for '{diSym.Name}' — abandoning build");
                     return null;
                 }
-                GetList(di, "DataItemLinks").Add(link);
+                foreach (var clause in clauses)
+                {
+                    var link = CreateDataItemLink(clause, fieldNoByName);
+                    if (link == null)
+                    {
+                        QLog($"BuildMetaQueryDesign({queryId}): could not resolve DataItemLink clause '{clause}' for '{diSym.Name}' — abandoning build");
+                        return null;
+                    }
+                    GetList(di, "DataItemLinks").Add(link);
+                }
             }
 
             GetList(mq, "DataItems").Add(di);
@@ -254,9 +297,17 @@ public static partial class RecordPatches
 
     // Build a case-insensitive field-NAME → field-no map for a table from the parsed table
     // shape (populated from AL source or the BC .app SymbolReference.json).
-    private static Dictionary<string, int> BuildFieldNameToNoMap(int tableNo)
+    internal static Dictionary<string, int> BuildFieldNameToNoMap(int tableNo)
     {
-        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["timestamp"] = 0,
+            ["SystemId"] = 2_000_000_000,
+            ["SystemCreatedAt"] = 2_000_000_001,
+            ["SystemCreatedBy"] = 2_000_000_002,
+            ["SystemModifiedAt"] = 2_000_000_003,
+            ["SystemModifiedBy"] = 2_000_000_004,
+        };
         if (_parsedTables.TryGetValue(tableNo, out var pt))
             foreach (var f in pt.Fields)
                 map[f.FieldName] = f.FieldId;
@@ -266,27 +317,201 @@ public static partial class RecordPatches
     private static int ResolveFieldNo(Dictionary<string, int> fieldNoByName, string fieldName)
         => fieldNoByName.TryGetValue(fieldName, out var no) ? no : -1;
 
-    // Parse `"<thisField>" = <SourceDataItem>."<sourceField>"` into a MetaQueryDataItemLink.
-    private static object? ParseDataItemLink(string link, Dictionary<string, int> thisFieldNoByName)
-    {
-        var eq = link.IndexOf('=');
-        if (eq < 0) return null;
-        var lhs = Unquote(link[..eq].Trim());
-        var rhs = link[(eq + 1)..].Trim();
-        var dot = rhs.IndexOf('.');
-        if (dot < 0) return null;
-        var sourceDataItem = rhs[..dot].Trim();
-        var sourceField = Unquote(rhs[(dot + 1)..].Trim());
+    internal sealed record ParsedDataItemLinkClause(
+        string DestinationField, string SourceDataItem, string SourceField);
 
-        int destFieldNo = ResolveFieldNo(thisFieldNoByName, lhs);
-        // Source field is on the referenced (parent) dataitem's table — resolve by following
-        // that table. We don't know its table no here without the parent dataitem, so resolve
-        // via the source data-item name → its RelatedTable from the query symbol map.
-        int srcFieldNo = ResolveSourceFieldNo(sourceDataItem, sourceField);
+    internal sealed record ParsedStaticQueryFilter(
+        string FieldOrColumnName, string FilterType, string Value);
+
+    internal static IReadOnlyList<ParsedStaticQueryFilter> ParseStaticQueryFilters(string text)
+    {
+        var result = new List<ParsedStaticQueryFilter>();
+        foreach (var rawClause in SplitTopLevel(text, ','))
+        {
+            var clause = rawClause.Trim();
+            if (clause.Length == 0) continue;
+
+            var eq = IndexOfOutsideQuotes(clause, '=');
+            if (eq <= 0) return Array.Empty<ParsedStaticQueryFilter>();
+
+            var name = Unquote(clause[..eq].Trim());
+            var rhs = clause[(eq + 1)..].Trim();
+            var openParen = rhs.IndexOf('(');
+            if (openParen <= 0 || rhs[^1] != ')')
+                return Array.Empty<ParsedStaticQueryFilter>();
+
+            var filterType = rhs[..openParen].Trim().ToUpperInvariant();
+            if (filterType is not ("CONST" or "FILTER"))
+                return Array.Empty<ParsedStaticQueryFilter>();
+            if (!HasSingleOuterParenthesisPair(rhs, openParen))
+                return Array.Empty<ParsedStaticQueryFilter>();
+
+            result.Add(new ParsedStaticQueryFilter(
+                name,
+                filterType,
+                rhs[(openParen + 1)..^1].Trim()));
+        }
+        return result;
+    }
+
+    // DataItemLink can contain multiple comma-separated equalities. Commas and dots inside
+    // quoted AL identifiers are data, not separators, so split only outside quotes.
+    internal static IReadOnlyList<ParsedDataItemLinkClause> ParseDataItemLinkClauses(string link)
+    {
+        var result = new List<ParsedDataItemLinkClause>();
+        foreach (var rawClause in SplitOutsideQuotes(link, ','))
+        {
+            var clause = rawClause.Trim();
+            if (clause.Length == 0) continue;
+
+            var eq = IndexOfOutsideQuotes(clause, '=');
+            if (eq <= 0) return Array.Empty<ParsedDataItemLinkClause>();
+            var destinationField = Unquote(clause[..eq].Trim());
+            var rhs = clause[(eq + 1)..].Trim();
+            var dot = IndexOfOutsideQuotes(rhs, '.');
+            if (dot <= 0 || dot == rhs.Length - 1)
+                return Array.Empty<ParsedDataItemLinkClause>();
+
+            result.Add(new ParsedDataItemLinkClause(
+                destinationField,
+                Unquote(rhs[..dot].Trim()),
+                Unquote(rhs[(dot + 1)..].Trim())));
+        }
+        return result;
+    }
+
+    private static IEnumerable<string> SplitOutsideQuotes(string text, char separator)
+    {
+        var start = 0;
+        var quoted = false;
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '"')
+            {
+                if (quoted && i + 1 < text.Length && text[i + 1] == '"')
+                {
+                    i++;
+                    continue;
+                }
+                quoted = !quoted;
+            }
+            else if (text[i] == separator && !quoted)
+            {
+                yield return text[start..i];
+                start = i + 1;
+            }
+        }
+        yield return text[start..];
+    }
+
+    private static IEnumerable<string> SplitTopLevel(string text, char separator)
+    {
+        var start = 0;
+        var doubleQuoted = false;
+        var singleQuoted = false;
+        var depth = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '"' && !singleQuoted)
+            {
+                if (doubleQuoted && i + 1 < text.Length && text[i + 1] == '"')
+                {
+                    i++;
+                    continue;
+                }
+                doubleQuoted = !doubleQuoted;
+                continue;
+            }
+            if (ch == '\'' && !doubleQuoted)
+            {
+                if (singleQuoted && i + 1 < text.Length && text[i + 1] == '\'')
+                {
+                    i++;
+                    continue;
+                }
+                singleQuoted = !singleQuoted;
+                continue;
+            }
+            if (doubleQuoted || singleQuoted) continue;
+            if (ch == '(') depth++;
+            else if (ch == ')') depth--;
+            else if (ch == separator && depth == 0)
+            {
+                yield return text[start..i];
+                start = i + 1;
+            }
+        }
+        yield return text[start..];
+    }
+
+    private static bool HasSingleOuterParenthesisPair(string text, int openParen)
+    {
+        var doubleQuoted = false;
+        var singleQuoted = false;
+        var depth = 0;
+        for (var i = openParen; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '"' && !singleQuoted)
+            {
+                if (doubleQuoted && i + 1 < text.Length && text[i + 1] == '"')
+                {
+                    i++;
+                    continue;
+                }
+                doubleQuoted = !doubleQuoted;
+                continue;
+            }
+            if (ch == '\'' && !doubleQuoted)
+            {
+                if (singleQuoted && i + 1 < text.Length && text[i + 1] == '\'')
+                {
+                    i++;
+                    continue;
+                }
+                singleQuoted = !singleQuoted;
+                continue;
+            }
+            if (doubleQuoted || singleQuoted) continue;
+            if (ch == '(') depth++;
+            else if (ch == ')' && --depth == 0)
+                return i == text.Length - 1;
+            if (depth < 0) return false;
+        }
+        return false;
+    }
+
+    private static int IndexOfOutsideQuotes(string text, char value)
+    {
+        var quoted = false;
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '"')
+            {
+                if (quoted && i + 1 < text.Length && text[i + 1] == '"')
+                {
+                    i++;
+                    continue;
+                }
+                quoted = !quoted;
+            }
+            else if (text[i] == value && !quoted)
+                return i;
+        }
+        return -1;
+    }
+
+    private static object? CreateDataItemLink(
+        ParsedDataItemLinkClause clause,
+        Dictionary<string, int> thisFieldNoByName)
+    {
+        var destFieldNo = ResolveFieldNo(thisFieldNoByName, clause.DestinationField);
+        var srcFieldNo = ResolveSourceFieldNo(clause.SourceDataItem, clause.SourceField);
         if (destFieldNo < 0 || srcFieldNo < 0) return null;
 
         var dl = Activator.CreateInstance(_tMetaQueryDataItemLink!)!;
-        SetProp(dl, "SourceDataItemName", sourceDataItem);
+        SetProp(dl, "SourceDataItemName", clause.SourceDataItem);
         SetProp(dl, "SourceFieldNo", srcFieldNo);
         SetProp(dl, "DestinationFieldNo", destFieldNo);
         return dl;
@@ -308,7 +533,9 @@ public static partial class RecordPatches
     }
 
     private static string Unquote(string s)
-        => s.Length >= 2 && s[0] == '"' && s[^1] == '"' ? s[1..^1] : s;
+        => s.Length >= 2 && s[0] == '"' && s[^1] == '"'
+            ? s[1..^1].Replace("\"\"", "\"")
+            : s;
 
     private static void AddOrderBys(object mq, string? orderBy, Dictionary<string, int> columnIdByName)
     {
@@ -338,7 +565,15 @@ public static partial class RecordPatches
 
     private static MethodInfo? _mMultiLanguageParse;
 
-    private static void AddColumn(object dataItem, int id, string name, int fieldNo, int index, string? caption = null)
+    private static void AddColumn(
+        object dataItem,
+        int id,
+        string name,
+        int fieldNo,
+        int index,
+        string? caption = null,
+        string? aggregation = null,
+        bool reverseSign = false)
     {
         var col = Activator.CreateInstance(_tMetaQueryColumn!)!;
         SetProp(col, "Id", id);
@@ -346,6 +581,13 @@ public static partial class RecordPatches
         SetProp(col, "FieldNo", fieldNo);
         SetProp(col, "QueryColumnIndex", index);
         SetProp(col, "FilterOnly", false);
+        SetProp(col, "ReverseSign", reverseSign);
+        if (!string.IsNullOrEmpty(aggregation))
+        {
+            SetProp(col, "FieldTotalingMethod", aggregation);
+            if (fieldNo == 0 && string.Equals(aggregation, "Count", StringComparison.OrdinalIgnoreCase))
+                SetProp(col, "ColumnType", "Integer");
+        }
         if (caption != null)
         {
             // MetaQueryColumn.CaptionML (MultiLanguage) feeds NCLMetaQueryColumn.columnCaptions
@@ -362,6 +604,38 @@ public static partial class RecordPatches
                 col.GetType().GetProperty("CaptionML", BindingFlags.Public | BindingFlags.Instance)?.SetValue(col, ml);
         }
         GetList(dataItem, "QueryColumns").Add(col);
+    }
+
+    private static bool AddColumnFilter(object metaQuery, int queryColumnId, ParsedStaticQueryFilter filter)
+    {
+        if (_tMetaQueryColumnFilter == null) return false;
+        var metaFilter = Activator.CreateInstance(_tMetaQueryColumnFilter)!;
+        SetProp(metaFilter, "QueryColumnId", queryColumnId);
+        SetProp(metaFilter, "TypeOfFilter", filter.FilterType);
+        SetProp(metaFilter, "Value", filter.Value);
+        GetList(metaQuery, "ColumnFilters").Add(metaFilter);
+        return true;
+    }
+
+    private static bool AddDataItemTableFilters(
+        object dataItem,
+        string text,
+        Dictionary<string, int> fieldNoByName)
+    {
+        if (_tMetaQueryFieldFilter == null) return false;
+        var filters = ParseStaticQueryFilters(text);
+        if (filters.Count == 0) return false;
+        foreach (var filter in filters)
+        {
+            var fieldNo = ResolveFieldNo(fieldNoByName, filter.FieldOrColumnName);
+            if (fieldNo < 0) return false;
+            var metaFilter = Activator.CreateInstance(_tMetaQueryFieldFilter)!;
+            SetProp(metaFilter, "FieldNo", fieldNo);
+            SetProp(metaFilter, "TypeOfFilter", filter.FilterType);
+            SetProp(metaFilter, "Value", filter.Value);
+            GetList(dataItem, "FieldFilters").Add(metaFilter);
+        }
+        return true;
     }
 
     // A filter-only query column: carries a real BC column id + resolved source field, but

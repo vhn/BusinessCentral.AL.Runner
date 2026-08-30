@@ -153,6 +153,8 @@ public sealed class DependencyLoader
             }
 
             Assembly? asm;
+            using var dependencyScope = BcCompiler.ScopeResolvedDeps(
+                DependencyCompileClosure(m, ordered));
             try
             {
                 asm = LoadOne(m, path, bucketRoot);
@@ -199,6 +201,53 @@ public sealed class DependencyLoader
             }
         }
         return list;
+    }
+
+    /// <summary>
+    /// Returns the concrete, dependency-first package set declared by a source app. The parent
+    /// bundle's resolver has already selected versions; this method only removes unrelated
+    /// branches before the source app is compiled.
+    /// </summary>
+    internal static IReadOnlyList<(AppManifest Manifest, string AppPath)> DependencyCompileClosure(
+        AppManifest source,
+        IReadOnlyList<(AppManifest Manifest, string AppPath)> ordered)
+    {
+        var needed = new HashSet<Guid>();
+        var pending = new Queue<DependencyRef>(source.Dependencies.Concat(AppLoader.ImplicitRoots(source)));
+
+        while (pending.TryDequeue(out var dependency))
+        {
+            var match = FindResolvedDependency(dependency, ordered);
+            if (match == null || match.Value.Manifest.AppId == source.AppId) continue;
+            if (!needed.Add(match.Value.Manifest.AppId)) continue;
+
+            foreach (var transitive in match.Value.Manifest.Dependencies)
+                pending.Enqueue(transitive);
+        }
+
+        return ordered.Where(candidate => needed.Contains(candidate.Manifest.AppId)).ToArray();
+    }
+
+    private static (AppManifest Manifest, string AppPath)? FindResolvedDependency(
+        DependencyRef dependency,
+        IReadOnlyList<(AppManifest Manifest, string AppPath)> ordered)
+    {
+        if (dependency.AppId != Guid.Empty)
+        {
+            foreach (var candidate in ordered)
+                if (candidate.Manifest.AppId == dependency.AppId)
+                    return candidate;
+            return null;
+        }
+
+        return ordered
+            .Where(candidate =>
+                string.Equals(candidate.Manifest.Publisher, dependency.Publisher, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(candidate.Manifest.Name, dependency.Name, StringComparison.OrdinalIgnoreCase)
+                && candidate.Manifest.Version >= dependency.Version)
+            .OrderByDescending(candidate => candidate.Manifest.Version)
+            .Select(candidate => ((AppManifest Manifest, string AppPath)?)candidate)
+            .FirstOrDefault();
     }
 
     /// <summary>
@@ -387,35 +436,16 @@ public sealed class DependencyLoader
             }
         }
 
-        var tempDir = Path.Combine(Path.GetTempPath(),
-            "al-runner-deps", SanitizeFileName($"{m.Publisher}_{m.Name}_{m.Version}"));
-        Directory.CreateDirectory(tempDir);
-        // Clean previously emitted .al files so a stale one doesn't pollute the compile.
-        foreach (var existing in Directory.EnumerateFiles(tempDir, "*.al"))
-        {
-            try { File.Delete(existing); } catch { }
-        }
-        foreach (var (name, src) in alSources)
-        {
-            var fileSafe = SanitizeFileName(name);
-            File.WriteAllText(Path.Combine(tempDir, fileSafe), src);
-        }
-        // Stage report layout resources (.rdlc/.docx/.xlsx) next to the .al so a code-bearing
-        // report's `LayoutFile = './X.rdlc'` reference resolves at compile time. Without these,
-        // BC's layout-embed step NREs (AL1081) and — because Emit is atomic per module — zeroes
-        // the WHOLE app, taking otherwise-clean codeunits (e.g. CU131352) down with it. Written
-        // with their real (URL-decoded) names so the relative './<Name>' reference matches.
-        foreach (var existing in Directory.EnumerateFiles(tempDir, "*.rdlc")
-                     .Concat(Directory.EnumerateFiles(tempDir, "*.docx"))
-                     .Concat(Directory.EnumerateFiles(tempDir, "*.xlsx")))
-        {
-            try { File.Delete(existing); } catch { }
-        }
-        foreach (var (layoutName, layoutBytes) in AppLoader.ExtractReportLayouts(appPath))
-        {
-            try { File.WriteAllBytes(Path.Combine(tempDir, Path.GetFileName(layoutName)), layoutBytes); }
-            catch (Exception ex) { Console.Error.WriteLine($"[deps] layout stage failed for {layoutName}: {ex.Message}"); }
-        }
+        // A source package is not a bag of independent AL files. Control-add-in resources,
+        // report layouts, nested source paths, and manifest compiler settings all participate
+        // in binding. Reconstruct the package's app-root shape before handing it to BC's
+        // compiler; flattening it changes the program and makes valid BC packages fail here.
+        var tempDir = Path.Combine(Path.GetTempPath(), "al-runner-deps",
+            SanitizeFileName($"{m.Publisher}_{m.Name}_{m.Version}-{cacheKey[..12]}"));
+        var stagedSourceCount = AppLoader.StageSourcePackage(appPath, tempDir);
+        if (stagedSourceCount == 0)
+            throw new DependencyLoadException(m.Publisher, m.Name, m.Version.ToString(),
+                "STAGE-ZERO", "Source package contained no stageable AL sources");
 
         IReadOnlyList<EmittedSource> emitted;
         // Snapshot the report-metadata registry before this dep's emit so we can

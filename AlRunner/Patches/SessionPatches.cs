@@ -12,6 +12,8 @@ namespace AlRunner;
 
 public static partial class BcRuntime
 {
+    private static string? _skeletonApplicationAreasBaseline;
+
     // NOTE: still consumed by NclCecilRewrite.cs to Cecil-rewrite NavSystemCodeunit.get_Session
     // (a different type from NavApplicationObjectBase.get_Session — its own JmpHook.Apply call
     // site was deleted as an orphan, #1883 follow-up, but this shared helper is not dead).
@@ -83,6 +85,54 @@ public static partial class BcRuntime
         {
             Console.Error.WriteLine($"[BcRuntime] WARN: appId seed failed: {ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Initialise the cache used by <c>NavSession.ApplicationAreas</c>. The skeleton session
+    /// bypasses the NavSession constructor, so its <c>applicationAreaCache</c> field is null.
+    /// BC's setter clears that cache before storing the new value, which otherwise makes the
+    /// standard test runner fail during SetupApplicationArea.
+    /// </summary>
+    internal static void SeedSkeletonApplicationAreaCache(Type sessionType, object session)
+    {
+        var field = sessionType.GetField("applicationAreaCache",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        if (field == null)
+            throw new InvalidOperationException(
+                "NavSession.applicationAreaCache field not found — Ncl shape changed.");
+
+        var cache = Activator.CreateInstance(field.FieldType)
+            ?? throw new InvalidOperationException(
+                "NavSession.applicationAreaCache could not be constructed.");
+        AlRunner.Infrastructure.FieldPoke.SetInstance(field, session, cache);
+    }
+
+    /// <summary>
+    /// Capture the session value produced by company initialization and app install triggers.
+    /// It is committed baseline state just like the Application Area Setup rows.
+    /// </summary>
+    internal static void CaptureSkeletonApplicationAreaBaseline()
+    {
+        _skeletonApplicationAreasBaseline =
+            (_skeletonSession as Microsoft.Dynamics.Nav.Runtime.NavSession)?.ApplicationAreas;
+    }
+
+    internal static void ClearSkeletonApplicationAreaBaseline()
+        => _skeletonApplicationAreasBaseline = null;
+
+    /// <summary>
+    /// Drop application-area values cached by the preceding isolation scope, then restore
+    /// the value captured with the post-install table baseline. Restoring an arbitrary empty
+    /// value would leave the session inconsistent with restored Application Area Setup rows
+    /// when a test library correctly decides that no table write is needed.
+    /// </summary>
+    internal static void ResetSkeletonApplicationAreaCache()
+    {
+        if (_skeletonSession is not Microsoft.Dynamics.Nav.Runtime.NavSession session)
+            return;
+
+        SeedSkeletonApplicationAreaCache(session.GetType(), session);
+        session.ApplicationAreas = _skeletonApplicationAreasBaseline ?? string.Empty;
     }
 
     /// <summary>

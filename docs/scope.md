@@ -53,13 +53,14 @@ real thing for any test that only observes documented BC behaviour.
 |---|---|---|---|
 | **Table storage** (record CRUD) | SQL Server | `TempTableDataProvider` in-memory store | Faithful for all functional reads/writes, keys, filters, ranges, modify-in-place. Different on: transaction commit/rollback (no-op), no row locking, no parallel-session isolation. |
 | **Metadata system** (`NCLMetaTable`, `NCLMetaField`, `NCLMetaCodeunit`, …) | Loaded from compiled `.app` metadata streams | `NclMetadataCachePopulator` parses AL source, builds equivalent structures via reflection | Faithful for field types, lengths, FieldClass, FlowField CalcFormula, primary keys, tableextension field merging. Boundary: anything the populator hasn't been taught about throws or NREs into the populator's logged-error channel. |
-| **Session / company / tenant / user** | Live BC session | Skeleton `NavSession`, `NavCompany`, `NavTenant` we populate with defaults | Faithful for any test that doesn't probe authentication state, license features, or telemetry identity. `UserId()` defaults to `"TESTUSER"`. `CompanyName()` defaults to `""`. Neither is currently configurable — open an issue if your workflow needs it. |
+| **Session / company / tenant / user** | Live BC session | Skeleton `NavSession`, `NavCompany`, `NavTenant` we populate with defaults | Faithful for any test that doesn't probe authentication state, license features, or telemetry identity. `UserId()` defaults to `"TESTUSER"`; `CompanyName()` defaults to `"My Company"`, with a matching row in the `Company` virtual table. Neither is currently configurable — open an issue if your workflow needs it. |
 | **Permissions** | Permission sets evaluated against entitlements | All-granted `PermissionSet` returned by `NavSession.GetPermissionSet` | Faithful for any test that doesn't probe permission *denial* paths. Tests asserting "access denied" must be excluded or moved to real service tier. |
 | **Time / random / GUID** | Real .NET implementations | Same — no replacement | Faithful. |
 | **Field caption / table caption / lookup-page IDs** | From metadata + language pack | From parsed AL source (real values for AL-compiled tables; falls back to `"FieldNN"` for base-app tables not compiled in this run) | Faithful for in-scope tables; documented stub for non-compiled base-app tables. |
 | **Event publisher → subscriber dispatch** | Service-tier event dispatcher | **Working as of 2026-05-11 (`c4bce11a`, W-8b A-prime).** Discovers `[NavEventSubscriber]`-attributed methods at startup, constructs real `NavEventSubscription` instances, and injects them into each table's `NavTableTriggerEventHandler.eventScopes[evt].registeredSubscriptions`. BC's own `NavEventScope.CheckAndFireTriggerEventsAsync` then dispatches — no JmpHook on the dispatch path (it would have been R2R-inlined and silently bypassed; see `feedback_r2r_inlining_traps.md`). | Faithful for documented event semantics including `var` params and `IncludeSender`. Manual-binding subscribers (`BindSubscription`) still pending. |
 | **`Page.RunModal` / report `[RequestPageHandler]`** | Real UI dialog | Looks up registered `[ModalPageHandler]` / `[RequestPageHandler]` and calls it | Faithful for the handler dispatch contract that test code relies on; no actual UI is rendered. |
-| **`RecordLink` (table 2000000068)** AL surface: `Rec.AddLink/HasLinks/DeleteLink/DeleteLinks/CopyLinks` | Stored in the platform RecordLink table | `RecordLinkPatches` in-memory dict keyed by `NavRecord.ALRecordId` (see commit landing 2026-05-17). Reset to empty between tests via `ResetPerTestState`. | Faithful for AL-observable semantics: `AddLink` returns a positive monotone id, `HasLinks` is true iff a live link exists, `Delete*` and `CopyLinks` behave as documented. Boundary: BC code reading the RecordLink table directly via `Record 2000000068` from inside a non-AL path (BC internals) is unaware of the polyfill — that path isn't an AL surface and isn't exercised by the tests we care about. |
+| **`RecordLink` (table 2000000068)** AL surface: `Rec.AddLink/HasLinks/DeleteLink/DeleteLinks/CopyLinks` | Stored in the platform Record Link table | The unmodified NCL implementation writes to the runner's in-memory Record Link table. | Faithful for AL-observable semantics, including reading the inserted row through `Record 2000000068`; table rows participate in normal test reset and install-baseline handling. |
+| **Query execution** | SQL projection, joins, grouping, and dataset export | In-memory projection over each table's `TempTableDataProvider`, with managed joins and provisional aggregation | Joins and dataset export are corpus-backed. Aggregate columns (`Sum`, `Count`, `Average`, `Min`, `Max`), aggregate `ColumnFilter`, and `ReverseSign` are implemented but remain provisional until matching corpus tests pass against a real BC service tier. |
 
 ---
 
@@ -86,6 +87,7 @@ tier with SQL Server.
 |---|---|
 | `HttpClient.Send`, `.Get`, `.Post`, `.Put`, `.Delete`, `.Patch` | Real HTTP requires a network and an external server. Tests that need an HTTP boundary must inject an AL interface and provide a fake in the test project. |
 | OAuth / Azure AD token acquisition | Same — external network. |
+| `ExternalBusinessEvent` delivery | BC queues delivery through service-tier infrastructure outside the runner process. Because delivery has no AL-observable result, the runner completes the delivery call without external subscribers. |
 | Outbound REST/SOAP consumers | Same. |
 
 ### §3.3. Web service publishing <a id="web-services"></a>
@@ -186,13 +188,7 @@ invokes `OnInitReport` → `OnPreReport` → per-DataItem `OnPreDataItem` / `OnP
 |---|---|
 | `Debugger.Attach`, `Break`, `StepInto`, etc. | No debug loop. See `docs/limitations.md#no-debugger-infrastructure`. |
 
-### §3.13. NavQuery — multi-dataitem queries <a id="navquery"></a>
-
-| API | Reason |
-|---|---|
-| Multi-dataitem queries (JOINs), aggregations (`Sum`, `Avg`, `Min`, `Max`), `SaveAsCsv`/`SaveAsXml`/`SaveAsJson`/`SaveAsExcel` | NavQuery compiles AL into SQL projections. A faithful in-memory equivalent is a multi-day workstream. Single-dataitem queries are in scope today (§2). |
-
-### §3.14. .NET interop (DotNet AL type) <a id="dotnet-interop"></a>
+### §3.13. .NET interop (DotNet AL type) <a id="dotnet-interop"></a>
 
 | API | Reason |
 |---|---|
@@ -214,7 +210,7 @@ hitting them files a runner-gap issue rather than silently passing.
 | `RecordImplementation.CalcFieldsAsync` residual FlowField shapes | Extend populator (basic CalcFormula + unquoted-name path landed `d337c849`, `ff0d83e7`) | residual edge cases |
 | `ALDatabase.AL*` cluster | Now throws `out-of-scope/ALDatabase.*` per scope.md §3 (per-method clean classification needs investigation — two Sonnet attempts segfaulted, see `feedback_aldatabase_hard.md`) | classification investigation |
 | `NavApplicationObjectBaseHandle\`1.get_Target` tableId=0 path | Synthetic empty record for default-variant case. Today throws `out-of-scope/NavRecord.CloneForVariant (default-variant tableId=0)` via `8efcc462`. | HANDOFF §6 Tier 1B |
-| `NavRecord..ctor` for `Company` and other system tables (excluding RecordLink — see §2) | BcAppFallback for SystemPackage AL source lands the metadata; real BC ctor body needs further skeleton DataAccessSource wiring | HANDOFF §6 Tier 1B |
+| `NavRecord..ctor` for remaining system tables (excluding Company and RecordLink — see §2) | BcAppFallback for SystemPackage AL source lands the metadata; real BC ctor bodies may need further skeleton DataAccessSource wiring | HANDOFF §6 Tier 1B |
 | AL Runner Config codeunit `131100` | v2 equivalent of v1's `MockSession` routing | HANDOFF §6 Tier 2 |
 | `FilterGroup(n)` scoped filter groups | Track group state on Record | known gap |
 | Manual-binding event subscribers (`BindSubscription`) | Auto-binding subscribers work as of `c4bce11a`; manual-binding wiring deferred | follow-on to W-8b |

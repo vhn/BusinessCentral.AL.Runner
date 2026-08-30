@@ -86,15 +86,14 @@
 //   The old ConditionalWeakTable bought automatic cleanup when a NavRecord became
 //   unreachable, at the cost of being the actual bug (see above). A plain
 //   Guid-keyed ConcurrentDictionary doesn't get that for free, but MediaSet membership is
-//   per-test mutable state exactly like RecordLinkPatches' polyfill store or
-//   TenantStoragePatches' isolated-storage store — real BC rolls it back at the end of
-//   every test's transaction. ResetForTest() below is wired into
+//   per-test mutable state exactly like TenantStoragePatches' isolated-storage store —
+//   real BC rolls it back at the end of every test's transaction. ResetForTest() below is wired into
 //   RecordPatches.ResetPerTestState() (called before every test method — see
 //   TestExecutor.cs) so the store is cleared at the same boundary those other
 //   per-test stores already use. That reclaims memory deterministically every test,
 //   rather than "eventually, whenever the GC gets around to the abandoned NavRecord" —
 //   strictly better than what the ConditionalWeakTable gave us, and no NavRecord/
-///  NavMediaSet instance is ever kept alive by this store (the key is a value-type Guid).
+//   NavMediaSet instance is ever kept alive by this store (the key is a value-type Guid).
 //
 // ALImport (ImportFile) is left exactly as before: a full-body replacement returning a
 // fresh Guid with no real content storage. That's an existing, separately-scoped decision

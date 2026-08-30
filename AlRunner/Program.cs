@@ -2083,6 +2083,7 @@ foreach (var bundle in bundles)
                     // Register any prebuilt bundle-root .app (with SymbolReference.json) so the
                     // generic NCLMetaQuery builder can read this bundle's own query column ids.
                     AlRunner.Patches.RecordPatches.RegisterBundleSymbolApps(depRootDir);
+                    AlRunner.Patches.RecordPatches.RefreshUnresolvedCalcFormulaTables();
                     // Populate BcRuntime with this bundle's identity for the
                     // NavApp.GetCurrentModuleInfo polyfill shim. A parent-of-many-apps bundle
                     // has no identity of its own; each AppGroup sets its own below.
@@ -3825,6 +3826,7 @@ return strictExitCode ? computedExitCode : 0;
                 foreach (var (_, appPath) in ordered)
                     AlRunner.Patches.RecordPatches.AddBcAppPath(appPath);
                 AlRunner.Patches.RecordPatches.RegisterBundleSymbolApps(bucketRoot);
+                AlRunner.Patches.RecordPatches.RefreshUnresolvedCalcFormulaTables();
                 SetBundleInfoFromAppJson(appJsonPath);
                 bundleId = AlRunner.Infrastructure.InProcessAppPackager.ReadIdentity(appJsonPath);
                 if (bundleId != null)
@@ -6943,8 +6945,7 @@ static HashSet<Guid> SiblingSymbolTargets(List<AlRunner.AppGroup> appGroups)
 static string? PrepareSiblingSymbolsDir(string bundleAbs)
 {
     BcCompiler.SetSiblingSymbolsDir(null);
-    var dir = Path.Combine(Path.GetTempPath(),
-        "al-runner-sibling-symbols", Path.GetFileName(bundleAbs.TrimEnd(Path.DirectorySeparatorChar)));
+    var dir = AlRunner.Infrastructure.SiblingSymbolsDirectory.ForBundle(bundleAbs);
     try
     {
         if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);

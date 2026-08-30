@@ -42,6 +42,10 @@ public static class JoinExecutor
     private static PropertyInfo? _pColColumnIndex;
     private static PropertyInfo? _pColColumnType;
     private static PropertyInfo? _pColParentDataItem;
+    private static PropertyInfo? _pColIsAggregated;
+    private static PropertyInfo? _pColAggregationType;
+    private static PropertyInfo? _pColReverseSign;
+    private static PropertyInfo? _pColEmptyValue;
     private static PropertyInfo? _pFieldColumnIndex;
     private static PropertyInfo? _pFieldFieldClass;
     private static PropertyInfo? _pOrderByColumn;
@@ -83,6 +87,10 @@ public static class JoinExecutor
         // column by value alone. See BuildJoinProjectionPlan below.
         _pColColumnType = tCol.GetProperty("ColumnType", F);
         _pColParentDataItem = tCol.GetProperty("ParentDataItem", F)!;
+        _pColIsAggregated = tCol.GetProperty("IsAggregated", F)!;
+        _pColAggregationType = tCol.GetProperty("AggregationType", F)!;
+        _pColReverseSign = tCol.GetProperty("ReverseSign", F)!;
+        _pColEmptyValue = tCol.GetProperty("EmptyValue", F)!;
         _pFieldColumnIndex = tField.GetProperty("ColumnIndex", F)!;
         _pFieldFieldClass = tField.GetProperty("FieldClass", F);
         _pOrderByColumn = tOrderBy.GetProperty("Column", F) ?? tOrderBy.GetProperty("QueryColumn", F);
@@ -226,11 +234,36 @@ public static class JoinExecutor
             projected.Add(fields);
         }
 
-        // 4. OrderBy over the projected result slots (top-level ordering).
-        ApplyJoinOrderBy(projected, queryDef);
-
         var result = new List<object>(projected.Count);
         foreach (var fields in projected)
+            result.Add(ctx.MakeReadOnlyRecordBuffer(nclMetaQuery, ctx.ToNavValueArray(fields)));
+        return result;
+    }
+
+    /// <summary>
+    /// Finalize already-projected query rows after the caller has applied WHERE-phase runtime
+    /// filters: group and aggregate when the design contains aggregate columns, apply
+    /// ReverseSign to result values, then apply the query's OrderBy. The caller applies
+    /// aggregate-column filters (HAVING) to the returned rows.
+    /// </summary>
+    public static List<object> Finalize(JoinContext ctx, object nclMetaQuery, IEnumerable rows)
+    {
+        EnsureReflection(nclMetaQuery);
+        var queryDef = _pMetaQueryQueryDefinition!.GetValue(nclMetaQuery)!;
+        EnsureReflection(queryDef);
+        var plan = BuildFinalizationPlan(queryDef);
+        var input = rows.Cast<object>().ToList();
+        List<object?[]> finalized;
+
+        if (plan.Columns.Any(column => column.IsAggregated))
+            finalized = AggregateRows(ctx, plan, input);
+        else
+            finalized = ProjectFinalRows(ctx, plan, input);
+
+        ApplyJoinOrderBy(finalized, queryDef);
+
+        var result = new List<object>(finalized.Count);
+        foreach (var fields in finalized)
             result.Add(ctx.MakeReadOnlyRecordBuffer(nclMetaQuery, ctx.ToNavValueArray(fields)));
         return result;
     }
@@ -435,6 +468,275 @@ public static class JoinExecutor
         return tableSlot;
     }
 
+    private sealed class FinalColumn
+    {
+        public required object Metadata;
+        public int Slot;
+        public bool IsAggregated;
+        public string Aggregation = "None";
+        public bool ReverseSign;
+    }
+
+    private sealed class FinalizationPlan
+    {
+        public int SlotCount;
+        public List<FinalColumn> Columns = new();
+    }
+
+    private static FinalizationPlan BuildFinalizationPlan(object queryDef)
+    {
+        var plan = new FinalizationPlan();
+        var dataItems = ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>();
+        foreach (var dataItem in dataItems)
+        {
+            var columns = ((IEnumerable?)_pDataItemQueryColumns!.GetValue(dataItem))?.Cast<object>()
+                ?? Enumerable.Empty<object>();
+            foreach (var column in columns)
+            {
+                if (IsFilterOnlyColumn(column)) continue;
+                var slot = (int)_pColColumnIndex!.GetValue(column)!;
+                if (slot < 0) continue;
+                plan.SlotCount = Math.Max(plan.SlotCount, slot + 1);
+                plan.Columns.Add(new FinalColumn
+                {
+                    Metadata = column,
+                    Slot = slot,
+                    IsAggregated = (bool)_pColIsAggregated!.GetValue(column)!,
+                    Aggregation = _pColAggregationType!.GetValue(column)?.ToString() ?? "None",
+                    ReverseSign = (bool)_pColReverseSign!.GetValue(column)!,
+                });
+            }
+        }
+        return plan;
+    }
+
+    private static List<object?[]> ProjectFinalRows(
+        JoinContext ctx,
+        FinalizationPlan plan,
+        List<object> input)
+    {
+        var result = new List<object?[]>(input.Count);
+        foreach (var row in input)
+        {
+            var fields = new object?[plan.SlotCount];
+            foreach (var column in plan.Columns)
+            {
+                if (column.Slot >= BufFieldCount(row)) continue;
+                var value = BufGet(row, column.Slot);
+                fields[column.Slot] = column.ReverseSign
+                    ? ReverseNumericValue(ctx, column.Metadata, value)
+                    : value;
+            }
+            result.Add(fields);
+        }
+        return result;
+    }
+
+    private sealed class AggregateGroup
+    {
+        public required object?[] Keys;
+        public List<object> Rows = new();
+    }
+
+    private sealed class AggregateGroupKey : IEquatable<AggregateGroupKey>
+    {
+        public required object?[] Values;
+
+        public bool Equals(AggregateGroupKey? other)
+            => other != null && KeysEqual(Values, other.Values);
+
+        public override bool Equals(object? obj)
+            => obj is AggregateGroupKey other && Equals(other);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            foreach (var value in Values)
+                hash.Add(value);
+            return hash.ToHashCode();
+        }
+    }
+
+    private static List<object?[]> AggregateRows(
+        JoinContext ctx,
+        FinalizationPlan plan,
+        List<object> input)
+    {
+        var keyColumns = plan.Columns.Where(column => !column.IsAggregated).ToList();
+        var aggregateColumns = plan.Columns.Where(column => column.IsAggregated).ToList();
+        var groups = new List<AggregateGroup>();
+        var groupsByKey = new Dictionary<AggregateGroupKey, AggregateGroup>();
+
+        foreach (var row in input)
+        {
+            var keys = keyColumns
+                .Select(column => column.Slot < BufFieldCount(row) ? BufGet(row, column.Slot) : null)
+                .ToArray();
+            var key = new AggregateGroupKey { Values = keys };
+            if (!groupsByKey.TryGetValue(key, out var group))
+            {
+                group = new AggregateGroup { Keys = keys };
+                groups.Add(group);
+                groupsByKey.Add(key, group);
+            }
+            group.Rows.Add(row);
+        }
+
+        // SQL returns one row for a global aggregate even when its input is empty. A grouped
+        // aggregate has no group and therefore no row.
+        if (groups.Count == 0 && keyColumns.Count == 0)
+            groups.Add(new AggregateGroup { Keys = Array.Empty<object?>() });
+
+        var result = new List<object?[]>(groups.Count);
+        foreach (var group in groups)
+        {
+            var fields = new object?[plan.SlotCount];
+            for (var i = 0; i < keyColumns.Count; i++)
+            {
+                var column = keyColumns[i];
+                var value = group.Keys[i];
+                fields[column.Slot] = column.ReverseSign
+                    ? ReverseNumericValue(ctx, column.Metadata, value)
+                    : value;
+            }
+            foreach (var column in aggregateColumns)
+                fields[column.Slot] = AggregateColumn(ctx, column, group.Rows);
+            result.Add(fields);
+        }
+        return result;
+    }
+
+    private static bool KeysEqual(object?[] left, object?[] right)
+    {
+        if (left.Length != right.Length) return false;
+        for (var i = 0; i < left.Length; i++)
+            if (!NavValuesEqual(left[i], right[i])) return false;
+        return true;
+    }
+
+    private static object? AggregateColumn(
+        JoinContext ctx,
+        FinalColumn column,
+        List<object> rows)
+    {
+        if (column.Aggregation == "Count")
+        {
+            var count = CreateNumericValue(ctx, column.Metadata, null, rows.Count);
+            return column.ReverseSign
+                ? ReverseNumericValue(ctx, column.Metadata, count)
+                : count;
+        }
+
+        var values = rows
+            .Where(row => column.Slot < BufFieldCount(row))
+            .Select(row => BufGet(row, column.Slot))
+            .Where(value => value != null)
+            .ToList();
+
+        object? result = column.Aggregation switch
+        {
+            "Sum" => CreateNumericValue(
+                ctx,
+                column.Metadata,
+                values.FirstOrDefault(),
+                values.Sum(value => NumericAsDecimal(ctx, value!))),
+            "Average" => CreateNumericValue(
+                ctx,
+                column.Metadata,
+                values.FirstOrDefault(),
+                values.Count == 0 ? 0 : values.Sum(value => NumericAsDecimal(ctx, value!)) / values.Count),
+            "Min" => values.Count == 0 ? EmptyValue(column.Metadata) : values.Min(NavValueComparer.Instance),
+            "Max" => values.Count == 0 ? EmptyValue(column.Metadata) : values.Max(NavValueComparer.Instance),
+            _ => throw ctx.OutOfScope(
+                "NavQuery (aggregate)",
+                $"query-aggregate-{column.Aggregation.ToLowerInvariant()}-not-implemented — aggregation method " +
+                $"'{column.Aggregation}' is not supported in-memory; see docs/scope.md"),
+        };
+
+        return column.ReverseSign
+            ? ReverseNumericValue(ctx, column.Metadata, result)
+            : result;
+    }
+
+    private static object? EmptyValue(object queryColumn)
+        => _pColEmptyValue!.GetValue(queryColumn);
+
+    private static decimal NumericAsDecimal(JoinContext ctx, object navValue)
+    {
+        var value = navValue.GetType().GetProperty("ValueAsObject", F)?.GetValue(navValue);
+        if (value == null) return 0;
+        if (value is decimal decimalValue) return decimalValue;
+        if (value is IConvertible convertible)
+            return convertible.ToDecimal(System.Globalization.CultureInfo.InvariantCulture);
+        if (value.GetType().FullName == "Microsoft.Dynamics.Nav.Runtime.Decimal18")
+        {
+            var toDecimal = value.GetType().GetMethod(
+                "ToDecimal",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                binder: null,
+                types: new[] { value.GetType() },
+                modifiers: null);
+            if (toDecimal != null)
+                return (decimal)toDecimal.Invoke(null, new[] { value })!;
+        }
+        throw ctx.OutOfScope(
+            "NavQuery (aggregate)",
+            $"query-aggregate-nonnumeric-source — value type '{value.GetType().FullName}' cannot be aggregated numerically; see docs/scope.md");
+    }
+
+    private static object? ReverseNumericValue(JoinContext ctx, object queryColumn, object? navValue)
+        => navValue == null
+            ? null
+            : CreateNumericValue(ctx, queryColumn, navValue, -NumericAsDecimal(ctx, navValue));
+
+    private static object CreateNumericValue(
+        JoinContext ctx,
+        object queryColumn,
+        object? sourceValue,
+        decimal value)
+    {
+        var template = EmptyValue(queryColumn) ?? sourceValue;
+        if (template == null)
+            throw ctx.OutOfScope(
+                "NavQuery (aggregate)",
+                "query-aggregate-result-type-unresolved — no query-column default or source value is available to type the aggregate result; see docs/scope.md");
+
+        var navType = template.GetType();
+        object argument;
+        Type argumentType;
+        switch (navType.Name)
+        {
+            case "NavDecimal":
+                argumentType = navType.Assembly.GetType("Microsoft.Dynamics.Nav.Runtime.Decimal18")!;
+                argument = Activator.CreateInstance(argumentType, value)!;
+                break;
+            case "NavInteger":
+                argumentType = typeof(int);
+                argument = checked((int)value);
+                break;
+            case "NavBigInteger":
+                argumentType = typeof(long);
+                argument = checked((long)value);
+                break;
+            default:
+                throw ctx.OutOfScope(
+                    "NavQuery (aggregate)",
+                    $"query-aggregate-result-type-{navType.Name.ToLowerInvariant()}-not-implemented — " +
+                    $"cannot create a numeric aggregate result of runtime type '{navType.FullName}'; see docs/scope.md");
+        }
+
+        var create = navType.GetMethod(
+            "Create",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { argumentType },
+            modifiers: null)
+            ?? throw ctx.OutOfScope(
+                "NavQuery (aggregate)",
+                $"query-aggregate-result-factory-missing — {navType.FullName}.Create({argumentType.Name}) was not found; see docs/scope.md");
+        return create.Invoke(null, new[] { argument })!;
+    }
+
     // Apply the query's OrderBy (top-level result ordering) over the projected result rows.
     private static void ApplyJoinOrderBy(List<object?[]> projected, object queryDef)
     {
@@ -485,6 +787,13 @@ public static class JoinExecutor
             if (x == null) return -1;
             if (y == null) return 1;
             if (x is IComparable cmp) { try { return cmp.CompareTo(y); } catch { } }
+            var compareTo = x.GetType().GetMethods(F)
+                .FirstOrDefault(method => method.Name == "CompareTo"
+                    && method.ReturnType == typeof(int)
+                    && method.GetParameters().Length == 1
+                    && method.GetParameters()[0].ParameterType.IsInstanceOfType(y));
+            if (compareTo != null)
+                return (int)compareTo.Invoke(x, new[] { y })!;
             return string.CompareOrdinal(x.ToString(), y.ToString());
         }
     }

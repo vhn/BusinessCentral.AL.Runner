@@ -12,8 +12,8 @@
 //   reloaded from disk.
 //
 // WHAT IS PERSISTED
-//   Exactly the four things InstallBaselineSnapshot holds — table rows, isolated storage,
-//   record links, auto-increment counters — MINUS the self-populating virtual system tables
+//   Exactly the three things InstallBaselineSnapshot holds — table rows, isolated storage,
+//   auto-increment counters — MINUS the self-populating virtual system tables
 //   (see IsSelfPopulatingVirtualTableId). Everything else round-trips through BC's OWN
 //   NavValue byte codec (NavValue.GetBytes / NavValue.CreateNavValueFromBytes, the pair the
 //   service tier itself uses to move field values in and out of binary), so the runner is not
@@ -55,7 +55,7 @@ public static partial class RecordPatches
     // deserialises cleanly under new semantics is the one failure mode a cache cannot
     // detect for itself.
     private const uint InstallBaselineDiskMagic = 0x42494C41;
-    internal const int InstallBaselineDiskSchemaVersion = 1;
+    internal const int InstallBaselineDiskSchemaVersion = 2;
 
     // Pool-entry kinds. Kind is stored per DISTINCT NavValue instance, not per row slot.
     private const byte KindBytes = 1;       // NavValue.GetBytes() + NavValue.CreateNavValueFromBytes
@@ -69,7 +69,9 @@ public static partial class RecordPatches
     /// just a size one.</summary>
     internal static bool IsSelfPopulatingVirtualTableId(int tableId) => tableId switch
     {
-        AllObjVirtualTableId or AllObjWithCaptionVirtualTableId or FieldVirtualTableId
+        CompanyVirtualTableId or DateVirtualTableId or TimeZoneVirtualTableId
+            or WindowsLanguageVirtualTableId
+            or AllObjVirtualTableId or AllObjWithCaptionVirtualTableId or FieldVirtualTableId
             or IntegerVirtualTableId or ReportLayoutListVirtualTableId
             or PageMetadataVirtualTableId or ReportMetadataVirtualTableId
             or ReportDataItemsVirtualTableId or PageControlFieldVirtualTableId
@@ -235,7 +237,6 @@ public static partial class RecordPatches
                 }
 
             TenantStoragePatches.SerializeInstallBaseline(w, snapshot.IsolatedStorage);
-            RecordLinkPatches.SerializeInstallBaseline(w, snapshot.RecordLinks);
 
             var ai = snapshot.AutoIncrement;
             w.Write(ai?.Count ?? 0);
@@ -442,7 +443,6 @@ public static partial class RecordPatches
             }
 
             var isolatedStorage = TenantStoragePatches.DeserializeInstallBaseline(r);
-            var recordLinks = RecordLinkPatches.DeserializeInstallBaseline(r);
 
             var aiCount = r.ReadInt32();
             var autoIncrement = new Dictionary<int, long>(aiCount);
@@ -460,7 +460,7 @@ public static partial class RecordPatches
 
             return new InstallBaselineSnapshot(
                 new[] { new BaselineSource(sourceObject, baselineTables) },
-                isolatedStorage, recordLinks, autoIncrement);
+                isolatedStorage, autoIncrement);
         }
         catch (Exception ex)
         {
@@ -509,7 +509,7 @@ public static partial class RecordPatches
     /// <summary>Value-level digest of everything an on-disk baseline carries, in the order it
     /// carries it: for every persistable table, every row, every field slot — the value's own
     /// NclType, its own defined length, its NULL flag and the exact bytes BC's
-    /// <c>GetBytes()</c> produces — plus the isolated-storage, record-link and auto-increment
+    /// <c>GetBytes()</c> produces — plus the isolated-storage and auto-increment
     /// state (sorted, since those stores' enumeration order is not meaningful).
     ///
     /// This is the ROUND-TRIP PROOF the cross-process test asserts on: the writing process
@@ -549,8 +549,6 @@ public static partial class RecordPatches
                 }
             }
         foreach (var line in TenantStoragePatches.DescribeInstallBaseline(snapshot.IsolatedStorage))
-            sb.Append(line).Append('\n');
-        foreach (var line in RecordLinkPatches.DescribeInstallBaseline(snapshot.RecordLinks))
             sb.Append(line).Append('\n');
         foreach (var (k, v) in (snapshot.AutoIncrement ?? new Dictionary<int, long>()).OrderBy(p => p.Key))
             sb.Append("ai|").Append(k).Append('|').Append(v).Append('\n');

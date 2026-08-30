@@ -54,7 +54,19 @@ internal static partial class BcAppSymbolCache
     // table has no card page at all — a real behavioral divergence, not a display nit),
     // and the Page Control Field provider would read as "no controls" — silent wrong
     // answers, not a cache miss, hence the bump.
-    private const int CacheVersion = 13;
+    // v14: query data items now have their #appId# module qualifier stripped from
+    //     RelatedTable, matching the report parser. Without this, queries over a table in
+    //     another app cannot build NCLMetaQuery and SetRange/SetFilter NRE at runtime.
+    // v15: enum values without an Implementation property inherit the enum's
+    //     DefaultImplementation. Without it, valid enum-to-interface casts fail at runtime.
+    // v16: query columns retain their Method property so source-less Count columns can be
+    //     represented instead of invalidating the entire query definition.
+    // v17: PageSymbol gained Parts, carrying dependency-page part control ids, hosted page
+    //     ids, and SubPageLink text. Without it TestPage parts on precompiled Base App pages
+    //     cannot be resolved even though SymbolReference.json states the complete link.
+    // v18: dependency table fields now retain TableRelation and ValidateTableRelation.
+    // Without the bump, a v17 payload would silently replay fields with no relation metadata.
+    private const int CacheVersion = 19;
     private static readonly ConcurrentDictionary<string, AppSymbols> ProcessCache = new(StringComparer.OrdinalIgnoreCase);
     // Issue #1820 — path -> content-hash memo. ComputeAppContentHash needs to read the
     // WHOLE .app to hash it (unlike the FileInfo.Length/LastWriteTimeUtc stat it replaced,
@@ -125,7 +137,10 @@ internal static partial class BcAppSymbolCache
         // (verified: Base Application 28.1's "Customer List" carries
         // CardPageID = "Customer Card", not a numeric id) — resolved against the run's page
         // inventory at Page Metadata row-build time, same as the source-parsed path.
-        string? CardPageName = null);
+        string? CardPageName = null,
+        // Part controls on a precompiled dependency page. The symbol file carries the
+        // compiler control id, hosted page id, and raw SubPageLink property.
+        List<PagePartSymbol>? Parts = null);
 
     /// <summary>
     /// One field control of a precompiled dependency page, as SymbolReference.json states
@@ -138,6 +153,9 @@ internal static partial class BcAppSymbolCache
     internal sealed record PageControlSymbol(
         int Id, string Name, string SourceExpression,
         string? VisibleExpr, string? EditableExpr, string? EnabledExpr, int Sequence);
+
+    internal sealed record PagePartSymbol(
+        int Id, string Name, int PagePartId, string? SubPageLink);
 
     /// <summary>
     /// A precompiled dependency's report, as far as SymbolReference.json states it. Feeds
@@ -218,10 +236,13 @@ internal static partial class BcAppSymbolCache
     internal sealed record QueryDataItemSymbol(
         int Id, string Name, string RelatedTable, string? SqlJoinType, string? DataItemLink,
         List<QueryColumnSymbol> Columns, List<QueryColumnSymbol> Filters,
-        List<QueryDataItemSymbol> DataItems);
+        List<QueryDataItemSymbol> DataItems, string? DataItemTableFilter = null);
 
-    // SourceColumn is the field NAME on RelatedTable; Id is the BC column id; Caption optional.
-    internal sealed record QueryColumnSymbol(int Id, string Name, string SourceColumn, string? Caption);
+    // SourceColumn is the field NAME on RelatedTable; a source-less Count aggregate has an
+    // empty SourceColumn and Method="Count". Id is the BC column id; Caption is optional.
+    internal sealed record QueryColumnSymbol(
+        int Id, string Name, string SourceColumn, string? Caption, string? Method = null,
+        string? ColumnFilter = null, bool ReverseSign = false);
 
     // #1820: ContentHash replaces Length/LastWriteUtcTicks. The KEY (below, in Get) already
     // switched from mtime to a content hash, so an old Length/LastWriteUtcTicks payload can
@@ -442,11 +463,10 @@ internal static partial class BcAppSymbolCache
     }
 
     /// <summary>
-    /// Parse one entry of a SymbolReference.json <c>Pages</c> array. Only <c>SourceTable</c>
-    /// is needed (issue #1719: binding a plain page variable's Rec) — everything else about
-    /// a precompiled page (its control tree) is out of reach without parsing its AL source,
-    /// which <see cref="RunnerPageInstance"/> already declines to do for a page the runner
-    /// did not compile itself.
+    /// Parse one entry of a SymbolReference.json <c>Pages</c> array. Besides page properties,
+    /// the symbol file exposes field controls and part controls. Part controls carry their
+    /// hosted page id and raw SubPageLink, which is enough for the live TestPage adapter to
+    /// bind a precompiled dependency page's subpage without parsing embedded AL source.
     /// <para><c>SourceTable</c>'s Properties value is the table's numeric ID as text (see
     /// e.g. Base Application's Page 700 "Error Messages": <c>SourceTable = "700"</c>), unlike
     /// <c>LookupPageId</c>/<c>DrillDownPageId</c> on a table, which are page NAMES — so this
@@ -477,15 +497,19 @@ internal static partial class BcAppSymbolCache
         bool deleteAllowed = !SymbolBoolFalse(props, "DeleteAllowed");
 
         var controls = new List<PageControlSymbol>();
+        var parts = new List<PagePartSymbol>();
         int seq = 0;
         if (page.TryGetProperty("Controls", out var controlsArr) && controlsArr.ValueKind == JsonValueKind.Array)
             foreach (var c in controlsArr.EnumerateArray())
+            {
                 CollectPageControlSymbols(c, controls, ref seq);
+                CollectPagePartSymbols(c, parts);
+            }
 
         return new PageSymbol(pageId, name!, sourceTableId, sourceTableTemporary,
             string.IsNullOrWhiteSpace(pageType) ? "Card" : pageType!, caption,
             editable, insertAllowed, modifyAllowed, deleteAllowed, controls,
-            string.IsNullOrWhiteSpace(cardPageName) ? null : cardPageName);
+            string.IsNullOrWhiteSpace(cardPageName) ? null : cardPageName, parts);
     }
 
     /// <summary>
@@ -517,6 +541,31 @@ internal static partial class BcAppSymbolCache
         if (control.TryGetProperty("Controls", out var children) && children.ValueKind == JsonValueKind.Array)
             foreach (var child in children.EnumerateArray())
                 CollectPageControlSymbols(child, into, ref sequence);
+    }
+
+    private static void CollectPagePartSymbols(JsonElement control, List<PagePartSymbol> into)
+    {
+        if (control.TryGetProperty("RelatedPagePartId", out var relatedPage)
+            && relatedPage.ValueKind == JsonValueKind.Object
+            && relatedPage.TryGetProperty("Id", out var pageIdProp)
+            && pageIdProp.TryGetInt32(out var pagePartId)
+            && pagePartId > 0)
+        {
+            var name = control.TryGetProperty("Name", out var nameProp) ? nameProp.GetString() : null;
+            var id = control.TryGetProperty("Id", out var idProp) && idProp.TryGetInt32(out var idValue)
+                ? idValue
+                : 0;
+            if (id != 0 && !string.IsNullOrEmpty(name))
+            {
+                var props = SymbolProperties(control);
+                props.TryGetValue("SubPageLink", out var subPageLink);
+                into.Add(new PagePartSymbol(id, name!, pagePartId, subPageLink));
+            }
+        }
+
+        if (control.TryGetProperty("Controls", out var children) && children.ValueKind == JsonValueKind.Array)
+            foreach (var child in children.EnumerateArray())
+                CollectPagePartSymbols(child, into);
     }
 
     private static bool SymbolBool(Dictionary<string, string> props, string name)
@@ -667,11 +716,13 @@ internal static partial class BcAppSymbolCache
     private static QueryDataItemSymbol? TryParseQueryDataItem(JsonElement el)
     {
         var name = el.TryGetProperty("Name", out var nameProp) ? nameProp.GetString() ?? string.Empty : string.Empty;
-        var relatedTable = el.TryGetProperty("RelatedTable", out var rtProp) ? rtProp.GetString() ?? string.Empty : string.Empty;
+        var relatedTable = StripModuleQualifier(
+            el.TryGetProperty("RelatedTable", out var rtProp) ? rtProp.GetString() : null) ?? string.Empty;
         int id = el.TryGetProperty("Id", out var idProp) && idProp.TryGetInt32(out var i) ? i : 0;
         var props = SymbolProperties(el);
         props.TryGetValue("SqlJoinType", out var sqlJoinType);
         props.TryGetValue("DataItemLink", out var dataItemLink);
+        props.TryGetValue("DataItemTableFilter", out var dataItemTableFilter);
 
         var columns = ParseQueryColumns(el, "Columns");
         var filters = ParseQueryColumns(el, "Filters");
@@ -683,7 +734,9 @@ internal static partial class BcAppSymbolCache
                 var c = TryParseQueryDataItem(child);
                 if (c != null) nested.Add(c);
             }
-        return new QueryDataItemSymbol(id, name, relatedTable, sqlJoinType, dataItemLink, columns, filters, nested);
+        return new QueryDataItemSymbol(
+            id, name, relatedTable, sqlJoinType, dataItemLink, columns, filters, nested,
+            dataItemTableFilter);
     }
 
     private static List<QueryColumnSymbol> ParseQueryColumns(JsonElement dataItem, string arrayName)
@@ -698,7 +751,13 @@ internal static partial class BcAppSymbolCache
             var sourceColumn = col.TryGetProperty("SourceColumn", out var scProp) ? scProp.GetString() ?? string.Empty : string.Empty;
             var props = SymbolProperties(col);
             props.TryGetValue("Caption", out var caption);
-            result.Add(new QueryColumnSymbol(id, name, sourceColumn, caption));
+            props.TryGetValue("Method", out var method);
+            props.TryGetValue("ColumnFilter", out var columnFilter);
+            var reverseSign = props.TryGetValue("ReverseSign", out var reverseSignText)
+                && (string.Equals(reverseSignText, "1", StringComparison.Ordinal)
+                    || bool.TryParse(reverseSignText, out var parsedReverseSign) && parsedReverseSign);
+            result.Add(new QueryColumnSymbol(
+                id, name, sourceColumn, caption, method, columnFilter, reverseSign));
         }
         return result;
     }
@@ -735,11 +794,28 @@ internal static partial class BcAppSymbolCache
                 if (isFlowField && props.TryGetValue("CalcFormula", out var calcFormulaText))
                     calcFormula = RecordPatches.TryParseCalcFormula($"CalcFormula = {calcFormulaText};");
                 props.TryGetValue("OptionMembers", out var optionMembers);
+                props.TryGetValue("OptionCaption", out var optionCaption);
                 props.TryGetValue("InitValue", out var initValue);
                 var isAutoIncrement = props.TryGetValue("AutoIncrement", out var autoIncrement)
                     && (autoIncrement == "1" || autoIncrement.Equals("true", StringComparison.OrdinalIgnoreCase));
-                fields.Add(new ParsedField(fieldId, fieldName, typeName, SymbolTypeLength(typeName), isFlowField, calcFormula,
-                    optionMembers, initValue, isAutoIncrement, IsFlowFilter: isFlowFilter));
+                List<ParsedRelationArm>? relationArms = null;
+                if (!isFlowField && !isFlowFilter && props.TryGetValue("TableRelation", out var relationText))
+                    relationArms = RecordPatches.TryParseTableRelation(relationText, fieldName);
+                var relationValidate = !SymbolBoolFalse(props, "ValidateTableRelation");
+                fields.Add(new ParsedField(
+                    fieldId,
+                    fieldName,
+                    typeName,
+                    SymbolTypeLength(typeName),
+                    IsFlowField: isFlowField,
+                    CalcFormula: calcFormula,
+                    OptionMembers: optionMembers,
+                    InitValueText: initValue,
+                    IsAutoIncrement: isAutoIncrement,
+                    RelationArms: relationArms,
+                    RelationValidate: relationValidate,
+                    IsFlowFilter: isFlowFilter,
+                    OptionCaption: optionCaption));
             }
         }
 
@@ -802,6 +878,10 @@ internal static partial class BcAppSymbolCache
         if (!enumType.TryGetProperty("Values", out var values) || values.ValueKind != JsonValueKind.Array)
             return null;
 
+        var enumProps = SymbolProperties(enumType);
+        var defaultImplementations = enumProps.TryGetValue("DefaultImplementation", out var defaultText)
+            ? AlEnumMetadataRegistry.ParseImplementationIds(defaultText)
+            : Array.Empty<int>();
         var options = new List<string>();
         var indexes = new List<int>();
         var implementations = new List<List<int>>();
@@ -817,17 +897,13 @@ internal static partial class BcAppSymbolCache
                 : nextOrdinal;
             options.Add(optionName);
             indexes.Add(ordinal);
-            var implementationIds = new List<int>();
+            var implementationIds = Array.Empty<int>();
             var props = SymbolProperties(value);
             if (props.TryGetValue("Implementation", out var implementationText))
-            {
-                foreach (var part in implementationText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                {
-                    if (int.TryParse(part, out var implementationId))
-                        implementationIds.Add(implementationId);
-                }
-            }
-            implementations.Add(implementationIds);
+                implementationIds = AlEnumMetadataRegistry.ParseImplementationIds(implementationText);
+            implementations.Add(AlEnumMetadataRegistry
+                .ApplyDefaultImplementations(implementationIds, defaultImplementations)
+                .ToList());
             // Issue #1775 — a value's declared Caption, same SymbolProperties read the
             // report/query/field Caption capture already uses elsewhere in this file.
             // Missing/empty means "declares none"; the consumer (AlEnumOptionMetadata.

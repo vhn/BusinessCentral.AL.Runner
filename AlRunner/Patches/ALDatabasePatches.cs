@@ -59,16 +59,80 @@ public static class ALDatabasePatches
     public static bool HasWriteTransaction(object? session)
         => System.Threading.Volatile.Read(ref _inWriteTransaction);
 
-    /// <summary>Replacement for ALDatabase.ALCommit(). There is nothing to flush — the
-    /// in-memory store is written through — but the write transaction ends here, which is
-    /// what AL observes via Database.IsInWriteTransaction().</summary>
+    /// <summary>Replacement for ALDatabase.ALCommit(). The service tier checks the active
+    /// method scope's CommitBehavior before it reaches the transaction manager: Ignore skips
+    /// the commit and Error raises Lang.CommitProhibited. NavMethodScope.RunBehavior still
+    /// maintains that state on the skeleton session, so this replacement must honor it too.
+    /// For the default behavior there is nothing to flush — the in-memory store is written
+    /// through — but the write transaction ends here, which is what AL observes through
+    /// Database.IsInWriteTransaction().</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static void ALDatabase_ALCommit()
     {
+        var commitBehavior = (AlRunner.BcRuntime.SkeletonSession as Microsoft.Dynamics.Nav.Runtime.NavSession)
+            ?.CommitBehavior ?? Microsoft.Dynamics.Nav.Types.CommitBehavior.Ok;
+        if (!CommitBehaviorAllowsCommit(commitBehavior)) return;
+
         System.Threading.Volatile.Write(ref _inWriteTransaction, false);
         // Everything written so far is now durable: a later AL error rolls back to HERE,
         // not to the start of the test method.
         RecordPatches.MarkCommitPoint();
+    }
+
+    /// <summary>
+    /// Start the transaction owned by <c>Codeunit.Run</c>. The service tier establishes a
+    /// fresh transaction boundary before invoking the codeunit; in the runner's write-through
+    /// store that means making the caller's current state durable before recording the inner
+    /// codeunit's first write.
+    /// </summary>
+    internal static void BeginCodeunitRunTransaction()
+    {
+        System.Threading.Volatile.Write(ref _inWriteTransaction, false);
+        RecordPatches.NoteTransactionBegin(AlRunner.BcRuntime.SkeletonSession);
+    }
+
+    /// <summary>
+    /// Finish the transaction owned by <c>Codeunit.Run</c>. This is an implicit platform
+    /// transaction boundary, so it is deliberately independent of AL's CommitBehavior setting.
+    /// </summary>
+    internal static void EndCodeunitRunTransaction(bool commit)
+    {
+        RecordPatches.NoteTransactionEnd(AlRunner.BcRuntime.SkeletonSession, commit);
+
+        System.Threading.Volatile.Write(ref _inWriteTransaction, false);
+    }
+
+    internal static bool CommitBehaviorAllowsCommit(Microsoft.Dynamics.Nav.Types.CommitBehavior behavior)
+        => behavior switch
+        {
+            Microsoft.Dynamics.Nav.Types.CommitBehavior.Ignore => false,
+            Microsoft.Dynamics.Nav.Types.CommitBehavior.Error => throw BuildCommitProhibited(),
+            _ => true,
+        };
+
+    private static Exception BuildCommitProhibited()
+    {
+        const string fallback = "The COMMIT statement is prohibited in the current scope.";
+
+        try
+        {
+            var languageAssembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Language");
+            var message = languageAssembly
+                              ?.GetType("Microsoft.Dynamics.Nav.Common.Language.Lang")
+                              ?.GetProperty("CommitProhibited",
+                                  System.Reflection.BindingFlags.Static
+                                  | System.Reflection.BindingFlags.Public
+                                  | System.Reflection.BindingFlags.NonPublic)
+                              ?.GetValue(null) as string
+                          ?? fallback;
+
+            return new Microsoft.Dynamics.Nav.Types.Exceptions.NavCSideException(message);
+        }
+        catch
+        {
+            return new InvalidOperationException(fallback);
+        }
     }
 
     /// <summary>Clear write-transaction state at the per-test isolation boundary, so one
@@ -76,6 +140,7 @@ public static class ALDatabasePatches
     public static void ResetWriteTransactionState()
     {
         System.Threading.Volatile.Write(ref _inWriteTransaction, false);
+        RecordPatches.ResetTransactionNesting();
         // The isolation boundary is also a commit point — BC's test framework commits
         // between test methods, which is why a rollback inside one test restores the state
         // the previous test left rather than the state the codeunit started with.
@@ -196,6 +261,7 @@ public static class ALDatabasePatches
     public static void NoteRecordWrite(object? record)
     {
         if (record is Microsoft.Dynamics.Nav.Runtime.NavRecord { IsTemporary: true }) return;
+        AlRunner.BcRuntime.NoteDatabaseBackedRecordWrite(record);
         System.Threading.Interlocked.Increment(ref _rowVersion);
         System.Threading.Volatile.Write(ref _inWriteTransaction, true);
         // First write since the last commit point: take the rollback snapshot now, before

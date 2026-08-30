@@ -187,6 +187,7 @@ public static partial class BcRuntime
             FieldPoke.SetInstance(_fSessCurrentScope, _skeletonSession, parent ?? _skeletonRootScope);
         }
 
+        ClearManualEventBindingsOwnedByScope(self);
         DetachTreeHandlerFromParent(self);
     }
 

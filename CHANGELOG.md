@@ -6,17 +6,6 @@ All notable changes to this project are documented here. Format based on
 
 ## [Unreleased]
 
-### Fixed
-- **number-sequence:** restore in-memory runtime support
-- **deps:** stop misreporting a dependency-load failure as a missing member, widen precompile's compile search path
-
-### Documentation
-- **agents:** make the audit-the-surrounding-shape step standing instruction
-- correct limitations.md's stale claims on transactions and query support
-
-### Changed
-- integrate NumberSequence support
-
 ## [2.2.0] - 2026-08-17
 
 ### Added

@@ -14,6 +14,19 @@ using Microsoft.Dynamics.Nav.Runtime;
 
 namespace AlRunner.Patches;
 
+internal sealed class FieldTriggerWiringTracker
+{
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, NCLMetaTable> _current = new();
+
+    internal bool IsCurrent(int tableId, NCLMetaTable metaTable)
+        => _current.TryGetValue(tableId, out var wired) && ReferenceEquals(wired, metaTable);
+
+    internal void MarkCurrent(int tableId, NCLMetaTable metaTable)
+        => _current[tableId] = metaTable;
+
+    internal void Clear() => _current.Clear();
+}
+
 public static partial class RecordPatches
 {
     // Positive-result cache: maps tableId → CLR Type for "Record<id>" subclasses of NavRecord.
@@ -409,6 +422,32 @@ public static partial class RecordPatches
         catch { return null; }
     }
 
+    internal static string NormalizeInitValueText(string typeName, string sourceValue)
+    {
+        var type = typeName.Trim();
+        if ((type.StartsWith("Text", StringComparison.OrdinalIgnoreCase)
+                || type.StartsWith("Code", StringComparison.OrdinalIgnoreCase))
+            && sourceValue.Length >= 2
+            && sourceValue.StartsWith("'")
+            && sourceValue.EndsWith("'"))
+        {
+            return sourceValue.Substring(1, sourceValue.Length - 2).Replace("''", "'");
+        }
+
+        // Enum and classic Option metadata both store identifier member names without
+        // AL's source-level double quotes. OptionMembers follows the same representation.
+        if ((type.StartsWith("Enum", StringComparison.OrdinalIgnoreCase)
+                || type.Equals("Option", StringComparison.OrdinalIgnoreCase))
+            && sourceValue.Length >= 2
+            && sourceValue.StartsWith("\"")
+            && sourceValue.EndsWith("\""))
+        {
+            return sourceValue.Substring(1, sourceValue.Length - 2).Replace("\"\"", "\"");
+        }
+
+        return sourceValue;
+    }
+
     private static object BuildMetaField(ParsedField f, int index, bool isPk, ParsedTable? parentTable = null)
     {
         var ctor = _tMetaField!.GetConstructors()
@@ -508,44 +547,19 @@ public static partial class RecordPatches
                 args[i] = f.OptionMembers;
                 continue;
             }
+            if (p.Name == "optionCaption" && !string.IsNullOrEmpty(f.OptionCaption))
+            {
+                args[i] = f.OptionCaption;
+                continue;
+            }
+            if (p.Name == "optionCaptionML" && !string.IsNullOrEmpty(f.OptionCaption))
+            {
+                var ml = BuildEnuMultiLanguage(p.ParameterType, f.OptionCaption!);
+                if (ml != null) { args[i] = ml; continue; }
+            }
             if (p.Name == "initValue" && !string.IsNullOrEmpty(f.InitValueText))
             {
-                // Pass the raw AL InitValue expression text. BC stores it on
-                // NCLMetaField.initialValueText and evaluates it via
-                // ALSystemVariable.EvaluateIntoNavValue at Init() time. For Text/Code
-                // fields the AL compiler stores the literal *without* the surrounding
-                // single quotes, so strip them here when present.
-                var iv = f.InitValueText;
-                var tn = f.TypeName.Trim();
-                if ((tn.StartsWith("Text", StringComparison.OrdinalIgnoreCase)
-                        || tn.StartsWith("Code", StringComparison.OrdinalIgnoreCase))
-                    && iv.Length >= 2 && iv.StartsWith("'") && iv.EndsWith("'"))
-                {
-                    iv = iv.Substring(1, iv.Length - 2).Replace("''", "'");
-                }
-                // Enum-typed fields: a quoted-identifier InitValue (e.g. the blank
-                // value `InitValue = " ";`, or any member name needing quotes) is
-                // captured by the source parser with its quotes intact, but enum
-                // member names are captured UNQUOTED at emit time (BcCompiler reads
-                // IEnumValueSymbol.Name) and NavOptionEvaluator.InternalEvaluate
-                // matches the text exactly (GetIndexFromCaption/GetIndexFromOption,
-                // ordinal compare, no trimming) — so `" "` (three chars) could never
-                // match the member named ` ` and every Init/Insert of the table threw
-                // NavNCLInvalidOptionStringException (#1674). Real BC's compiled
-                // metadata stores the member name unquoted — Base App symbol packages
-                // carry {"Name":"InitValue","Value":" "} for exactly this shape — so
-                // stripping the outer quotes (and un-doubling AL's "" escape) is
-                // observably equivalent to real BC. Symbol-loaded fields already
-                // arrive unquoted and pass through unchanged; classic Option fields
-                // are untouched (their OptionMembers are captured with the same
-                // quoting as their InitValue, so the pair stays internally
-                // consistent).
-                else if (tn.StartsWith("Enum", StringComparison.OrdinalIgnoreCase)
-                    && iv.Length >= 2 && iv.StartsWith("\"") && iv.EndsWith("\""))
-                {
-                    iv = iv.Substring(1, iv.Length - 2).Replace("\"\"", "\"");
-                }
-                args[i] = iv;
+                args[i] = NormalizeInitValueText(f.TypeName, f.InitValueText);
                 continue;
             }
             if (p.HasDefaultValue) { args[i] = p.DefaultValue; continue; }
@@ -638,8 +652,24 @@ public static partial class RecordPatches
                         $"[RecordPatches] TableRelation on '{forFieldName}': where() field '{w.SourceFieldName}' not found on '{target.TableName}' — relation dropped");
                     return null;
                 }
-                filterObjects.Add(BuildMetaFilter(srcField.FieldId,
-                    w.Kind == ParsedCalcFilterKind.Const ? "CONST" : "FILTER", w.Value ?? ""));
+                if (w.Kind == ParsedCalcFilterKind.Field)
+                {
+                    var localField = referencingTable?.Fields.FirstOrDefault(x =>
+                        string.Equals(x.FieldName, w.ParentFieldName, StringComparison.OrdinalIgnoreCase));
+                    if (localField == null)
+                    {
+                        Console.Error.WriteLine(
+                            $"[RecordPatches] TableRelation on '{forFieldName}': where() parent field '{w.ParentFieldName}' not found on '{referencingTable?.TableName}' — relation dropped");
+                        return null;
+                    }
+                    filterObjects.Add(BuildMetaFilter(srcField.FieldId, "FIELD", localField.FieldId.ToString(),
+                        w.ValueIsFilter, w.OnlyMaxLimit));
+                }
+                else
+                {
+                    filterObjects.Add(BuildMetaFilter(srcField.FieldId,
+                        w.Kind == ParsedCalcFilterKind.Const ? "CONST" : "FILTER", w.Value ?? ""));
+                }
             }
 
             var ctor = _tMetaFieldRelation.GetConstructors()
@@ -708,6 +738,7 @@ public static partial class RecordPatches
         }
         if (srcTable == null)
         {
+            MarkUnresolvedCalcFormula(parentTable.TableId);
             Console.Error.WriteLine($"[RecordPatches] BuildMetaCalcFormula: source table '{cf.SourceTableName}' not found in parsed tables");
             return null;
         }
@@ -720,6 +751,7 @@ public static partial class RecordPatches
                 string.Equals(f.FieldName, cf.SourceFieldName, StringComparison.OrdinalIgnoreCase));
             if (srcField == null)
             {
+                MarkUnresolvedCalcFormula(parentTable.TableId);
                 Console.Error.WriteLine($"[RecordPatches] BuildMetaCalcFormula: source field '{cf.SourceFieldName}' not found in table '{cf.SourceTableName}'");
                 return null;
             }
@@ -739,8 +771,9 @@ public static partial class RecordPatches
                 string.Equals(f.FieldName, filter.SourceFieldName, StringComparison.OrdinalIgnoreCase));
             if (srcFilterField == null)
             {
+                MarkUnresolvedCalcFormula(parentTable.TableId);
                 Console.Error.WriteLine($"[RecordPatches] BuildMetaCalcFormula: filter source field '{filter.SourceFieldName}' not found in '{cf.SourceTableName}'");
-                continue;
+                return null;
             }
 
             switch (filter.Kind)
@@ -1041,15 +1074,18 @@ public static partial class RecordPatches
             // anyway would permanently skip the real wiring once that suite's own
             // assembly does load. Only a table whose type actually resolved is
             // recorded, so later calls retry the rest.
-            if (_fieldTriggersWiredTables.ContainsKey(kvp.Key)) continue;
-            if (kvp.Value is NCLMetaTable mt && WireFieldTriggerHandlers(mt, kvp.Key))
-                _fieldTriggersWiredTables.TryAdd(kvp.Key, 1);
+            if (kvp.Value is not NCLMetaTable mt) continue;
+            if (_fieldTriggerWiring.IsCurrent(kvp.Key, mt)) continue;
+            if (WireFieldTriggerHandlers(mt, kvp.Key))
+                _fieldTriggerWiring.MarkCurrent(kvp.Key, mt);
         }
     }
 
-    // Tables whose field-trigger handlers have been wired, so the per-table call on the hot
-    // record-materialisation path is a no-op after the first time.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> _fieldTriggersWiredTables = new();
+    // Metadata instances whose field-trigger handlers have been wired, so the per-table call on
+    // the hot record-materialisation path is a no-op after the first time. This must track object
+    // identity, not only table id: a later bundle can rebuild a table's NCLMetaTable while retaining
+    // the same id, and the replacement starts with empty EventTriggerData.
+    private static readonly FieldTriggerWiringTracker _fieldTriggerWiring = new();
 
     /// <summary>
     /// Wire a single table's field-trigger handlers (the field OnValidate/OnLookup methods on the
@@ -1063,13 +1099,13 @@ public static partial class RecordPatches
     internal static void WireFieldTriggerHandlersForTable(int tableId, object metaTableObj)
     {
         if (metaTableObj is not NCLMetaTable mt) return;
-        if (_fieldTriggersWiredTables.ContainsKey(tableId)) return; // already wired
+        if (_fieldTriggerWiring.IsCurrent(tableId, mt)) return; // already wired
         // Called from the record-materialisation path, where the table's own Record
         // CLR type is expected to already be loaded — but only record success (see
         // WireFieldTriggerHandlersAll) so a stale/premature call cannot permanently
         // block a later, correct one.
         if (WireFieldTriggerHandlers(mt, tableId))
-            _fieldTriggersWiredTables.TryAdd(tableId, 1);
+            _fieldTriggerWiring.MarkCurrent(tableId, mt);
     }
 
     // Single AppDomain walk that finds every NavRecord-derived "Record<N>" type and bulk-populates
@@ -1161,7 +1197,7 @@ public static partial class RecordPatches
             // and lazily-built precompiled tables wire at record-materialisation
             // time, after all loads. The one shape this does not cover — a bundle
             // reload introducing a NEW tableextension on a table already recorded in
-            // _fieldTriggersWiredTables — is skipped by the wired-tables guard, and
+            // _fieldTriggerWiring — is skipped by the wired-table guard, and
             // always has been for the OnBefore/OnAfterValidate lists too.
             if (byField.Count == 0)
             {
@@ -1437,7 +1473,16 @@ public static partial class RecordPatches
     private static System.Reflection.FieldInfo? _fNCLMetaFieldFieldOptionMetadata;
     private static System.Text.RegularExpressions.Regex _rxEnumTypeName = new(
         "^\\s*Enum\\s+(?:\"([^\"]+)\"|([A-Za-z_][\\w]*))\\s*$",
-        System.Text.RegularExpressions.RegexOptions.Compiled);
+        System.Text.RegularExpressions.RegexOptions.Compiled
+        | System.Text.RegularExpressions.RegexOptions.IgnoreCase
+        | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    internal static string? ParseEnumTypeName(string typeName)
+    {
+        var match = _rxEnumTypeName.Match(typeName ?? string.Empty);
+        if (!match.Success) return null;
+        return match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value;
+    }
 
     // Re-apply enum field-option metadata for every cached NCLMetaTable. Called
     // from BcRuntime.SetTestAssembly after Emit, by which time AlEnumMetadataRegistry
@@ -1464,9 +1509,7 @@ public static partial class RecordPatches
             var enumNameByFieldId = new Dictionary<int, string>();
             foreach (var f in parsed.Fields.Concat(extFields))
             {
-                var m = _rxEnumTypeName.Match(f.TypeName ?? string.Empty);
-                if (!m.Success) continue;
-                var enumName = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
+                var enumName = ParseEnumTypeName(f.TypeName);
                 if (!string.IsNullOrEmpty(enumName))
                     enumNameByFieldId[f.FieldId] = enumName;
             }

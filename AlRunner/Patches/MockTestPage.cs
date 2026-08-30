@@ -194,8 +194,12 @@ internal class LiveNavTestPage : MockITestPage
     {
         if (_parts.TryGetValue(controlId, out var cached)) return cached;
 
-        var definition = _page?.TryGetPartDefinition(controlId)
-            ?? throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+        var definition = _page?.TryGetPartDefinition(controlId);
+        var dependencyDefinition = definition == null
+            ? RecordPatches.TryGetDependencyPagePartSymbol(_pageId, controlId)
+            : null;
+        if (definition == null && dependencyDefinition == null)
+            throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
                 $"TestPage part {controlId} (page {_pageId})",
                 "testpage-part — the runner could not resolve this control to a subpage part"
                 + (_page == null
@@ -204,7 +208,7 @@ internal class LiveNavTestPage : MockITestPage
                     : "; the hosting page's metadata declares no part with this control id")
                 + ". See docs/scope.md");
 
-        var partPageId = definition.PagePartID;
+        var partPageId = definition?.PagePartID ?? dependencyDefinition!.PagePartId;
         var built = _owner == null ? null : TestPageFactory.TryBuild(_owner, partPageId, out _);
         if (built == null)
             throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
@@ -217,7 +221,9 @@ internal class LiveNavTestPage : MockITestPage
         // a parent SourceTable field, so a SourceTable-less host (the Worksheet-dialog shape,
         // legal AL) always lands in the linkless case. Demanding the record up front turned
         // every part access on such a host into a refusal the operation never required.
-        var links = SubPageLinks(definition, partPageId);
+        var links = definition != null
+            ? SubPageLinks(definition, partPageId)
+            : RecordPatches.ResolveDependencyPagePartLinks(_pageId, dependencyDefinition!);
         var part = new LiveNavTestPart(
             built.Record, RecordPatches.GetPageControlFieldMap(partPageId),
             RecordPatches.GetInsertAllowedForPage(partPageId), built.Page, _owner!, partPageId,
@@ -337,30 +343,37 @@ internal class LiveNavTestPage : MockITestPage
     }
 
     /// <summary>
-    /// The SubPageLink as (part field, parent field) pairs. Only FilterType.FIELD is a
-    /// SubPageLink in the AL sense (<c>SubPageLink = ReportId = field(ReportId)</c>); CONST
-    /// and FILTER links are a different, unimplemented shape and refuse loudly rather than
-    /// silently leaving the part unfiltered — an unfiltered part shows other rows' children,
-    /// which is a wrong answer, not a missing one.
+    /// Convert the runtime metadata representation of a compiled page's SubPageLink into
+    /// the same typed links used for dependency-symbol pages.
     /// </summary>
-    private static (int PartFieldNo, int ParentFieldNo)[] SubPageLinks(
+    private static TestPagePartLink[] SubPageLinks(
         Microsoft.Dynamics.Nav.Types.Metadata.InfopartPageDefinition definition, int partPageId)
     {
-        var links = new List<(int, int)>();
+        var links = new List<TestPagePartLink>();
         foreach (var link in definition.SubFormLink ?? new List<Microsoft.Dynamics.Nav.Types.Metadata.FilterDefinition>())
         {
-            if (link.FilterType != Microsoft.Dynamics.Nav.Types.Metadata.FilterType.FIELD)
-                throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
-                    $"TestPage part → page {partPageId} SubPageLink ({link.FilterType})",
-                    $"testpage-part-link — only FilterType.FIELD SubPageLinks are implemented; "
-                    + $"this part links field {link.FieldID} by {link.FilterType} '{link.FilterValue}'. "
-                    + "See docs/scope.md");
-            if (!int.TryParse(link.FilterValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parentFieldNo))
-                throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
-                    $"TestPage part → page {partPageId} SubPageLink",
-                    $"testpage-part-link — a FIELD link's value must be the parent's field number, "
-                    + $"but this one is '{link.FilterValue}'. See docs/scope.md");
-            links.Add((link.FieldID, parentFieldNo));
+            switch (link.FilterType.ToString().ToUpperInvariant())
+            {
+                case "FIELD":
+                    if (!int.TryParse(link.FilterValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parentFieldNo))
+                        throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                            $"TestPage part → page {partPageId} SubPageLink",
+                            $"testpage-part-link — a FIELD link's value must be the parent's field number, "
+                            + $"but this one is '{link.FilterValue}'. See docs/scope.md");
+                    links.Add(new TestPagePartLink(link.FieldID, TestPagePartLinkKind.Field, parentFieldNo));
+                    break;
+                case "CONST":
+                    links.Add(new TestPagePartLink(link.FieldID, TestPagePartLinkKind.Const, Value: link.FilterValue));
+                    break;
+                case "FILTER":
+                    links.Add(new TestPagePartLink(link.FieldID, TestPagePartLinkKind.Filter, Value: link.FilterValue));
+                    break;
+                default:
+                    throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                        $"TestPage part → page {partPageId} SubPageLink ({link.FilterType})",
+                        $"testpage-part-link — unsupported FilterType {link.FilterType} on field {link.FieldID}. "
+                        + "See docs/scope.md");
+            }
         }
         return links.ToArray();
     }
@@ -407,6 +420,12 @@ internal class LiveNavTestPage : MockITestPage
                           && (_page?.PageEditable ?? true);
     }
 
+    internal void MarkModalOpened(bool editable)
+    {
+        _opened = true;
+        _staticEditable = editable;
+    }
+
     private bool _staticEditable = true;
 
     /// <summary>Run the page's OnOpenPage — see RunnerTestPageState.MarkOpened.</summary>
@@ -420,6 +439,7 @@ internal class LiveNavTestPage : MockITestPage
     // dropped every insert made through a TestPage; a LIVE page has a real record, so it
     // must initialise the buffer and remember to flush it.
     private bool _pendingNewRow;
+    private bool _pendingNewRowExistedWhenStarted;
 
     public override void InsertEmptyRow(bool beforeCurrent)
     {
@@ -451,13 +471,26 @@ internal class LiveNavTestPage : MockITestPage
             _record!.ALInit();
         }
 
+        // A page trigger may persist this exact row while a later field is being validated.
+        // Remember whether the key already existed at New() time so FlushPendingNewRow can
+        // distinguish that transition from an ordinary AutoSplitKey draft whose provisional
+        // key happens to collide with an existing row before SplitKey assigns the real key.
+        _pendingNewRowExistedWhenStarted = _record!.ExistsAsync(_record.ALRecordId)
+            .AsTask().GetAwaiter().GetResult();
         _pendingNewRow = true;
     }
 
     internal void FlushPendingNewRow()
     {
         if (!_pendingNewRow) return;
+        if (TryAdoptExternallyPersistedPendingRow())
+        {
+            _pendingNewRow = false;
+            _pendingNewRowExistedWhenStarted = false;
+            return;
+        }
         _pendingNewRow = false;
+        _pendingNewRowExistedWhenStarted = false;
         // AutoSplitKey, in BC's own order: SplitKey, then OnInsertRecord, then the record's
         // Insert (NavForm.SaveRecordAsync / NavForm.InsertAsync(belowXRec) both do exactly
         // this). Skipping it left the last primary-key field at its Init() default, so a page
@@ -481,8 +514,37 @@ internal class LiveNavTestPage : MockITestPage
         _record!.ALInsertAsync(DataError.TrapError, true, false).GetAwaiter().GetResult();
     }
 
+    /// <summary>
+    /// A field/page validation can save the draft through another record variable and then
+    /// modify it before control returns to the TestPage client. In that case the draft's key
+    /// changes from absent to present while <c>_pendingNewRow</c> is still true. A real
+    /// client adopts the server's returned row; inserting the stale client buffer again loses
+    /// those changes. Reload the persisted row and treat it as already saved.
+    /// </summary>
+    private bool TryAdoptExternallyPersistedPendingRow()
+    {
+        if (_pendingNewRowExistedWhenStarted) return false;
+        var record = _record!;
+        if (!record.ExistsAsync(record.ALRecordId).AsTask().GetAwaiter().GetResult()) return false;
+
+        using var persisted = record.CloneRecord(record.Parent, reset: true, keepCompany: true);
+        var primaryKey = record.MetaTable?.PrimaryKey;
+        if (primaryKey == null || primaryKey.KeyFieldCount == 0) return false;
+        foreach (var keyField in primaryKey.KeyFieldsList)
+            persisted.ALSetRange(keyField.FieldNo, record.GetFieldValue(keyField.FieldNo));
+        if (!persisted.ALFindFirstAsync(DataError.TrapError).GetAwaiter().GetResult()) return false;
+
+        record.ALAssign(persisted);
+        return true;
+    }
+
     /// <summary>Abandon an in-progress new row without writing it — how Cancel closes.</summary>
-    internal void DiscardPendingNewRow() { _pendingNewRow = false; _pendingModify = false; }
+    internal void DiscardPendingNewRow()
+    {
+        _pendingNewRow = false;
+        _pendingNewRowExistedWhenStarted = false;
+        _pendingModify = false;
+    }
 
     // BC's AutoSplitKey increment. Named NavForm.AutoSplitKeyIncrement there, and the same
     // literal in the client's AutoKeyGenerator — both sides of the wire agree on 10000.
@@ -1794,11 +1856,11 @@ internal sealed class LiveNavTestPart : LiveNavTestPage, ITestPart
     // host has no parent record and needs none) — every read below sits inside a _links
     // loop, so a null parent is never dereferenced.
     private readonly NavRecord? _parentRecord;
-    private readonly (int PartFieldNo, int ParentFieldNo)[] _links;
+    private readonly TestPagePartLink[] _links;
 
     public LiveNavTestPart(NavRecord record, IReadOnlyDictionary<int, int> controlIdToFieldNo, bool creatable,
         RunnerPageInstance? page, object owner, int pageId,
-        NavRecord? parentRecord, (int PartFieldNo, int ParentFieldNo)[] links)
+        NavRecord? parentRecord, TestPagePartLink[] links)
         : base(record, controlIdToFieldNo, creatable, page, owner, pageId)
     {
         _parentRecord = parentRecord;
@@ -1815,10 +1877,12 @@ internal sealed class LiveNavTestPart : LiveNavTestPage, ITestPart
         // never the null-record case RequireRecord exists to catch — it is a guaranteed hit,
         // used here for its record rather than for its refusal.
         var record = RequireRecord("subpage link");
-        foreach (var (partFieldNo, parentFieldNo) in _links)
+        foreach (var link in _links)
         {
-            var parentValue = _parentRecord!.GetFieldValue(parentFieldNo);
-            record.ALSetRange(partFieldNo, parentValue);
+            if (link.Kind == TestPagePartLinkKind.Field)
+                record.ALSetRange(link.PartFieldNo, _parentRecord!.GetFieldValue(link.ParentFieldNo));
+            else
+                record.ALSetFilter(link.PartFieldNo, link.Value ?? string.Empty);
         }
     }
 
@@ -1840,10 +1904,51 @@ internal sealed class LiveNavTestPart : LiveNavTestPage, ITestPart
     /// </summary>
     public override void InsertEmptyRow(bool beforeCurrent)
     {
+        var filterLink = _links.FirstOrDefault(link => link.Kind == TestPagePartLinkKind.Filter);
+        if (filterLink != null)
+            throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                $"TestPage New() through SubPageLink filter on field {filterLink.PartFieldNo}",
+                "testpage-part-link — a FILTER expression does not identify one value to stamp "
+                + "onto a new row. See docs/scope.md");
+
         ApplyLink();
         base.InsertEmptyRow(beforeCurrent);
         var record = RequireRecord("subpage link");
-        foreach (var (partFieldNo, parentFieldNo) in _links)
-            record.SetFieldValue(partFieldNo, _parentRecord!.GetFieldValue(parentFieldNo));
+        foreach (var link in _links)
+        {
+            if (link.Kind == TestPagePartLinkKind.Field)
+                record.SetFieldValue(link.PartFieldNo, _parentRecord!.GetFieldValue(link.ParentFieldNo));
+            else if (link.Kind == TestPagePartLinkKind.Const)
+                record.SetFieldValue(link.PartFieldNo, ConstantValue(record, link));
+        }
+    }
+
+    private static NavValue ConstantValue(NavRecord record, TestPagePartLink link)
+    {
+        if (!record.MetaTable.TryGetFieldByNo(link.PartFieldNo, out var field) || field == null)
+            throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                $"TestPage SubPageLink const on field {link.PartFieldNo}",
+                "testpage-part-link — the part field metadata is unavailable. See docs/scope.md");
+
+        var raw = (link.Value ?? string.Empty).Trim();
+        object value = field.FieldNavType switch
+        {
+            NavType.Integer => int.Parse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture),
+            NavType.BigInteger => long.Parse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture),
+            NavType.Decimal => decimal.Parse(raw, NumberStyles.Number, CultureInfo.InvariantCulture),
+            NavType.Boolean when raw.Equals("true", StringComparison.OrdinalIgnoreCase) || raw == "1" => true,
+            NavType.Boolean when raw.Equals("false", StringComparison.OrdinalIgnoreCase) || raw == "0" => false,
+            NavType.Code or NavType.Text => UnquoteString(raw),
+            _ => throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                $"TestPage SubPageLink const on {field.FieldNavType} field {link.PartFieldNo}",
+                $"testpage-part-link — const({raw}) conversion for {field.FieldNavType} is not implemented. "
+                + "See docs/scope.md"),
+        };
+        return NavValue.CreateNavValueFromObject(field, value);
+
+        static string UnquoteString(string text)
+            => text.Length >= 2 && text[0] == '\'' && text[^1] == '\''
+                ? text[1..^1].Replace("''", "'")
+                : text;
     }
 }

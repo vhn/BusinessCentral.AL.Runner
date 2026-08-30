@@ -276,6 +276,59 @@ public class PageExtensionParserTests
         finally { Cleanup(); }
     }
 
+    [Fact]
+    public void QuotedOptionMembers_AreStoredAsRuntimeMemberNames()
+    {
+        try
+        {
+            Parse("TryParseTableExtensionFile", $$"""
+                tableextension {{PageExtId}} "PX Base Table Ext" extends "PX Base Table"
+                {
+                    fields
+                    {
+                        field(50000; "PX Status"; Option)
+                        {
+                            OptionMembers = ,"Issue Coupon","Discount Application","Manual Archive";
+                        }
+                    }
+                }
+                """);
+
+            var fields = ExtensionFields("PX Base Table");
+
+            Assert.Equal(
+                ",Issue Coupon,Discount Application,Manual Archive",
+                FieldProp(fields, 50000, "OptionMembers"));
+        }
+        finally { Cleanup(); }
+    }
+
+    [Fact]
+    public void OptionCaption_IsCarriedWithItsRuntimeMemberNames()
+    {
+        try
+        {
+            Parse("TryParseTableExtensionFile", $$"""
+                tableextension {{PageExtId}} "PX Base Table Ext" extends "PX Base Table"
+                {
+                    fields
+                    {
+                        field(50000; "PX Reference Type"; Option)
+                        {
+                            OptionMembers = EXTERNALTICKETNO;
+                            OptionCaption = 'Ticket No.';
+                        }
+                    }
+                }
+                """);
+
+            var fields = ExtensionFields("PX Base Table");
+
+            Assert.Equal("Ticket No.", FieldProp(fields, 50000, "OptionCaption"));
+        }
+        finally { Cleanup(); }
+    }
+
     /// <summary>
     /// The AutoIncrement half of #1711(a), pinned HERE and not in an AL bundle: today's AL
     /// compiler rejects the property inside a tableextension outright — AL0404, "Property

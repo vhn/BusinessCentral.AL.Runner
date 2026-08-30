@@ -266,16 +266,39 @@ public sealed partial class BcCompiler
                 else saved = null; // nothing removed — restore is a no-op
             }
         }
-        return new RestoreResolvedDeps(saved);
+        return new RestoreResolvedDeps(saved, restore: saved != null);
+    }
+
+    /// <summary>
+    /// Temporarily narrows compile-time package specifications to one source dependency's
+    /// declared closure. Dependency source must be bound as its own app, not against every
+    /// unrelated package required by the parent test bundle.
+    /// </summary>
+    internal static IDisposable ScopeResolvedDeps(
+        IReadOnlyList<(AppManifest Manifest, string AppPath)> deps)
+    {
+        IReadOnlyList<(AppManifest Manifest, string AppPath)>? saved;
+        lock (_refSync)
+        {
+            saved = _resolvedDeps;
+            _resolvedDeps = deps;
+            _refSpecs = null;
+        }
+        return new RestoreResolvedDeps(saved, restore: true);
     }
 
     private sealed class RestoreResolvedDeps : IDisposable
     {
         private readonly IReadOnlyList<(AppManifest Manifest, string AppPath)>? _saved;
-        public RestoreResolvedDeps(IReadOnlyList<(AppManifest, string)>? saved) => _saved = saved;
+        private readonly bool _restore;
+        public RestoreResolvedDeps(IReadOnlyList<(AppManifest, string)>? saved, bool restore)
+        {
+            _saved = saved;
+            _restore = restore;
+        }
         public void Dispose()
         {
-            if (_saved == null) return;
+            if (!_restore) return;
             lock (_refSync) { _resolvedDeps = _saved; _refSpecs = null; }
         }
     }
@@ -1189,11 +1212,29 @@ public sealed partial class BcCompiler
                     .ToList();
                 Mark("json-loaders");
 
-                // Nothing to serve references from at all — same no-op result as before.
-                // (Deliberately leaves _refLoader / _loaderSignature untouched, as the
-                // original early-return did.)
+                // A bundle can have no package-cache references and still have symbols from
+                // an earlier sibling app. Handle that source-only shape before the base-loader
+                // early return; otherwise the dependent compiles with zero specs (AL0185).
                 if (loaderScanDirs.Count == 0 && jsonLoaders.Count == 0)
+                {
+                    if (_siblingSymbols != null && _siblingSymbols.HasAny)
+                    {
+                        var siblingSpecs = _siblingSymbols.EnumerateSpecs()
+                            .Where(s => _currentAppId == null || s.AppId != _currentAppId.Value)
+                            .DistinctBy(s => s.AppId)
+                            .Select(s => new NavCA.SymbolReferenceSpecification(
+                                publisher: s.Publisher, name: s.Name, version: s.Version,
+                                exact: false, appId: s.AppId, isPropagated: false,
+                                alternateIds: ImmutableArray<Guid>.Empty))
+                            .ToArray();
+                        _refSpecs = siblingSpecs;
+                        return siblingSpecs.Length == 0
+                            ? (null, siblingSpecs)
+                            : (_siblingSymbols, siblingSpecs);
+                    }
+
                     return (null, Array.Empty<NavCA.SymbolReferenceSpecification>());
+                }
 
                 _cachedJsonLoaders = jsonLoaders;
                 NavCA.ISymbolReferenceLoader? packageLoader = loaderScanDirs.Count > 0
@@ -2853,6 +2894,7 @@ public sealed partial class BcCompiler
             if (symbol is NavCA.IEnumBaseTypeSymbol enumSym)
             {
                 var values = enumSym.Values;
+                var defaultImplementations = ReadEnumDefaultImplementations(enumSym);
                 var options = new string[values.Length];
                 var indexes = new int[values.Length];
                 var implementations = new int[values.Length][];
@@ -2861,7 +2903,8 @@ public sealed partial class BcCompiler
                 {
                     options[i] = values[i].Name ?? string.Empty;
                     indexes[i] = values[i].Ordinal;
-                    implementations[i] = ReadEnumValueImplementations(values[i]);
+                    implementations[i] = AlEnumMetadataRegistry.ApplyDefaultImplementations(
+                        ReadEnumValueImplementations(values[i]), defaultImplementations);
                     captions[i] = ReadEnumValueCaption(values[i]);
                 }
                 if (symbol is NavCA.IEnumExtensionTypeSymbol enumExtSym
@@ -3124,12 +3167,20 @@ public sealed partial class BcCompiler
                 var text = impl?.ValueText;
                 if (string.IsNullOrEmpty(text))
                     return Array.Empty<int>();
-                var parts = text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                var ids = new List<int>(parts.Length);
-                foreach (var part in parts)
-                    if (int.TryParse(part, out var id))
-                        ids.Add(id);
-                return ids.ToArray();
+                return AlEnumMetadataRegistry.ParseImplementationIds(text);
+            }
+            catch
+            {
+                return Array.Empty<int>();
+            }
+        }
+
+        private static int[] ReadEnumDefaultImplementations(NavCA.IEnumBaseTypeSymbol enumSymbol)
+        {
+            try
+            {
+                var implementation = enumSymbol.GetProperty(NavCA.PropertyKind.DefaultImplementation);
+                return AlEnumMetadataRegistry.ParseImplementationIds(implementation?.ValueText);
             }
             catch
             {

@@ -19,10 +19,10 @@
 //   made before it in place. Green either way for a test that only checks the error text —
 //   and silently wrong for one that checks what is in the table afterwards.
 //
-//   BC's own APIs establish additional, NESTED commit points too — a real
-//   Session.EndTransaction(commit: true) (or EndTransactionWorldAndTransaction) inside a BC
-//   API is exactly as durable, from AL's point of view, as an explicit Commit() statement.
-//   See NoteTransactionEnd below (AlRunner#1946).
+//   BC's own APIs establish logical transaction scopes too. A successful outermost
+//   Session.EndTransaction (or EndTransactionWorldAndTransaction) advances the commit point;
+//   a nested completion only decrements TransactionCount and remains governed by its parent.
+//   See NoteTransactionBegin/NoteTransactionEnd below (AlRunner#1946).
 //
 // HOW IT IS DONE HERE
 //   The runner's tables are BC TempTableDataProviders held in _dataAccessByTable, and
@@ -47,16 +47,38 @@ public static partial class RecordPatches
     // Per-table row images captured since the last commit point, keyed by the
     // (DataAccessSource, tableId) pair _dataAccessByTable itself is keyed by.
     private static readonly Dictionary<(object Source, int TableId), BaselineTable> _txCommitPoint = new();
+    private static readonly Stack<Dictionary<(object Source, int TableId), BaselineTable>>
+        _logicalTransactionFrames = new();
 
     /// <summary>
     /// Establish a commit point: everything written up to now survives a later rollback.
     /// Called at each test-method boundary and from AL's <c>Commit()</c>.
     /// </summary>
-    public static void MarkCommitPoint() => _txCommitPoint.Clear();
+    public static void MarkCommitPoint()
+    {
+        _txCommitPoint.Clear();
+        foreach (var frame in _logicalTransactionFrames)
+            frame.Clear();
+    }
+
+    /// <summary>
+    /// Prepended to SessionTransactionExtensions.BeginTransaction and
+    /// BeginTransactionWorldAndTransaction, and also called by the Codeunit.Run replacement.
+    /// BC commits the caller's current write transaction when it opens a new outer logical
+    /// transaction. A nested begin only increments TransactionCount.
+    /// </summary>
+    public static void NoteTransactionBegin(object? session)
+    {
+        if (_logicalTransactionFrames.Count == 0)
+            MarkCommitPoint();
+
+        _logicalTransactionFrames.Push(new());
+    }
 
     /// <summary>
     /// Prepended to SessionTransactionExtensions.EndTransaction(NavSession, bool commit) and
-    /// .EndTransactionWorldAndTransaction(NavSession, bool commit) — see AlRunner#1946.
+    /// EndTransactionWorldAndTransaction(NavSession, bool commit), and also called by the
+    /// Codeunit.Run replacement — see AlRunner#1946.
     ///
     /// BC's own APIs run their internal work inside an explicit nested transaction. The
     /// static overload of <c>NavXmlPort.Import</c> is one — decompiled, unmodified Ncl body:
@@ -68,9 +90,10 @@ public static partial class RecordPatches
     /// which is the common, idiomatic AL shape, so both extension methods need the hook, not
     /// just the more obviously-named one.
     ///
-    /// A real <c>commit == true</c> there is exactly as durable, from AL's point of view, as
-    /// an explicit <c>Commit()</c> statement: a later, unrelated <c>asserterror</c> in the
-    /// CALLER must not roll back work an inner API already committed.
+    /// At the outermost matching end, <c>commit == true</c> is exactly as durable as an
+    /// explicit <c>Commit()</c> statement, while <c>false</c> restores the row store to the
+    /// matching outer begin. Nested ends do neither: BC's TransactionManager only changes
+    /// TransactionCount until it reaches zero.
     ///
     /// Before this hook, only AL's own <c>Commit()</c> and the per-test isolation boundary
     /// called <see cref="MarkCommitPoint"/>, so <see cref="RollbackToCommitPoint"/> rolled
@@ -91,8 +114,23 @@ public static partial class RecordPatches
     /// </summary>
     public static void NoteTransactionEnd(object? session, bool commit)
     {
-        if (commit) MarkCommitPoint();
+        Dictionary<(object Source, int TableId), BaselineTable>? frame = null;
+        if (_logicalTransactionFrames.Count > 0)
+            frame = _logicalTransactionFrames.Pop();
+
+        if (!commit && frame != null)
+            RestoreSnapshot(frame);
+
+        if (_logicalTransactionFrames.Count != 0)
+            return;
+
+        if (commit)
+            MarkCommitPoint();
+        else
+            _txCommitPoint.Clear();
     }
+
+    internal static void ResetTransactionNesting() => _logicalTransactionFrames.Clear();
 
     /// <summary>
     /// Snapshot the record's table if this is its first write since the last commit point.
@@ -113,7 +151,9 @@ public static partial class RecordPatches
         {
             if (!perTable.TryGetValue(tableId, out var dataAccess)) continue;
             var key = (source, tableId);
-            if (_txCommitPoint.ContainsKey(key)) continue;
+            bool commitPointNeedsSnapshot = !_txCommitPoint.ContainsKey(key);
+            bool frameNeedsSnapshot = _logicalTransactionFrames.Any(frame => !frame.ContainsKey(key));
+            if (!commitPointNeedsSnapshot && !frameNeedsSnapshot) continue;
 
             var provider = GetDataProvider(dataAccess);
             if (provider == null || provider.GetType().Name != "TempTableDataProvider") continue;
@@ -130,7 +170,11 @@ public static partial class RecordPatches
                     if (row is TempTableRecordBuffer buffer)
                         rows.Add(CloneValues(buffer.ToArray()));
 
-            _txCommitPoint[key] = new BaselineTable(tableId, metaTable, rows.ToArray());
+            var snapshot = new BaselineTable(tableId, metaTable, rows.ToArray());
+            if (commitPointNeedsSnapshot)
+                _txCommitPoint[key] = snapshot;
+            foreach (var frame in _logicalTransactionFrames)
+                frame.TryAdd(key, snapshot);
         }
     }
 
@@ -145,7 +189,16 @@ public static partial class RecordPatches
     public static void RollbackToCommitPoint(object? session)
     {
         if (_txCommitPoint.Count == 0) return;
-        foreach (var ((source, tableId), saved) in _txCommitPoint.ToList())
+        RestoreSnapshot(_txCommitPoint);
+        // The rolled-back work is gone; the commit point itself still stands, so the next
+        // write re-snapshots from the restored state.
+        _txCommitPoint.Clear();
+    }
+
+    private static void RestoreSnapshot(
+        IReadOnlyDictionary<(object Source, int TableId), BaselineTable> snapshot)
+    {
+        foreach (var ((source, tableId), saved) in snapshot)
         {
             if (!_dataAccessByTable.TryGetValue(source, out var perTable)) continue;
             if (!perTable.TryGetValue(tableId, out var dataAccess)) continue;
@@ -155,9 +208,6 @@ public static partial class RecordPatches
             ClearProviderInPlace(provider);
             InsertRows(provider, saved.MetaTable, saved.Rows);
         }
-        // The rolled-back work is gone; the commit point itself still stands, so the next
-        // write re-snapshots from the restored state.
-        _txCommitPoint.Clear();
     }
 
     /// <summary>

@@ -706,6 +706,157 @@ public static class AppLoader
     }
 
     /// <summary>
+    /// Reconstructs the source tree embedded in an AL package so it can be compiled with the
+    /// same relative paths and manifest inputs as the original app. The package prefixes source
+    /// files with <c>src/</c>, control-add-in resources with <c>addin/src/</c>, and report
+    /// layouts with <c>layout/</c>; all three prefixes are removed when staging.
+    /// </summary>
+    internal static int StageSourcePackage(string appPath, string destinationRoot)
+    {
+        Directory.CreateDirectory(destinationRoot);
+        using var zip = OpenAppZip(appPath);
+        var sourceCount = StageSourcePackageFromZip(zip, destinationRoot);
+        if (sourceCount > 0) return sourceCount;
+
+        var nested = zip.Entries.FirstOrDefault(e =>
+            e.FullName.EndsWith(".app", StringComparison.OrdinalIgnoreCase)
+            && !e.FullName.Contains('/'));
+        if (nested == null) return 0;
+
+        using var nestedStream = nested.Open();
+        using var buffer = new MemoryStream();
+        nestedStream.CopyTo(buffer);
+        using var nestedZip = OpenZipFromNavx(buffer.ToArray());
+        return StageSourcePackageFromZip(nestedZip, destinationRoot);
+    }
+
+    private static int StageSourcePackageFromZip(ZipArchive zip, string destinationRoot)
+    {
+        var sourceEntries = zip.Entries
+            .Where(e => e.FullName.StartsWith("src/", StringComparison.OrdinalIgnoreCase)
+                     && e.FullName.EndsWith(".al", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (sourceEntries.Count == 0) return 0;
+
+        foreach (var entry in zip.Entries)
+        {
+            var relativePath = PackageSourceRelativePath(entry.FullName);
+            if (relativePath == null || entry.FullName.EndsWith('/')) continue;
+
+            var destinationPath = SafePackageDestination(destinationRoot, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+            using var input = entry.Open();
+            using var output = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None);
+            input.CopyTo(output);
+        }
+
+        var manifestEntry = zip.Entries.FirstOrDefault(e =>
+            string.Equals(e.FullName, "NavxManifest.xml", StringComparison.OrdinalIgnoreCase));
+        if (manifestEntry != null)
+        {
+            using var manifestStream = manifestEntry.Open();
+            WriteCompilerManifest(manifestStream, Path.Combine(destinationRoot, "app.json"));
+        }
+
+        return sourceEntries.Count;
+    }
+
+    private static string? PackageSourceRelativePath(string entryName)
+    {
+        string? encoded = entryName switch
+        {
+            var name when name.StartsWith("src/", StringComparison.OrdinalIgnoreCase) => name[4..],
+            var name when name.StartsWith("addin/src/", StringComparison.OrdinalIgnoreCase) => name[10..],
+            var name when name.StartsWith("layout/", StringComparison.OrdinalIgnoreCase) => name[7..],
+            _ => null,
+        };
+        if (encoded == null) return null;
+
+        var decoded = encoded;
+        for (var i = 0; i < 4; i++)
+        {
+            var next = Uri.UnescapeDataString(decoded);
+            if (next == decoded) break;
+            decoded = next;
+        }
+        return decoded.Replace('\\', '/');
+    }
+
+    private static string SafePackageDestination(string destinationRoot, string relativePath)
+    {
+        var root = Path.GetFullPath(destinationRoot)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var destination = Path.GetFullPath(Path.Combine(
+            root, relativePath.Replace('/', Path.DirectorySeparatorChar)));
+        if (!destination.StartsWith(root, StringComparison.Ordinal))
+            throw new InvalidDataException($"Package entry escapes staging root: {relativePath}");
+        return destination;
+    }
+
+    private static void WriteCompilerManifest(Stream manifestStream, string destinationPath)
+    {
+        var doc = XDocument.Load(manifestStream);
+        XNamespace ns = "http://schemas.microsoft.com/navx/2015/manifest";
+        var app = doc.Root?.Element(ns + "App")
+            ?? throw new InvalidDataException("NavxManifest.xml has no App element");
+
+        var dependencies = (doc.Root?.Element(ns + "Dependencies")?.Elements(ns + "Dependency")
+                ?? Enumerable.Empty<XElement>())
+            .Select(dep => new Dictionary<string, object?>
+            {
+                ["id"] = dep.Attribute("Id")?.Value,
+                ["name"] = dep.Attribute("Name")?.Value ?? "",
+                ["publisher"] = dep.Attribute("Publisher")?.Value ?? "",
+                ["version"] = dep.Attribute("MinVersion")?.Value
+                    ?? dep.Attribute("Version")?.Value
+                    ?? "0.0.0.0",
+            })
+            .ToArray();
+        var internalsVisibleTo = (doc.Root?.Element(ns + "InternalsVisibleTo")?.Elements(ns + "Module")
+                ?? Enumerable.Empty<XElement>())
+            .Select(module => new Dictionary<string, object?>
+            {
+                ["id"] = module.Attribute("Id")?.Value,
+                ["name"] = module.Attribute("Name")?.Value ?? "",
+                ["publisher"] = module.Attribute("Publisher")?.Value ?? "",
+            })
+            .ToArray();
+        var features = (doc.Root?.Element(ns + "Features")?.Elements(ns + "Feature")
+                ?? Enumerable.Empty<XElement>())
+            .Select(feature => feature.Value)
+            .Where(value => value.Length > 0)
+            .ToArray();
+        var preprocessorSymbols = (doc.Root?.Element(ns + "PreprocessorSymbols")
+                ?.Elements(ns + "PreprocessorSymbol") ?? Enumerable.Empty<XElement>())
+            .Select(symbol => symbol.Attribute("Name")?.Value)
+            .Where(value => !string.IsNullOrEmpty(value))
+            .Cast<string>()
+            .ToArray();
+
+        var appJson = new Dictionary<string, object?>
+        {
+            ["id"] = app.Attribute("Id")?.Value,
+            ["name"] = app.Attribute("Name")?.Value ?? "",
+            ["publisher"] = app.Attribute("Publisher")?.Value ?? "",
+            ["version"] = app.Attribute("Version")?.Value ?? "0.0.0.0",
+            ["platform"] = app.Attribute("Platform")?.Value,
+            ["application"] = app.Attribute("Application")?.Value,
+            ["runtime"] = app.Attribute("Runtime")?.Value,
+            ["target"] = app.Attribute("Target")?.Value,
+            ["contextSensitiveHelpUrl"] = app.Attribute("ContextSensitiveHelpUrl")?.Value,
+            ["dependencies"] = dependencies,
+            ["internalsVisibleTo"] = internalsVisibleTo,
+            ["features"] = features,
+            ["preprocessorSymbols"] = preprocessorSymbols,
+        };
+        File.WriteAllText(destinationPath, JsonSerializer.Serialize(appJson, new JsonSerializerOptions
+        {
+            WriteIndented = true,
+        }));
+    }
+
+    /// <summary>
     /// Returns report layout resources (`.rdlc`, `.docx`, `.xlsx`) shipped in an `.app`'s
     /// <c>layout/</c> folder, as (FileName, Bytes). A code-bearing report object declares
     /// <c>LayoutFile = './X.rdlc'</c> relative to its source; BC's compile-time layout-embed

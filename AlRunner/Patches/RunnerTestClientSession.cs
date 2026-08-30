@@ -63,13 +63,16 @@ public sealed class RunnerTestClientSession : ITestClientSession
         // source-expression table and never touches the record at all.
         var record = ReadProperty(form, "SourceTable") as NavRecord;
 
-        return new AlRunner.LiveNavTestPage(
+        var page = RunnerPageInstance.Adopt(form, pageId);
+        var testPage = new AlRunner.LiveNavTestPage(
             record,
             RecordPatches.GetPageControlFieldMap(pageId),
             RecordPatches.GetInsertAllowedForPage(pageId),
-            RunnerPageInstance.Adopt(form, pageId),
+            page,
             _session,
             pageId);
+        testPage.MarkModalOpened(page.PageEditable);
+        return testPage;
     }
 
     private object? RegisteredForm(Guid handle)

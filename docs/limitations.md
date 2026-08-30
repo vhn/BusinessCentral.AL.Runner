@@ -19,12 +19,12 @@ the BC runtime environment:
 - **Permissions and entitlements** — there is no permission system. All field/table
   access succeeds unconditionally. `entitlement_declaration`, `permissionset_declaration`,
   and `permissionsetextension_declaration` object types compile but have no effect at runtime.
-- **Company context** — no active BC company. `CompanyName()` and `UserId()` are
-  seeded with fixed defaults (empty string / `"TESTUSER"`) at runtime startup —
-  not currently configurable via a CLI flag or an AL-callable API. Code that
-  only branches on whether the name is empty still takes the "empty" branch by
-  default. If your workflow needs a different value, open an issue describing
-  the use case.
+- **Company context** — the runner has one synthetic company. `CompanyName()` and
+  `UserId()` are seeded with fixed defaults (`"My Company"` / `"TESTUSER"`) at
+  runtime startup, and the `Company` virtual table contains that company. These
+  values are not currently configurable via a CLI flag or an AL-callable API. If
+  your workflow needs different values or multiple companies, open an issue
+  describing the use case.
 - **Base app data** — no standard BC tables are populated. Code that reads
   `G/L Account`, `Customer`, `Vendor`, or any other base app table finds them empty
   unless your test inserts data.
@@ -186,31 +186,32 @@ AL that tests the *logic* around task creation (what codeunit runs, what state i
 - `System.GetDotNetType(Joker)` — resolves the `.NET` type for an arbitrary AL value; no `.NET` type resolution without BC service tier.
 - `assembly_declaration`, `dotnet_declaration`, `type_declaration` — object types that wrap .NET assemblies; not compiled in standalone mode.
 
-### Query — joins and dataset export work; aggregation does not
+### Query — joins and dataset export work; aggregation is provisional
 
 Query objects work in-memory: `Open` reads from the mock table store, `Read`
 iterates rows, `Close` releases the result set. `SetFilter`, `SetRange`, and
 `TopNumberOfRows` filter and limit the results, including runtime `SetRange`/
-`SetFilter` applied to either side of a join. Column values are returned from the
-current row via `GetColumnValueSafe`.
+`SetFilter` applied to either side of a join. `DataItemTableFilter` is applied to
+source rows, while an aggregate `ColumnFilter` is applied after grouping. Column
+values are returned from the current row via `GetColumnValueSafe`.
 
 **Multi-dataitem queries (JOINs) are supported.** Inner and left-outer joins
 across two dataitems run a real in-memory join, including unmatched-parent
 handling for `LeftOuterJoin`. Pinned by the upstream corpus
 (`query/TestQueryJoin.al`, migrated from this repo's own `query-join` suite).
 
+**Aggregate execution is implemented but not yet BC-adjudicated.** The runner
+currently handles `Sum`, `Count`, `Average`, `Min`, and `Max`, grouping by the
+non-aggregate columns and applying source-less `Count`, `ReverseSign`, and
+aggregate `ColumnFilter`. Until equivalent corpus coverage has passed against a
+real BC service tier, treat this surface as provisional rather than a faithful
+compatibility claim.
+
 **`SaveAsJson`, `SaveAsXml`, and `SaveAsCsv` run BC's own implementation** against
 the query's real metadata and produce a genuine dataset — they are not stubbed out.
 
 There is no `Query.SaveAsExcel` method in the AL language; this doc previously
 listed one that doesn't exist.
-
-**Not supported: aggregation.** A column with `Method = Sum` (or `Count`,
-`Average`, `Min`, `Max`) does not aggregate or group — the runner returns each
-row's own value unaggregated instead of collapsing rows per BC's SQL projection.
-This is a known gap, not the documented `NotSupportedException` this doc used to
-claim — the runner returns a wrong value silently rather than throwing. Tracked in
-[#2137](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/2137).
 
 ### UI objects — out of scope
 
@@ -296,7 +297,7 @@ the exact value will see different results.
 
 | AL call | Real BC | al-runner |
 |---|---|---|
-| `CompanyName()` | Active company name | `""` (fixed default, not currently configurable) |
+| `CompanyName()` | Active company name | `"My Company"` (fixed default, not currently configurable) |
 | `UserId()` | Authenticated user | `"TESTUSER"` (fixed default, not currently configurable) |
 | `IsSessionActive(id)` | True while session runs | Always `false` |
 | `GuiAllowed()` | False in background sessions | `false` |
@@ -392,9 +393,6 @@ These are not architectural limits. They can be fixed; report them at
 https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues.
 
 - **FilterGroup** — `Rec.FilterGroup(n)` has no effect; filters always apply to group 0.
-- **Query aggregation** — a query column with `Method = Sum`/`Count`/`Average`/`Min`/`Max`
-  does not aggregate or group rows; it silently returns each row's own unaggregated value.
-  Tracked in [#2137](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/2137).
 
 ---
 

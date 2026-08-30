@@ -56,7 +56,7 @@ public static class CompanyAccessPatches
     private static FieldInfo? _fCompanyName;
 
     /// <summary>The session's company display name, read off BC's own NavCompany.</summary>
-    private static string SessionCompanyName(object? session)
+    internal static string SessionCompanyName(object? session)
     {
         var company = session?.GetType()
             .GetProperty("Company", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?
