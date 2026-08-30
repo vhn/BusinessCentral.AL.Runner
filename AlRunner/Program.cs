@@ -1470,6 +1470,60 @@ if (!provisionSubcommand)
         var testAppsOut = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
             AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, full);
 
+        if (decision.ShouldDownloadTest)
+        {
+            if (AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(
+                    new[] { testAppsOut }, versionFloors))
+            {
+                Console.Error.WriteLine($"[provision] test toolkit already complete at {testAppsOut}.");
+            }
+            else
+            {
+                Console.Error.WriteLine("[provision] test-toolkit apps missing — downloading...");
+                var rc = AlRunner.Provisioning.ArtifactDownloader.TestApps(
+                    full, testAppsOut, m => Console.Error.WriteLine($"[provision] {m}"));
+                if (rc != 0)
+                {
+                    Console.Error.WriteLine("[provision] test-toolkit download failed; cannot continue.");
+                    return 2;
+                }
+            }
+            // Make the downloaded apps visible to resolution: add the artifact-cache dir as
+            // an additional search root rather than copying its contents into the project.
+            if (!packageCacheDirs.Contains(testAppsOut))
+                packageCacheDirs.Add(testAppsOut);
+            // Re-check: never silently continue on a partial/failed provision.
+            toolkitPresent = AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(
+                PlatformCheckDirs(), versionFloors);
+            if (!toolkitPresent)
+            {
+                Console.Error.WriteLine("[provision] test-toolkit apps still missing after download.");
+                return 2;
+            }
+        }
+
+        // Issue #2103: re-derive the need from the manifests that are now READABLE.
+        //
+        // The pre-scan above only ever sees the BUNDLE's own app.json roots. Learning that
+        // (say) "Tests-TestLibraries" itself depends on "Application Test Library" means
+        // reading THAT app's NavxManifest.xml, which lives inside the test-apps set — the
+        // very thing that had not been fetched yet. That chicken-and-egg used to be broken
+        // by a hand-transcribed edge table, which was correct for the BC version whoever
+        // wrote it checked and silently wrong for the rest: on BC 27.x the same app declares
+        // no Application Test Library dependency at all (and no 27.x artifact ships that
+        // app), so the table sent provisioning after something unobtainable and the run died
+        // with "platform apps (Application Test Library) still missing after download".
+        //
+        // Downloading the test set FIRST removes the guess: its manifests are the real,
+        // per-version answer, and DecideManifestProvisioning reads them straight off disk.
+        // Hence the order here — test-apps, then re-decide, then platform-apps.
+        decision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+            manifestDependencyRoots, platformReport, PlatformCheckDirs());
+        foreach (var badPkg in decision.UnreadablePackages)
+            Console.Error.WriteLine(
+                $"[provision] warning: could not read the manifest of '{badPkg}' — its Microsoft " +
+                "dependency edges are unknown, so a provisioning need it implies may be missed.");
+
         if (decision.ShouldDownloadPlatform)
         {
             // Reuse-first (AC #4/#5): the resolved `full` version can be a warm same-
@@ -1521,38 +1575,6 @@ if (!provisionSubcommand)
                     PlatformCheckDirs(), versionFloors))
             {
                 Console.Error.WriteLine("[provision] platform apps (Application Test Library) still missing after download.");
-                return 2;
-            }
-        }
-
-        if (decision.ShouldDownloadTest)
-        {
-            if (AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(
-                    new[] { testAppsOut }, versionFloors))
-            {
-                Console.Error.WriteLine($"[provision] test toolkit already complete at {testAppsOut}.");
-            }
-            else
-            {
-                Console.Error.WriteLine("[provision] test-toolkit apps missing — downloading...");
-                var rc = AlRunner.Provisioning.ArtifactDownloader.TestApps(
-                    full, testAppsOut, m => Console.Error.WriteLine($"[provision] {m}"));
-                if (rc != 0)
-                {
-                    Console.Error.WriteLine("[provision] test-toolkit download failed; cannot continue.");
-                    return 2;
-                }
-            }
-            // Make the downloaded apps visible to resolution: add the artifact-cache dir as
-            // an additional search root rather than copying its contents into the project.
-            if (!packageCacheDirs.Contains(testAppsOut))
-                packageCacheDirs.Add(testAppsOut);
-            // Re-check: never silently continue on a partial/failed provision.
-            toolkitPresent = AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(
-                PlatformCheckDirs(), versionFloors);
-            if (!toolkitPresent)
-            {
-                Console.Error.WriteLine("[provision] test-toolkit apps still missing after download.");
                 return 2;
             }
         }
@@ -7475,14 +7497,27 @@ static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
 
     if (provisionManifestApps)
     {
-        if (!EnsurePlatformAppsProvisioned(full, bundles))
-            return 1;
+        // Issue #2103: test toolkit FIRST, platform apps second — the same ordering the
+        // --auto-provision path uses, for the same reason. Whether the bundle needs the
+        // platform set is decided by walking the real Microsoft dependency edges, and those
+        // edges live in the test-toolkit packages' own NavxManifest.xml. Fetch that set
+        // first and EnsurePlatformAppsProvisioned can read the answer instead of guessing it
+        // from a hand-written table that was only ever right for one BC version.
         if (!EnsureTestToolkitProvisioned(full, bundles))
+            return 1;
+        if (!EnsurePlatformAppsProvisioned(full, bundles))
             return 1;
     }
     provisionedVersion = full;
     return 0;
 }
+
+// Issue #2103: DecideManifestProvisioning reads its dependency edges from the SAME dirs it
+// checks for presence, so a caller that omits the test-apps dir gets "no edges known" and a
+// decision degraded to direct membership. Folding it in is presence-safe — the no-fallback
+// platform apps ship in the w1 Extensions set, never in the test-apps set.
+static List<string> WithEdgeSources(IEnumerable<string> searchDirs, string testAppsDir)
+    => searchDirs.Append(testAppsDir).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
 // Ensure the manifest-required platform set for the selected full BC version. A warm
 // same-minor set is reused only after the same manifest decision that triggered the
@@ -7494,8 +7529,22 @@ static bool EnsurePlatformAppsProvisioned(string selectedFullVersion, List<strin
     var roots = ScanManifestDependencyRoots(bundles);
     var initialReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
         selectedFullVersion, bundleDirs);
+    // Issue #2103: include the runner-owned test-apps dir in what the decision may READ.
+    // EnsureTestToolkitProvisioned has just populated it, and those packages' own manifests
+    // are where the real Microsoft dependency edges come from — the per-version fact that
+    // decides whether this bundle needs the platform set at all. Adding it cannot make the
+    // platform set look falsely complete: Application Test Library ships in the w1
+    // Extensions set, never in the test-apps set. Every DecideManifestProvisioning call in
+    // this function folds it in for that reason — a warm-candidate or post-download check
+    // that could not see the edges would answer "needs nothing" and skip a real download.
+    var testAppsDir = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
+        artifactsRoot, selectedFullVersion);
     var initialDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
-        roots, initialReport, bundleDirs);
+        roots, initialReport, WithEdgeSources(bundleDirs, testAppsDir));
+    foreach (var badPkg in initialDecision.UnreadablePackages)
+        Console.Error.WriteLine(
+            $"[provision] warning: could not read the manifest of '{badPkg}' — its Microsoft " +
+            "dependency edges are unknown, so a provisioning need it implies may be missed.");
 
     if (!initialDecision.ShouldDownloadPlatform)
     {
@@ -7520,7 +7569,7 @@ static bool EnsurePlatformAppsProvisioned(string selectedFullVersion, List<strin
         var candidateReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
             selectedFullVersion, searchDirs);
         var candidateDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
-            roots, candidateReport, searchDirs);
+            roots, candidateReport, WithEdgeSources(searchDirs, testAppsDir));
         if (!candidateDecision.ShouldDownloadPlatform)
         {
             Console.Error.WriteLine($"[provision] platform apps already complete at {candidate}; " +
@@ -7560,7 +7609,7 @@ static bool EnsurePlatformAppsProvisioned(string selectedFullVersion, List<strin
     var finalReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
         selectedFullVersion, finalDirs);
     var finalDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
-        roots, finalReport, finalDirs);
+        roots, finalReport, WithEdgeSources(finalDirs, testAppsDir));
     if (finalDecision.ShouldDownloadPlatform)
     {
         Console.Error.WriteLine(
