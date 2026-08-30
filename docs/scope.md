@@ -58,7 +58,7 @@ real thing for any test that only observes documented BC behaviour.
 | **Time / random / GUID** | Real .NET implementations | Same — no replacement | Faithful. |
 | **Field caption / table caption / lookup-page IDs** | From metadata + language pack | From parsed AL source (real values for AL-compiled tables; falls back to `"FieldNN"` for base-app tables not compiled in this run) | Faithful for in-scope tables; documented stub for non-compiled base-app tables. |
 | **Event publisher → subscriber dispatch** | Service-tier event dispatcher | **Working as of 2026-05-11 (`c4bce11a`, W-8b A-prime).** Discovers `[NavEventSubscriber]`-attributed methods at startup, constructs real `NavEventSubscription` instances, and injects them into each table's `NavTableTriggerEventHandler.eventScopes[evt].registeredSubscriptions`. BC's own `NavEventScope.CheckAndFireTriggerEventsAsync` then dispatches — no JmpHook on the dispatch path (it would have been R2R-inlined and silently bypassed; see `feedback_r2r_inlining_traps.md`). | Faithful for documented event semantics including `var` params and `IncludeSender`. Manual-binding subscribers (`BindSubscription`) still pending. |
-| **`Page.RunModal` / report `[RequestPageHandler]`** | Real UI dialog | Looks up registered `[ModalPageHandler]` / `[RequestPageHandler]` and calls it | Faithful for the handler dispatch contract that test code relies on; no actual UI is rendered. |
+| **`Page.Run` / `Page.RunModal` / report `[RequestPageHandler]`** | Real UI page or dialog | Looks up a registered page trap or `[PageHandler]` / `[ModalPageHandler]` / `[RequestPageHandler]` and calls it | Faithful for the handler and `TestPage.Trap()` dispatch contracts that test code relies on; no actual UI is rendered. |
 | **`RecordLink` (table 2000000068)** AL surface: `Rec.AddLink/HasLinks/DeleteLink/DeleteLinks/CopyLinks` | Stored in the platform Record Link table | The unmodified NCL implementation writes to the runner's in-memory Record Link table. | Faithful for AL-observable semantics, including reading the inserted row through `Record 2000000068`; table rows participate in normal test reset and install-baseline handling. |
 | **Query execution** | SQL projection, joins, grouping, and dataset export | In-memory projection over each table's `TempTableDataProvider`, with managed joins and provisional aggregation | Joins and dataset export are corpus-backed. Aggregate columns (`Sum`, `Count`, `Average`, `Min`, `Max`), aggregate `ColumnFilter`, and `ReverseSign` are implemented but remain provisional until matching corpus tests pass against a real BC service tier. |
 
@@ -180,7 +180,7 @@ invokes `OnInitReport` → `OnPreReport` → per-DataItem `OnPreDataItem` / `OnP
 
 | API | Reason |
 |---|---|
-| `Page.Run` (non-modal), `controladdin`, `usercontrol`, profiles | Requires BC client. UI dialog **callbacks** (`[MessageHandler]`, `[ConfirmHandler]`, …) are in scope under §2; the UI itself isn't. |
+| Unhandled `Page.Run` (non-modal), `controladdin`, `usercontrol`, profiles | Requires BC client. Handler- or trap-backed `Page.Run` and UI dialog **callbacks** (`[MessageHandler]`, `[ConfirmHandler]`, …) are in scope under §2; the UI itself isn't. |
 
 ### §3.12. Debugger <a id="debugger"></a>
 

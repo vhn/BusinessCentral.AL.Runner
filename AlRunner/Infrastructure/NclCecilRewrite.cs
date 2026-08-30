@@ -1231,6 +1231,8 @@ public static class NclCecilRewrite
             Console.Error.WriteLine(
                 "[Cecil] Rewrote NavTestExecution.TestHandleModalForm client callback → RunnerModalDispatch.FormRunModal");
 
+            RewriteTestHandleFormClientCallback(asm.MainModule, navTestExecutionType);
+
             // NavSession.SetServerFormRequestData — called by TestHandleModalForm just BEFORE
             // the dispatch above, and its real body throws NotSupportedException outright when
             // there is no service connection. See RunnerModalDispatch for why setting
@@ -8137,6 +8139,158 @@ public static class NclCecilRewrite
 
         return 2;
     }
+
+    internal static void RewriteTestHandleFormClientCallback(
+        ModuleDefinition module,
+        TypeDefinition navTestExecutionType)
+    {
+        var methods = navTestExecutionType.Methods.Where(m =>
+            m.Name == "TestHandleForm"
+            && m.Parameters.Count == 2
+            && m.Parameters[0].ParameterType.FullName
+                == "Microsoft.Dynamics.Nav.Runtime.NavForm"
+            && m.Parameters[1].ParameterType.FullName
+                == "Microsoft.Dynamics.Nav.Runtime.NavFormRuntimeParameters"
+            && m.ReturnType.MetadataType == MetadataType.Boolean
+            && m.HasBody).ToList();
+        if (methods.Count != 1)
+            throw new InvalidOperationException(
+                "NavTestExecution.TestHandleForm(NavForm, NavFormRuntimeParameters): "
+                + $"found {methods.Count}, expected exactly 1 — Ncl shape changed; do not commit");
+        var method = methods[0];
+
+        var callbackCalls = method.Body.Instructions.Where(i =>
+            (i.OpCode == OpCodes.Callvirt || i.OpCode == OpCodes.Call)
+            && i.Operand is MethodReference mr
+            && mr.Name == "FormRun"
+            && mr.Parameters.Count == 1).ToList();
+        if (callbackCalls.Count != 1)
+            throw new InvalidOperationException(
+                $"TestHandleForm has {callbackCalls.Count} FormRun callback calls, expected exactly 1 "
+                + "— Ncl shape changed; do not commit");
+
+        var callbackCall = callbackCalls[0];
+        var callback = (MethodReference)callbackCall.Operand;
+        if (callback.DeclaringType.FullName
+                != "Microsoft.Dynamics.Nav.Types.IClientCallbackHandler"
+            || callback.Parameters[0].ParameterType.FullName
+                != "Microsoft.Dynamics.Nav.Types.FormRunRequest"
+            || callback.ReturnType.MetadataType != MetadataType.Void)
+            throw new InvalidOperationException(
+                "TestHandleForm FormRun callback signature changed — Ncl shape changed; do not commit");
+
+        var proxyCall = callbackCall.Previous;
+        while (proxyCall != null
+               && proxyCall.Operand is not MethodReference { Name: "Proxy" })
+            proxyCall = proxyCall.Previous;
+        var callbackGetter = proxyCall?.Previous;
+        var serviceGetter = callbackGetter?.Previous;
+        var loadExecution = serviceGetter?.Previous;
+        if (proxyCall == null
+            || callbackGetter?.Operand is not MethodReference { Name: "get_CallbackHandler" }
+            || serviceGetter?.Operand is not MethodReference { Name: "get_ServiceConnection" }
+            || loadExecution?.OpCode != OpCodes.Ldarg_0
+            || method.Body.Instructions
+                .SkipWhile(i => i != proxyCall.Next)
+                .TakeWhile(i => i != callbackCall)
+                .Any(i => !IsFormRunRequestLoad(i)))
+        {
+            throw new InvalidOperationException(
+                "TestHandleForm receiver chain shape changed — Ncl shape changed; do not commit");
+        }
+
+        var findHandlerCalls = method.Body.Instructions.Where(i =>
+            (i.OpCode == OpCodes.Callvirt || i.OpCode == OpCodes.Call)
+            && i.Operand is MethodReference mr
+            && mr.Name == "FindHandler"
+            && mr.Parameters.Count == 4).ToList();
+        if (findHandlerCalls.Count != 1)
+            throw new InvalidOperationException(
+                $"TestHandleForm has {findHandlerCalls.Count} FindHandler(4) calls, expected exactly 1 "
+                + "— Ncl shape changed; do not commit");
+
+        var findHandler = findHandlerCalls[0];
+        var throwIfNotFound = findHandler.Previous?.Previous;
+        var storeHandler = findHandler.Next;
+        var loadHandler = storeHandler?.Next;
+        var loadNull = loadHandler?.Next;
+        var equality = loadNull?.Next;
+        var branchWhenFound = equality?.Next;
+        var unhandledReturnValue = branchWhenFound?.Next;
+        var unhandledReturn = unhandledReturnValue?.Next;
+        var storedHandlerLocal = LocalIndex(storeHandler);
+        var loadedHandlerLocal = LocalIndex(loadHandler);
+        var handlerFoundTarget = branchWhenFound?.Operand as Instruction;
+        if (throwIfNotFound?.OpCode != OpCodes.Ldc_I4_1
+            || !IsStoreLocal(storeHandler)
+            || !IsLoadLocal(loadHandler)
+            || storedHandlerLocal == null
+            || storedHandlerLocal != loadedHandlerLocal
+            || loadNull?.OpCode != OpCodes.Ldnull
+            || equality?.Operand is not MethodReference { Name: "op_Equality" }
+            || (branchWhenFound?.OpCode != OpCodes.Brfalse
+                && branchWhenFound?.OpCode != OpCodes.Brfalse_S)
+            || handlerFoundTarget?.OpCode != OpCodes.Ldarg_0
+            || method.Body.Instructions.IndexOf(handlerFoundTarget)
+                > method.Body.Instructions.IndexOf(loadExecution)
+            || unhandledReturnValue?.OpCode != OpCodes.Ldc_I4_0
+            || unhandledReturn?.OpCode != OpCodes.Ret)
+        {
+            throw new InvalidOperationException(
+                "TestHandleForm null-handler branch shape changed — Ncl shape changed; do not commit");
+        }
+
+        var dispatch = typeof(AlRunner.Patches.RunnerModalDispatch).GetMethod(
+            nameof(AlRunner.Patches.RunnerModalDispatch.FormRun),
+            BindingFlags.Public | BindingFlags.Static)
+            ?? throw new InvalidOperationException(
+                "RunnerModalDispatch.FormRun not found — do not commit");
+        var throwUnhandled = typeof(AlRunner.Patches.RunnerModalDispatch).GetMethod(
+            nameof(AlRunner.Patches.RunnerModalDispatch.ThrowUnhandledNonModalForm),
+            BindingFlags.Public | BindingFlags.Static)
+            ?? throw new InvalidOperationException(
+                "RunnerModalDispatch.ThrowUnhandledNonModalForm not found — do not commit");
+
+        var il = method.Body.GetILProcessor();
+        throwIfNotFound.OpCode = OpCodes.Ldc_I4_0;
+        throwIfNotFound.Operand = null;
+        il.InsertBefore(unhandledReturnValue, il.Create(
+            OpCodes.Call, module.ImportReference(throwUnhandled)));
+        il.Remove(serviceGetter);
+        il.Remove(callbackGetter);
+        il.Remove(proxyCall);
+        il.Replace(callbackCall, il.Create(
+            OpCodes.Call, module.ImportReference(dispatch)));
+
+        Console.Error.WriteLine(
+            "[Cecil] Rewrote NavTestExecution.TestHandleForm client callback → "
+            + "RunnerModalDispatch.FormRun (preserve unhandled non-modal OOS)");
+    }
+
+    private static bool IsFormRunRequestLoad(Instruction instruction)
+        => instruction.OpCode.Code is Code.Ldloc or Code.Ldloc_S
+            or Code.Ldloc_0 or Code.Ldloc_1 or Code.Ldloc_2 or Code.Ldloc_3
+            or Code.Ldfld;
+
+    private static bool IsStoreLocal(Instruction? instruction)
+        => instruction?.OpCode.Code is Code.Stloc or Code.Stloc_S
+            or Code.Stloc_0 or Code.Stloc_1 or Code.Stloc_2 or Code.Stloc_3;
+
+    private static bool IsLoadLocal(Instruction? instruction)
+        => instruction?.OpCode.Code is Code.Ldloc or Code.Ldloc_S
+            or Code.Ldloc_0 or Code.Ldloc_1 or Code.Ldloc_2 or Code.Ldloc_3;
+
+    private static int? LocalIndex(Instruction? instruction)
+        => instruction?.OpCode.Code switch
+        {
+            Code.Ldloc_0 or Code.Stloc_0 => 0,
+            Code.Ldloc_1 or Code.Stloc_1 => 1,
+            Code.Ldloc_2 or Code.Stloc_2 => 2,
+            Code.Ldloc_3 or Code.Stloc_3 => 3,
+            Code.Ldloc or Code.Ldloc_S or Code.Stloc or Code.Stloc_S
+                => (instruction.Operand as VariableDefinition)?.Index,
+            _ => null,
+        };
 
     internal static void RewriteQuotedOptionEvaluation(ModuleDefinition module)
     {

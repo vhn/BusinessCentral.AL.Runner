@@ -2,8 +2,7 @@
 // provide.
 //
 // WHERE IT IS USED
-//   NavTestExecution.TestHandleModalForm pushes a delegate that builds the NavTestPage the
-//   AL [ModalPageHandler] receives:
+//   NavTestExecution's page-handler paths build the NavTestPage the AL handler or trap receives:
 //       new NavTestPage(..., TestClientProxy<ITestPage>.Proxy(
 //           testClientSession.GetPage(runRequest.Data.FormHandle)))
 //   Real BC gets that session by Assembly.Load-ing the TestPageClient, which does not exist
@@ -35,9 +34,9 @@ public sealed class RunnerTestClientSession : ITestClientSession
     {
         var form = RegisteredForm(formHandle)
             ?? throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
-                $"TestPage modal page (handle {formHandle})",
+                $"TestPage page (handle {formHandle})",
                 "testpage-modal — no form is registered under this handle, so the runner cannot "
-                + "hand the [ModalPageHandler] the page it is being asked to drive. "
+                + "hand the page handler or trap the page it is being asked to drive. "
                 + "See docs/scope.md");
 
         // A REQUEST page is not a page over a record — it has no source table at all, so the
@@ -71,6 +70,10 @@ public sealed class RunnerTestClientSession : ITestClientSession
             page,
             _session,
             pageId);
+        var closeOnRelease = !forClose
+            ? RunnerModalDispatch.TakeTrappedFormClose(formHandle)
+            : null;
+        testPage.SetClientFormClose(closeOnRelease);
         testPage.MarkModalOpened(page.PageEditable);
         return testPage;
     }

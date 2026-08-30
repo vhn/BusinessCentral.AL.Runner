@@ -122,15 +122,13 @@ dispatch, and report/request-page variables support a limited standalone surface
   line appended to a grid numbered from something other than 10000 does not continue from
   the last row. Tracked in
   [#1755](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1755).
-- `Page.Run()` is a no-op. `Page.RunModal()` dispatches to `[ModalPageHandler]` if
-  registered, otherwise throws — both the page-variable form
+- Static `Page.Run()` dispatches to `[PageHandler]` or attaches to a preceding
+  `TestPage.Trap()` during a test; without either it throws the documented non-modal UI
+  out-of-scope error. `Page.RunModal()` dispatches to
+  `[ModalPageHandler]` if registered, otherwise throws — both the page-variable form
   (`P.SetRecord(Rec); P.RunModal();`) and the static-by-id forms
   (`Page.RunModal(id, Record)`, `Page.RunModal(Page::"X", Record)`, and Base App
-  `Codeunit 700 "Page Management"` code that routes through them). The static
-  `Page.RunModal(0, Record)` form, which real BC resolves via the record table's
-  `LookupPageId`, is not yet implemented and throws
-  [#1918](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1918); pass an
-  explicit page id in the meantime.
+  `Codeunit 700 "Page Management"` code that routes through them).
 - Request pages can be handled via `[RequestPageHandler]`, but this is handler dispatch
   only, not real request-page rendering.
 - Report variables support `Run()`, `RunRequestPage()`, `SetTableView()`, and
