@@ -652,20 +652,30 @@ internal sealed class RunnerPageInstance
     /// name rather than doing nothing — doing nothing let a test invoke a lookup, observe no
     /// change, and compare two empty strings successfully.
     /// </summary>
-    internal NavText? RaiseOnLookup(int controlId, NavText current)
+    internal NavText? RaiseOnLookup(int controlId, NavText current, Func<bool>? tryTableFieldLookup = null)
     {
-        var trigger = FindTrigger(controlId, "_OnLookup", "OnLookup", arity: 1)
-            ?? throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+        var trigger = FindTrigger(controlId, "_OnLookup", "OnLookup", arity: 1);
+        if (trigger == null)
+        {
+            // BC's lookup precedence is page control first, source table field second,
+            // TableRelation UI last. The table-field handler is already wired onto the
+            // record's NCLMetaField; give the Rec-bound TestPage field a chance to run it
+            // before classifying the remaining client-driven TableRelation lookup as OOS.
+            if (tryTableFieldLookup?.Invoke() == true) return null;
+
+            throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
                 $"TestPage lookup on control {controlId} (page {_pageId})",
-                "testpage-lookup — the control declares no OnLookup trigger, so its lookup comes "
-                + "from a TableRelation and would open the related table's list page, which the "
-                + "runner cannot stand up. See docs/scope.md");
+                "testpage-lookup — neither the control nor its source table field declares an "
+                + "OnLookup trigger, so its lookup comes from a TableRelation and would open the "
+                + "related table's list page, which the runner cannot stand up. See docs/scope.md");
+        }
 
         var value = current;
         var byRef = new ByRef<NavText>(() => value, v => value = v);
 
+        var resolvedTrigger = trigger.Value;
         object? result;
-        try { result = trigger.Method.Invoke(trigger.Target, new object?[] { byRef }); }
+        try { result = resolvedTrigger.Method.Invoke(resolvedTrigger.Target, new object?[] { byRef }); }
         catch (TargetInvocationException tie) when (tie.InnerException != null)
         {
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();

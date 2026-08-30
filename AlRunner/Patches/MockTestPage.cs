@@ -1519,7 +1519,8 @@ internal sealed class LiveNavTestField : ITestField
 
         // BC's contract: the trigger writes the selection back and returns true; a false
         // return means the user cancelled and the field keeps its value.
-        var picked = _page.RaiseOnLookup(_controlId, NavText.Create(Value));
+        var picked = _page.RaiseOnLookup(_controlId, NavText.Create(Value),
+            () => RecordPatches.TryInvokeFieldLookup(_record, _fieldNo));
         if (picked != null) Value = picked.ToString();
     }
 

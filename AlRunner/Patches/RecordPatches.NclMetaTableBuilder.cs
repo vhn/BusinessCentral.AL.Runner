@@ -1000,6 +1000,7 @@ public static partial class RecordPatches
     private static FieldInfo? _fEventTriggerDataValueBacking;
     private static FieldInfo? _fValidateHandlerBacking;
     private static FieldInfo? _fLookupHandlerBacking;
+    private static MethodInfo? _mInvokeFieldTriggerHandlerAsync;
     private static PropertyInfo? _pOnBeforeValidateHandlers;
     private static PropertyInfo? _pOnAfterValidateHandlers;
     private static Type? _tFieldTriggerHandlerListClosed;
@@ -1032,8 +1033,17 @@ public static partial class RecordPatches
         }
         var navAobj = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavApplicationObjectBase");
         if (_tFieldTriggerHandler1 != null && navAobj != null)
+        {
             _tFieldTriggerHandlerListClosed = typeof(List<>).MakeGenericType(
                 _tFieldTriggerHandler1.MakeGenericType(navAobj));
+            var closedHandlerType = _tFieldTriggerHandler1.MakeGenericType(navAobj);
+            _mInvokeFieldTriggerHandlerAsync = typeof(NavRecord).GetMethod(
+                "InvokeFieldTriggerHandlerAsync",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                binder: null,
+                types: new[] { closedHandlerType },
+                modifiers: null);
+        }
     }
 
     /// <summary>
@@ -1231,6 +1241,41 @@ public static partial class RecordPatches
             Console.Error.WriteLine($"[RecordPatches] WireFieldTriggerHandlers({tableId}) failed: {ex.GetType().Name}: {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Invoke a source table field's OnLookup through NCL's own dispatcher. This preserves
+    /// the runtime's base-record versus table-extension target selection instead of calling
+    /// the stored delegate directly with the wrong application-object instance.
+    /// </summary>
+    internal static bool TryInvokeFieldLookup(NavRecord record, int fieldNo)
+    {
+        EnsureFieldTriggerReflection();
+        if (!record.MetaTable.TryGetFieldByNo(fieldNo, out var field))
+            return false;
+
+        var eventData = _fEventTriggerDataValueBacking?.GetValue(field);
+        var handler = eventData == null ? null : _fLookupHandlerBacking?.GetValue(eventData);
+        if (handler == null)
+            return false;
+        if (_mInvokeFieldTriggerHandlerAsync == null)
+            throw new InvalidOperationException(
+                "NavRecord.InvokeFieldTriggerHandlerAsync was not found for the loaded BC engine.");
+
+        try
+        {
+            var pending = _mInvokeFieldTriggerHandlerAsync.Invoke(record, new[] { handler });
+            if (pending is not System.Threading.Tasks.ValueTask valueTask)
+                throw new InvalidOperationException(
+                    "NavRecord.InvokeFieldTriggerHandlerAsync returned an unexpected value.");
+            valueTask.GetAwaiter().GetResult();
+        }
+        catch (TargetInvocationException tie) when (tie.InnerException != null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+            throw;
+        }
+        return true;
     }
 
     /// <summary>
