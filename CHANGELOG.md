@@ -10,6 +10,7 @@ All notable changes to this project are documented here. Format based on
 - **runtime:** expand Business Central compatibility
 
 ### Fixed
+- **ui:** dispatch non-modal page handlers
 - **testpage:** dispatch source field lookup triggers
 - **testpage:** evaluate negated boolean bindings
 
