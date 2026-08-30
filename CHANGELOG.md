@@ -6,6 +6,16 @@ All notable changes to this project are documented here. Format based on
 
 ## [Unreleased]
 
+### Added
+- **runtime:** expand Business Central compatibility
+
+### Fixed
+- **testpage:** dispatch source field lookup triggers
+- **testpage:** evaluate negated boolean bindings
+
+### Documentation
+- update runtime compatibility scope
+
 ## [2.2.0] - 2026-08-17
 
 ### Added
