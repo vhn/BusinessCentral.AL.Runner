@@ -20,6 +20,22 @@ namespace AlRunner;
 
 public static partial class BcRuntime
 {
+    private sealed class ProviderWriteGeneration
+    {
+        public long Value;
+    }
+
+    private sealed class ObservedProviderWriteGeneration
+    {
+        public long Value = -1;
+    }
+
+    private static readonly ConditionalWeakTable<object, ProviderWriteGeneration>
+        _providerWriteGenerations = new();
+    private static readonly ConditionalWeakTable<object, ObservedProviderWriteGeneration>
+        _observedProviderWriteGenerations = new();
+    private static PropertyInfo? _pDataAccessDataProviderForFindFreshness;
+
     /// <summary>
     /// All record / data-access JMP-hooks. Called from ApplyAllPatches once during
     /// runtime bootstrap, after NavSession / NavMethodScope / NavApplicationObjectBase
@@ -40,11 +56,6 @@ public static partial class BcRuntime
         // EventSubscriberPatches.CreateTableTriggerEventHandler / InjectAll can run during
         // NclMetaTableBuilder / NclMetadataCachePopulator without extra plumbing.
         AlRunner.Patches.EventSubscriberPatches.Register(navNcl);
-
-        // RecordLink (table 2000000068) in-memory polyfill — AL `Rec.AddLink/HasLinks/
-        // DeleteLinks/CopyLinks` paths. Real BC body NREs in NavRecord..ctor because
-        // our skeleton lacks a TenantDataAccess for system tables (see docs/scope.md §2).
-        AlRunner.Patches.RecordLinkPatches.Register(navNcl);
 
         // NavRecordId.get_CollationAwareStringComparer — real getter walks
         // Session.Database.CollationAwareStringComparer which NREs on the skeleton
@@ -221,6 +232,24 @@ public static partial class BcRuntime
                 BindingFlags.NonPublic | BindingFlags.Instance);
             _fRecordImplementationMetaTable = recImplType.GetField("metaTable",
                 BindingFlags.NonPublic | BindingFlags.Instance);
+            _mRecordImplementationInvalidateCurrentResultSetEnumerator = recImplType.GetMethod(
+                "InvalidateCurrentResultSetEnumerator",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                binder: null,
+                types: Type.EmptyTypes,
+                modifiers: null)
+                ?? throw new MissingMethodException(
+                    recImplType.FullName,
+                    "InvalidateCurrentResultSetEnumerator()");
+            _mRecordImplementationCalcAutoCalcFieldsAsync = recImplType.GetMethod(
+                "CalcAutoCalcFieldsAsync",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                binder: null,
+                types: new[] { typeof(bool) },
+                modifiers: null)
+                ?? throw new MissingMethodException(
+                    recImplType.FullName,
+                    "CalcAutoCalcFieldsAsync(Boolean)");
             var dataAccessType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.DataAccess");
             if (dataAccessType != null)
             {
@@ -331,8 +360,8 @@ public static partial class BcRuntime
 
     /// <summary>
     /// Replacement for RecordImplementation.InternalFindRecordWithoutCheckingValuesAsync —
-    /// thin passthrough that hits dataAccess.TryGetByPrimaryKeyAsync and bypasses the original
-    /// body's permission-event/diagnostic args evaluation, which NREs through
+    /// primary-key lookup that preserves BC's successful-lookup state transition while bypassing
+    /// the original body's permission-event/diagnostic args evaluation, which NREs through
     /// Session.CurrentMethodScope.ApplicationObject (null on the skeleton root scope) when the
     /// requested record is not found.
     /// </summary>
@@ -360,12 +389,32 @@ public static partial class BcRuntime
             if (resultObj == null) return new System.Threading.Tasks.ValueTask<bool>(false);
 
             bool found = (bool)(_pMrbResultResult!.GetValue(resultObj) ?? false);
-            if (found && useRecord)
+            if (found)
             {
-                var recBuffer = _pMrbResultRecordBuffer?.GetValue(resultObj);
-                _fRecordImplementationMutableRecordBuffer?.SetValue(self, recBuffer);
+                if (useRecord)
+                {
+                    var recBuffer = _pMrbResultRecordBuffer?.GetValue(resultObj);
+                    _mRecordImplementationInvalidateCurrentResultSetEnumerator!.Invoke(self, null);
+                    _fRecordImplementationMutableRecordBuffer?.SetValue(self, recBuffer);
+                }
+
+                // BC's original body performs this after a successful primary-key lookup.
+                // SetAutoCalcFields therefore applies equally to Get and Find; omitting it
+                // leaves BLOBs and FlowFields unloaded only on the runner's Get replacement.
+                if (calcAutoCalcFields)
+                {
+                    var calcTaskObj = _mRecordImplementationCalcAutoCalcFieldsAsync!.Invoke(
+                        self,
+                        new object[] { true });
+                    var calcTask = calcTaskObj?.GetType().GetMethod("AsTask")?.Invoke(calcTaskObj, null)
+                        as System.Threading.Tasks.Task
+                        ?? throw new InvalidOperationException(
+                            "RecordImplementation.CalcAutoCalcFieldsAsync did not return a ValueTask.");
+                    calcTask.GetAwaiter().GetResult();
+                }
+
+                return new System.Threading.Tasks.ValueTask<bool>(true);
             }
-            if (found) return new System.Threading.Tasks.ValueTask<bool>(true);
 
             // Not found. BC's own body decides the failure mode RIGHT HERE from errorLevel —
             // nothing downstream re-checks — so returning false unconditionally silently turned
@@ -383,6 +432,65 @@ public static partial class BcRuntime
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(tie.InnerException);
             return default;
         }
+    }
+
+    /// <summary>
+    /// Records a write against the in-memory provider that stands in for a database table.
+    /// The generation is shared by every record variable backed by that provider.
+    /// </summary>
+    public static void NoteDatabaseBackedRecordWrite(object? record)
+    {
+        if (record is not Microsoft.Dynamics.Nav.Runtime.NavRecord navRecord || navRecord.IsTemporary)
+            return;
+
+        var recordImplementation = _fNavRecordRecordImplementation?.GetValue(navRecord)
+            ?? throw new InvalidOperationException(
+                "NavRecord.recordImplementation is unavailable while recording a database write.");
+        var provider = GetRecordDataProvider(recordImplementation);
+        if (!AlRunner.Patches.BlobStoreIsolationPatches.IsDatabaseBacked(provider))
+            return;
+
+        var generation = _providerWriteGenerations.GetValue(
+            provider!, static _ => new ProviderWriteGeneration());
+        System.Threading.Interlocked.Increment(ref generation.Value);
+    }
+
+    /// <summary>
+    /// Invalidates a database-backed record's cached equality-find result after another
+    /// record variable has written through the same provider. Permanent tables use a
+    /// TempTableDataProvider in the standalone runtime, whose native copied-enumerator
+    /// validity token can otherwise leave <c>Source.Find()</c> on the pre-write row.
+    /// </summary>
+    public static void PrepareDatabaseBackedFindEquals(object recordImplementation)
+    {
+        var provider = GetRecordDataProvider(recordImplementation);
+        if (!AlRunner.Patches.BlobStoreIsolationPatches.IsDatabaseBacked(provider))
+            return;
+
+        var generation = _providerWriteGenerations.GetValue(
+            provider!, static _ => new ProviderWriteGeneration());
+        var observed = _observedProviderWriteGenerations.GetValue(
+            recordImplementation, static _ => new ObservedProviderWriteGeneration());
+        var current = System.Threading.Volatile.Read(ref generation.Value);
+        if (System.Threading.Volatile.Read(ref observed.Value) == current)
+            return;
+
+        _mRecordImplementationInvalidateCurrentResultSetEnumerator!.Invoke(
+            recordImplementation,
+            null);
+        System.Threading.Volatile.Write(ref observed.Value, current);
+    }
+
+    private static object? GetRecordDataProvider(object recordImplementation)
+    {
+        var dataAccess = _fRecordImplementationDataAccess?.GetValue(recordImplementation)
+            ?? throw new InvalidOperationException(
+                "RecordImplementation.dataAccess is unavailable while resolving record freshness.");
+        _pDataAccessDataProviderForFindFreshness ??= dataAccess.GetType().GetProperty(
+            "DataProvider",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new MissingMemberException(dataAccess.GetType().FullName, "DataProvider");
+        return _pDataAccessDataProviderForFindFreshness.GetValue(dataAccess);
     }
 
 
@@ -530,14 +638,14 @@ public static partial class BcRuntime
     /// <summary>
     /// Register a tableId + fieldNo pair as an AutoIncrement-enabled field.
     /// Called by NclMetaTableBuilder after constructing an NCLMetaTable that has an
-    /// AutoIncrement field, so <see cref="NavRecord_ALInsertAsync3"/> can assign the counter.
+    /// AutoIncrement field, so <see cref="AssignAutoIncrement"/> can assign the counter.
     /// </summary>
     public static void RegisterAutoIncrementField(int tableId, int fieldNo)
         => _aiFieldIds[tableId] = fieldNo;
 
     /// <summary>
     /// AutoIncrement assignment helper, called via Cecil-prepended IL at the start
-    /// of NavRecord.ALInsertAsync(DataError, bool, bool). Pure side-effect:
+    /// of NavRecord.ALInsertAsync and NavRecord.InsertAsync. Pure side-effect:
     /// if the table has a registered AutoIncrement field and that field is currently
     /// zero/empty on `self`, advance the per-table counter and stamp the new value
     /// into the field. Any exception is swallowed — the real async body then runs

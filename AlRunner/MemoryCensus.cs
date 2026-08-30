@@ -46,7 +46,6 @@ internal static class MemoryCensus
 
         var (daSources, daTables) = Patches.RecordPatches.CensusDataAccessByTable();
         var mediaEntries = Patches.MediaSetPatches.CensusEntryCount();
-        var linkEntries = Patches.RecordLinkPatches.CensusEntryCount();
         var storageEntries = Patches.TenantStoragePatches.CensusEntryCount();
         var sharedChildren = BcRuntime.CensusSharedObjectContainerChildCount();
 
@@ -54,7 +53,7 @@ internal static class MemoryCensus
             $"[mem-census] #{n} {codeunit}.{method} " +
             $"gcTotalMB={gcTotal / 1024.0 / 1024.0:F1} rssMB={rssKb / 1024.0:F1} " +
             $"asm={asmCount} daSources={daSources} daTables={daTables} " +
-            $"media={mediaEntries} links={linkEntries} storage={storageEntries} " +
+            $"media={mediaEntries} storage={storageEntries} " +
             $"sharedChildren={sharedChildren}");
     }
 }

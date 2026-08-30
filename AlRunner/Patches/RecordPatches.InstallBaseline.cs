@@ -10,8 +10,8 @@
 //
 // WHAT THIS DOES
 //   Install triggers run ONCE. The resulting rows are snapshotted out of the in-memory
-//   TempTableDataProviders (plus isolated storage, record links and the auto-increment
-//   counters, which are equally part of committed install state), and each codeunit
+//   TempTableDataProviders (plus isolated storage and the auto-increment counters, which
+//   are equally part of committed install state), and each codeunit
 //   boundary restores that snapshot instead of re-running AL.
 //
 //   Rows are deep-copied on both capture and restore, so a test mutating a restored row
@@ -49,12 +49,10 @@ public static partial class RecordPatches
     internal sealed record InstallBaselineSnapshot(
         IReadOnlyList<BaselineSource> Sources,
         object? IsolatedStorage,
-        object? RecordLinks,
         IReadOnlyDictionary<int, long>? AutoIncrement);
 
     private static IReadOnlyList<BaselineSource>? _installBaseline;
     private static object? _isolatedStorageBaseline;
-    private static object? _recordLinkBaseline;
     private static IReadOnlyDictionary<int, long>? _autoIncrementBaseline;
     private static ConstructorInfo? _ibMutableBufferCtor;
 
@@ -63,8 +61,8 @@ public static partial class RecordPatches
         var snapshot = CaptureInstallBaselineSnapshot();
         _installBaseline = snapshot.Sources;
         _isolatedStorageBaseline = snapshot.IsolatedStorage;
-        _recordLinkBaseline = snapshot.RecordLinks;
         _autoIncrementBaseline = snapshot.AutoIncrement;
+        BcRuntime.CaptureSkeletonApplicationAreaBaseline();
     }
 
     public static void RestoreInstallBaseline()
@@ -73,7 +71,7 @@ public static partial class RecordPatches
         if (_installBaseline == null)
             return;
         RestoreInstallBaselineSnapshot(new InstallBaselineSnapshot(
-            _installBaseline, _isolatedStorageBaseline, _recordLinkBaseline, _autoIncrementBaseline),
+            _installBaseline, _isolatedStorageBaseline, _autoIncrementBaseline),
             resetFirst: false);
     }
 
@@ -130,7 +128,6 @@ public static partial class RecordPatches
         var snapshot = new InstallBaselineSnapshot(
             sources,
             TenantStoragePatches.CaptureInstallBaseline(),
-            RecordLinkPatches.CaptureInstallBaseline(),
             BcRuntime.CaptureAutoIncrementBaseline());
         PerfTrace.Log($"InstallBaseline.Capture {sources.Sum(s => s.Tables.Count)} table(s), " +
                       $"{sources.Sum(s => s.Tables.Sum(t => t.Rows.Length))} row(s)" +
@@ -232,7 +229,6 @@ public static partial class RecordPatches
         }
 
         TenantStoragePatches.RestoreInstallBaseline(snapshot.IsolatedStorage);
-        RecordLinkPatches.RestoreInstallBaseline(snapshot.RecordLinks);
         BcRuntime.RestoreAutoIncrementBaseline(snapshot.AutoIncrement);
         PerfTrace.Log($"InstallBaseline.Restore {restoredRows} row(s)");
     }

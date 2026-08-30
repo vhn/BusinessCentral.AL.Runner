@@ -19,7 +19,7 @@ namespace AlRunner.Infrastructure;
 
 public static class NclCecilRewrite
 {
-    private const int CACHE_VERSION = 130;
+    private const int CACHE_VERSION = 135;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Cecil-owned skip registry (JmpHook→Cecil migration enabler).
@@ -148,6 +148,11 @@ public static class NclCecilRewrite
         // SessionTransactionExtensions.Rollback — AL's write-transaction rollback, which
         // NavMethodScope.AssertError calls after catching an error.
         "Microsoft.Dynamics.Nav.Runtime.SessionTransactionExtensions::Rollback/1",
+        // ExternalBusinessEvent delivery is an out-of-process notification queued through
+        // SQL after the AL publisher returns. The standalone runner has neither queue nor SQL,
+        // so both delivery entry points complete without external subscribers.
+        "Microsoft.Dynamics.Nav.Runtime.NavExternalBusinessEventMethodScope`1::RunExternalBusinessEvent/0",
+        "Microsoft.Dynamics.Nav.Runtime.NavExternalBusinessEventMethodScope`1::RunExternalBusinessEventAsync/0",
         // TreeHandler.get_Session — `=> session`, and that field is null on every tree the
         // runner builds (the root handler has no session to propagate). Callers do not
         // null-check it: NavFieldRef.ALValidateSafe() hands it straight to
@@ -155,6 +160,10 @@ public static class NclCecilRewrite
         "Microsoft.Dynamics.Nav.Runtime.TreeHandler::get_Session/0",
         // SessionTransactionExtensions.HasWriteTransaction — AL's Database.IsInWriteTransaction().
         "Microsoft.Dynamics.Nav.Runtime.SessionTransactionExtensions::HasWriteTransaction/1",
+        // The standalone runner has one session and no SQL lock manager. RecordLink uses this
+        // guard only to decide whether it may take the cheap empty-table path before filtering
+        // the in-memory Record Link table.
+        "Microsoft.Dynamics.Nav.Runtime.RecordLink::IsRecordLinkTableLocked/1",
         // ALDatabase.CurrentTransactionType — AL's Database.CurrentTransactionType().
         "Microsoft.Dynamics.Nav.Runtime.ALDatabase::get_ALCurrentTransactionType/0",
         "Microsoft.Dynamics.Nav.Runtime.ALDatabase::set_ALCurrentTransactionType/1",
@@ -266,21 +275,7 @@ public static class NclCecilRewrite
         "Microsoft.Dynamics.Nav.Runtime.NavRecord::GetCallerRecord/1",
         // NavRecord::UpdateReferencesOnRenameAsync/2 is deliberately NOT here: BC's real
         // body runs (rename propagation to validated TableRelation fields, issue #1730).
-        // RecordLink / management
-        "Microsoft.Dynamics.Nav.Runtime.RecordLink::MoveLinksAsync/2",
-        // RecordLink::HasLinks/1 is ALSO Cecil-rewritten (ReplaceWithStaticHelper below, "RecordLink
-        // — rewrite all link-management methods") but was missing from this list (#1883 follow-up).
-        // RecordLinkPatches.cs separately JmpHook's the same static with its own replacement
-        // (RecordLink_HasLinks) — kept as defense-in-depth (same precedent as NavXmlPort::Run
-        // below), but the missing key here meant the audit misclassified it as "orphaned" instead
-        // of "redundant", and — more importantly — meant JmpHook.Apply would have actually
-        // installed the native patch on top of the Cecil-rewritten body if AL_RUNNER_ENABLE_JMPHOOK=1
-        // ever re-enabled the JmpHook layer: the exact JmpHook+Cecil COEXISTENCE double-dispatch
-        // spin this registry exists to prevent (see NCLEnumMetadata::Create/1 above). Registering
-        // the key here makes JmpHook.Apply skip installing the native patch entirely (see
-        // JmpHook.Apply's CecilOwned check) — the redundant registration becomes provably inert
-        // under BOTH JmpHook-enabled and JmpHook-disabled configurations, not just the default.
-        "Microsoft.Dynamics.Nav.Runtime.RecordLink::HasLinks/1",
+        // management
         "Microsoft.Dynamics.Nav.Runtime.NavManagementTasks::CopyCompany/2",
         // NCLMetaApplicationObject
         "Microsoft.Dynamics.Nav.Runtime.NCLMetaApplicationObject::CheckApplicationObjectIsValid/1",
@@ -393,6 +388,7 @@ public static class NclCecilRewrite
         // ALCompiler.DotNetToNavOutStream — skeleton SharedObjects fallback for
         // .NET-stream → NavOutStream marshalling (Cryptography Management GenerateHash).
         "Microsoft.Dynamics.Nav.Runtime.ALCompiler::DotNetToNavOutStream/2",
+        "Microsoft.Dynamics.Nav.Runtime.ALCompiler::DotNetToNavInStream/2",
         // NavDotNet.CreateNavServerHandle — catch block replaced with OOS throw so
         // absent server add-in assemblies (Azure KV SDK, etc.) fail loud instead of
         // NRE-ing on NavGlobal.SystemTenant (null on skeleton). Happy-path try block
@@ -478,10 +474,35 @@ public static class NclCecilRewrite
         .Where(op => op.Size == 2 && ((ushort)op.Value >> 8) == 0xFE)
         .ToDictionary(op => unchecked((byte)op.Value));
 
+    internal static int PreserveRuntimeEventSubscriptionChecks(TypeDefinition metadataType)
+    {
+        var checks = metadataType.Methods
+            .Where(method => method.Name == "IsEventSubscribed")
+            .ToList();
+        if (checks.Count == 0)
+            throw new InvalidOperationException("IsEventSubscribed method not found");
+
+        foreach (var method in checks)
+        {
+            var delegatesToRuntimeHandler = method.ReturnType.FullName == "System.Boolean"
+                && method.HasBody
+                && method.Body.Instructions.Any(instruction =>
+                    instruction.Operand is MethodReference target
+                    && target.Name == "IsEventSubscribed"
+                    && target.DeclaringType.FullName
+                        == "Microsoft.Dynamics.Nav.EventSubscription.NavTriggerEventHandler");
+            if (!delegatesToRuntimeHandler)
+                throw new InvalidOperationException(
+                    $"Unsupported NCLMetaApplicationObject.IsEventSubscribed shape: {method.FullName}");
+        }
+
+        return checks.Count;
+    }
+
 
     /// <summary>
-    /// Reads Ncl.dll bytes, rewrites IsEventSubscribed body to return true,
-    /// strips R2R header, returns modified bytes ready for Assembly.Load.
+    /// Reads Ncl.dll bytes, applies the runner's runtime substitutions, strips the R2R
+    /// header, and returns modified bytes ready for Assembly.Load.
     /// </summary>
     public static byte[] RewriteNcl(string nclPath)
     {
@@ -498,28 +519,9 @@ public static class NclCecilRewrite
         if (type == null)
             throw new InvalidOperationException("NCLMetaApplicationObject type not found in Ncl.dll");
 
-        int rewroteCount = 0;
-        foreach (var method in type.Methods.Where(mm => mm.Name == "IsEventSubscribed").ToList())
-        {
-            Console.Error.WriteLine($"[Cecil] Rewriting {method.FullName}");
-            if (method.ReturnType.FullName != "System.Boolean")
-            {
-                Console.Error.WriteLine($"[Cecil]  - skipping: return type is {method.ReturnType.FullName}");
-                continue;
-            }
-            var body = method.Body;
-            body.Instructions.Clear();
-            body.Variables.Clear();
-            body.ExceptionHandlers.Clear();
-            var il = body.GetILProcessor();
-            il.Append(il.Create(OpCodes.Ldc_I4_1));
-            il.Append(il.Create(OpCodes.Ret));
-            body.MaxStackSize = 1;
-            rewroteCount++;
-        }
-        if (rewroteCount == 0)
-            throw new InvalidOperationException("IsEventSubscribed method not found");
-        Console.Error.WriteLine($"[Cecil] Rewrote {rewroteCount} IsEventSubscribed overload(s) → return true");
+        var preservedSubscriptionChecks = PreserveRuntimeEventSubscriptionChecks(type);
+        Console.Error.WriteLine(
+            $"[Cecil] Preserved {preservedSubscriptionChecks} runtime-backed IsEventSubscribed overload(s)");
 
         // NCLEnumMetadata.Create(int) — precompiled Microsoft dependency DLLs call
         // this directly (not through BcAssembler's emitted C# helper), and the real
@@ -1765,8 +1767,8 @@ public static class NclCecilRewrite
             Console.Error.WriteLine("[Cecil] Rewrote SessionTransactionExtensions.Rollback → row-store rollback");
         }
 
-        // 8g. SessionTransactionExtensions.EndTransaction / EndTransactionWorldAndTransaction —
-        //     see RecordPatches.NoteTransactionEnd.
+        // 8g. SessionTransactionExtensions.BeginTransaction / BeginTransactionWorldAndTransaction
+        //     and their matching End methods — see RecordPatches.NoteTransactionBegin / End.
         //
         //     AL Runner#1946: BC's own APIs wrap their internal work in an explicit nested
         //     transaction (decompiled, unmodified Ncl body of the static overload of
@@ -1785,10 +1787,10 @@ public static class NclCecilRewrite
         //     committed. Reproducible with no XmlPort involved at all — see
         //     RecordPatches.NoteTransactionEnd's doc comment.
         //
-        //     Prepend, not replace: the original bodies (SessionTransactionManager.EndTransaction
-        //     / EndTransactionWorldAndTransaction) already run safely today (every passing
-        //     XmlPort Export/Import test goes through one of them), so this only adds the
-        //     missing commit-point bookkeeping alongside them.
+        //     Prepend, not replace: the original SessionTransactionManager bodies already run
+        //     safely. Tracking both sides preserves their TransactionCount rule: only an
+        //     outermost successful end advances the rollback baseline; a nested completion
+        //     remains part of the parent transaction.
         {
             var sessTxType2 = asm.MainModule.Types
                 .FirstOrDefault(t => t.FullName == "Microsoft.Dynamics.Nav.Runtime.SessionTransactionExtensions")
@@ -1800,6 +1802,23 @@ public static class NclCecilRewrite
                 BindingFlags.Public | BindingFlags.Static)
                 ?? throw new InvalidOperationException(
                     "[Cecil] RecordPatches.NoteTransactionEnd not found");
+
+            var noteTransactionBeginHelper = typeof(AlRunner.Patches.RecordPatches).GetMethod(
+                nameof(AlRunner.Patches.RecordPatches.NoteTransactionBegin),
+                BindingFlags.Public | BindingFlags.Static)
+                ?? throw new InvalidOperationException(
+                    "[Cecil] RecordPatches.NoteTransactionBegin not found");
+
+            foreach (var methodName in new[] { "BeginTransaction", "BeginTransactionWorldAndTransaction" })
+            {
+                var beginTransactionMethod = sessTxType2.Methods
+                    .FirstOrDefault(m => m.Name == methodName && m.IsStatic
+                                         && m.Parameters.Count == 1 && m.HasBody)
+                    ?? throw new InvalidOperationException(
+                        $"[Cecil] SessionTransactionExtensions.{methodName}(NavSession) not found — Ncl shape changed; do not commit");
+
+                PrependStaticCall(asm.MainModule, beginTransactionMethod, noteTransactionBeginHelper, argSlots: 1);
+            }
 
             foreach (var methodName in new[] { "EndTransaction", "EndTransactionWorldAndTransaction" })
             {
@@ -2169,6 +2188,26 @@ public static class NclCecilRewrite
             Console.Error.WriteLine($"[Cecil] Rewrote NavMethodScope.OnRunEventAsync → CodeunitEventDispatcher");
         }
 
+        // ExternalBusinessEvent is distinct from AL's in-process BusinessEvent. BC queues it
+        // for external subscribers through service-tier infrastructure the standalone runner
+        // does not provide. Delivery has no AL-observable result, so complete both paths after
+        // the publisher succeeds. Ordinary BusinessEvent and IntegrationEvent dispatch continue
+        // through OnRunEventAsync above.
+        {
+            var externalBusinessEventScope = asm.MainModule.GetType(
+                    "Microsoft.Dynamics.Nav.Runtime.NavExternalBusinessEventMethodScope`1")
+                ?? throw new InvalidOperationException(
+                    "NavExternalBusinessEventMethodScope`1 not found — Ncl shape changed");
+            var rewritten = RewriteExternalBusinessEventDelivery(externalBusinessEventScope);
+            Console.Error.WriteLine(
+                $"[Cecil] Rewrote {rewritten} ExternalBusinessEvent delivery method(s) → completed no-op");
+        }
+
+        // Metadata filters use AL identifier quoting for option members that contain spaces.
+        // The filter parser has already isolated one token by the time InternalEvaluate runs,
+        // but it preserves those quotes while OptionString stores runtime names unquoted.
+        RewriteQuotedOptionEvaluation(asm.MainModule);
+
         // NavObjectList<T>.get_Target — generic property, JmpHook can't reach
         // per-instantiation native code reliably. Real body chains through
         // base.Tree.Session.Company.SharedObjects on the lazy-create path; on
@@ -2257,8 +2296,9 @@ public static class NclCecilRewrite
             Console.Error.WriteLine("[Cecil] Rewrote NavObjectDictionary`2.get_Target → BcRuntime.NavObjectDictionary_get_Target helper");
         }
 
-        // ALCompiler.DotNetToNavOutStream — marshals a NavDotNet-wrapped .NET Stream into
-        // a NavOutStream. Real body wraps the stream in a NavStreamProvider parented to
+        // ALCompiler.DotNetToNavInStream / DotNetToNavOutStream marshal a
+        // NavDotNet-wrapped .NET Stream into a Nav stream. Their real bodies wrap the
+        // stream in a NavStreamProvider parented to
         //     parentOfResult.Tree.Session.Company.SharedObjects
         // which is null on the headless skeleton → NRE (or ArgumentNullException from the
         // TreeObject base ctor). Hit by System Application CU 1279 "Cryptography Management
@@ -2273,9 +2313,14 @@ public static class NclCecilRewrite
             var dotNetToNavOutStream = alCompilerType.Methods.FirstOrDefault(m =>
                 m.Name == "DotNetToNavOutStream" && m.Parameters.Count == 2)
                 ?? throw new InvalidOperationException("ALCompiler.DotNetToNavOutStream/2 not found — shape changed");
+            var dotNetToNavInStream = alCompilerType.Methods.FirstOrDefault(m =>
+                m.Name == "DotNetToNavInStream" && m.Parameters.Count == 2)
+                ?? throw new InvalidOperationException("ALCompiler.DotNetToNavInStream/2 not found — shape changed");
+            ReplaceBodyWithHelper(asm.MainModule, dotNetToNavInStream,
+                nameof(AlRunner.BcRuntime.ALCompiler_DotNetToNavInStream));
             ReplaceBodyWithHelper(asm.MainModule, dotNetToNavOutStream,
                 nameof(AlRunner.BcRuntime.ALCompiler_DotNetToNavOutStream));
-            Console.Error.WriteLine("[Cecil] Rewrote ALCompiler.DotNetToNavOutStream → BcRuntime helper (skeleton SharedObjects fallback)");
+            Console.Error.WriteLine("[Cecil] Rewrote ALCompiler DotNet-to-stream bridges → BcRuntime helpers (skeleton SharedObjects fallback)");
         }
 
         // NavHttpClient egress (ALGet/ALPost/ALPut/ALDelete/ALPatch + their *Async and
@@ -3140,40 +3185,6 @@ public static class NclCecilRewrite
                     il.InsertBefore(firstOriginal, il.Create(OpCodes.Ret));
                     Console.Error.WriteLine($"[Cecil] Prepended NavALErrorType case (enum={alErrorEnumValue}) to NavValue.CreateNavValueFromObject");
                 }
-            }
-        }
-
-        // RecordLink — rewrite all link-management methods to call BcRuntime helpers
-        // backed by an in-memory dictionary. Real impl writes to table 2000000068
-        // (Record Link), which the runner has no SQL backend for.
-        {
-            var recordLinkType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.RecordLink");
-            if (recordLinkType != null)
-            {
-                void ReplaceWithStaticHelper(string mName, string helperName, int paramCount)
-                {
-                    var m = recordLinkType.Methods.FirstOrDefault(x => x.Name == mName && x.Parameters.Count == paramCount);
-                    if (m == null || !m.HasBody) return;
-                    var helperMi = typeof(AlRunner.BcRuntime).GetMethod(helperName, BindingFlags.Public | BindingFlags.Static);
-                    if (helperMi == null) return;
-                    var helperRef = asm.MainModule.ImportReference(helperMi);
-                    m.Body.Instructions.Clear();
-                    m.Body.ExceptionHandlers.Clear();
-                    m.Body.Variables.Clear();
-                    var il = m.Body.GetILProcessor();
-                    for (int i = 0; i < paramCount; i++)
-                        il.Append(il.Create(OpCodes.Ldarg, i));
-                    il.Append(il.Create(OpCodes.Call, helperRef));
-                    il.Append(il.Create(OpCodes.Ret));
-                    Console.Error.WriteLine($"[Cecil] Rewrote RecordLink.{mName}({paramCount}) → {helperName}");
-                }
-                ReplaceWithStaticHelper("AddLinkAsync", nameof(AlRunner.BcRuntime.RecordLink_AddLinkAsync), 3);
-                ReplaceWithStaticHelper("HasLinks", nameof(AlRunner.BcRuntime.RecordLink_HasLinks), 1);
-                ReplaceWithStaticHelper("DeleteLinksAsync", nameof(AlRunner.BcRuntime.RecordLink_DeleteLinksAsync), 1);
-                ReplaceWithStaticHelper("DeleteLinkAsync", nameof(AlRunner.BcRuntime.RecordLink_DeleteLinkAsync), 2);
-                ReplaceWithStaticHelper("CopyLinksAsync", nameof(AlRunner.BcRuntime.RecordLink_CopyLinksAsync), 2);
-                ReplaceWithStaticHelper("MoveLinksAsync", nameof(AlRunner.BcRuntime.RecordLink_MoveLinksAsync), 2);
-                ReplaceWithStaticHelper("TableHasLinks", nameof(AlRunner.BcRuntime.RecordLink_TableHasLinks), 3);
             }
         }
 
@@ -4084,12 +4095,12 @@ public static class NclCecilRewrite
             Console.Error.WriteLine("[Cecil] Replaced ALNavApp.GetDataVersionForUpgrade → return null (no skeleton upgrade)");
         }
 
-        // ── NavRecord.ALInsertAsync(DataError, bool, bool) — AutoIncrement prepend ──
-        // The 3-arg ALInsertAsync is the async state-machine entrypoint for AL
-        // `Rec.Insert()` calls. Its first instruction (`ldloca.s V_0`) begins the
-        // state-machine setup — we prepend a synchronous `AssignAutoIncrement(this)`
-        // call before that, so any registered AI field on `this`'s table is stamped
-        // with the next counter value before the storage layer's duplicate-key check.
+        // ── NavRecord insert entry points — AutoIncrement prepend ────────────────
+        // AL `Rec.Insert()` enters through ALInsertAsync(DataError,bool,bool), while
+        // NCL helpers such as RecordLink.AddLinkAsync call the lower-level
+        // InsertAsync(DataError,bool,bool,bool) directly. Prepend the same synchronous
+        // `AssignAutoIncrement(this)` helper to both so every route to the in-memory
+        // storage layer observes SQL's auto-increment behavior.
         //
         // Why Cecil and not JmpHook: the method is `async ValueTask<bool>` and
         // JmpHook on async ValueTask entry points causes SIGSEGV under R2R (see
@@ -4110,13 +4121,20 @@ public static class NclCecilRewrite
         {
             var navRecord = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.NavRecord")
                 ?? throw new InvalidOperationException("NavRecord type not found in Ncl");
-            var alInsert3 = navRecord.Methods.FirstOrDefault(m =>
+            var alInsert = navRecord.Methods.FirstOrDefault(m =>
                 m.Name == "ALInsertAsync"
                 && m.Parameters.Count == 3
                 && m.Parameters[0].ParameterType.Name == "DataError"
                 && m.Parameters[1].ParameterType.MetadataType == Mono.Cecil.MetadataType.Boolean
                 && m.Parameters[2].ParameterType.MetadataType == Mono.Cecil.MetadataType.Boolean)
                 ?? throw new InvalidOperationException("NavRecord.ALInsertAsync(DataError,bool,bool) not found");
+            var insert = navRecord.Methods.FirstOrDefault(m =>
+                m.Name == "InsertAsync"
+                && m.Parameters.Count == 4
+                && m.Parameters[0].ParameterType.Name == "DataError"
+                && m.Parameters.Skip(1).All(p =>
+                    p.ParameterType.MetadataType == Mono.Cecil.MetadataType.Boolean))
+                ?? throw new InvalidOperationException("NavRecord.InsertAsync(DataError,bool,bool,bool) not found");
 
             var helperMi = typeof(AlRunner.BcRuntime).GetMethod(
                 nameof(AlRunner.BcRuntime.AssignAutoIncrement),
@@ -4124,16 +4142,37 @@ public static class NclCecilRewrite
                 ?? throw new InvalidOperationException("BcRuntime.AssignAutoIncrement not found");
             var helperRef = asm.MainModule.ImportReference(helperMi);
 
-            var body = alInsert3.Body;
-            var il = body.GetILProcessor();
-            var firstOriginal = body.Instructions[0];
-            il.InsertBefore(firstOriginal, il.Create(OpCodes.Ldarg_0));
-            il.InsertBefore(firstOriginal, il.Create(OpCodes.Call, helperRef));
-            // The helper consumes the ldarg.0 and pushes nothing. MaxStackSize only
-            // grows if our prepended call needs more than the existing budget; one
-            // extra slot covers it. Bump conservatively to be safe.
-            if (body.MaxStackSize < 1) body.MaxStackSize = 1;
-            Console.Error.WriteLine("[Cecil] Prepended AssignAutoIncrement → NavRecord.ALInsertAsync(DataError,bool,bool)");
+            foreach (var method in new[] { alInsert, insert })
+            {
+                var body = method.Body;
+                var il = body.GetILProcessor();
+                var firstOriginal = body.Instructions[0];
+                il.InsertBefore(firstOriginal, il.Create(OpCodes.Ldarg_0));
+                il.InsertBefore(firstOriginal, il.Create(OpCodes.Call, helperRef));
+                if (body.MaxStackSize < 1) body.MaxStackSize = 1;
+                Console.Error.WriteLine($"[Cecil] Prepended AssignAutoIncrement → NavRecord.{method.Name}");
+            }
+        }
+
+        // RecordLink.HasLinks/TableHasLinks probe the SQL transaction cache before reading
+        // table 2000000068. There is no external session that can hold a table lock in the
+        // standalone runner, and constructing that cache requires a live NavDatabase. Return
+        // the faithful single-session answer and let the unmodified methods filter the real
+        // in-memory Record Link rows.
+        {
+            var recordLink = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.RecordLink")
+                ?? throw new InvalidOperationException("RecordLink type not found in Ncl");
+            var isLocked = recordLink.Methods.FirstOrDefault(m =>
+                m.Name == "IsRecordLinkTableLocked"
+                && m.IsStatic
+                && m.Parameters.Count == 1
+                && m.Parameters[0].ParameterType.Name == "ITreeObject")
+                ?? throw new InvalidOperationException("RecordLink.IsRecordLinkTableLocked(ITreeObject) not found");
+            var returnFalse = typeof(AlRunner.BcRuntime).GetMethod(
+                nameof(AlRunner.BcRuntime.ReturnFalse_1Arg),
+                BindingFlags.Public | BindingFlags.Static)
+                ?? throw new InvalidOperationException("BcRuntime.ReturnFalse_1Arg not found");
+            ReplaceBodyWithHelper(asm.MainModule, isLocked, returnFalse);
         }
 
         // ── NavRecord.ALInsertAsync(DataError, bool, bool) — SystemFields stamp prepend ──
@@ -7012,7 +7051,7 @@ public static class NclCecilRewrite
         // helper (ReplaceBodyWithHelper handles arg-boxing + return-cast), and add
         // every key to CecilOwned so the existing Hook(...) install auto-no-ops.
         //
-        // The *Async no-op targets (VerifySecurityFilters*, MoveLinksAsync,
+        // The *Async no-op targets (VerifySecurityFilters* and
         // UpdateReferencesOnRenameAsync) all return the NON-generic ValueTask and map
         // to HelperShims.ReturnValueTask{2..5} (which return `default` ValueTask) —
         // an exact value-type return match, so no completed-task shim is needed.
@@ -7150,16 +7189,17 @@ public static class NclCecilRewrite
                 PrependStaticCall(nclMod,
                     ByParams(Rt + "TempTableRecordBuffer", "CloneBlobs", "MutableRecordBuffer"),
                     H(blobIsolation, "DetachStoredBlobs"),
-                    argSlots: 1); // `this` — the freshly stored row
+                    argSlots: 1); // `this` — the stored row
 
-                // ── Rowversion stamping (issue #1980) ────────────────────────────────
+                // ── Database system fields on writes (issue #1980) ───────────────────
                 // SQL assigns a rowversion on every insert/update; the SQL stand-in never
                 // did, so NavRecord.HasBeenInserted (== "timestamp field is non-zero") was
                 // false for every stored row and NavForm.SaveRecordAsync always chose
                 // Insert — CurrPage.SaveRecord() in a field OnValidate dup-keyed on rows
-                // reached via GoToRecord. Stamp the record buffer before Insert/Modify run;
-                // the guard inside the helper keeps `temporary` records at timestamp 0,
-                // exactly like real BC. See Patches/RowVersionPatches.cs for the audit.
+                // reached via GoToRecord. The same SQL boundary keeps an existing SystemId
+                // immutable when AL resets its current buffer with Init(). Stamp rowversion
+                // and restore SystemId before Insert/Modify run; the database-backed guard
+                // leaves `temporary` records untouched. See RowVersionPatches.cs.
                 var rowVersion = typeof(AlRunner.Patches.RowVersionPatches);
 
                 PrependStaticCall(nclMod,
@@ -7327,11 +7367,6 @@ public static class NclCecilRewrite
                 ByParams(Rt + "NCLMetaTable", "ComputeReferencingRelations", "NavAppGroup", "NCLMetaTable"),
                 H(recordPatches, "NCLMetaTable_ComputeReferencingRelations"));
 
-            // ── RecordLink.MoveLinksAsync(NavRecord,NavRecord) static → ReturnValueTask2 ──
-            ReplaceBodyWithHelper(nclMod,
-                ByParams(Rt + "RecordLink", "MoveLinksAsync", "NavRecord", "NavRecord"),
-                H(helperShims, "ReturnValueTask2"));
-
             // ── NavManagementTasks.CopyCompany(String,String) instance void → NoOp3 ──
             ReplaceBodyWithHelper(nclMod,
                 ByParams(Rt + "NavManagementTasks", "CopyCompany", "String", "String"),
@@ -7395,6 +7430,15 @@ public static class NclCecilRewrite
                 ByParams(Rt + "RecordImplementation", "InternalFindRecordWithoutCheckingValuesAsync",
                          "DataError", "PrimaryKeyCacheRequest", "Boolean", "Boolean"),
                 H(helperShims, "RecordImpl_InternalFindRecordWithoutCheckingValuesAsync"));
+            // A non-temporary record assignment clones the current result-set enumerator.
+            // When the copy writes through the runner's TempTableDataProvider, the source
+            // record can retain that pre-write row even though a fresh record sees the update.
+            // Track the provider's write generation at the AL write boundary and invalidate
+            // only an equality-find whose record variable has not observed that generation.
+            PrependStaticCall(nclMod,
+                ByParams(Rt + "RecordImplementation", "FindEqualsImpAsync", "DataError", "Boolean"),
+                H(helperShims, "PrepareDatabaseBackedFindEquals"),
+                argSlots: 1);
             ReplaceBodyWithHelper(nclMod,
                 ByParams(Rt + "RecordImplementation", "VerifySecurityFiltersOnRecordAsync",
                          "IRecordBuffer", "FilterFieldDictionary", "Boolean", "Boolean"),
@@ -8049,11 +8093,97 @@ public static class NclCecilRewrite
             + "new Ncl and add a case for the new shape.");
     }
 
+    internal static int RewriteExternalBusinessEventDelivery(TypeDefinition scopeType)
+    {
+        var syncMatches = scopeType.Methods.Where(method =>
+            method.Name == "RunExternalBusinessEvent"
+            && method.Parameters.Count == 0
+            && method.ReturnType.FullName == "System.Void"
+            && method.HasBody).ToArray();
+        var asyncMatches = scopeType.Methods.Where(method =>
+            method.Name == "RunExternalBusinessEventAsync"
+            && method.Parameters.Count == 0
+            && method.ReturnType.FullName == "System.Threading.Tasks.ValueTask"
+            && method.HasBody).ToArray();
+
+        if (syncMatches.Length != 1 || asyncMatches.Length != 1)
+            throw new InvalidOperationException(
+                "[Cecil] expected exactly one RunExternalBusinessEvent() and one "
+                + "RunExternalBusinessEventAsync() on NavExternalBusinessEventMethodScope<T>; "
+                + $"found {syncMatches.Length} sync and {asyncMatches.Length} async. "
+                + "Ncl shape changed; do not commit.");
+
+        var sync = syncMatches[0];
+        sync.Body.Instructions.Clear();
+        sync.Body.Variables.Clear();
+        sync.Body.ExceptionHandlers.Clear();
+        var syncIl = sync.Body.GetILProcessor();
+        syncIl.Append(syncIl.Create(OpCodes.Ret));
+        sync.Body.MaxStackSize = 0;
+
+        var async = asyncMatches[0];
+        async.Body.Instructions.Clear();
+        async.Body.Variables.Clear();
+        async.Body.ExceptionHandlers.Clear();
+        async.Body.InitLocals = true;
+        var completed = new VariableDefinition(async.ReturnType);
+        async.Body.Variables.Add(completed);
+        var il = async.Body.GetILProcessor();
+        il.Append(il.Create(OpCodes.Ldloca_S, completed));
+        il.Append(il.Create(OpCodes.Initobj, async.ReturnType));
+        il.Append(il.Create(OpCodes.Ldloc, completed));
+        il.Append(il.Create(OpCodes.Ret));
+        async.Body.MaxStackSize = 1;
+
+        return 2;
+    }
+
+    internal static void RewriteQuotedOptionEvaluation(ModuleDefinition module)
+    {
+        var evaluator = module.GetType("Microsoft.Dynamics.Nav.Runtime.NavOptionEvaluator")
+            ?? throw new InvalidOperationException(
+                "[Cecil] NavOptionEvaluator not found — Ncl shape changed; do not commit");
+        var matches = evaluator.Methods.Where(method =>
+            method.Name == "InternalEvaluate"
+            && method.HasBody
+            && method.Parameters.Count == 6
+            && method.Parameters[4].ParameterType.FullName == "System.String").ToArray();
+        if (matches.Length != 1)
+            throw new InvalidOperationException(
+                "[Cecil] expected exactly one NavOptionEvaluator.InternalEvaluate with a "
+                + $"string source parameter; found {matches.Length}. Ncl shape changed; do not commit.");
+
+        var method = matches[0];
+        var helper = typeof(AlRunner.BcRuntime).GetMethod(
+            nameof(AlRunner.BcRuntime.NormalizeQuotedOptionValue),
+            BindingFlags.Public | BindingFlags.Static,
+            binder: null,
+            types: [
+                typeof(Microsoft.Dynamics.Nav.Runtime.INavValueMetadata),
+                typeof(string)
+            ],
+            modifiers: null)
+            ?? throw new InvalidOperationException(
+                "BcRuntime.NormalizeQuotedOptionValue not found");
+        var helperRef = module.ImportReference(helper);
+        var il = method.Body.GetILProcessor();
+        var first = method.Body.Instructions[0];
+        var metadata = method.Parameters[3];
+        var source = method.Parameters[4];
+        il.InsertBefore(first, il.Create(OpCodes.Ldarg, metadata));
+        il.InsertBefore(first, il.Create(OpCodes.Ldarg, source));
+        il.InsertBefore(first, il.Create(OpCodes.Call, helperRef));
+        il.InsertBefore(first, il.Create(OpCodes.Starg, source));
+        if (method.Body.MaxStackSize < 2) method.Body.MaxStackSize = 2;
+        Console.Error.WriteLine(
+            "[Cecil] Normalized quoted option tokens before NavOptionEvaluator.InternalEvaluate");
+    }
+
     /// <summary>
     /// Clear <paramref name="target"/>'s body and emit `ldarg.0..N; call BcRuntime.helper; ret`,
     /// forwarding every IL argument (incl. `this` for instance methods) to the static helper.
     /// The helper's return value (if any) is left on the stack as the method result.
-    /// Generalises the inline RecordLink ReplaceWithStaticHelper.
+    /// Generalises the earlier inline static-helper rewrites.
     /// </summary>
     private static void ReplaceBodyWithHelper(
         ModuleDefinition module, MethodDefinition target, string bcRuntimeHelperName)

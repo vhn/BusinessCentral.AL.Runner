@@ -464,13 +464,16 @@ public static partial class RecordPatches
             calcFormula = CalcFormulaFrom(PropValue(props, "CalcFormula"));
 
         // Option-type fields: OptionMembers is the comma-separated list BC's
-        // NCLOptionMetadata constructor expects. Tokens are trimmed; empty entries are kept
+        // NCLOptionMetadata constructor expects. AL quotes members that contain spaces, but
+        // the runtime metadata stores their names without identifier quotes. Split only on
+        // commas outside quoted identifiers, unquote each token, and retain empty entries
         // (BC allows blank members, and #1674 depends on that).
         string? optionMembers = null;
         if (ftype.Equals("Option", StringComparison.OrdinalIgnoreCase)
             && PropValue(props, "OptionMembers") is { } om)
         {
-            optionMembers = string.Join(",", om.ToString().Split(',').Select(s => s.Trim()));
+            optionMembers = string.Join(",",
+                SplitOutsideQuotes(om.ToString(), ',').Select(token => Unquote(token.Trim())));
         }
 
         // InitValue is passed to MetaField.initValue as RAW AL TEXT, quotes and all, because
@@ -481,6 +484,9 @@ public static partial class RecordPatches
 
         bool isAutoIncrement = PropIs(props, "AutoIncrement", "true");
         var caption = CaptionFrom(PropValue(props, "Caption"));
+        var optionCaption = ftype.Equals("Option", StringComparison.OrdinalIgnoreCase)
+            ? CaptionFrom(PropValue(props, "OptionCaption"))
+            : null;
 
         // ObsoleteState / ObsoleteReason (#1780): the Field virtual table (2000000041) reports
         // these via BC's own FieldDataProvider.GetFieldRecordBuffer, which reads them off the
@@ -516,7 +522,8 @@ public static partial class RecordPatches
 
         return new ParsedField(fid, fname, ftype, length, isFlowField, calcFormula,
             optionMembers, initValueText, isAutoIncrement, caption,
-            relationArms, relationValidate, isFlowFilter, obsoleteState, obsoleteReason);
+            relationArms, relationValidate, isFlowFilter, obsoleteState, obsoleteReason,
+            optionCaption);
     }
 
     /// <summary>
@@ -545,7 +552,7 @@ public static partial class RecordPatches
                 return null;
             }
             var conditions = RelationConditionList(node.IfExpression?.IfTableRelationCondition, fieldName);
-            var filters = RelationConditionList(node.TableFilter?.Filter, fieldName);
+            var filters = RelationConditionList(node.TableFilter?.Filter, fieldName, allowFieldLinks: true);
             if (conditions == null || filters == null) return null;
             arms.Add(new ParsedRelationArm(parts[0], parts.Count == 2 ? parts[1] : null,
                 conditions, filters));
@@ -556,16 +563,14 @@ public static partial class RecordPatches
     /// <summary>
     /// The conditions of an <c>if (...)</c> arm, or the entries of a <c>where(...)</c>
     /// filter — the same <c>TableFilterExpressionSyntax</c> node, and the same shapes as a
-    /// CalcFormula's where, so they reuse <see cref="ParsedCalcFilter"/>. Only
-    /// <c>const(...)</c> and <c>filter(...)</c> are carried: they are what
-    /// <c>MetaCondition</c>/<c>MetaFilter</c> hold as evaluable text. A <c>field(...)</c>
-    /// link (and the FlowFilter forms) reads ANOTHER field of the referencing row at
-    /// evaluation time; emitting it as const/filter text would apply a comparison BC never
-    /// wrote, so it refuses the whole relation instead (null) — those shapes remain a
-    /// tracked gap, dropped as loudly as they were silently before #1737.
+    /// CalcFormula's where, so they reuse <see cref="ParsedCalcFilter"/>. Conditional
+    /// <c>if (...)</c> clauses carry <c>const(...)</c> and <c>filter(...)</c>. A relation's
+    /// <c>where(...)</c> clause may also carry <c>field(...)</c>, which is resolved against
+    /// the record declaring the relation at evaluation time. Other shapes refuse the whole
+    /// relation rather than emitting a comparison BC never wrote.
     /// </summary>
     private static List<ParsedCalcFilter>? RelationConditionList(
-        NavSyntax.TableFilterExpressionSyntax? filter, string fieldName)
+        NavSyntax.TableFilterExpressionSyntax? filter, string fieldName, bool allowFieldLinks = false)
     {
         var list = new List<ParsedCalcFilter>();
         if (filter == null) return list;
@@ -573,6 +578,17 @@ public static partial class RecordPatches
         {
             switch (cond)
             {
+                // "Item No." = field("Item No.") in a where(...) clause. The target field
+                // is constrained by a field on the record declaring the relation, exactly
+                // like a CalcFormula FIELD filter. Conditional-relation if(...) clauses do
+                // not accept this shape, so callers must opt in for where(...) only.
+                case NavSyntax.SimpleFieldExpressionSyntax sfe when allowFieldLinks:
+                    list.Add(new ParsedCalcFilter(
+                        Unquote(sfe.LeftHandSide?.ToString()?.Trim() ?? ""),
+                        ParsedCalcFilterKind.Field,
+                        ParentFieldName: Unquote(sfe.Identifier?.ToString()?.Trim() ?? "")));
+                    break;
+
                 // Kind = const(A)
                 case NavSyntax.ConstExpressionSyntax ce:
                     list.Add(new ParsedCalcFilter(
@@ -957,6 +973,26 @@ public static partial class RecordPatches
         }
         return null;
     }
+
+    /// <summary>
+    /// Parses a TableRelation value recovered from a dependency's SymbolReference.json by
+    /// wrapping it in a minimal field declaration and using the same syntax-tree parser as
+    /// source-authored tables.
+    /// </summary>
+    internal static List<ParsedRelationArm>? TryParseTableRelation(string relationText, string fieldName)
+    {
+        if (string.IsNullOrWhiteSpace(relationText)) return null;
+        var wrapped = "table 50000 __TableRelationProbe { fields { field(1; __F; Code[20]) { "
+                    + "TableRelation = " + relationText + "; } } }";
+        foreach (var obj in ParseAlObjects(wrapped))
+        {
+            if (obj is not NavSyntax.TableSyntax table || table.Fields == null) continue;
+            foreach (var f in table.Fields.Fields)
+                if (PropValue(f.PropertyList, "TableRelation") is NavSyntax.TableRelationPropertyValueSyntax relation)
+                    return ParseRelationArms(relation, fieldName);
+        }
+        return null;
+    }
 }
 
 // ─── Data holders ────────────────────────────────────────────────────────────
@@ -1008,8 +1044,8 @@ internal record ParsedCalcFormula(string FormulaType, string SourceTableName, st
 /// <summary>One arm of a field's TableRelation — the plain shape is a single arm with no
 /// conditions. <paramref name="Conditions"/> constrain fields of the REFERENCING table (the
 /// one declaring the relation); <paramref name="Filters"/> (from <c>where(...)</c>) constrain
-/// fields of the related source table. Both reuse the <see cref="ParsedCalcFilter"/> shapes,
-/// restricted to Const/Filter by the parser.</summary>
+/// fields of the related source table. Both reuse the <see cref="ParsedCalcFilter"/> shapes;
+/// conditions support Const/Filter, while filters additionally support Field links.</summary>
 internal record ParsedRelationArm(string TableName, string? FieldName, List<ParsedCalcFilter> Conditions, List<ParsedCalcFilter> Filters);
 
 /// <param name="ObsoleteState">The AL member name as written — "No" (also the default when
@@ -1018,7 +1054,7 @@ internal record ParsedRelationArm(string TableName, string? FieldName, List<Pars
 /// names exactly, so <c>Enum.Parse</c> in BuildMetaField needs no translation table (#1780).</param>
 /// <param name="ObsoleteReason">The declared reason text, unquoted/unescaped, or null when the
 /// field declares no ObsoleteReason (distinct from an explicit empty string).</param>
-internal record ParsedField(int FieldId, string FieldName, string TypeName, int Length, bool IsFlowField = false, ParsedCalcFormula? CalcFormula = null, string? OptionMembers = null, string? InitValueText = null, bool IsAutoIncrement = false, string? Caption = null, List<ParsedRelationArm>? RelationArms = null, bool RelationValidate = true, bool IsFlowFilter = false, string ObsoleteState = "No", string? ObsoleteReason = null);
+internal record ParsedField(int FieldId, string FieldName, string TypeName, int Length, bool IsFlowField = false, ParsedCalcFormula? CalcFormula = null, string? OptionMembers = null, string? InitValueText = null, bool IsAutoIncrement = false, string? Caption = null, List<ParsedRelationArm>? RelationArms = null, bool RelationValidate = true, bool IsFlowFilter = false, string ObsoleteState = "No", string? ObsoleteReason = null, string? OptionCaption = null);
 internal record ParsedKey(string Name, List<int> FieldIds);
 /// <param name="LookupPageName">The table's declared <c>LookupPageId</c> as WRITTEN — a page
 /// name (<c>"Customer List"</c>) or a bare id in text form. Both sources state it by name:

@@ -169,6 +169,15 @@ public static partial class RecordPatches
     }
 
     /// <summary>
+    /// The declared name of a base-page field control, whether the page was compiled from
+    /// source in this run or arrived precompiled in a dependency app.
+    /// </summary>
+    internal static string? TryGetAnyPageControlName(int pageId, int controlId)
+        => TryGetPageMemberName(pageId, controlId, isExtension: false)
+           ?? TryGetDependencyPageSymbol(pageId)?.Controls?
+               .FirstOrDefault(control => control.Id == controlId)?.Name;
+
+    /// <summary>
     /// Whether the page permits inserts (AL's <c>InsertAllowed</c>, default TRUE when the
     /// property is absent). Drives ITestPage.Creatable, which BC's NavTestPageBase.New()
     /// checks before inserting.

@@ -122,7 +122,7 @@ public static partial class RecordPatches
     private static volatile bool _lightReady;
 
     public static bool DataAccess_IsFieldFindRequest(object self, object request)
-        => IsFieldFindRequest(request);
+        => IsFieldFindRequest(request) && IsManagedFieldDataAccess(self);
 
     private static bool IsFieldFindRequest(object request)
     {

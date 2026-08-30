@@ -1,4 +1,5 @@
-// AlCompilerStreamPatches — replacement for ALCompiler.DotNetToNavOutStream.
+// AlCompilerStreamPatches — replacements for ALCompiler.DotNetToNavInStream and
+// ALCompiler.DotNetToNavOutStream.
 //
 // The real body (Ncl.dll, runtime engine — ours to patch) is:
 //
@@ -35,15 +36,82 @@ namespace AlRunner;
 
 public static partial class BcRuntime
 {
-    private static PropertyInfo? _pNavDotNetValue;
+    private static MethodInfo? _mNavInStreamDefault;
     private static MethodInfo? _mNavOutStreamDefault;
     private static ConstructorInfo? _ctorNavStreamProviderFromStream;
+    private static ConstructorInfo? _ctorNavInStream;
     private static ConstructorInfo? _ctorNavOutStream;
     private static ConstructorInfo? _ctorNavNclConversionException;
 
     private static Assembly NclAssembly()
         => AppDomain.CurrentDomain.GetAssemblies()
             .First(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Ncl");
+
+    private static object? GetNavDotNetValue(object obj)
+        => obj.GetType().GetProperty(
+                "Value",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?.GetValue(obj);
+
+    private static object CreateNavStreamProvider(
+        Assembly navNcl,
+        System.IO.Stream stream,
+        object parentOfResult)
+    {
+        var container = ResolveSharedObjectContainer(parentOfResult);
+        if (_ctorNavStreamProviderFromStream == null)
+        {
+            var tProvider = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavStreamProvider")!;
+            var tIContainer = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.ITreeSharedObjectContainer")!;
+            _ctorNavStreamProviderFromStream = tProvider.GetConstructor(
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                null, new[] { typeof(System.IO.Stream), tIContainer }, null)!;
+        }
+        return _ctorNavStreamProviderFromStream.Invoke(new object[] { stream, container });
+    }
+
+    private static Exception NavStreamConversionException(object obj, Type targetType)
+    {
+        if (_ctorNavNclConversionException == null)
+        {
+            var tEx = AppDomain.CurrentDomain.GetAssemblies()
+                .Select(a => a.GetType("Microsoft.Dynamics.Nav.Types.Exceptions.NavNCLConversionException"))
+                .First(t => t != null)!;
+            _ctorNavNclConversionException = tEx.GetConstructor(new[] { typeof(Type), typeof(Type) })!;
+        }
+        return (Exception)_ctorNavNclConversionException.Invoke(new object[] { obj.GetType(), targetType });
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static object ALCompiler_DotNetToNavInStream(object parentOfResult, object? obj)
+    {
+        var navNcl = NclAssembly();
+        var tNavInStream = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavInStream")!;
+        var tITreeObject = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.ITreeObject")!;
+
+        if (obj == null)
+        {
+            _mNavInStreamDefault ??= tNavInStream.GetMethod("Default",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                null, new[] { tITreeObject }, null)!;
+            return _mNavInStreamDefault.Invoke(null, new[] { parentOfResult })!;
+        }
+
+        if (GetNavDotNetValue(obj) is System.IO.Stream stream)
+        {
+            var provider = CreateNavStreamProvider(navNcl, stream, parentOfResult);
+            if (_ctorNavInStream == null)
+            {
+                var tINavStreamProvider = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.INavStreamProvider")!;
+                _ctorNavInStream = tNavInStream.GetConstructor(
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    null, new[] { tITreeObject, tINavStreamProvider }, null)!;
+            }
+            return _ctorNavInStream.Invoke(new[] { parentOfResult, provider })!;
+        }
+
+        throw NavStreamConversionException(obj, tNavInStream);
+    }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static object ALCompiler_DotNetToNavOutStream(object parentOfResult, object? obj)
@@ -60,21 +128,9 @@ public static partial class BcRuntime
             return _mNavOutStreamDefault.Invoke(null, new[] { parentOfResult })!;
         }
 
-        _pNavDotNetValue ??= obj.GetType().GetProperty("Value",
-            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var value = _pNavDotNetValue.GetValue(obj);
-        if (value is System.IO.Stream stream)
+        if (GetNavDotNetValue(obj) is System.IO.Stream stream)
         {
-            var container = ResolveSharedObjectContainer(parentOfResult);
-            if (_ctorNavStreamProviderFromStream == null)
-            {
-                var tProvider = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavStreamProvider")!;
-                var tIContainer = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.ITreeSharedObjectContainer")!;
-                _ctorNavStreamProviderFromStream = tProvider.GetConstructor(
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                    null, new[] { typeof(System.IO.Stream), tIContainer }, null)!;
-            }
-            var provider = _ctorNavStreamProviderFromStream.Invoke(new object[] { stream, container });
+            var provider = CreateNavStreamProvider(navNcl, stream, parentOfResult);
             if (_ctorNavOutStream == null)
             {
                 var tINavStreamProvider = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.INavStreamProvider")!;
@@ -85,15 +141,7 @@ public static partial class BcRuntime
             return _ctorNavOutStream.Invoke(new[] { parentOfResult, provider })!;
         }
 
-        // Faithful to the real body: unsupported inner value → NavNCLConversionException.
-        if (_ctorNavNclConversionException == null)
-        {
-            var tEx = AppDomain.CurrentDomain.GetAssemblies()
-                .Select(a => a.GetType("Microsoft.Dynamics.Nav.Types.Exceptions.NavNCLConversionException"))
-                .First(t => t != null)!;
-            _ctorNavNclConversionException = tEx.GetConstructor(new[] { typeof(Type), typeof(Type) })!;
-        }
-        throw (Exception)_ctorNavNclConversionException.Invoke(new object[] { obj.GetType(), tNavOutStream });
+        throw NavStreamConversionException(obj, tNavOutStream);
     }
 
     // Resolve the ITreeSharedObjectContainer the real body reads from

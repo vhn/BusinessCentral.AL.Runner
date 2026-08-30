@@ -83,6 +83,7 @@ public static class EventSubscriberPatches
     private static readonly Dictionary<TableEventKey, List<MethodInfo>> _byTableEventKey = new();
     private static readonly Dictionary<ObjectEventKey, List<MethodInfo>> _byObjectEventKey = new();
     private static readonly List<ValidateSub> _validateSubs = new();
+    private static ConditionalWeakTable<NCLMetaTable, HashSet<MethodInfo>> _tableSubscriberMethodsByMetaTable = new();
 
     /// <summary>
     /// Look up codeunit-event subscribers registered for a (publisherCodeunitId, eventMethodName).
@@ -412,6 +413,7 @@ public static class EventSubscriberPatches
             _tableTypeCache.Clear();
             _objectEventTypeCache.Clear();
             _injectedSubscriberMethods.Clear();
+            _tableSubscriberMethodsByMetaTable = new();
             _seededScopeTypes.Clear();
             _scannedAssemblies.Clear();
             _lastScannedCount = 0;
@@ -501,77 +503,127 @@ public static class EventSubscriberPatches
                 int publisherId = kv.Key.PublisherId;
                 int ord = kv.Key.EventTypeOrdinal;
 
-                object? metaTable;
-                try { metaTable = getNclMetaTable(publisherId); }
+                NCLMetaTable? metaTable;
+                try { metaTable = getNclMetaTable(publisherId) as NCLMetaTable; }
                 catch { metaTable = null; }
                 if (metaTable == null)
                 {
                     // Publisher table not yet built — will retry on next InjectAll pass.
-                    foreach (var s in kv.Value) if (!_injectedSubscriberMethods.Contains(s.Method)) skipped++;
+                    skipped += kv.Value.Count;
                     continue;
                 }
-
-                object? handler;
-                try { handler = _fTableTriggerEventHandler!.GetValue(metaTable); }
-                catch { handler = null; }
-                if (handler == null)
-                {
-                    foreach (var s in kv.Value) if (!_injectedSubscriberMethods.Contains(s.Method)) skipped++;
-                    continue;
-                }
-
-                var ordEnum = Enum.ToObject(_tNavTriggerEventType!, ord);
-                var createIfNotFound = Enum.ToObject(_tEventScopeGetOption!, 1); // CreateIfNotFound
-                object? scope;
-                try { scope = _miGetEventScope!.Invoke(handler, new object?[] { ordEnum, createIfNotFound }); }
-                catch (Exception ex)
-                {
-                    var inner = ex is TargetInvocationException tie ? tie.InnerException ?? ex : ex;
-                    Console.Error.WriteLine($"[Subscribers] GetEventScope({publisherId},{ord}) failed: " +
-                        $"{inner.GetType().Name}: {inner.Message}");
-                    failed += kv.Value.Count;
-                    continue;
-                }
-                if (scope == null)
-                {
-                    failed += kv.Value.Count;
-                    continue;
-                }
-
-                var existing = (Array?)_fRegisteredSubscriptions!.GetValue(scope);
-                var newOnes = new List<object>();
-                foreach (var sub in kv.Value)
-                {
-                    if (_injectedSubscriberMethods.Contains(sub.Method)) continue;
-                    object? subscription;
-                    try { subscription = BuildSubscription(sub); }
-                    catch (Exception ex)
-                    {
-                        var inner = ex is TargetInvocationException tie ? tie.InnerException ?? ex : ex;
-                        Console.Error.WriteLine($"[Subscribers] BuildSubscription failed for " +
-                            $"{sub.DiagnosticName}: {inner.GetType().Name}: {inner.Message}");
-                        failed++;
-                        _injectedSubscriberMethods.Add(sub.Method); // don't retry
-                        continue;
-                    }
-                    if (subscription == null) { failed++; _injectedSubscriberMethods.Add(sub.Method); continue; }
-                    newOnes.Add(subscription);
-                    _injectedSubscriberMethods.Add(sub.Method);
-                    injected++;
-                }
-                if (newOnes.Count == 0) continue;
-
-                int oldLen = existing?.Length ?? 0;
-                var merged = Array.CreateInstance(_tNavEventSubscription!, oldLen + newOnes.Count);
-                if (existing != null && oldLen > 0) Array.Copy(existing, 0, merged, 0, oldLen);
-                for (int i = 0; i < newOnes.Count; i++) merged.SetValue(newOnes[i], oldLen + i);
-                FieldPoke.SetInstance(_fRegisteredSubscriptions, scope, merged);
+                InjectTableTriggerSubscribersForKey(
+                    metaTable, publisherId, ord, kv.Value, ref injected, ref failed, ref skipped);
             }
         }
 
         if (injected > 0 || failed > 0)
             Console.Error.WriteLine($"[Subscribers] inject: injected={injected} failed={failed} " +
                 $"skipped-no-publisher={skipped} keys={_byKey.Count}");
+    }
+
+    /// <summary>
+    /// Attach implicit Insert/Modify/Delete/Rename subscribers when a publisher table is first
+    /// materialized after the startup injection pass. Precompiled dependency tables are built
+    /// on demand, so limiting lazy injection to field-validation subscribers leaves their
+    /// table-level events permanently unwired.
+    /// </summary>
+    public static void InjectTableTriggerSubsForTable(int tableId, NCLMetaTable metaTable)
+    {
+        if (_reflectionFailed) return;
+        EnsureRegistryFresh();
+        if (_navAppGroupBaseGroup == null) return;
+
+        int injected = 0, failed = 0, skipped = 0;
+        lock (_lock)
+        {
+            foreach (var kv in _byKey)
+            {
+                if (kv.Key.PublisherId != tableId) continue;
+                InjectTableTriggerSubscribersForKey(
+                    metaTable, tableId, kv.Key.EventTypeOrdinal, kv.Value,
+                    ref injected, ref failed, ref skipped);
+            }
+        }
+
+        if (injected > 0 || failed > 0)
+            Console.Error.WriteLine($"[Subscribers] lazy-table-inject: table={tableId} " +
+                $"injected={injected} failed={failed} skipped={skipped}");
+    }
+
+    private static void InjectTableTriggerSubscribersForKey(
+        NCLMetaTable metaTable,
+        int publisherId,
+        int eventTypeOrdinal,
+        IReadOnlyList<SubscriberHandle> subscribers,
+        ref int injected,
+        ref int failed,
+        ref int skipped)
+    {
+        var injectedMethods = _tableSubscriberMethodsByMetaTable.GetValue(
+            metaTable, _ => new HashSet<MethodInfo>());
+        var pending = subscribers.Where(sub => !injectedMethods.Contains(sub.Method)).ToList();
+        if (pending.Count == 0) return;
+
+        object? handler;
+        try { handler = _fTableTriggerEventHandler!.GetValue(metaTable); }
+        catch { handler = null; }
+        if (handler == null)
+        {
+            skipped += pending.Count;
+            return;
+        }
+
+        var ordEnum = Enum.ToObject(_tNavTriggerEventType!, eventTypeOrdinal);
+        var createIfNotFound = Enum.ToObject(_tEventScopeGetOption!, 1);
+        object? scope;
+        try { scope = _miGetEventScope!.Invoke(handler, new object?[] { ordEnum, createIfNotFound }); }
+        catch (Exception ex)
+        {
+            var inner = ex is TargetInvocationException tie ? tie.InnerException ?? ex : ex;
+            Console.Error.WriteLine($"[Subscribers] GetEventScope({publisherId},{eventTypeOrdinal}) failed: " +
+                $"{inner.GetType().Name}: {inner.Message}");
+            failed += pending.Count;
+            return;
+        }
+        if (scope == null)
+        {
+            failed += pending.Count;
+            return;
+        }
+
+        var existing = (Array?)_fRegisteredSubscriptions!.GetValue(scope);
+        var newOnes = new List<object>();
+        foreach (var sub in pending)
+        {
+            object? subscription;
+            try { subscription = BuildSubscription(sub); }
+            catch (Exception ex)
+            {
+                var inner = ex is TargetInvocationException tie ? tie.InnerException ?? ex : ex;
+                Console.Error.WriteLine($"[Subscribers] BuildSubscription failed for " +
+                    $"{sub.DiagnosticName}: {inner.GetType().Name}: {inner.Message}");
+                failed++;
+                injectedMethods.Add(sub.Method);
+                continue;
+            }
+            if (subscription == null)
+            {
+                failed++;
+                injectedMethods.Add(sub.Method);
+                continue;
+            }
+            newOnes.Add(subscription);
+            injectedMethods.Add(sub.Method);
+            injected++;
+        }
+        if (newOnes.Count == 0) return;
+
+        int oldLen = existing?.Length ?? 0;
+        var merged = Array.CreateInstance(_tNavEventSubscription!, oldLen + newOnes.Count);
+        if (existing != null && oldLen > 0) Array.Copy(existing, 0, merged, 0, oldLen);
+        for (int i = 0; i < newOnes.Count; i++) merged.SetValue(newOnes[i], oldLen + i);
+        FieldPoke.SetInstance(_fRegisteredSubscriptions, scope, merged);
     }
 
     /// <summary>

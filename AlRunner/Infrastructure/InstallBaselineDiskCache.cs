@@ -3,9 +3,11 @@
 // this removes it across processes, which is where the remaining cost lives (every CI test
 // spawn, every corpus/runner-extras invocation, every --watch rebuild pays the same 5.9s).
 //
-// Layout: <cache-root>/install-baseline/<sha256-of-key>.bin, written atomically (temp file in
-// the same directory + File.Move(overwrite)) because CI runs four runner processes in
-// parallel and they all key on the same MS-platform dependency closure.
+// Layout: <cache-root>/install-baseline/<sha256-of-key>.bin. CI runs four runner processes in
+// parallel and they can all miss the same MS-platform dependency closure. Fresh computations
+// are state-equivalent but not byte-identical (BC seeds fresh SystemId/timestamp values), so a
+// per-key file lock makes the first complete writer win instead of letting later writers replace
+// a valid snapshot with a different one.
 //
 // The KEY is everything the snapshot's content depends on:
 //   * the dependency assembly set, by Module Version ID (InstallTriggerRunner
@@ -55,6 +57,23 @@ internal static class InstallBaselineDiskCache
     internal static string PathForKey(string keyText)
         => Path.Combine(CacheRoots.Resolve(CacheName), HashKey(keyText) + ".bin");
 
+    private static FileStream AcquireEntryLock(string path)
+    {
+        var lockPath = path + ".lock";
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (true)
+        {
+            try
+            {
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException) when (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(10);
+            }
+        }
+    }
+
     /// <summary>Read the raw bytes for a key, or null when there is no usable entry. Deletes an
     /// entry it could not read so the next run rewrites it instead of failing again.</summary>
     internal static byte[]? TryRead(string keyText)
@@ -67,33 +86,56 @@ internal static class InstallBaselineDiskCache
         Console.Error.WriteLine($"[InstallBaselineDisk] entry path: {path}");
         try
         {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            using var entryLock = AcquireEntryLock(path);
             if (!File.Exists(path)) return null;
-            return File.ReadAllBytes(path);
+            try
+            {
+                return File.ReadAllBytes(path);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[InstallBaselineDisk] unreadable entry {path}: {ex.GetType().Name}: {ex.Message}");
+                try { File.Delete(path); } catch { /* best effort; the caller will recompute */ }
+                return null;
+            }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[InstallBaselineDisk] unreadable entry {path}: {ex.GetType().Name}: {ex.Message}");
-            Delete(keyText);
             return null;
         }
     }
 
     /// <summary>Delete the entry for a key. Used when the bytes are present but do not decode —
-    /// a corrupt or truncated file (a process killed mid-write on a filesystem without atomic
-    /// rename, say) must not make every subsequent run pay the decode failure.</summary>
-    internal static void Delete(string keyText)
+    /// a corrupt or truncated file must not make every subsequent run pay the decode failure.
+    /// The comparison is load-bearing: another process may have replaced the bad bytes with a
+    /// valid first-writer snapshot after this process read them.</summary>
+    internal static void Delete(string keyText, byte[] expectedPayload)
     {
-        try { File.Delete(PathForKey(keyText)); }
+        var path = PathForKey(keyText);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            using var entryLock = AcquireEntryLock(path);
+            if (!File.Exists(path)) return;
+            if (!File.ReadAllBytes(path).AsSpan().SequenceEqual(expectedPayload))
+            {
+                Console.Error.WriteLine($"[InstallBaselineDisk] not deleting {path}: entry changed after it was read");
+                return;
+            }
+            File.Delete(path);
+        }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[InstallBaselineDisk] could not delete stale entry: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
-    /// <summary>Write the entry atomically. A temp file in the SAME directory keeps the rename
-    /// on one filesystem, and File.Move(overwrite: true) is the atomic replace — so a reader in
-    /// a parallel CI process sees either the previous complete file or the new complete file,
-    /// never a half-written one.</summary>
+    /// <summary>Write the entry atomically when it is still absent. A temp file in the SAME
+    /// directory keeps the rename on one filesystem. The per-key lock makes the first complete
+    /// writer win, so every later reader observes one stable snapshot rather than whichever
+    /// state-equivalent but byte-different computation happened to finish last.</summary>
     internal static bool TryWrite(string keyText, byte[] payload)
     {
         var path = PathForKey(keyText);
@@ -102,8 +144,14 @@ internal static class InstallBaselineDiskCache
         try
         {
             Directory.CreateDirectory(dir);
+            using var entryLock = AcquireEntryLock(path);
+            if (File.Exists(path))
+            {
+                Console.Error.WriteLine($"[InstallBaselineDisk] keeping existing entry at {path}; another process published this key first");
+                return false;
+            }
             File.WriteAllBytes(tmp, payload);
-            File.Move(tmp, path, overwrite: true);
+            File.Move(tmp, path);
             Console.Error.WriteLine($"[InstallBaselineDisk] wrote {payload.Length} byte(s) to {path}");
             return true;
         }

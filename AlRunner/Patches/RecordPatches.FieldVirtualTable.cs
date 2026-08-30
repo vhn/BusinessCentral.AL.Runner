@@ -76,6 +76,19 @@ public static partial class RecordPatches
     // so repeated accesses only top up newly-built tables (idempotent, no dup rows).
     private static readonly ConditionalWeakTable<object, ConcurrentDictionary<int, byte>> _fvtPopulatedByProvider = new();
 
+    // A regular virtual Field record and `Record "Field" temporary` have the same table id
+    // and both use TempTableDataProvider in the runner. Mark only the DataAccess created for
+    // the virtual-table facade so the managed find bypass never populates a caller-owned
+    // temporary Field buffer.
+    private sealed class ManagedFieldDataAccessMarker { }
+    private static readonly ConditionalWeakTable<object, ManagedFieldDataAccessMarker> _managedFieldDataAccesses = new();
+
+    private static void MarkManagedFieldDataAccess(object dataAccess)
+        => _managedFieldDataAccesses.GetValue(dataAccess, static _ => new ManagedFieldDataAccessMarker());
+
+    private static bool IsManagedFieldDataAccess(object dataAccess)
+        => _managedFieldDataAccesses.TryGetValue(dataAccess, out _);
+
     /// <summary>
     /// True if <paramref name="table"/> is the virtual Field system table (2000000041).
     /// </summary>

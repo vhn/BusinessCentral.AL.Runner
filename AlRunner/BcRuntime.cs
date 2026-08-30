@@ -81,6 +81,8 @@ public static partial class BcRuntime
     private static FieldInfo? _fRecordImplementationMetaTable;          // RecordImplementation.metaTable
     private static FieldInfo? _fRecordImplementationMutableRecordBuffer; // RecordImplementation.mutableRecordBuffer
     private static MethodInfo? _mDataAccessTryGetByPrimaryKeyAsync;
+    private static MethodInfo? _mRecordImplementationInvalidateCurrentResultSetEnumerator;
+    private static MethodInfo? _mRecordImplementationCalcAutoCalcFieldsAsync;
     private static PropertyInfo? _pMrbResultResult;     // MutableRecordBufferResult<bool>.Result
     private static PropertyInfo? _pMrbResultRecordBuffer;
 
@@ -116,6 +118,81 @@ public static partial class BcRuntime
 
     public static (Guid AppId, string Name, string Publisher, string Version) GetCurrentModuleAppInfo()
         => _currentBundleInfo;
+
+    /// <summary>
+    /// NCL's filter parser preserves AL identifier quotes around an option token, while
+    /// runtime option metadata stores the member name without them. Normalize only that
+    /// already-isolated token; operators remain the filter parser's responsibility.
+    /// </summary>
+    public static string NormalizeQuotedOptionValue(
+        Microsoft.Dynamics.Nav.Runtime.INavValueMetadata metadata,
+        string source)
+    {
+        var optionMetadata = metadata.NavOptionMetadata;
+        return NormalizeQuotedOptionValueForMetadata(
+            source,
+            optionMetadata?.OptionString ?? string.Empty,
+            optionMetadata?.OptionString?.Split(',') ?? [],
+            optionMetadata?.IsEnum ?? false,
+            optionMetadata?.OptionCaption?.Split(',') ?? []);
+    }
+
+    internal static string NormalizeQuotedOptionValueForMetadata(
+        string source,
+        string optionString)
+        => NormalizeQuotedOptionValueForMetadata(
+            source,
+            optionString,
+            optionString.Split(','),
+            isEnum: false);
+
+    internal static string NormalizeQuotedOptionValueForMetadata(
+        string source,
+        string optionString,
+        IReadOnlyList<string> optionNames,
+        bool isEnum,
+        IReadOnlyList<string>? optionCaptions = null)
+    {
+        string normalized;
+        if (source.Length == 0)
+            normalized = string.Empty;
+        else if (source.Length >= 2 && source[0] == '"' && source[^1] == '"')
+            normalized = source[1..^1].Replace("\"\"", "\"");
+        else if (source.Length >= 2 && source[0] == '\'' && source[^1] == '\'')
+            normalized = source[1..^1].Replace("''", "'");
+        else
+            normalized = source;
+
+        var members = optionString.Split(',');
+        if (normalized.Length == 0)
+        {
+            // AL spells the unnamed enum value as value(0; " "), while a filter literal
+            // for that value is ''. NCL's OptionString can expose its empty caption rather
+            // than the member name; NavOptionEvaluator still requires the single space.
+            if (isEnum
+                && (optionNames.Contains(" ", StringComparer.Ordinal)
+                    || members.Contains(" ", StringComparer.Ordinal)
+                    || members.Contains(string.Empty, StringComparer.Ordinal)))
+                return " ";
+            if (members.Contains(string.Empty, StringComparer.Ordinal))
+                return string.Empty;
+            if (members.Contains(" ", StringComparer.Ordinal))
+                return " ";
+            return string.Empty;
+        }
+
+        var canonicalNames = optionNames.Count == 0 ? members : optionNames;
+        foreach (var member in canonicalNames)
+            if (string.Equals(member, normalized, StringComparison.OrdinalIgnoreCase))
+                return member;
+
+        if (optionCaptions?.Count == canonicalNames.Count)
+            for (var index = 0; index < optionCaptions.Count; index++)
+                if (string.Equals(optionCaptions[index], normalized, StringComparison.OrdinalIgnoreCase))
+                    return canonicalNames[index];
+
+        return normalized;
+    }
 
     /// <summary>
     /// Module info of the app whose emitted assembly is <paramref name="asm"/> —
@@ -517,6 +594,7 @@ public static partial class BcRuntime
     public static void ResetForNewBundleReload(bool preserveEmitCaptures = false)
     {
         _currentTestAssembly = null;
+        ClearSkeletonApplicationAreaBaseline();
         // AL-output type caches that live on this partial class (CodeunitPatches,
         // XmlPortPatches). Their finders already prefer CurrentTestAssembly; the
         // caches just need dropping so the rebuild re-resolves against the new asm.
@@ -900,6 +978,7 @@ public static partial class BcRuntime
         if (aoType != null && sessType != null)
         {
             _skeletonSession = RuntimeHelpers.GetUninitializedObject(sessType);
+            SeedSkeletonApplicationAreaCache(sessType, _skeletonSession);
             // GetUninitializedObject leaves cultureSettings = default(ClientSettings) — a
             // struct whose every pattern string is null. Because it is a struct, BC's own
             // "no session → use the default" fallback can never fire (see

@@ -70,18 +70,7 @@ public static partial class BcRuntime
         Microsoft.Dynamics.Nav.Runtime.NavCodeunit self,
         Microsoft.Dynamics.Nav.Types.DataError errorLevel,
         Microsoft.Dynamics.Nav.Runtime.NavRecord? record)
-    {
-        try
-        {
-            InvokeOnRun(self, record);
-            return new System.Threading.Tasks.ValueTask<bool>(true);
-        }
-        catch (TargetInvocationException tie) when (tie.InnerException != null)
-        {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(tie.InnerException);
-            return default;
-        }
-    }
+        => new(RunCodeunitInTransaction(self, errorLevel, record));
 
     /// <summary>
     /// Replacement for NavCodeunit.RunCodeunit(DataError, int, NavRecord).
@@ -95,18 +84,48 @@ public static partial class BcRuntime
         int objectId,
         Microsoft.Dynamics.Nav.Runtime.NavRecord? record)
     {
+        var handle = CreateCodeunitHandle(objectId);
+        var target = NavCodeunitHandle_CreateTarget(handle);
+        return RunCodeunitInTransaction(target, errorLevel, record);
+    }
+
+    private static bool RunCodeunitInTransaction(
+        Microsoft.Dynamics.Nav.Runtime.NavCodeunit target,
+        Microsoft.Dynamics.Nav.Types.DataError errorLevel,
+        Microsoft.Dynamics.Nav.Runtime.NavRecord? record)
+    {
         bool trap = errorLevel == Microsoft.Dynamics.Nav.Types.DataError.TrapError;
+        Microsoft.Dynamics.Nav.Runtime.RecordState? recordState = null;
+        bool result = false;
+
+        ALDatabasePatches.BeginCodeunitRunTransaction();
+        if (trap && record != null)
+        {
+            recordState = record.CreateRecordState();
+            recordState.BackupTableAndRecordHandle();
+        }
+
         try
         {
-            var handle = CreateCodeunitHandle(objectId);
-            var target = NavCodeunitHandle_CreateTarget(handle);
-            InvokeOnRun(target, record);
-            return true;
+            try
+            {
+                InvokeOnRun(target, record);
+                result = true;
+            }
+            catch (Microsoft.Dynamics.Nav.Types.Exceptions.NavBaseException ex) when (trap)
+            {
+                // A trapped Codeunit.Run restores both the supplied record handle and all
+                // table writes made by the failed codeunit before returning false.
+                recordState?.RestoreRecord();
+                StoreLastExceptionOnSkeletonSession(ex);
+            }
+
+            return result;
         }
-        catch when (trap)
+        finally
         {
-            // TrapError contract for Codeunit.Run(...): swallow and return false.
-            return false;
+            recordState?.Dispose();
+            ALDatabasePatches.EndCodeunitRunTransaction(result);
         }
     }
 
@@ -212,7 +231,7 @@ public static partial class BcRuntime
                 t.GetAwaiter().GetResult();
                 return;
             case System.Threading.Tasks.ValueTask vt:
-                vt.GetAwaiter().GetResult();
+                vt.AsTask().GetAwaiter().GetResult();
                 return;
             default:
                 var rt = result.GetType();
@@ -395,19 +414,30 @@ public static partial class BcRuntime
 
         // BC's own body returns null when the page's SourceObject.SourceTable is 0 — a page
         // without a source table is legal AL, and PrimaryKeyFields then reads as empty.
-        // Mirror that, but ONLY for a page we actually parsed: answering null for a page the
-        // parser never saw would turn a runner gap into a silently empty primary key.
-        if (!RecordPatches.IsPageParsed(pageId))
+        // Mirror that only when either AL source or a dependency's SymbolReference describes
+        // the page; an entirely unknown page must still fail loudly.
+        int tableId;
+        if (RecordPatches.IsPageParsed(pageId))
+        {
+            if (!RecordPatches.PageDeclaresSourceTable(pageId))
+                return null!;
+
+            tableId = RecordPatches.GetSourceTableIdForPage(pageId);
+            if (tableId == 0)
+                throw new InvalidOperationException($"TestPage {pageId} has no parsed SourceTable.");
+        }
+        else if (RecordPatches.HasDependencyPageMetadata(pageId))
+        {
+            tableId = RecordPatches.TryGetDependencySourceTableIdForPage(pageId);
+            if (tableId == 0)
+                return null!;
+        }
+        else
+        {
             throw new InvalidOperationException(
-                $"TestPage {pageId} was never parsed from AL source — cannot resolve its " +
+                $"TestPage {pageId} is absent from AL source and dependency metadata — cannot resolve its " +
                 $"SourceTable, and guessing would silently yield an empty primary key.");
-
-        if (!RecordPatches.PageDeclaresSourceTable(pageId))
-            return null!;
-
-        var tableId = RecordPatches.GetSourceTableIdForPage(pageId);
-        if (tableId == 0)
-            throw new InvalidOperationException($"TestPage {pageId} has no parsed SourceTable.");
+        }
 
         return RecordPatches.GetOrBuildNCLMetaTable(tableId)
             ?? throw new InvalidOperationException($"TestPage {pageId} SourceTable {tableId} has no NCLMetaTable.");

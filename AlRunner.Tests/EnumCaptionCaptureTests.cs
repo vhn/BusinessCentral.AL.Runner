@@ -123,4 +123,41 @@ public sealed class EnumCaptionCaptureTests : IDisposable
             entry.Implementations, entry.Captions);
         Assert.Equal("Beta Caption", meta.GetCaptionFromIndex(entry.Indexes[idxB]));
     }
+
+    [SkippableFact]
+    public void CaptureOutputter_EnumValueWithoutOverride_UsesDefaultImplementation()
+    {
+        TestArtifacts.SkipIf(!_engine.Ready,
+            _engine.SkipReason ?? "the in-process BC engine is not ready (see BcEngineCollection).");
+
+        File.WriteAllText(Path.Combine(_root, "DefaultImplementation.al"), """
+            interface "EnumDefaultImpl Contract"
+            {
+                procedure Execute();
+            }
+
+            codeunit 90203 "EnumDefaultImpl Handler" implements "EnumDefaultImpl Contract"
+            {
+                procedure Execute()
+                begin
+                end;
+            }
+
+            enum 90204 "EnumDefaultImpl Kind" implements "EnumDefaultImpl Contract"
+            {
+                DefaultImplementation = "EnumDefaultImpl Contract" = "EnumDefaultImpl Handler";
+
+                value(0; Default)
+                {
+                }
+            }
+            """);
+
+        var output = new BcCompiler().Emit(new[] { _root }, "EnumDefaultImplModule");
+        Assert.True(output.Sources.Count > 0,
+            $"Expected the enum to emit; diagnostics: {string.Join(" | ", output.Diagnostics.Take(10))}");
+        Assert.True(AlEnumMetadataRegistry.TryGet(90204, out var entry));
+
+        Assert.Equal(new[] { 90203 }, Assert.Single(entry.Implementations));
+    }
 }

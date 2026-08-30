@@ -169,6 +169,7 @@ public static partial class BcRuntime
         // Wire field OnValidate/OnLookup handlers + field-validate subscribers onto this table's
         // metatable (lazy wiring for on-demand-built tables — e.g. a precompiled BaseApp table).
         RecordPatches.WireFieldTriggerHandlersForTable(tableNo, metaTable);
+        AlRunner.Patches.EventSubscriberPatches.InjectTableTriggerSubsForTable(tableNo, metaTable);
         AlRunner.Patches.EventSubscriberPatches.InjectValidateSubsForTable(tableNo, metaTable);
         // SharedRecordRef.Record is a non-public-accessor property on the headless
         // build, so include NonPublic in the lookup (Public-only returns null → NRE).
@@ -225,106 +226,6 @@ public static partial class BcRuntime
         var shared = ctor.Invoke(new[] { _skeletonSharedObjectContainer });
         _mTreeSetReferenceTarget?.Invoke(tree, new[] { shared });
         return shared;
-    }
-
-    // RecordLink — in-memory link store keyed by RuntimeHelpers.GetHashCode(NavRecord).
-    // Real impl writes to table 2000000068 (Record Link) which the runner has no SQL
-    // backend for. Cecil rewrites RecordLink.{AddLinkAsync, HasLinks, DeleteLinksAsync,
-    // DeleteLinkAsync, CopyLinksAsync, MoveLinksAsync, TableHasLinks} to the helpers
-    // below. Both `Rec.AddLink(...)` and `RecRef.AddLink(...)` funnel through this one
-    // store, so it must satisfy both AL surfaces — do not add a second one.
-    //
-    // Links carry an ID because that is BC's contract: AddLink returns the "Link ID"
-    // primary key of the Record Link row it created (strictly positive — it is an
-    // AutoIncrement field), and DeleteLink(ID) addresses that row. Returning 0 and
-    // no-oping DeleteLink was a silent fake that made Rec.DeleteLink(Id) do nothing.
-    private readonly record struct LinkEntry(int Id, string Url, string Description);
-
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, System.Collections.Generic.List<LinkEntry>> _recordLinks = new();
-
-    /// <summary>Next Record Link "Link ID". Starts at 1: BC's AutoIncrement key is
-    /// strictly positive, and AL code tests <c>LinkId &gt; 0</c> for success.</summary>
-    private static int _nextLinkId;
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static System.Threading.Tasks.ValueTask<int> RecordLink_AddLinkAsync(object record, string url, string description)
-    {
-        if (record == null) throw new ArgumentNullException(nameof(record));
-        if (url == null) throw new ArgumentNullException(nameof(url));
-        if (description == null) throw new ArgumentNullException(nameof(description));
-        if (url.Length > 2048) throw new ArgumentException("RecordLink URL above max size");
-        var key = RuntimeHelpers.GetHashCode(record);
-        var list = _recordLinks.GetOrAdd(key, _ => new System.Collections.Generic.List<LinkEntry>());
-        var id = System.Threading.Interlocked.Increment(ref _nextLinkId);
-        lock (list) list.Add(new LinkEntry(id, url, description));
-        return new System.Threading.Tasks.ValueTask<int>(id);
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static bool RecordLink_HasLinks(object record)
-    {
-        if (record == null) throw new ArgumentNullException(nameof(record));
-        return _recordLinks.TryGetValue(RuntimeHelpers.GetHashCode(record), out var list) && list.Count > 0;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static System.Threading.Tasks.ValueTask RecordLink_DeleteLinksAsync(object record)
-    {
-        if (record == null) throw new ArgumentNullException(nameof(record));
-        _recordLinks.TryRemove(RuntimeHelpers.GetHashCode(record), out _);
-        return System.Threading.Tasks.ValueTask.CompletedTask;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static System.Threading.Tasks.ValueTask RecordLink_DeleteLinkAsync(object record, int linkId)
-    {
-        if (record == null) throw new ArgumentNullException(nameof(record));
-        if (_recordLinks.TryGetValue(RuntimeHelpers.GetHashCode(record), out var list))
-        {
-            lock (list)
-            {
-                list.RemoveAll(e => e.Id == linkId);
-                if (list.Count == 0) _recordLinks.TryRemove(RuntimeHelpers.GetHashCode(record), out _);
-            }
-        }
-        // BC's DeleteLink on a non-existent Link ID is a no-op, not an error.
-        return System.Threading.Tasks.ValueTask.CompletedTask;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static System.Threading.Tasks.ValueTask RecordLink_CopyLinksAsync(object src, object dst)
-    {
-        if (src == null || dst == null) return System.Threading.Tasks.ValueTask.CompletedTask;
-        if (_recordLinks.TryGetValue(RuntimeHelpers.GetHashCode(src), out var srcList))
-        {
-            var dstList = _recordLinks.GetOrAdd(RuntimeHelpers.GetHashCode(dst), _ => new System.Collections.Generic.List<LinkEntry>());
-            // Copy creates NEW Record Link rows, so each copy gets a fresh Link ID —
-            // unlike MoveLinks below, which relocates the existing rows and keeps theirs.
-            lock (srcList)
-            {
-                var snapshot = srcList.ToArray(); // src may == dst
-                lock (dstList)
-                    foreach (var e in snapshot)
-                        dstList.Add(e with { Id = System.Threading.Interlocked.Increment(ref _nextLinkId) });
-            }
-        }
-        return System.Threading.Tasks.ValueTask.CompletedTask;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static System.Threading.Tasks.ValueTask RecordLink_MoveLinksAsync(object src, object dst)
-    {
-        if (src == null || dst == null) return System.Threading.Tasks.ValueTask.CompletedTask;
-        if (_recordLinks.TryRemove(RuntimeHelpers.GetHashCode(src), out var list))
-            _recordLinks[RuntimeHelpers.GetHashCode(dst)] = list;
-        return System.Threading.Tasks.ValueTask.CompletedTask;
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static bool RecordLink_TableHasLinks(object parentTree, object table, string companyName)
-    {
-        // Conservative: only true if any record from any table has a link in our store.
-        return _recordLinks.Count > 0;
     }
 
     // NavValue.CreateNavValueFromObject lacks a switch case for NavNclType.NavALErrorType

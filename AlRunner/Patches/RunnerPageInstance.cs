@@ -552,9 +552,36 @@ internal sealed class RunnerPageInstance
     /// </summary>
     internal void RaiseOnValidate(int controlId)
     {
-        var trigger = FindTrigger(controlId, "_OnValidate", "OnValidate");
+        foreach (var trigger in FindModifiedControlTriggers(controlId, "_OnBeforeValidate"))
+            Invoke(trigger);
+
+        var baseTrigger = FindTrigger(controlId, "_OnValidate", "OnValidate");
         // A control with no OnValidate simply has no such method, which is not an error.
-        if (trigger != null) Invoke(trigger.Value);
+        if (baseTrigger != null) Invoke(baseTrigger.Value);
+
+        foreach (var extensionTrigger in FindModifiedControlTriggers(controlId, "_OnAfterValidate"))
+            Invoke(extensionTrigger);
+    }
+
+    /// <summary>
+    /// Validation triggers declared by a pageextension's <c>modify(Control)</c> block. The
+    /// trigger method lives on the extension type, but the control id remains in the base
+    /// page's id space; extension-added controls use the ordinary <see cref="FindTrigger"/>
+    /// path instead.
+    /// </summary>
+    private List<TriggerMatch> FindModifiedControlTriggers(int controlId, string suffix)
+    {
+        var matches = new List<TriggerMatch>();
+        var declaredName = RecordPatches.TryGetAnyPageControlName(_pageId, controlId);
+        foreach (var extensionId in RecordPatches.GetPageExtensionIdsForPage(_pageId))
+        {
+            var instance = GetOrCreateExtensionInstance(extensionId);
+            if (instance == null) continue;
+            var match = FindTriggerOnTarget(
+                instance, _pageId, controlId, suffix, "OnValidate", arity: 0, declaredName);
+            if (match != null) matches.Add(match.Value);
+        }
+        return matches;
     }
 
     /// <summary>
@@ -825,12 +852,21 @@ internal sealed class RunnerPageInstance
             binder: null, types: new[] { typeof(bool) }, modifiers: null);
         if (newRecord == null) return false;
 
+        // NavForm consults metadata to decide whether NewRecord should dispatch OnNewRecord.
+        // Source-compiled pages have the real CLR override, but the skeleton metadata can still
+        // report that the trigger is unused. In that one shape BC performs the initialization
+        // and filter work below but skips the override, so dispatch it explicitly afterwards.
+        var triggerReportedUnused = FindNavFormMethod("IsOnNewRecordUsed", Type.EmptyTypes) is { } used
+            && used.Invoke(_form, Array.Empty<object>()) is false;
+
         try { newRecord.Invoke(_form, new object[] { belowXRec }); }
         catch (TargetInvocationException tie) when (tie.InnerException != null)
         {
             // OnNewRecord runs inside this call; an Error() it raises is the test's result.
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
         }
+        if (triggerReportedUnused)
+            RaiseOnNewRecord(belowXRec);
         return true;
     }
 

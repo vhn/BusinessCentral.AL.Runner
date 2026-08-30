@@ -54,6 +54,53 @@ public static partial class RecordPatches
     // Negative cache: tableIds we've already tried and not found.
     private static readonly HashSet<int> _bcMissCache = new();
 
+    // A source table referenced by a CalcFormula can be unavailable when the parent
+    // NCLMetaTable is first built: RecordPatches.Register runs before Program registers the
+    // resolved dependency .app paths. Keep only those parent ids so Program can refresh the
+    // frozen EmptyFormula instances once the complete dependency symbol set is available.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte>
+        _tablesWithUnresolvedCalcFormulas = new();
+
+    private static void MarkUnresolvedCalcFormula(int parentTableId)
+        => _tablesWithUnresolvedCalcFormulas.TryAdd(parentTableId, 0);
+
+    internal static void RefreshUnresolvedCalcFormulaTables()
+    {
+        var tableIds = _tablesWithUnresolvedCalcFormulas.Keys.ToArray();
+        if (tableIds.Length == 0)
+            return;
+
+        foreach (var tableId in tableIds)
+        {
+            _tablesWithUnresolvedCalcFormulas.TryRemove(tableId, out _);
+            _metaTableCache.TryRemove(tableId, out _);
+            RemoveTableFromSkeletonMetadataCache(tableId);
+        }
+
+        PopulateNclMetadataCache();
+    }
+
+    private static void RemoveTableFromSkeletonMetadataCache(int tableId)
+    {
+        var skeleton = BcRuntime.SkeletonNCLMetadata;
+        if (skeleton == null)
+            return;
+
+        EnsureCachePopulatorReflection();
+        if (_fNCLMetadataCacheEntries == null)
+            throw new InvalidOperationException(
+                "Cannot refresh unresolved CalcFormula metadata: NCLMetadata cache entries are unavailable.");
+
+        var entries = _fNCLMetadataCacheEntries.GetValue(skeleton) as Array;
+        const int objectTypeTable = 1;
+        if (entries == null || entries.Length <= objectTypeTable
+            || entries.GetValue(objectTypeTable) is not System.Collections.IDictionary tables)
+            throw new InvalidOperationException(
+                "Cannot refresh unresolved CalcFormula metadata: the NCLMetadata table cache has an unexpected shape.");
+
+        tables.Remove(tableId);
+    }
+
     /// <summary>
     /// Register a BC dependency .app path so its AL table sources can be used
     /// as a fallback when a test's own src/ doesn't define a referenced table.

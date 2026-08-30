@@ -38,6 +38,7 @@ public static partial class RecordPatches
     private static Type? _tJoinExecutor;
     private static Type? _tJoinContext;
     private static MethodInfo? _mExecute;
+    private static MethodInfo? _mFinalize;
     private static MethodInfo? _mIsMultiDataItem;
     private static object? _joinCtx;
     private static readonly object _joinLoadLock = new();
@@ -57,6 +58,7 @@ public static partial class RecordPatches
             _tJoinContext = _joinAsm.GetType("AlRunner.QueryJoin.JoinContext", throwOnError: true)!;
             _mIsMultiDataItem = _tJoinExecutor.GetMethod("IsMultiDataItem", BindingFlags.Public | BindingFlags.Static)!;
             _mExecute = _tJoinExecutor.GetMethod("Execute", BindingFlags.Public | BindingFlags.Static)!;
+            _mFinalize = _tJoinExecutor.GetMethod("Finalize", BindingFlags.Public | BindingFlags.Static)!;
             _joinCtx = BuildJoinContext();
         }
     }
@@ -186,6 +188,21 @@ public static partial class RecordPatches
         catch (TargetInvocationException tie) when (tie.InnerException != null)
         {
             throw tie.InnerException; // surface the executor's real exception (e.g. OOS)
+        }
+    }
+
+    private static IEnumerable FinalizeQueryRows(object nclMetaQuery, IEnumerable rows)
+    {
+        EnsureJoinExecutorLoaded();
+        try
+        {
+            return (IEnumerable)_mFinalize!.Invoke(
+                null,
+                new object[] { _joinCtx!, nclMetaQuery, rows })!;
+        }
+        catch (TargetInvocationException tie) when (tie.InnerException != null)
+        {
+            throw tie.InnerException;
         }
     }
 

@@ -1,6 +1,5 @@
-// RowVersionPatches — assign a rowversion ("timestamp", field 0) to every row written
-// through a DATABASE-BACKED TempTableDataProvider, the way SQL Server does on every
-// insert and update.
+// RowVersionPatches — provide SQL-owned system-field behavior for rows written through
+// a DATABASE-BACKED TempTableDataProvider.
 //
 // ── The gap this closes (issue #1980) ────────────────────────────────────────
 //
@@ -46,6 +45,20 @@
 // Ncl contains no record-changed check for this provider), so a record holding an
 // older stamp than the store never trips anything.
 //
+// The Modify prepend also restores SystemId from the buffer's original row before
+// the provider stores it. SQL owns that system field: AL may reset the current value
+// with Init(), but Modify cannot replace an existing row's SystemId. The in-memory
+// provider otherwise writes the reset value into its tree, making GetBySystemId lose
+// the row even though the primary key is unchanged.
+//
+// The Insert prepend enforces SystemId uniqueness for database-backed records. NCL's
+// TempTableDataProvider intentionally excludes its synthetic SystemId key from the
+// provider's generic unique-index dictionary because ordinary temporary records may
+// repeat an empty SystemId. The runner also uses that provider as its SQL stand-in, where
+// accepting the same explicit SystemId twice is observably wrong. Scanning the provider's
+// live primary tree keeps delete and transaction-rollback behavior correct without a
+// second state store that could drift from the rows.
+//
 // ── Loud-failures audit (issue #1986) ─────────────────────────────────────────
 //
 // The five reflection lookups below (MetaTable, TimestampField, FieldIndex, the
@@ -67,6 +80,9 @@
 // answer — "this table has no timestamp field" — not a reflection failure, and
 // must not be conflated with one (see the comment at that line).
 using System.Reflection;
+using System.Collections;
+using System.Runtime.ExceptionServices;
+using Microsoft.Dynamics.Nav.Runtime;
 
 namespace AlRunner.Patches;
 
@@ -78,17 +94,194 @@ public static class RowVersionPatches
 
     private static PropertyInfo? _pMetaTable;      // MutableRecordBuffer.MetaTable
     private static PropertyInfo? _pTimestampField; // NCLMetaTable.TimestampField (internal)
+    private static PropertyInfo? _pSystemIdField;  // NCLMetaTable.SystemIdField (internal)
     private static PropertyInfo? _pFieldIndex;     // NCLMetaField.FieldIndex
     private static PropertyInfo? _pItem;           // MutableRecordBuffer.this[int]
     private static MethodInfo? _mCreate;           // NavBigInteger.Create(long)
+    private static MethodInfo? _mGetOriginalValue; // MutableRecordBuffer.GetOriginalValue(int)
+    private static FieldInfo? _fPrimaryTree;       // TempTableDataProvider.primaryTree
+    private static MethodInfo? _mGetUniqueConstraintException;
 
     /// <summary>Cecil prepend on TempTableDataProvider.Insert — (this, companyToken, recordBuffer).</summary>
     public static void OnBeforeInsert(object? provider, int companyToken, object? recordBuffer)
-        => Stamp(provider, recordBuffer);
+    {
+        RejectDuplicateSystemId(provider, recordBuffer);
+        Stamp(provider, recordBuffer);
+    }
 
     /// <summary>Cecil prepend on TempTableDataProvider.Modify — same first three arg slots.</summary>
     public static void OnBeforeModify(object? provider, int companyToken, object? recordBuffer)
-        => Stamp(provider, recordBuffer);
+    {
+        PreserveSystemId(provider, recordBuffer);
+        Stamp(provider, recordBuffer);
+    }
+
+    private static void RejectDuplicateSystemId(object? provider, object? recordBuffer)
+    {
+        if (provider == null || recordBuffer == null
+            || !BlobStoreIsolationPatches.IsDatabaseBacked(provider)) return;
+
+        var bufferType = recordBuffer.GetType();
+        _pMetaTable ??= bufferType.GetProperty("MetaTable",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {bufferType.Name}.MetaTable property not found — " +
+                "SystemId uniqueness cannot resolve its reflection target");
+        var metaTable = _pMetaTable.GetValue(recordBuffer)
+            ?? throw new InvalidOperationException(
+                "[RowVersionPatches] record buffer has no MetaTable");
+
+        _pSystemIdField ??= metaTable.GetType().GetProperty("SystemIdField",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {metaTable.GetType().Name}.SystemIdField property not found — " +
+                "SystemId uniqueness cannot resolve its reflection target");
+        var systemIdField = _pSystemIdField.GetValue(metaTable);
+        if (systemIdField == null) return;
+
+        _pFieldIndex ??= systemIdField.GetType().GetProperty("FieldIndex",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {systemIdField.GetType().Name}.FieldIndex property not found — " +
+                "SystemId uniqueness cannot resolve its reflection target");
+        var index = (int)_pFieldIndex.GetValue(systemIdField)!;
+
+        _pItem ??= bufferType.GetProperty("Item",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {bufferType.Name}.Item indexer not found — " +
+                "SystemId uniqueness cannot resolve its reflection target");
+        var systemIdValue = _pItem.GetValue(recordBuffer, new object[] { index })
+            ?? throw new InvalidOperationException(
+                "[RowVersionPatches] database-backed Insert has no SystemId value");
+        var systemId = ReadSystemId(systemIdValue);
+        if (systemId == Guid.Empty) return;
+
+        var providerType = provider.GetType();
+        _fPrimaryTree ??= providerType.GetField("primaryTree",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {providerType.Name}.primaryTree field not found — " +
+                "SystemId uniqueness cannot inspect stored rows");
+        var primaryTreeValue = _fPrimaryTree.GetValue(provider);
+        if (primaryTreeValue == null) return;
+        if (primaryTreeValue is not IEnumerable primaryTree)
+            throw new InvalidOperationException(
+                "[RowVersionPatches] TempTableDataProvider.primaryTree is not enumerable");
+
+        foreach (var row in primaryTree)
+        {
+            if (row is not TempTableRecordBuffer stored)
+                throw new InvalidOperationException(
+                    "[RowVersionPatches] TempTableDataProvider.primaryTree contains an unexpected row type");
+            var values = stored.ToArray();
+            if (index < 0 || index >= values.Length)
+                throw new InvalidOperationException(
+                    $"[RowVersionPatches] stored row has no SystemId slot at index {index}");
+            if (ReadSystemId(values[index]) == systemId)
+                ThrowDuplicateSystemId(metaTable, systemIdValue);
+        }
+    }
+
+    private static Guid ReadSystemId(object value)
+        => value switch
+        {
+            NavGuid navGuid => navGuid.Value,
+            Guid guid => guid,
+            _ => throw new InvalidOperationException(
+                $"[RowVersionPatches] SystemId slot contains {value.GetType().Name}, expected NavGuid")
+        };
+
+    private static void ThrowDuplicateSystemId(object metaTable, object systemIdValue)
+    {
+        if (metaTable is not NCLMetaTable table)
+            throw new InvalidOperationException(
+                $"[RowVersionPatches] SystemId uniqueness received {metaTable.GetType().Name}, " +
+                "expected NCLMetaTable");
+        if (systemIdValue is not NavValue navValue)
+            throw new InvalidOperationException(
+                $"[RowVersionPatches] SystemId uniqueness received {systemIdValue.GetType().Name}, " +
+                "expected NavValue");
+
+        NCLMetaKey? systemIdKey = null;
+        for (var i = 0; i < table.KeyCount; i++)
+        {
+            var key = table.GetKeyByIndex(i);
+            if (key.IsSystemIdKey)
+            {
+                systemIdKey = key;
+                break;
+            }
+        }
+        if (systemIdKey == null)
+            throw new InvalidOperationException(
+                $"[RowVersionPatches] table {table.TableId} has a SystemId field but no SystemId key");
+
+        var helperType = typeof(NCLMetaTable).Assembly.GetType(
+            "Microsoft.Dynamics.Nav.Runtime.RecordImplementationHelper")
+            ?? throw new InvalidOperationException(
+                "[RowVersionPatches] RecordImplementationHelper type not found");
+        _mGetUniqueConstraintException ??= helperType.GetMethod(
+            "GetUniqueConstraintException",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(NCLMetaTable), typeof(NCLMetaKey), typeof(NavValue[]) },
+            modifiers: null)
+            ?? throw new InvalidOperationException(
+                "[RowVersionPatches] RecordImplementationHelper.GetUniqueConstraintException not found");
+        var duplicate = _mGetUniqueConstraintException.Invoke(
+            null, new object[] { table, systemIdKey, new[] { navValue } }) as Exception
+            ?? throw new InvalidOperationException(
+                "[RowVersionPatches] GetUniqueConstraintException returned no exception");
+        ExceptionDispatchInfo.Capture(duplicate).Throw();
+    }
+
+    private static void PreserveSystemId(object? provider, object? recordBuffer)
+    {
+        if (recordBuffer == null || !BlobStoreIsolationPatches.IsDatabaseBacked(provider)) return;
+
+        var bufferType = recordBuffer.GetType();
+        _pMetaTable ??= bufferType.GetProperty("MetaTable",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {bufferType.Name}.MetaTable property not found — " +
+                "SystemId preservation cannot resolve its reflection target");
+        var metaTable = _pMetaTable.GetValue(recordBuffer)
+            ?? throw new InvalidOperationException(
+                "[RowVersionPatches] record buffer has no MetaTable");
+
+        _pSystemIdField ??= metaTable.GetType().GetProperty("SystemIdField",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {metaTable.GetType().Name}.SystemIdField property not found — " +
+                "SystemId preservation cannot resolve its reflection target");
+        var systemIdField = _pSystemIdField.GetValue(metaTable);
+        if (systemIdField == null) return;
+
+        _pFieldIndex ??= systemIdField.GetType().GetProperty("FieldIndex",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {systemIdField.GetType().Name}.FieldIndex property not found — " +
+                "SystemId preservation cannot resolve its reflection target");
+        var index = (int)_pFieldIndex.GetValue(systemIdField)!;
+
+        _mGetOriginalValue ??= bufferType.GetMethod("GetOriginalValue",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+            binder: null, types: new[] { typeof(int) }, modifiers: null)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {bufferType.Name}.GetOriginalValue(int) method not found — " +
+                "SystemId preservation cannot resolve its reflection target");
+        var originalSystemId = _mGetOriginalValue.Invoke(recordBuffer, new object[] { index })
+            ?? throw new InvalidOperationException(
+                "[RowVersionPatches] database-backed Modify has no original SystemId");
+
+        _pItem ??= bufferType.GetProperty("Item",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException(
+                $"[RowVersionPatches] {bufferType.Name}.Item indexer not found — " +
+                "SystemId preservation cannot resolve its reflection target");
+        _pItem.SetValue(recordBuffer, originalSystemId, new object[] { index });
+    }
 
     private static void Stamp(object? provider, object? recordBuffer)
     {

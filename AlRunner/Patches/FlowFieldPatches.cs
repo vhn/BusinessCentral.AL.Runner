@@ -86,7 +86,6 @@ public static class FlowFieldPatches
     private static object? _filterTypeField;                  // NCLMetaFilterType.Field
     private static PropertyInfo? _pCalcFormulaSourceField;
     private static PropertyInfo? _pCalcFormulaNegateResult;
-    private static MethodInfo? _mCalcFormulaNegateValue;      // NCLMetaCalculationFormula.NegateValue(NavValue)
     private static PropertyInfo? _pCalcFormulaTableId;
     private static PropertyInfo? _pCalcFormulaFieldId;
     private static PropertyInfo? _pFilterFieldValueField;      // NCLMetaFilterField.ValueField (returns INavFieldMetadata)
@@ -216,8 +215,6 @@ public static class FlowFieldPatches
         _pCalcFormulaFilters = _tNCLMetaCalcFormula.GetProperty("Filters");
         _pCalcFormulaSourceField = _tNCLMetaCalcFormula.GetProperty("SourceField");
         _pCalcFormulaNegateResult = _tNCLMetaCalcFormula.GetProperty("NegateResult");
-        _mCalcFormulaNegateValue = _tNCLMetaCalcFormula.GetMethod("NegateValue",
-            BindingFlags.Public | BindingFlags.Instance);
         _pCalcFormulaTableId = _tNCLMetaCalcFormula.GetProperty("TableId");
         _pCalcFormulaFieldId = _tNCLMetaCalcFormula.GetProperty("FieldId");
         _fCalcFormulaEmpty = _tNCLMetaCalcFormula.GetField("EmptyFormula",
@@ -490,6 +487,22 @@ public static class FlowFieldPatches
             throw;
         }
     }
+
+    /// <summary>
+    /// Negate a signed FlowField result with the same type dispatch as BC 28.1's
+    /// <c>NCLMetaCalculationFormula.NegateValue</c>. Calling that method through reflection
+    /// after the runtime hooks are active can re-enter its patched entry point recursively;
+    /// keeping the three observed numeric operations local avoids that dispatch boundary.
+    /// Non-numeric values are returned unchanged, matching BC's default branch.
+    /// </summary>
+    internal static NavValue NegateFlowFieldValue(NavValue value)
+        => value switch
+        {
+            NavDecimal decimalValue => NavDecimal.Create(-decimalValue.Value),
+            NavBigInteger bigIntegerValue => NavBigInteger.Create(checked(0L - bigIntegerValue.Value)),
+            NavInteger integerValue => NavInteger.Create(checked(0 - integerValue.Value)),
+            _ => value,
+        };
 
     /// <summary>
     /// #1757 — stands in for BC's own <c>FlowFieldsHelper.CalcFieldsAsync</c> (the 9-arg
@@ -834,21 +847,10 @@ public static class FlowFieldPatches
                 continue;
             }
 
-            // #1708 — `CalcFormula = -sum(...)`. The negation is BC's own
-            // NCLMetaCalculationFormula.NegateValue rather than a local `-x`, so every
-            // CalculationMethod gets the semantics BC gives it (the Base Application ships
-            // both `-sum(...)` and `-exist(...)`, and negating a Boolean is not arithmetic).
+            // #1708 — `CalcFormula = -sum(...)`. This mirrors BC's own
+            // NCLMetaCalculationFormula.NegateValue type dispatch; see NegateFlowFieldValue.
             if (negate && result != null)
-            {
-                if (_mCalcFormulaNegateValue == null)
-                    // Writing the POSITIVE aggregate instead would be the exact silent
-                    // wrong value #1708 is about, so this is loud rather than best-effort.
-                    AlRunner.Infrastructure.RunnerScope.ThrowNotYetImplemented(
-                        "CalcFormula = -sum(...) (NCLMetaCalculationFormula.NegateValue)",
-                        "BC's own value negation is not present on this build, so a signed " +
-                        "FlowField cannot be computed faithfully — issue #1708");
-                result = (NavValue?)_mCalcFormulaNegateValue.Invoke(formula, new object?[] { result });
-            }
+                result = NegateFlowFieldValue(result);
 
             if (result != null)
                 results.Add(Tuple.Create((INavFieldMetadata)(NCLMetaField)fieldObj, result));
@@ -920,7 +922,6 @@ public static class FlowFieldPatches
                 if (_mTtdpTryGetValue!.Invoke(dataProvider, tryGetArgs) is true)
                     storedBuffer = tryGetArgs[1];
             }
-
             // Issue #1765 / corpus 60944: a temporary record's BLOB carried over by a
             // Rename() (not freshly dirtied by it) is lost on real BC — HasValue() reads
             // false after Get()+CalcFields() on the renamed row, even though the same

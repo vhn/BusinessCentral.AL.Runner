@@ -132,8 +132,8 @@ public sealed class TestExecutor
     // A HIT restores table rows only (RestoreInstallBaselineSnapshot →
     // RecordPatches.InstallBaseline.cs), so at first glance any NON-table side effect a
     // dependency Install trigger left in process-wide state — SingleInstance codeunit
-    // instance variables, the shared-object container, write-transaction state, MediaSet /
-    // RecordLink / IsolatedStorage entries stashed outside a table row — would not be
+    // instance variables, the shared-object container, write-transaction state, or MediaSet /
+    // IsolatedStorage entries stashed outside a table row — would not be
     // reproduced on a HIT. That would be a real gap.
     //
     // It isn't one, because every codeunit boundary in this run — INCLUDING the app
@@ -141,12 +141,12 @@ public sealed class TestExecutor
     // TestIsolation.Codeunit / TestIsolation.Test branches further down in this file), and
     // that call begins with ResetPerTestState() (RecordPatches.cs), which unconditionally
     // wipes exactly those things: _dataAccessByTable per-table rows,
-    // RecordLinkPatches.ResetForTest(), TenantStoragePatches.ResetForTest(),
+    // TenantStoragePatches.ResetForTest(),
     // MediaSetPatches.ResetForTest(), ALDatabasePatches.ResetWriteTransactionState(),
     // BcRuntime.DisposeSkeletonSharedObjectContainerChildren(), and
     // BcRuntime.ResetSingleInstanceCache(). So the set of install-seed state that can ever
     // survive to the moment ANY test body runs is exactly
-    // {table rows, isolated storage, record links, auto-increment} — precisely the four
+    // {table rows (including Record Link), isolated storage, auto-increment} — precisely the three
     // things InstallBaselineSnapshot captures. A non-table side effect of a dependency
     // Install trigger was already unobservable to every test BEFORE this cache existed;
     // caching the snapshot doesn't create a new gap, it caches the only part of the
@@ -209,7 +209,7 @@ public sealed class TestExecutor
             // Present but unusable (truncated, written by an older codec, a table whose shape
             // moved). Drop it so the write below replaces it instead of every future run
             // paying the same failed decode.
-            AlRunner.Infrastructure.InstallBaselineDiskCache.Delete(keyText);
+            AlRunner.Infrastructure.InstallBaselineDiskCache.Delete(keyText, bytes);
             return null;
         }
         return snapshot;
@@ -337,10 +337,9 @@ public sealed class TestExecutor
         // are re-executing the SAME dependency assemblies' Install triggers / the SAME
         // codeunit 2 body every app group even though the dependency closure had not changed.
         // The dep+company baseline cache field doc above has the full justification; this is
-        // just the cache-or-compute call site. Install triggers do not create a company's
-        // baseline rows — company CREATION does, via codeunit 2 "Company-Initialize" — so on a
-        // miss it still runs right after the dependency triggers, before the snapshot is taken,
-        // exactly matching the order the uncached path always ran in.
+        // just the cache-or-compute call site. Company creation runs before dependency Install
+        // triggers. The order is load-bearing: Base App codeunit 2 skips InitSourceCodeSetup
+        // once any Source Code row exists, while dependency Install triggers seed those rows.
         using (AlRunner.Infrastructure.PhaseLog.AppStage("install-seed-dep-company-baseline"))
         {
             var depKey = InstallTriggerRunner.CurrentDependencySetKey();
@@ -395,8 +394,8 @@ public sealed class TestExecutor
                 }
                 else
                 {
-                    InstallTriggerRunner.RunDependenciesOnly();
                     CompanyInitializer.EnsureCompanyInitialized();
+                    InstallTriggerRunner.RunDependenciesOnly();
                     var snapshot = AlRunner.Patches.RecordPatches.CaptureInstallBaselineSnapshot();
                     lock (_depCompanyBaselineCacheLock)
                         _depCompanyBaselineCache[depKey] = snapshot;
@@ -832,6 +831,7 @@ public sealed class TestExecutor
             var inner = Unwrap(tex);
             PerfTrace.Log($"TestExecutor.RunOne FAIL {codeunit}.{m.Name} {sw.ElapsedMilliseconds}ms {inner.GetType().Name}: {inner.Message}");
             var alStack = AlRunner.Infrastructure.AlCallStackCapture.GetCaptured(inner);
+            RollbackFailedTest();
             // BC's Assert.* throws specific exception types for test failures.
             // We can't classify Pass/Fail vs Error perfectly without knowing all of them,
             // so for now: any thrown exception is Fail.
@@ -843,6 +843,7 @@ public sealed class TestExecutor
         {
             PerfTrace.Log($"TestExecutor.RunOne ERROR {codeunit}.{m.Name} {sw.ElapsedMilliseconds}ms {ex.GetType().Name}: {ex.Message}");
             var alStack = AlRunner.Infrastructure.AlCallStackCapture.GetCaptured(ex);
+            RollbackFailedTest();
             return new TestResult(codeunit, m.Name, TestOutcome.Error,
                 ex.Message, ex.ToString(), sw.Elapsed, alStack, displayName,
                 ex);
@@ -853,6 +854,12 @@ public sealed class TestExecutor
             // Env-gated memory-census diagnostic (AL_RUNNER_MEM_CENSUS=1); no-op when unset — see MemoryCensus.cs.
             MemoryCensus.Log(codeunit, m.Name);
         }
+    }
+
+    private static void RollbackFailedTest()
+    {
+        AlRunner.Patches.RecordPatches.RollbackToCommitPoint(BcRuntime.SkeletonSession);
+        AlRunner.Patches.ALDatabasePatches.ResetWriteTransactionState();
     }
 
     // Issue #2070 root cause: this watchdog's clock is WALL-CLOCK time on the AL

@@ -58,6 +58,34 @@ public static class AlEnumMetadataRegistry
     // treated exactly like an array of all-nulls.
     public sealed record Entry(int Id, string Name, string[] Options, int[] Indexes, int[][] Implementations, string?[]? Captions = null);
 
+    internal static int[] ParseImplementationIds(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return Array.Empty<int>();
+        return text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(part => int.TryParse(part, out var id) ? id : -1)
+            .Where(id => id >= 0)
+            .ToArray();
+    }
+
+    internal static int[] ApplyDefaultImplementations(int[] valueImplementations, int[] defaultImplementations)
+    {
+        if (valueImplementations.Length == 0)
+            return defaultImplementations.ToArray();
+        if (defaultImplementations.Length == 0)
+            return valueImplementations;
+
+        var merged = new int[Math.Max(valueImplementations.Length, defaultImplementations.Length)];
+        for (var i = 0; i < merged.Length; i++)
+        {
+            var valueImplementation = i < valueImplementations.Length ? valueImplementations[i] : 0;
+            merged[i] = valueImplementation != 0
+                ? valueImplementation
+                : i < defaultImplementations.Length ? defaultImplementations[i] : 0;
+        }
+        return merged;
+    }
+
     // Base-enum registrations, keyed by the enum's own object Id. This also
     // absorbs precompiled-dependency enums (RegisterFromAppPath) and cache
     // replay (Program.cs sidecar), both of which hand in already-flattened

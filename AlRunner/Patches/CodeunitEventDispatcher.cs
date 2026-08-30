@@ -84,11 +84,9 @@ public static partial class BcRuntime
     /// Entry point called from the Cecil-rewritten NavMethodScope.OnRunEventAsync.
     /// Returns default ValueTask — synchronous execution model.
     /// </summary>
-    private static bool _firstEntryLogged;
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static System.Threading.Tasks.ValueTask CodeunitEventDispatch_OnRunEventAsync(object publisherScope)
     {
-        if (!_firstEntryLogged) { _firstEntryLogged = true; Console.Error.WriteLine($"[Dispatch] entry-method first hit"); }
         if (Environment.GetEnvironmentVariable("AL_RUNNER_DISPATCHER_OFF") == "1")
             return default;
         try { DispatchCore(publisherScope); }
@@ -121,15 +119,11 @@ public static partial class BcRuntime
                   // own for callers that fall through it (e.g. DispatchCore's catch, below).
     }
 
-    private static bool _firstDispatchLogged;
-    private static bool _firstFireLogged;
-
     private static void DispatchCore(object publisherScope)
     {
         if (publisherScope == null) return;
         var scopeType = publisherScope.GetType();
         Interlocked.Increment(ref _dispatchCount);
-        if (!_firstDispatchLogged) { _firstDispatchLogged = true; Console.Error.WriteLine($"[Dispatch] first call: scope={scopeType.FullName}"); }
 
         // Decode publisher id + event method name from scope type name.
         //   Microsoft.Dynamics.Nav.BusinessApplication.Codeunit50041+OnDoCalc_Scope
@@ -149,9 +143,9 @@ public static partial class BcRuntime
         if (declType == null) return;
         var declName = declType.Name;
         var scopeName = scopeType.Name;
-        int us = scopeName.IndexOf('_');
-        if (us < 0) return;
-        string eventMethodName = scopeName.Substring(0, us);
+        const string scopeSuffix = "_Scope";
+        if (!scopeName.EndsWith(scopeSuffix, StringComparison.Ordinal)) return;
+        string eventMethodName = scopeName[..^scopeSuffix.Length];
 
         if (!TryDecodeEventPublisherDeclType(declName, out var publisherKind, out int publisherId)) return;
         IReadOnlyList<MethodInfo>? subs = publisherKind switch
@@ -164,7 +158,6 @@ public static partial class BcRuntime
         };
         if (subs == null || subs.Count == 0) return;
         Interlocked.Increment(ref _dispatchFiredCount);
-        if (!_firstFireLogged) { _firstFireLogged = true; Console.Error.WriteLine($"[Dispatch] first FIRE: {declName}.{eventMethodName} → {subs.Count} subs"); }
         if (Environment.GetEnvironmentVariable("ALRUNNER_DISPATCH_TRACE") == "1")
             Console.Error.WriteLine($"[Dispatch] FIRE {declName}.{eventMethodName} → {subs.Count} subs");
 
@@ -311,10 +304,12 @@ public static partial class BcRuntime
     ///
     /// Why it is needed at all, when BC already unbinds on its own: BC removes an entry as
     /// the bound instance's tree is disposed, which is how AL's "the binding ends when the
-    /// variable goes out of scope" works, and it covers the common case here — TestExecutor
-    /// disposes the test codeunit at the end of its run, taking any subscriber a test-codeunit
-    /// global had bound with it. It does NOT cover an instance owned by something the runner
-    /// keeps alive across that boundary. A <c>SingleInstance</c> codeunit is exactly that: it
+    /// variable goes out of scope" works. TestExecutor disposes the test codeunit at the end
+    /// of its run, taking any subscriber a test-codeunit global had bound with it. Method-local
+    /// subscribers need the narrower scope-exit sweep below because the runner deliberately
+    /// detaches method-scope trees without cascading disposal. This full reset handles instances
+    /// owned by something the runner keeps alive across the isolation boundary. A
+    /// <c>SingleInstance</c> codeunit is exactly that: it
     /// is rooted in the session's own tree, <see cref="ResetSingleInstanceCache"/> drops the
     /// runner's pointer without ending its life, and a subscriber it had bound therefore
     /// stayed live for the whole PROCESS — firing into every later test codeunit and every
@@ -335,6 +330,41 @@ public static partial class BcRuntime
     /// the same way, or the reset only appears to have happened.
     /// </summary>
     internal static void ClearManualEventBindings() => SessionEventBindings()?.Clear();
+
+    /// <summary>
+    /// Remove bindings whose subscriber instance is owned by <paramref name="scope"/>'s tree.
+    /// AL method-local codeunit variables expire when the declaring method returns. The runner's
+    /// method-scope disposal intentionally detaches instead of cascading through child objects,
+    /// so BC's normal tree-disposal unbind never runs for those locals. Walking the existing tree
+    /// ancestry lets us end only bindings owned by this scope; test-codeunit globals and locals
+    /// owned by an outer method remain bound for their actual lifetime.
+    /// </summary>
+    internal static void ClearManualEventBindingsOwnedByScope(object? scope)
+    {
+        var bindings = SessionEventBindings();
+        if (scope is not Microsoft.Dynamics.Nav.Runtime.ITreeObject scopeTree ||
+            bindings == null || _fTreeHandlerParent == null)
+            return;
+
+        var scopeHandler = scopeTree.Tree;
+        if (scopeHandler == null) return;
+
+        for (var i = bindings.Count - 1; i >= 0; i--)
+        {
+            var bound = bindings[i];
+            if (bound is not Microsoft.Dynamics.Nav.Runtime.ITreeObject boundTree) continue;
+            object? handler = boundTree.Tree;
+            while (handler != null)
+            {
+                handler = _fTreeHandlerParent.GetValue(handler);
+                if (ReferenceEquals(handler, scopeHandler))
+                {
+                    bindings.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+    }
 
     /// <summary>
     /// <paramref name="publisher"/> when its tree is still usable, otherwise the skeleton
@@ -372,8 +402,9 @@ public static partial class BcRuntime
 
     /// <summary>
     /// Is this parameter (positionally) capable of being the "Sender" param of an
-    /// IncludeSender=true event subscriber? AL emits it as a positional first parameter whose
-    /// name is "Sender" (case-insensitive) and whose type is either <c>NavCodeunitHandle</c> (or
+    /// IncludeSender=true event subscriber? For an event with no declared arguments AL emits it
+    /// first; when the event has arguments, AL appends a parameter named "Sender"
+    /// (case-insensitive). Its type is either <c>NavCodeunitHandle</c> (or
     /// a typed codeunit-handle subclass, for a codeunit publisher) or <c>INavRecordHandle</c> (an
     /// interface, or a concrete <c>Record&lt;N&gt;</c> implementing it, for a TABLE publisher —
     /// #1956). This only answers the TYPE-SHAPE question; the call site additionally requires
@@ -383,7 +414,7 @@ public static partial class BcRuntime
     /// </summary>
     internal static bool IsSenderParameter(ParameterInfo p, int paramIndex)
     {
-        if (paramIndex != 0) return false;
+        if (!CanOccupySenderSlot(p, paramIndex)) return false;
         // Codeunit publisher: AL emits sender as Codeunit50047 (the publisher CLR type) — the
         // bundle's typed handle. The runtime type ancestry traces back to NavCodeunitHandle.
         var t = p.ParameterType;
@@ -397,6 +428,9 @@ public static partial class BcRuntime
         if (typeof(Microsoft.Dynamics.Nav.Runtime.INavRecordHandle).IsAssignableFrom(p.ParameterType)) return true;
         return false;
     }
+
+    private static bool CanOccupySenderSlot(ParameterInfo p, int paramIndex)
+        => paramIndex == 0 || string.Equals(p.Name, "sender", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Is this the sender parameter of an <c>IncludeSender=true</c> event whose publisher is
@@ -434,7 +468,7 @@ public static partial class BcRuntime
     /// coming from the scope rather than from the publisher.</para>
     /// </summary>
     private static bool IsNonCodeunitSenderParameter(ParameterInfo p, int paramIndex, object publisher)
-        => paramIndex == 0 && p.ParameterType.IsInstanceOfType(publisher);
+        => CanOccupySenderSlot(p, paramIndex) && p.ParameterType.IsInstanceOfType(publisher);
 
     private static Type? _tNavCodeunitHandle;
     private static ConstructorInfo? _ciNavCodeunitHandleByIdInt;
