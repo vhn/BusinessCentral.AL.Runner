@@ -39,7 +39,7 @@ public static partial class RecordPatches
 
     // Lazy fallback index: tableId → (appPath, alSource). Built only when symbols miss.
     private static Dictionary<int, (string AppPath, string Source)>? _bcTableIndex;
-    private static Dictionary<int, (string AppPath, ParsedTable Table)>? _bcSymbolTableIndex;
+    private static Dictionary<int, (string AppPath, ParsedTable Table, string? Caption)>? _bcSymbolTableIndex;
     // Query symbol index: queryId → QuerySymbol, built from registered .app SymbolReference.json.
     private static Dictionary<int, BcAppSymbolCache.QuerySymbol>? _bcSymbolQueryIndex;
     // Raw SymbolReference.json files registered as query-symbol-only sources (the bundle's
@@ -191,7 +191,9 @@ public static partial class RecordPatches
                 _bcMissCache.Add(tableId);
                 return false;
             }
-            // Parse the source slice that contains this table id.
+            // Parse the source slice that contains this table id. The table parser owns the
+            // structural table shape; the object-caption parser owns the top-level Caption.
+            TryParseObjectCaptionFile(entry.Source);
             TryParseTableFile(entry.Source);
             if (_parsedTables.ContainsKey(tableId))
             {
@@ -342,6 +344,7 @@ public static partial class RecordPatches
                     {
                         if (_parsedTables.ContainsKey(id)) continue;
                         if (!alreadySeenSources.Add(entry.Source)) continue;
+                        TryParseObjectCaptionFile(entry.Source);
                         TryParseTableFile(entry.Source);
                         if (_parsedTables.ContainsKey(id)) parsedNow++;
                     }
@@ -483,14 +486,23 @@ public static partial class RecordPatches
     private static void EnsureBcSymbolTableIndex()
     {
         if (_bcSymbolTableIndex != null) return;
-        var idx = new Dictionary<int, (string, ParsedTable)>();
+        var idx = new Dictionary<int, (string, ParsedTable, string?)>();
         foreach (var appPath in _bcAppPaths)
         {
             try
             {
-                foreach (var table in BcAppSymbolCache.Get(appPath).Tables)
+                var symbols = BcAppSymbolCache.Get(appPath);
+                var captionsByTableId = new Dictionary<int, string?>();
+                foreach (var obj in symbols.Objects)
+                    if (string.Equals(obj.Kind, "Table", StringComparison.OrdinalIgnoreCase))
+                        captionsByTableId.TryAdd(obj.Id, obj.Caption);
+
+                foreach (var table in symbols.Tables)
                     if (!idx.ContainsKey(table.TableId))
-                        idx[table.TableId] = (appPath, table);
+                    {
+                        captionsByTableId.TryGetValue(table.TableId, out var caption);
+                        idx[table.TableId] = (appPath, table, caption);
+                    }
             }
             catch (Exception ex)
             {
@@ -502,6 +514,24 @@ public static partial class RecordPatches
             Console.Error.WriteLine($"[RecordPatches] BcAppFallback: indexed {idx.Count} symbol table id(s) across {_bcAppPaths.Count} BC .app file(s)");
         // Co-build the extension index whenever the table index is (re)built.
         EnsureBcSymbolExtensionIndex();
+    }
+
+    private static string? ResolveTableCaption(int tableId)
+    {
+        // Presence is authoritative even when Caption is absent: a table parsed from AL
+        // (workspace source or embedded dependency source) owns its object id and must not
+        // inherit a same-id symbol caption.
+        if (_parsedObjectCaptions.TryGetValue(("Table", tableId), out var sourceCaption))
+            return sourceCaption;
+
+        lock (_bcTableIndexLock)
+        {
+            EnsureBcSymbolTableIndex();
+            return _bcSymbolTableIndex != null
+                && _bcSymbolTableIndex.TryGetValue(tableId, out var entry)
+                    ? entry.Caption
+                    : null;
+        }
     }
 
     /// <summary>

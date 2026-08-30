@@ -190,11 +190,12 @@ public static partial class RecordPatches
             // Page.RunModal(0, Row) threw "You tried to invoke the Page object with the
             // ID 0" instead of resolving the declared page.
             var lookupFormId = ResolvePageReference(parsed.LookupPageName);
+            var caption = ResolveTableCaption(tableId);
 
             // Build MetaTable via named-parameter ctor.  The public ctor takes many
             // named params with defaults; we resolve by name and fall back to defaults.
             var defaultMetaTable = CallMetaTableCtor(tableId, parsed.TableName, fields, allKeys.ToArray(),
-                parsed.IsTableTypeTemporary, parsed.DataPerCompany, lookupFormId);
+                parsed.IsTableTypeTemporary, parsed.DataPerCompany, caption, lookupFormId);
             if (defaultMetaTable == null) return null;
 
             // NavAppGroup.BaseGroup
@@ -291,7 +292,7 @@ public static partial class RecordPatches
     }
 
     private static object? CallMetaTableCtor(int id, string name, object[] fields, object[] allKeys,
-        bool isTableTypeTemporary, bool isDataPerCompany, int lookupFormId = 0)
+        bool isTableTypeTemporary, bool isDataPerCompany, string? caption, int lookupFormId = 0)
     {
         if (_tMetaTable == null) return null;
         var ctor = _tMetaTable.GetConstructors()
@@ -306,6 +307,17 @@ public static partial class RecordPatches
             var p = ps[i];
             if (p.Name == "id") { args[i] = id; continue; }
             if (p.Name == "name") { args[i] = name; continue; }
+            if (p.Name == "caption" && !string.IsNullOrEmpty(caption))
+            {
+                args[i] = caption;
+                continue;
+            }
+            if (p.Name == "captionML" && !string.IsNullOrEmpty(caption))
+            {
+                // BC reads the merged multilingual caption, not the plain caption string.
+                var ml = BuildEnuMultiLanguage(p.ParameterType, caption);
+                if (ml != null) { args[i] = ml; continue; }
+            }
             if (p.Name == "fields")
             {
                 // ImmutableArray<MetaField>
