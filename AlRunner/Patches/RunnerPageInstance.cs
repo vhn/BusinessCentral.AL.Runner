@@ -405,7 +405,8 @@ internal sealed class RunnerPageInstance
         if (string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase) || raw == "1") return true;
         if (string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase) || raw == "0") return false;
 
-        var expression = _sourceExpressions[raw];
+        var (expressionName, negate) = ParseBooleanPropertyBinding(raw);
+        var expression = _sourceExpressions[expressionName];
         if (expression == null)
             // Loudly, not true-by-default: this property IS the page's read-only contract,
             // and answering "editable" for one we could not evaluate makes every test of
@@ -417,12 +418,24 @@ internal sealed class RunnerPageInstance
                 + "See docs/scope.md");
 
         var value = GetValue(expression);
-        return value?.ClientObject is bool b
-            ? b
-            : throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+        if (value?.ClientObject is not bool booleanValue)
+            throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
                 $"TestPage page {_pageId} element {elementId} — {propertyName}",
                 $"testpage-control-property — expression '{raw}' evaluated to "
                 + $"'{value?.ClientObject ?? "null"}', which is not a Boolean. See docs/scope.md");
+        return negate ? !booleanValue : booleanValue;
+    }
+
+    /// <summary>
+    /// Split the emitted boolean property spelling into its registered expression name and
+    /// the optional unary <c>not</c>. NavForm registers only the inner dataset expression.
+    /// </summary>
+    internal static (string ExpressionName, bool Negate) ParseBooleanPropertyBinding(string raw)
+    {
+        const string NotPrefix = "not ";
+        return raw.StartsWith(NotPrefix, StringComparison.OrdinalIgnoreCase)
+            ? (raw[NotPrefix.Length..].Trim(), true)
+            : (raw, false);
     }
 
     /// <summary>
