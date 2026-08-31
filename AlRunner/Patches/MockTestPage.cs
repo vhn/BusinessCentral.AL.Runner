@@ -437,6 +437,32 @@ internal class LiveNavTestPage : MockITestPage
     {
         _opened = true;
         _staticEditable = editable;
+
+        // Opening a page causes the BC client to request its first dataset row before the
+        // modal handler receives a TestPage. Preserve a SetRecord row when it still belongs
+        // to the applied view; otherwise position on that view's first row. Without this
+        // client step, a filtered-but-unpositioned record stays at its Init() defaults and
+        // the handler validates fields on a fictitious primary key.
+        if (_record == null)
+            return;
+
+        var found = _record.ALFindAsync(DataError.TrapError, "=").GetAwaiter().GetResult()
+                    || _record.ALFindFirstAsync(DataError.TrapError).GetAwaiter().GetResult();
+        Loaded(found);
+
+        // An insert-allowed empty list still exposes the client's blank draft row. A handler
+        // that navigates away from it first saves that draft, including the table OnInsert
+        // trigger. Keeping it pending here preserves that leave-the-row behavior without
+        // creating a record merely because the page opened.
+        if (!found && _creatable)
+        {
+            // The caller's SetTableView record may still occupy xRec even though the filtered
+            // page has no current row. The client's blank draft has no before-image; leaving the
+            // caller there makes filter-initialized values appear unchanged and skips their
+            // table OnValidate triggers.
+            InitializeBlankRecordBuffer(_record.OldRecord);
+            InsertEmptyRow(beforeCurrent: false);
+        }
     }
 
     private bool _staticEditable = true;
@@ -453,6 +479,7 @@ internal class LiveNavTestPage : MockITestPage
     // must initialise the buffer and remember to flush it.
     private bool _pendingNewRow;
     private bool _pendingNewRowExistedWhenStarted;
+    private bool _pendingEmptyMultipleLineBefore;
 
     public override void InsertEmptyRow(bool beforeCurrent)
     {
@@ -467,8 +494,8 @@ internal class LiveNavTestPage : MockITestPage
         // read NOW and the number computed from it at flush time (ProposeAutoSplitKey).
         CaptureInsertPosition();
 
-        // Ask the page to start the row, exactly as it would for a user: BC's NavForm.NewRecord
-        // does ALInit, fills the linking fields in from the page's own filters, and raises
+        // The client blanks the current record buffer before asking NavForm to start the row.
+        // NavForm then fills the linking fields in from the page's own filters and raises
         // OnNewRecord. A filtered page is showing one parent's rows, so a row created on it
         // belongs to that parent — that is what makes Lines.New() on a subpage produce a line
         // already attached to its header.
@@ -477,12 +504,8 @@ internal class LiveNavTestPage : MockITestPage
         // so the row arrived with blank keys and the damage surfaced one step later: an
         // OnValidate looking its parent up found nothing, and the test failed naming a derived
         // field rather than the key that was never set.
-        if (!(_page?.TryNewRecord(!beforeCurrent) ?? false))
-        {
-            // Record-only mode: no page to ask, so no filters and no trigger to run either.
-            // Non-null: guaranteed by the RequireRecord guard at the top of this method.
-            _record!.ALInit();
-        }
+        InitializeBlankRecordBuffer(_record!);
+        _page?.TryNewRecord(!beforeCurrent);
 
         // A page trigger may persist this exact row while a later field is being validated.
         // Remember whether the key already existed at New() time so FlushPendingNewRow can
@@ -493,17 +516,33 @@ internal class LiveNavTestPage : MockITestPage
         _pendingNewRow = true;
     }
 
+    private static void InitializeBlankRecordBuffer(NavRecord record)
+    {
+        record.ALInit();
+        // ALInit deliberately preserves primary-key values. A new client draft has no values
+        // at all, including its key, while its record view must retain the existing filters.
+        var primaryKey = record.MetaTable?.PrimaryKey;
+        if (primaryKey == null) return;
+        for (var i = 0; i < primaryKey.KeyFieldCount; i++)
+            record.ClearFieldValue(primaryKey.KeyFieldsList[i].FieldNo);
+    }
+
     internal void FlushPendingNewRow()
     {
         if (!_pendingNewRow) return;
+        var persistEmptyMultipleLineBefore = _pendingEmptyMultipleLineBefore;
         if (TryAdoptExternallyPersistedPendingRow())
         {
             _pendingNewRow = false;
             _pendingNewRowExistedWhenStarted = false;
+            _pendingEmptyMultipleLineBefore = false;
+            if (persistEmptyMultipleLineBefore)
+                PersistEmptyMultipleLineBeforeCurrent();
             return;
         }
         _pendingNewRow = false;
         _pendingNewRowExistedWhenStarted = false;
+        _pendingEmptyMultipleLineBefore = false;
         // AutoSplitKey, in BC's own order: SplitKey, then OnInsertRecord, then the record's
         // Insert (NavForm.SaveRecordAsync / NavForm.InsertAsync(belowXRec) both do exactly
         // this). Skipping it left the last primary-key field at its Init() default, so a page
@@ -525,6 +564,8 @@ internal class LiveNavTestPage : MockITestPage
         // Non-null: _pendingNewRow is only ever set true by InsertEmptyRow, which refuses by
         // name first when the page has no record — see RequireRecord there.
         _record!.ALInsertAsync(DataError.TrapError, true, false).GetAwaiter().GetResult();
+        if (persistEmptyMultipleLineBefore)
+            PersistEmptyMultipleLineBeforeCurrent();
     }
 
     /// <summary>
@@ -551,11 +592,76 @@ internal class LiveNavTestPage : MockITestPage
         return true;
     }
 
+    /// <summary>
+    /// Persist the untouched draft row that precedes the first explicit row in an empty
+    /// MultipleNewLines grid. BC's client does this after the explicit row becomes a saved row
+    /// (<c>NavRecordStateHandler.SaveDraftRowsAboveCurrentRow</c>). The service marks it as an
+    /// empty multiple line, which initialises and validates filter fields but deliberately calls
+    /// <c>NsDataAccess.InsertAsync</c> with <c>runTrigger: false</c>.
+    /// </summary>
+    private void PersistEmptyMultipleLineBeforeCurrent()
+    {
+        var current = _record!;
+        var primaryKey = current.MetaTable?.PrimaryKey
+            ?? throw new InvalidOperationException("MultipleNewLines AutoSplitKey page has no primary key");
+        if (primaryKey.KeyFieldCount == 0)
+            throw new InvalidOperationException("MultipleNewLines AutoSplitKey page has an empty primary key");
+
+        var keyField = primaryKey.KeyFieldsList[primaryKey.KeyFieldCount - 1];
+        var upperBound = Unwrap(current.GetFieldValue(keyField.FieldNo));
+        object? lowerBound = null;
+
+        using (var probe = current.CloneRecord(current.Parent, reset: false, keepCompany: true))
+        {
+            var prefix = new object?[primaryKey.KeyFieldCount - 1];
+            for (var i = 0; i < prefix.Length; i++)
+                prefix[i] = Unwrap(current.GetFieldValue(primaryKey.KeyFieldsList[i].FieldNo));
+
+            if (probe.ExistsAsync(probe.ALRecordId).AsTask().GetAwaiter().GetResult()
+                && probe.ALNextAsync(-1).GetAwaiter().GetResult() != 0)
+            {
+                var sameSequence = true;
+                for (var i = 0; i < prefix.Length; i++)
+                    sameSequence &= Equals(
+                        Unwrap(probe.GetFieldValue(primaryKey.KeyFieldsList[i].FieldNo)),
+                        prefix[i]);
+                if (sameSequence)
+                    lowerBound = Unwrap(probe.GetFieldValue(keyField.FieldNo));
+            }
+        }
+
+        var autoKey = upperBound switch
+        {
+            int upper => Box(CalculateClientAutoKey<int>((int?)lowerBound, upper, 1, 0)),
+            long upper => Box(CalculateClientAutoKey<long>((long?)lowerBound, upper, 1, 0)),
+            decimal upper => Box(CalculateClientAutoKey<decimal>((decimal?)lowerBound, upper, 1, 0)),
+            Guid => Guid.NewGuid(),
+            _ => null,
+        };
+        if (autoKey == null)
+            throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                "TestPage MultipleNewLines empty draft AutoSplitKey",
+                $"cannot assign a predecessor key for {keyField.FieldNavType}",
+                "ui");
+
+        using var blank = current.CloneRecord(current.Parent, reset: false, keepCompany: true);
+        blank.ALInit();
+        var initializedFields = blank.InitializeFieldsFromFilters(false);
+        blank.ValidateFieldsAsync(initializedFields).GetAwaiter().GetResult();
+        blank.SetFieldValue(
+            keyField.FieldNo,
+            NavValue.CreateNavValueFromObject(keyField, autoKey));
+        blank.ALInsertAsync(DataError.TrapError, false, false).GetAwaiter().GetResult();
+
+        static object? Box<T>(T? value) where T : struct => value.HasValue ? value.Value : null;
+    }
+
     /// <summary>Abandon an in-progress new row without writing it — how Cancel closes.</summary>
     internal void DiscardPendingNewRow()
     {
         _pendingNewRow = false;
         _pendingNewRowExistedWhenStarted = false;
+        _pendingEmptyMultipleLineBefore = false;
         _pendingModify = false;
     }
 
@@ -594,11 +700,13 @@ internal class LiveNavTestPage : MockITestPage
     ///   <c>TestPageProxy.InsertEmptyRow</c> inserts the test's row AFTER the current one
     ///   (<c>InsertBehavior = RowUpdateBehavior.After</c>, whatever <c>beforeCurrent</c> says). On
     ///   an empty grid the current row is that placeholder, so the test's first row is the SECOND
-    ///   draft and takes the second interval: 0 + 2 * 10000. The placeholder itself is never
-    ///   persisted — nothing edits it — which is why no row at 10000 ever appears. On a grid that
-    ///   already has data the current row is a real one, the placeholder sits after the new row,
-    ///   and the count is 0: last + 1 * 10000. Both are measured on real BC 27.5 and 28.3 by
-    ///   corpus CU60922.
+    ///   draft and takes the second interval: 0 + 2 * 10000. Ordinary pages never persist the
+    ///   untouched placeholder, which is why corpus CU60922 sees no row at 10000. A page declaring
+    ///   MultipleNewLines is the exception: after the explicit row becomes saved, the client sends
+    ///   drafts above it through the empty-multiple-line insert modelled by
+    ///   <see cref="PersistEmptyMultipleLineBeforeCurrent"/>. On a grid that already has data the
+    ///   current row is a real one, the placeholder sits after the new row, and the count is 0:
+    ///   last + 1 * 10000.
     ///
     /// THE RUNNER'S INSERTION POINT
     ///   The row the cursor sits on when New() is called, read by
@@ -635,6 +743,7 @@ internal class LiveNavTestPage : MockITestPage
     private void CaptureInsertPosition()
     {
         _insertPositionCaptured = false;
+        _pendingEmptyMultipleLineBefore = false;
         if (_page == null || !_page.NeedsAutoSplitKey) return;
         // Non-null: only reached from InsertEmptyRow, which refuses by name first when the
         // page has no record — see RequireRecord there.
@@ -676,6 +785,7 @@ internal class LiveNavTestPage : MockITestPage
             // Empty grid: the placeholder is the row the insert lands AFTER, so it burns the
             // first interval — the measured 20000 for a first line (corpus CU60922).
             _insertDraftRowsBefore = 1;
+            _pendingEmptyMultipleLineBefore = _page.SupportsMultipleNewLines;
         }
         _insertPositionCaptured = true;
 
@@ -688,7 +798,7 @@ internal class LiveNavTestPage : MockITestPage
             var prefix = new object?[primaryKey.KeyFieldCount - 1];
             for (var i = 0; i < prefix.Length; i++)
                 prefix[i] = Unwrap(probe.GetFieldValue(primaryKey.KeyFieldsList[i].FieldNo));
-            if (probe.ALNext() <= 0) return null;
+            if (probe.ALNextAsync(1).GetAwaiter().GetResult() <= 0) return null;
             for (var i = 0; i < prefix.Length; i++)
                 if (!Equals(Unwrap(probe.GetFieldValue(primaryKey.KeyFieldsList[i].FieldNo)), prefix[i]))
                     return null;
@@ -1963,14 +2073,6 @@ internal sealed class LiveNavTestPart : LiveNavTestPage, ITestPart
 
         ApplyLink();
         base.InsertEmptyRow(beforeCurrent);
-        var record = RequireRecord("subpage link");
-        foreach (var link in _links)
-        {
-            if (link.Kind == TestPagePartLinkKind.Field)
-                record.SetFieldValue(link.PartFieldNo, _parentRecord!.GetFieldValue(link.ParentFieldNo));
-            else if (link.Kind == TestPagePartLinkKind.Const)
-                record.SetFieldValue(link.PartFieldNo, ConstantValue(record, link));
-        }
     }
 
     private static NavValue ConstantValue(NavRecord record, TestPagePartLink link)

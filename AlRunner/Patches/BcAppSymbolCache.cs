@@ -66,7 +66,10 @@ internal static partial class BcAppSymbolCache
     //     cannot be resolved even though SymbolReference.json states the complete link.
     // v18: dependency table fields now retain TableRelation and ValidateTableRelation.
     // Without the bump, a v17 payload would silently replay fields with no relation metadata.
-    private const int CacheVersion = 19;
+    // v20: PageSymbol retains AutoSplitKey and MultipleNewLines so reconstructed dependency
+    // page metadata preserves BC's client-side multi-line draft semantics. A v19 payload
+    // deserialises both as false, silently disabling those semantics on affected pages.
+    private const int CacheVersion = 20;
     private static readonly ConcurrentDictionary<string, AppSymbols> ProcessCache = new(StringComparer.OrdinalIgnoreCase);
     // Issue #1820 — path -> content-hash memo. ComputeAppContentHash needs to read the
     // WHOLE .app to hash it (unlike the FileInfo.Length/LastWriteTimeUtc stat it replaced,
@@ -140,7 +143,9 @@ internal static partial class BcAppSymbolCache
         string? CardPageName = null,
         // Part controls on a precompiled dependency page. The symbol file carries the
         // compiler control id, hosted page id, and raw SubPageLink property.
-        List<PagePartSymbol>? Parts = null);
+        List<PagePartSymbol>? Parts = null,
+        // Client-side list-page insertion properties needed by TestPage draft handling.
+        bool AutoSplitKey = false, bool MultipleNewLines = false);
 
     /// <summary>
     /// One field control of a precompiled dependency page, as SymbolReference.json states
@@ -495,6 +500,8 @@ internal static partial class BcAppSymbolCache
         bool insertAllowed = !SymbolBoolFalse(props, "InsertAllowed");
         bool modifyAllowed = !SymbolBoolFalse(props, "ModifyAllowed");
         bool deleteAllowed = !SymbolBoolFalse(props, "DeleteAllowed");
+        bool autoSplitKey = SymbolBool(props, "AutoSplitKey");
+        bool multipleNewLines = SymbolBool(props, "MultipleNewLines");
 
         var controls = new List<PageControlSymbol>();
         var parts = new List<PagePartSymbol>();
@@ -509,7 +516,8 @@ internal static partial class BcAppSymbolCache
         return new PageSymbol(pageId, name!, sourceTableId, sourceTableTemporary,
             string.IsNullOrWhiteSpace(pageType) ? "Card" : pageType!, caption,
             editable, insertAllowed, modifyAllowed, deleteAllowed, controls,
-            string.IsNullOrWhiteSpace(cardPageName) ? null : cardPageName, parts);
+            string.IsNullOrWhiteSpace(cardPageName) ? null : cardPageName, parts,
+            autoSplitKey, multipleNewLines);
     }
 
     /// <summary>

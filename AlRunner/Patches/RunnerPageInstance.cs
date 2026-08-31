@@ -822,6 +822,15 @@ internal sealed class RunnerPageInstance
            && form.MasterPage?.PageProperties?.SourceObject?.AutoSplitKey == true;
 
     /// <summary>
+    /// Whether the page keeps multiple client-side draft rows. When the first explicit row in
+    /// an empty grid becomes persisted, BC saves the untouched draft above it through the
+    /// service's empty-multiple-line insert path.
+    /// </summary>
+    internal bool SupportsMultipleNewLines
+        => _form is NavForm form
+           && form.MasterPage?.PageProperties?.SourceObject?.MultipleNewLines == true;
+
+    /// <summary>
     /// Hand BC's <c>NavForm.SplitKey()</c> the key the CLIENT proposes for the row about to be
     /// inserted — <c>NavForm.AutoKeyValue</c>, the first thing SplitKey consults.
     ///
@@ -881,11 +890,27 @@ internal sealed class RunnerPageInstance
         var triggerReportedUnused = FindNavFormMethod("IsOnNewRecordUsed", Type.EmptyTypes) is { } used
             && used.Invoke(_form, Array.Empty<object>()) is false;
 
-        try { newRecord.Invoke(_form, new object[] { belowXRec }); }
+        // This call is the client-side New action, not AL invoking CurrPage.NewRecord. The
+        // client asks NavForm to validate values copied from exact filters before OnNewRecord;
+        // otherwise a filtered primary key reaches the draft as a raw assignment and its table
+        // OnValidate never gets a chance to reject it.
+        var navForm = _form as NavForm;
+        var validateFieldsInOnNewRecord = navForm?.ValidateFieldsInOnNewRecord ?? false;
+        if (navForm != null)
+            navForm.ValidateFieldsInOnNewRecord = true;
+        try
+        {
+            newRecord.Invoke(_form, new object[] { belowXRec });
+        }
         catch (TargetInvocationException tie) when (tie.InnerException != null)
         {
             // OnNewRecord runs inside this call; an Error() it raises is the test's result.
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+        }
+        finally
+        {
+            if (navForm != null)
+                navForm.ValidateFieldsInOnNewRecord = validateFieldsInOnNewRecord;
         }
         if (triggerReportedUnused)
             RaiseOnNewRecord(belowXRec);
