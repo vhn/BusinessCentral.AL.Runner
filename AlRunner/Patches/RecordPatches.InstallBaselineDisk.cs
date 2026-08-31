@@ -12,8 +12,8 @@
 //   reloaded from disk.
 //
 // WHAT IS PERSISTED
-//   Exactly the three things InstallBaselineSnapshot holds — table rows, isolated storage,
-//   auto-increment counters — MINUS the self-populating virtual system tables
+//   Exactly the four things InstallBaselineSnapshot holds — table rows, isolated storage,
+//   auto-increment counters, and pending task ids — MINUS the self-populating virtual system tables
 //   (see IsSelfPopulatingVirtualTableId). Everything else round-trips through BC's OWN
 //   NavValue byte codec (NavValue.GetBytes / NavValue.CreateNavValueFromBytes, the pair the
 //   service tier itself uses to move field values in and out of binary), so the runner is not
@@ -55,7 +55,7 @@ public static partial class RecordPatches
     // deserialises cleanly under new semantics is the one failure mode a cache cannot
     // detect for itself.
     private const uint InstallBaselineDiskMagic = 0x42494C41;
-    internal const int InstallBaselineDiskSchemaVersion = 2;
+    internal const int InstallBaselineDiskSchemaVersion = 3;
 
     // Pool-entry kinds. Kind is stored per DISTINCT NavValue instance, not per row slot.
     private const byte KindBytes = 1;       // NavValue.GetBytes() + NavValue.CreateNavValueFromBytes
@@ -150,14 +150,29 @@ public static partial class RecordPatches
     /// is a normal outcome that costs only the persistence.</summary>
     internal static byte[]? TrySerializeInstallBaselineSnapshot(InstallBaselineSnapshot snapshot, string cacheKey)
     {
+        var skeleton = ResolveSkeletonDataAccessSource();
+        if (skeleton == null)
+        {
+            DiskLog("not persisting: the skeleton session has no DataAccessSource yet");
+            return null;
+        }
+        return TrySerializeInstallBaselineSnapshot(snapshot, cacheKey, skeleton);
+    }
+
+    /// <summary>Source-explicit form used by the disk codec's in-process round-trip tests.
+    /// The production entry point above supplies the skeleton source.</summary>
+    internal static byte[]? TrySerializeInstallBaselineSnapshot(
+        InstallBaselineSnapshot snapshot,
+        string cacheKey,
+        object expectedSource)
+    {
         if (snapshot.Sources.Count != 1)
         {
             DiskLog($"not persisting: snapshot has {snapshot.Sources.Count} DataAccessSource(s), expected exactly 1");
             return null;
         }
         var source = snapshot.Sources[0];
-        var skeleton = ResolveSkeletonDataAccessSource();
-        if (skeleton == null || !ReferenceEquals(skeleton, source.Source))
+        if (!ReferenceEquals(expectedSource, source.Source))
         {
             DiskLog("not persisting: the captured DataAccessSource is not the skeleton session's, "
                   + "so a disk restore could not re-attach the rows to the source AL will read through");
@@ -242,6 +257,10 @@ public static partial class RecordPatches
             w.Write(ai?.Count ?? 0);
             if (ai != null)
                 foreach (var (k, v) in ai) { w.Write(k); w.Write(v); }
+
+            w.Write(snapshot.PendingTaskIds.Count);
+            foreach (var taskId in snapshot.PendingTaskIds.Order())
+                w.Write(taskId.ToByteArray());
         }
         return ms.ToArray();
     }
@@ -354,6 +373,16 @@ public static partial class RecordPatches
             DiskLog("cannot restore: the skeleton session has no DataAccessSource yet");
             return null;
         }
+        return TryDeserializeInstallBaselineSnapshot(blob, cacheKey, sourceObject);
+    }
+
+    /// <summary>Source-explicit form used by the disk codec's in-process round-trip tests.
+    /// The production entry point above supplies the skeleton source.</summary>
+    internal static InstallBaselineSnapshot? TryDeserializeInstallBaselineSnapshot(
+        byte[] blob,
+        string cacheKey,
+        object sourceObject)
+    {
         try
         {
             using var ms = new MemoryStream(blob, writable: false);
@@ -452,6 +481,16 @@ public static partial class RecordPatches
                 autoIncrement[k] = r.ReadInt64();
             }
 
+            var pendingTaskCount = r.ReadInt32();
+            if (pendingTaskCount < 0 || pendingTaskCount > (ms.Length - ms.Position) / 16)
+            {
+                DiskLog($"cannot restore: pending-task count {pendingTaskCount} exceeds the payload");
+                return null;
+            }
+            var pendingTaskIds = new Guid[pendingTaskCount];
+            for (var i = 0; i < pendingTaskCount; i++)
+                pendingTaskIds[i] = new Guid(r.ReadBytes(16));
+
             if (ms.Position != ms.Length)
             {
                 DiskLog($"cannot restore: {ms.Length - ms.Position} trailing byte(s) after the payload");
@@ -460,7 +499,9 @@ public static partial class RecordPatches
 
             return new InstallBaselineSnapshot(
                 new[] { new BaselineSource(sourceObject, baselineTables) },
-                isolatedStorage, autoIncrement);
+                isolatedStorage,
+                autoIncrement,
+                pendingTaskIds);
         }
         catch (Exception ex)
         {
@@ -509,7 +550,7 @@ public static partial class RecordPatches
     /// <summary>Value-level digest of everything an on-disk baseline carries, in the order it
     /// carries it: for every persistable table, every row, every field slot — the value's own
     /// NclType, its own defined length, its NULL flag and the exact bytes BC's
-    /// <c>GetBytes()</c> produces — plus the isolated-storage and auto-increment
+    /// <c>GetBytes()</c> produces — plus the isolated-storage, auto-increment, and pending-task
     /// state (sorted, since those stores' enumeration order is not meaningful).
     ///
     /// This is the ROUND-TRIP PROOF the cross-process test asserts on: the writing process
@@ -552,6 +593,8 @@ public static partial class RecordPatches
             sb.Append(line).Append('\n');
         foreach (var (k, v) in (snapshot.AutoIncrement ?? new Dictionary<int, long>()).OrderBy(p => p.Key))
             sb.Append("ai|").Append(k).Append('|').Append(v).Append('\n');
+        foreach (var taskId in snapshot.PendingTaskIds.Order())
+            sb.Append("task|").Append(taskId.ToString("D")).Append('\n');
 
         using var sha = System.Security.Cryptography.SHA256.Create();
         return Convert.ToHexString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(sb.ToString())))[..16];

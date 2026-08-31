@@ -963,6 +963,25 @@ public class RadDeltaWatchTests
               ],
               "Id": 61881,
               "Name": "DTB Item Ext"
+            },
+            {
+              "TargetObject": "#437dbf0e84ff417a965ded2bb9650972#Item",
+              "Fields": [
+                {
+                  "TypeDefinition": { "Name": "Boolean" },
+                  "Properties": [
+                    {
+                      "Name": "CalcFormula",
+                      "Value": "Exist(\"Item Variant\" where(\"Item No.\" = field(\"No.\")))"
+                    },
+                    { "Name": "FieldClass", "Value": "FlowField" }
+                  ],
+                  "Id": 61883,
+                  "Name": "DTB Has Variants"
+                }
+              ],
+              "Id": 61883,
+              "Name": "DTB Item FlowField Ext"
             }
           ],
           "Reports": [],

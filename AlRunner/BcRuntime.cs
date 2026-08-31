@@ -1584,14 +1584,14 @@ public static partial class BcRuntime
             }
         }
 
-        // ALTaskScheduler.CheckCodeUnit / ALCanCreateTask / CanCreateTask (scope.md §3.6,
-        // #1733) are now Cecil-owned (see NclCecilRewrite.cs, CecilOwned + the ALTaskScheduler
-        // block in RewriteNcl). This JmpHook registration used to live here as a no-op for
-        // CheckCodeUnit, but JmpHook is off by default (Cecil-only) — the registration was
-        // silently dead, and BC's real CheckCodeUnit body ran and threw a codeunit-resolution
-        // error before ever reaching CanCreateTask. Deleted rather than left as a redundant
-        // Hook(...) call site (JmpHook.Apply auto-skips Cecil-owned keys anyway, but a call
-        // site with no effect either way is dead code the audit would just flag).
+        // ALTaskScheduler sync CreateTask, sync/async lifecycle, CheckCodeUnit, ALCanCreateTask,
+        // and CanCreateTask (scope.md §2 and §3.6, #1733) are Cecil-owned; see
+        // NclCecilRewrite.cs. The old CheckCodeUnit JmpHook registration was silently dead under
+        // Cecil-only mode, so BC's
+        // metadata lookup rejected freshly compiled codeunits before the documented scheduler
+        // boundary was reached. The synchronous CreateTask seam now validates through the
+        // runner's assembly index. All TaskScheduler helper calls are emitted directly by Cecil;
+        // none are registered here.
 
         // ALMethodScope.AssignScopeId is Cecil-owned (see NclCecilRewrite.cs, "NavMethodScope
         // cluster") — chains through Session.NCLMetadata which is null; no-op leaves scopeId =
@@ -1960,11 +1960,11 @@ public static partial class BcRuntime
         }
 
         // ALTaskScheduler.ALCreateTaskAsync is deliberately LEFT UNMODIFIED (see
-        // NclCecilRewrite.cs, scope.md §3.6, #1733): its real body already throws BC's own
-        // NavCreateScheduledTasksNotAllowedException once CanCreateTask/CheckCodeUnit are
-        // patched to let it reach that gate. A JmpHook registration used to live here trying
-        // to make it return a fresh Guid instead — a silent fake suppressing BC's own guard —
-        // and was always dead (JmpHook is off by default).
+        // NclCecilRewrite.cs, scope.md §3.6, #1733). A dead JmpHook once tried to replace that
+        // asynchronous service-tier path with a Guid. The supported AL surface now uses a
+        // distinct Cecil-owned synchronous ALCreateTask/7 helper; sync and async lifecycle
+        // calls share its pending-id store, while direct async creation still reaches BC's own
+        // CanCreateTask gate and fails loudly.
 
         // SessionTransactionExtensions.SetRecordConsistent / SetRecordInconsistent
         // — extension methods on NavSession that reach DataAccessSource (null on

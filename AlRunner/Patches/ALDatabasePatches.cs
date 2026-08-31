@@ -261,12 +261,12 @@ public static class ALDatabasePatches
     public static void NoteRecordWrite(object? record)
     {
         if (record is Microsoft.Dynamics.Nav.Runtime.NavRecord { IsTemporary: true }) return;
-        AlRunner.BcRuntime.NoteDatabaseBackedRecordWrite(record);
         System.Threading.Interlocked.Increment(ref _rowVersion);
         System.Threading.Volatile.Write(ref _inWriteTransaction, true);
         // First write since the last commit point: take the rollback snapshot now, before
         // this write lands. Deferring it to here is what keeps a read-only test free.
         RecordPatches.NoteTransactionWrite(record);
+        AlRunner.BcRuntime.NoteDatabaseBackedRecordWrite(record);
     }
 
     /// <summary>Replacement for ALDatabase.ALLastUsedRowVersion() — the runner's

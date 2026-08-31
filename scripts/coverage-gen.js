@@ -246,7 +246,9 @@ const RUNTIME_API_MOCK_FILES = {
 // AL types that tie to architectural limits (see docs/limitations.md).
 // These stay "not-possible" no matter what the mock files say.
 const RUNTIME_API_NOT_POSSIBLE_TYPES = new Set([
-  "TaskScheduler",    // CreateTask is a sync stub, but the contract is parallel
+  // This type-level report intentionally under-reports the bounded pending-id lifecycle:
+  // there is still no scheduler or task execution.
+  "TaskScheduler",
   "Debugger",         // No debugger in standalone mode
 ]);
 

@@ -11,6 +11,27 @@ codeunit 64227 "EOM Tests"
     var
         Assert: Codeunit "EOM Assert";
 
+    [Test]
+    [HandlerFunctions('EmptyCardHandler')]
+    procedure EmptyInsertAllowedPage_RunModal_DoesNotInsertDraft()
+    var
+        Item: Record "EOM Item";
+        Card: Page "EOM Card";
+    begin
+        Item.DeleteAll();
+        Item.SetRange("Code", 'NO-MATCH');
+        Card.SetTableView(Item);
+
+        Card.RunModal();
+
+        Assert.IsTrue(Item.IsEmpty(), 'closing an untouched empty page must not insert its blank client draft');
+    end;
+
+    [ModalPageHandler]
+    procedure EmptyCardHandler(var Card: TestPage "EOM Card")
+    begin
+    end;
+
     /// Leaves exactly ONE row in the table, so `TestPage.First()` lands on it. Tests share the
     /// in-memory table, and First() sorts by the primary key — without this, a row seeded by an
     /// earlier test wins and every assertion reads the wrong record.

@@ -120,7 +120,8 @@ public static partial class RecordPatches
                         enumSymbol.Name,
                         enumSymbol.Options.ToArray(),
                         enumSymbol.Indexes.ToArray(),
-                        enumSymbol.Implementations.Select(i => i.ToArray()).ToArray());
+                        enumSymbol.Implementations.Select(i => i.ToArray()).ToArray(),
+                        enumSymbol.Captions?.ToArray());
                 // Invalidate the indexes so newly-added .app gets picked up on next miss.
                 _bcTableIndex = null;
                 _bcSymbolTableIndex = null;

@@ -157,7 +157,7 @@ public sealed class ExpectationManifestWiringTests : IDisposable
         Assert.Contains("no longer diverges from BC", output, StringComparison.Ordinal);
         // Direction 2: undeclared OOS throw → add an entry. Fires for the typed throw
         // AND for the Cecil-injected message-convention throw.
-        Assert.Contains("Unexpected out-of-scope: HttpClient.Get", output, StringComparison.Ordinal);
+        Assert.Contains("Unexpected out-of-scope: HttpClient.Send", output, StringComparison.Ordinal);
         Assert.Contains("Add an expect-oos entry", output, StringComparison.Ordinal);
         // Direction 3a: declared reason does not match the thrown reason.
         Assert.Contains("Expected OOS reason 'email-smtp' but runner threw reason 'external-http'",

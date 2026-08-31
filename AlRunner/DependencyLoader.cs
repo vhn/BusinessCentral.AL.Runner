@@ -597,6 +597,9 @@ public sealed class DependencyLoader
             ms.Write(bytes, 0, bytes.Length);
         }
 
+        // v3: enum-registry sidecars preserve base-enum and enumextension registrations
+        // separately. A v2 sidecar flattened an extension against its target id and replayed
+        // it as a base enum, which could replace the target's own members on a cache hit.
         // v2 (issue #1815): runner fingerprint switched from mtime+length to a content
         // hash (mtime moved on every CI rebuild, so a persisted cache could never hit),
         // and an explicit bc:<version> line was added (a content hash alone is identical
@@ -604,7 +607,7 @@ public sealed class DependencyLoader
         // would collide on one cache entry and a leg could load a dependency DLL compiled
         // against another BC version's symbols). v1 entries carried neither and must not
         // be served under the new key shape.
-        WriteLine("schema:v2");
+        WriteLine("schema:v3");
         AlRunner.Infrastructure.RunnerFingerprint.WriteKeyLines(WriteLine);
         WriteLine($"app:{manifest.AppId}:{manifest.Publisher}:{manifest.Name}:{manifest.Version}");
         foreach (var dep in manifest.Dependencies.OrderBy(d => $"{d.Publisher}/{d.Name}/{d.Version}/{d.AppId}", StringComparer.OrdinalIgnoreCase))

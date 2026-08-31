@@ -129,12 +129,12 @@ public sealed class TestExecutor
     // WHY CACHING THE SNAPSHOT IS LOSSLESS — the structural argument, not an appeal to
     // BC's Install-trigger contract:
     //
-    // A HIT restores table rows only (RestoreInstallBaselineSnapshot →
-    // RecordPatches.InstallBaseline.cs), so at first glance any NON-table side effect a
+    // A HIT restores the bounded InstallBaselineSnapshot (RestoreInstallBaselineSnapshot →
+    // RecordPatches.InstallBaseline.cs), so at first glance any OTHER non-table side effect a
     // dependency Install trigger left in process-wide state — SingleInstance codeunit
-    // instance variables, the shared-object container, write-transaction state, or MediaSet /
-    // IsolatedStorage entries stashed outside a table row — would not be
-    // reproduced on a HIT. That would be a real gap.
+    // instance variables, the shared-object container, write-transaction state, or MediaSet
+    // entries stashed outside a table row — would not be reproduced on a HIT. That would be a
+    // real gap.
     //
     // It isn't one, because every codeunit boundary in this run — INCLUDING the app
     // group's very first codeunit — calls RecordPatches.RestoreInstallBaseline() (see the
@@ -142,12 +142,13 @@ public sealed class TestExecutor
     // that call begins with ResetPerTestState() (RecordPatches.cs), which unconditionally
     // wipes exactly those things: _dataAccessByTable per-table rows,
     // TenantStoragePatches.ResetForTest(),
-    // MediaSetPatches.ResetForTest(), ALDatabasePatches.ResetWriteTransactionState(),
+    // MediaSetPatches.ResetForTest(), BcRuntime.TaskScheduler_ResetForTest(),
+    // ALDatabasePatches.ResetWriteTransactionState(),
     // BcRuntime.DisposeSkeletonSharedObjectContainerChildren(), and
     // BcRuntime.ResetSingleInstanceCache(). So the set of install-seed state that can ever
     // survive to the moment ANY test body runs is exactly
-    // {table rows (including Record Link), isolated storage, auto-increment} — precisely the three
-    // things InstallBaselineSnapshot captures. A non-table side effect of a dependency
+    // {table rows (including Record Link), isolated storage, auto-increment, pending task ids} —
+    // precisely the four things InstallBaselineSnapshot captures. Any other non-table side effect of a dependency
     // Install trigger was already unobservable to every test BEFORE this cache existed;
     // caching the snapshot doesn't create a new gap, it caches the only part of the
     // dependency Install/Company-Initialize output that was ever able to reach a test in
@@ -680,14 +681,15 @@ public sealed class TestExecutor
     // preserve it in method order: every compiled procedure gets its own nested
     // "{MethodName}_Scope_<hash>" type carrying a SignatureSpanAttribute whose EncodedSpan
     // holds the absolute source line the procedure's own `procedure` keyword sits on — the
-    // same metadata AlCallStackCapture already decodes for stack-trace line numbers. Sorting
-    // by that line recovers true declaration order without touching the compiler's own
-    // (unmodifiable) member ordering.
+    // same metadata AlCallStackCapture already decodes for stack-trace line numbers. The
+    // suffix match must be exact: otherwise a method such as Foo can borrow FooExtended's
+    // source line. Sorting by the exact scope type's line recovers true declaration order
+    // without touching the compiler's own (unmodifiable) member ordering.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo[]> _sourceOrderCache = new();
     private static Type? _signatureSpanAttrType;
     private static bool _signatureSpanAttrTypeResolved;
     private static readonly System.Text.RegularExpressions.Regex _scopeTypeSuffix =
-        new(@"_Scope_+\d+$", System.Text.RegularExpressions.RegexOptions.Compiled);
+        new(@"^_Scope_+\d+$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
     /// Returns <paramref name="t"/>'s public instance methods ordered by AL source

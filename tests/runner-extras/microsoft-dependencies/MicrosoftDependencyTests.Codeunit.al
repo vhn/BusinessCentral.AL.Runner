@@ -145,6 +145,14 @@ codeunit 61001 "Microsoft Dependency Tests"
     end;
 
     [Test]
+    procedure BaseAppCodeunit_EnvironmentInformation_IsOnPrem_IsFalse()
+    var
+        EnvironmentInformation: Codeunit "Environment Information";
+    begin
+        Assert.IsTrue(not EnvironmentInformation.IsOnPrem(), 'A running test-execution SaaS sandbox must not simultaneously report as OnPrem.');
+    end;
+
+    [Test]
     procedure BaseAppCodeunit_WorkflowSetup_InitWorkflow_NoThrow()
     // Regression: before fix, WorkflowEventHandling.AddEventToLibrary would throw
     //   "An event with description 'Approval of an item journal batch is requested.' already exists."

@@ -74,6 +74,7 @@ public static partial class BcRuntime
         {
             FieldPoke.SetInstance(_fExecutingTestCodeUnit, _testExecutionInstance, testCodeunitInstance);
             SetExecutingTestMethod(testMethod);
+            EnterTestExecutionApplicationIdScope();
             if (!_testTenantEnvironmentTypeSet && _mSetTestTenantEnvironmentType != null)
             {
                 _mSetTestTenantEnvironmentType.Invoke(null, new object[] { true });
@@ -101,6 +102,7 @@ public static partial class BcRuntime
         {
             SetExecutingTestMethod(null);
             FieldPoke.SetInstance(_fExecutingTestCodeUnit, _testExecutionInstance, null);
+            LeaveTestExecutionApplicationIdScope();
         }
         catch (Exception ex)
         {
