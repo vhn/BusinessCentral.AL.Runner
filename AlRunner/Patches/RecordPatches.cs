@@ -185,6 +185,11 @@ public static partial class RecordPatches
         _parsedXmlPorts.Clear();
         _parsedObjectDecls.Clear();
         _parsedObjectCaptions.Clear();
+        // Register() is intentionally one-shot, but the Microsoft SystemPackage tables it
+        // publishes are not bundle-derived. Restore their exact Microsoft-owned shapes after
+        // clearing the bundle dictionaries; otherwise the first watch/server reload falls back
+        // to reduced hand-declared Media/Tenant Media platform-table shapes.
+        RestoreSystemAppPackageTablesAfterReload();
         _metaFormCache.Clear();
         // #1957: the "already (successfully|un-)loaded" bookkeeping is a statement about
         // the NCLMetaForm instances _metaFormCache.Clear() just discarded — it must go

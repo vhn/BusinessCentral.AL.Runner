@@ -1,0 +1,13 @@
+{
+  "id": "1c918953-7a67-4fbd-9541-f37e40875751",
+  "name": "SystemPackage Watch Reload Fixture",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "dependencies": [],
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [
+    { "from": 72500, "to": 72509 }
+  ],
+  "runtime": "13.0"
+}
