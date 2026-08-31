@@ -7,6 +7,7 @@ All notable changes to this project are documented here. Format based on
 ## [Unreleased]
 
 ### Added
+- **runtime:** extend headless Business Central parity
 - **runtime:** expand Business Central compatibility
 
 ### Fixed
