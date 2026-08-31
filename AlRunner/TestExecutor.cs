@@ -680,14 +680,15 @@ public sealed class TestExecutor
     // preserve it in method order: every compiled procedure gets its own nested
     // "{MethodName}_Scope_<hash>" type carrying a SignatureSpanAttribute whose EncodedSpan
     // holds the absolute source line the procedure's own `procedure` keyword sits on — the
-    // same metadata AlCallStackCapture already decodes for stack-trace line numbers. Sorting
-    // by that line recovers true declaration order without touching the compiler's own
-    // (unmodifiable) member ordering.
+    // same metadata AlCallStackCapture already decodes for stack-trace line numbers. The
+    // suffix match must be exact: otherwise a method such as Foo can borrow FooExtended's
+    // source line. Sorting by the exact scope type's line recovers true declaration order
+    // without touching the compiler's own (unmodifiable) member ordering.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo[]> _sourceOrderCache = new();
     private static Type? _signatureSpanAttrType;
     private static bool _signatureSpanAttrTypeResolved;
     private static readonly System.Text.RegularExpressions.Regex _scopeTypeSuffix =
-        new(@"_Scope_+\d+$", System.Text.RegularExpressions.RegexOptions.Compiled);
+        new(@"^_Scope_+\d+$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>
     /// Returns <paramref name="t"/>'s public instance methods ordered by AL source
