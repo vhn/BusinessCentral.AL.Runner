@@ -199,6 +199,10 @@ public static partial class RecordPatches
         _installBaseline = null;
         _isolatedStorageBaseline = null;
         _autoIncrementBaseline = null;
+        _pendingTaskIdsBaseline = null;
+        // A server/watch reload is a new bundle execution, so neither live task ids nor the
+        // prior bundle's captured install-task ids may cross into it.
+        AlRunner.BcRuntime.TaskScheduler_ResetForTest();
         // Drop the in-memory table rows so an edited re-run starts clean instead of
         // seeing Inserts from the previous run (which would e.g. throw "already exists").
         _dataAccessByTable.Clear();
@@ -1223,6 +1227,11 @@ public static partial class RecordPatches
         // transient NavRecord instance, which is exactly what makes it durable — and
         // exactly why it needs this reset).
         AlRunner.Patches.MediaSetPatches.ResetForTest();
+
+        // Pending TaskScheduler ids follow the configured AL test-isolation boundary. The
+        // membership store is deliberately non-transactional within a test, but it must not
+        // outlive the same reset boundary as the in-memory table rows it approximates.
+        AlRunner.BcRuntime.TaskScheduler_ResetForTest();
 
         // Write-transaction state behind Database.IsInWriteTransaction(). A test that
         // writes without committing must not leave the next test believing it started

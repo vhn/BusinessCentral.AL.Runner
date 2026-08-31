@@ -117,18 +117,20 @@ dispatch, and report/request-page variables support a limited standalone surface
   `Rec` that is already in the table, with the page's `AutoSplitKey` field assigned
   (BC's own `NavForm.SplitKey`, in 10000 increments). A plain `SetValue` still does not
   save: the row is written when something leaves it (a cursor move, an action, or close).
-  The `AutoSplitKey` *values* are not yet BC's: the runner has no client cursor to take an
-  insertion point from, so an empty grid starts at 10000 where BC starts at 20000, and a
-  line appended to a grid numbered from something other than 10000 does not continue from
-  the last row. Tracked in
-  [#1755](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1755).
+  `AutoSplitKey` uses the page's filtered cursor and BC's client-side draft intervals for
+  empty grids, appends, and insertion between existing rows. On a `MultipleNewLines` page,
+  saving the first explicit row also persists the untouched predecessor draft through BC's
+  empty-line path, without running the table insert trigger. Unsupported key-field types fail
+  explicitly instead of receiving a guessed key.
 - Static `Page.Run()` dispatches to `[PageHandler]` or attaches to a preceding
   `TestPage.Trap()` during a test; without either it throws the documented non-modal UI
   out-of-scope error. `Page.RunModal()` dispatches to
   `[ModalPageHandler]` if registered, otherwise throws — both the page-variable form
   (`P.SetRecord(Rec); P.RunModal();`) and the static-by-id forms
   (`Page.RunModal(id, Record)`, `Page.RunModal(Page::"X", Record)`, and Base App
-  `Codeunit 700 "Page Management"` code that routes through them).
+  `Codeunit 700 "Page Management"` code that routes through them). The handler's TestPage
+  starts on the `SetRecord` row when it remains in the applied view, or on that view's first
+  row when the source record is filtered but not positioned.
 - Request pages can be handled via `[RequestPageHandler]`, but this is handler dispatch
   only, not real request-page rendering.
 - Report variables support `Run()`, `RunRequestPage()`, `SetTableView()`, and
@@ -164,17 +166,23 @@ The runner executes in a single .NET process with no attached BC debugger. Debug
 
 `Debugger.Activate()`, `Debugger.Deactivate()`, and `Debugger.IsActive()` are supported — they are stripped or return `false`.
 
-### Task scheduler — synchronous dispatch
+### Task scheduler — pending-ID lifecycle without execution
 
-`TaskScheduler.CreateTask()` dispatches the target codeunit **synchronously, inline**,
-before returning — the same pattern as `StartSession`. The implications:
+`TaskScheduler.CanCreateTask()` returns `false` because the runner has no background
+scheduler. Guarded AL therefore skips scheduling. In AL compiled by this runner, an unguarded
+`CreateTask()` call validates requested codeunit ids against the loaded assembly index, returns
+a fresh non-empty GUID, and retains that GUID in a process-local pending set. A codeunit known
+only through app metadata, but not loaded as a CLR type, fails that validation. `TaskExists()`,
+`CancelTask()`, and `SetTaskReady()` answer from membership; `SetTaskReady()` never dispatches
+the task.
 
-- `TaskExists()` always returns `false` — the task already completed before the call returned.
-- `CancelTask()` and `SetTaskReady()` are no-ops — the task has already run.
-- `CanCreateTask()` returns `false` — there is no background job queue.
-- `NotBefore` and `CompanyName` parameters are accepted but ignored — the codeunit runs immediately in the current company context.
-
-AL that tests the *logic* around task creation (what codeunit runs, what state it produces) works here. AL that tests the *scheduling contract* (task still pending, NotBefore delay, cancellation before execution) cannot work here because there is no background scheduler.
+Test-created ids are cleared at the configured test-isolation boundary; ids created by install
+triggers are restored with the install baseline. The set is not transactional within a test, so AL
+rollback does not undo membership changes. The runner does not model readiness,
+`NotBefore`, company switching, timeout handling, Scheduled Task rows, task execution, or
+failure-codeunit execution. The same `CreateTask()` statement in a precompiled MS / ISV app uses
+BC's untouched async runtime path and retains BC's refusal behavior. AL that depends on
+scheduling effects requires a real Business Central service tier.
 
 ### No DotNet interop
 

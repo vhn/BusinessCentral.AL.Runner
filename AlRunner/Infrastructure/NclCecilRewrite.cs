@@ -19,7 +19,7 @@ namespace AlRunner.Infrastructure;
 
 public static class NclCecilRewrite
 {
-    private const int CACHE_VERSION = 135;
+    private const int CACHE_VERSION = 137;
     private const string ExternalHttpOosMessage =
         "out-of-scope: HttpClient.Send — external-http — see docs/scope.md#external-http";
 
@@ -402,10 +402,16 @@ public static class NclCecilRewrite
         // NavNCLDotNetCreateException (which is trappable and would be silently swallowed
         // by TryInvokeAsync → TryInitializeFromCurrentApp returns false with no OOS signal).
         "Microsoft.Dynamics.Nav.Runtime.NavDotNet::CreateDotNet/1",
-        // ALTaskScheduler cluster (scope.md §3.6, #1733) — CanCreateTask/ALCanCreateTask
-        // rewritten to return false (no scheduler headlessly) and CheckCodeUnit no-op'd so
-        // ALCreateTaskAsync's real body reaches that CanCreateTask gate instead of throwing
-        // a codeunit-resolution error first. See the RewriteNcl block below for detail.
+        // ALTaskScheduler cluster (scope.md §3.6, #1733) — CreateTask and lifecycle
+        // membership are backed by pending ids without scheduling or execution. Both sync and
+        // async lifecycle surfaces share the store; async CreateTask remains untouched.
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALCreateTask/7",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALTaskExists/1",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALCancelTask/1",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALSetTaskReady/2",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALTaskExistsAsync/2",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALCancelTaskAsync/2",
+        "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALSetTaskReadyAsync/3",
         "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALCanCreateTask/0",
         "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::ALCanCreateTask/1",
         "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler::CanCreateTask/1",
@@ -433,10 +439,37 @@ public static class NclCecilRewrite
         string methodName,
         string returnType,
         params string[] parameterTypes)
+        => ResolveExactEntryPoint(
+            type, methodName, isPublic: true, returnType, "#2049", parameterTypes);
+
+    internal static MethodDefinition ResolveTaskSchedulerEntryPoint(
+        TypeDefinition type,
+        string methodName,
+        string returnType,
+        params string[] parameterTypes)
+        => ResolveExactEntryPoint(
+            type, methodName, isPublic: true, returnType, "#1733", parameterTypes);
+
+    internal static MethodDefinition ResolveTaskSchedulerEntryPoint(
+        TypeDefinition type,
+        string methodName,
+        bool isPublic,
+        string returnType,
+        params string[] parameterTypes)
+        => ResolveExactEntryPoint(
+            type, methodName, isPublic, returnType, "#1733", parameterTypes);
+
+    private static MethodDefinition ResolveExactEntryPoint(
+        TypeDefinition type,
+        string methodName,
+        bool isPublic,
+        string returnType,
+        string issueReference,
+        params string[] parameterTypes)
     {
         var matches = type.Methods.Where(method =>
                 method.Name == methodName &&
-                method.IsPublic &&
+                (isPublic ? method.IsPublic : method.IsPrivate) &&
                 method.IsStatic &&
                 method.HasBody &&
                 method.ReturnType.FullName == returnType &&
@@ -447,14 +480,15 @@ public static class NclCecilRewrite
         if (matches.Length == 1)
             return matches[0];
 
-        var expected = $"{returnType} {type.FullName}.{methodName}({string.Join(", ", parameterTypes)})";
+        var visibility = isPublic ? "public" : "private";
+        var expected = $"{visibility} static {returnType} {type.FullName}.{methodName}({string.Join(", ", parameterTypes)})";
         var available = string.Join("; ", type.Methods
             .Where(method => method.Name == methodName)
             .Select(method => method.FullName));
         throw new InvalidOperationException(
             $"[Cecil] expected exactly one {expected}, found {matches.Length}. " +
             $"Available overloads: {(available.Length == 0 ? "<none>" : available)}. " +
-            "Ncl shape changed; do not commit (#2049).");
+            $"Ncl shape changed; do not commit ({issueReference}).");
     }
 
     // Cecil uses '/' between an outer type and a nested type; reflection uses '+'.
@@ -2466,72 +2500,151 @@ public static class NclCecilRewrite
             }
         }
 
-        // ALTaskScheduler — background-job scheduling (scope.md §3.6).
+        // ALTaskScheduler — pending-id lifecycle without background execution (scope.md §3.6).
         //
-        // ALCreateTaskAsync is LEFT UNMODIFIED on purpose: its real BC body already
-        // throws BC's own NavCreateScheduledTasksNotAllowedException when
-        // CanCreateTask(session) is false (which we make so below). Letting the real
-        // body run is the faithful behaviour — guarded AL (`if CanCreateTask then …`)
-        // skips creation cleanly; unguarded AL that calls CreateTask directly gets
-        // BC's own loud "scheduled tasks not allowed" exception instead of a silent
-        // Guid.Empty. (Earlier this method was rewritten to return Guid.Empty to satisfy
-        // an archived bucket-1 test; that was a silent fake suppressing BC's guard.)
+        // ALCreateTask/7 is the synchronous entry point emitted for AL CreateTask overloads.
+        // Real BC validates the requested codeunits, persists a task, returns a non-empty id,
+        // and does not execute the background session before the call returns. The runner retains
+        // only Guid membership, so TaskExists / CancelTask / SetTaskReady are coherent while no
+        // task can run. Precompiled Microsoft apps call the async lifecycle entry points directly,
+        // so both lifecycle surfaces must share this store. ALCreateTaskAsync is deliberately left
+        // unmodified: direct async creation still fails loudly through BC's CanCreateTask gate.
         {
-            var alTaskSchedulerType = asm.MainModule.GetType("Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler");
-            if (alTaskSchedulerType != null)
+            var alTaskSchedulerType = asm.MainModule.GetType(
+                "Microsoft.Dynamics.Nav.Runtime.ALTaskScheduler")
+                ?? throw new InvalidOperationException(
+                    "[Cecil] ALTaskScheduler not found — Ncl shape changed; do not commit");
+            var patchType = typeof(AlRunner.BcRuntime);
+
+            void RewriteTaskScheduler(
+                string methodName,
+                string returnType,
+                string helperName,
+                Type[] helperParameterTypes,
+                params string[] nclParameterTypes)
             {
+                var target = ResolveTaskSchedulerEntryPoint(
+                    alTaskSchedulerType, methodName, returnType, nclParameterTypes);
+                var helper = patchType.GetMethod(
+                    helperName,
+                    BindingFlags.Public | BindingFlags.Static,
+                    binder: null,
+                    types: helperParameterTypes,
+                    modifiers: null)
+                    ?? throw new InvalidOperationException(
+                        $"[Cecil] helper {patchType.Name}.{helperName}({string.Join(", ", helperParameterTypes.Select(type => type.Name))}) not found");
+                var helperReturnType = asm.MainModule.ImportReference(helper.ReturnType).FullName;
+                var helperParameters = helper.GetParameters()
+                    .Select(parameter => asm.MainModule.ImportReference(parameter.ParameterType).FullName)
+                    .ToArray();
+                if (helperReturnType != returnType ||
+                    !helperParameters.SequenceEqual(nclParameterTypes, StringComparer.Ordinal))
+                    throw new InvalidOperationException(
+                        $"[Cecil] helper {helper} does not exactly match {target.FullName}");
+                var asyncAttribute = target.CustomAttributes.FirstOrDefault(attribute =>
+                    attribute.AttributeType.Name == "AsyncStateMachineAttribute");
+                if (asyncAttribute != null)
+                    target.CustomAttributes.Remove(asyncAttribute);
+                ReplaceBodyWithHelper(asm.MainModule, target, helper);
+            }
 
-                // ALTaskScheduler.ALCanCreateTask + private CanCreateTask — both access
-                // session.Authenticator which NREs on the skeleton.  The runner has no real
-                // task scheduler, so the faithful return value is false (no tasks can be
-                // created).  InsertJobQueueData in WorkflowSetup.InitWorkflow gates its
-                // job-queue row insertion on this, so returning false makes it skip the
-                // Insert cleanly rather than NRE-ing through the authenticator.
-                // Both methods return plain bool — ldc.i4.0; ret is all we need.
-                // No new typeRefs/memberRefs added (avoids R2R token-shift risk).
-                foreach (var m in alTaskSchedulerType.Methods
-                    .Where(x => (x.Name == "ALCanCreateTask" || x.Name == "CanCreateTask")
-                                && x.ReturnType.FullName == "System.Boolean"
-                                && x.HasBody))
+            RewriteTaskScheduler(
+                "ALCreateTask", "System.Guid",
+                nameof(AlRunner.BcRuntime.ALTaskScheduler_ALCreateTask),
+                new[]
                 {
-                    var body = m.Body;
-                    body.Instructions.Clear();
-                    body.Variables.Clear();
-                    body.ExceptionHandlers.Clear();
-                    var ilc = body.GetILProcessor();
-                    ilc.Append(ilc.Create(OpCodes.Ldc_I4_0));   // false
-                    ilc.Append(ilc.Create(OpCodes.Ret));
-                    body.MaxStackSize = 1;
-                    Console.Error.WriteLine($"[Cecil] Rewrote ALTaskScheduler.{m.Name} → return false");
-                }
+                    typeof(int), typeof(int), typeof(bool), typeof(string),
+                    typeof(Microsoft.Dynamics.Nav.Runtime.NavDateTime),
+                    typeof(Microsoft.Dynamics.Nav.Runtime.NavRecordId),
+                    typeof(Microsoft.Dynamics.Nav.Runtime.NavDuration),
+                },
+                "System.Int32", "System.Int32", "System.Boolean", "System.String",
+                "Microsoft.Dynamics.Nav.Runtime.NavDateTime",
+                "Microsoft.Dynamics.Nav.Runtime.NavRecordId",
+                "Microsoft.Dynamics.Nav.Runtime.NavDuration");
+            RewriteTaskScheduler(
+                "ALTaskExists", "System.Boolean",
+                nameof(AlRunner.BcRuntime.ALTaskScheduler_ALTaskExists),
+                new[] { typeof(Guid) },
+                "System.Guid");
+            RewriteTaskScheduler(
+                "ALCancelTask", "System.Boolean",
+                nameof(AlRunner.BcRuntime.ALTaskScheduler_ALCancelTask),
+                new[] { typeof(Guid) },
+                "System.Guid");
+            RewriteTaskScheduler(
+                "ALSetTaskReady", "System.Boolean",
+                nameof(AlRunner.BcRuntime.ALTaskScheduler_ALSetTaskReady),
+                new[] { typeof(Guid), typeof(Microsoft.Dynamics.Nav.Runtime.NavDateTime) },
+                "System.Guid", "Microsoft.Dynamics.Nav.Runtime.NavDateTime");
+            RewriteTaskScheduler(
+                "ALTaskExistsAsync", "System.Threading.Tasks.ValueTask`1<System.Boolean>",
+                nameof(AlRunner.BcRuntime.ALTaskScheduler_ALTaskExistsAsync),
+                new[] { typeof(Microsoft.Dynamics.Nav.Runtime.NavSession), typeof(Guid) },
+                "Microsoft.Dynamics.Nav.Runtime.NavSession", "System.Guid");
+            RewriteTaskScheduler(
+                "ALCancelTaskAsync", "System.Threading.Tasks.ValueTask`1<System.Boolean>",
+                nameof(AlRunner.BcRuntime.ALTaskScheduler_ALCancelTaskAsync),
+                new[] { typeof(Microsoft.Dynamics.Nav.Runtime.NavSession), typeof(Guid) },
+                "Microsoft.Dynamics.Nav.Runtime.NavSession", "System.Guid");
+            RewriteTaskScheduler(
+                "ALSetTaskReadyAsync", "System.Threading.Tasks.ValueTask`1<System.Boolean>",
+                nameof(AlRunner.BcRuntime.ALTaskScheduler_ALSetTaskReadyAsync),
+                new[]
+                {
+                    typeof(Microsoft.Dynamics.Nav.Runtime.NavSession), typeof(Guid),
+                    typeof(Microsoft.Dynamics.Nav.Runtime.NavDateTime),
+                },
+                "Microsoft.Dynamics.Nav.Runtime.NavSession", "System.Guid",
+                "Microsoft.Dynamics.Nav.Runtime.NavDateTime");
+            Console.Error.WriteLine(
+                "[Cecil] Rewrote ALTaskScheduler CreateTask + sync/async lifecycle → pending-id store");
 
-                // ALTaskScheduler.CheckCodeUnit(NavSession, int) — the ALCreateTaskAsync
-                // state machine calls this TWICE (codeunitId, then failureCodeunitId) BEFORE
-                // it ever reaches the CanCreateTask gate above (#1733). Its real body calls
-                // NCLMetadata.GetMetaCodeunitById, which does not know about a freshly
-                // compiled test bundle's own codeunits, and throws a codeunit-resolution
-                // NavALException naming the calling test codeunit itself — CanCreateTask is
-                // never reached, so the documented scope.md §3.6 contract (unguarded CreateTask
-                // hits BC's own NavCreateScheduledTasksNotAllowedException) never manifests.
-                // The runner resolves codeunits via assembly-scan elsewhere (CreateTarget), so
-                // this metadata check is redundant here; no-op lets execution fall through to
-                // the CanCreateTask gate. A JmpHook no-op for this used to live in BcRuntime.cs
-                // but JmpHook is off by default (Cecil-only) — that registration was silently
-                // dead, which is exactly how this bug presented.
-                foreach (var m in alTaskSchedulerType.Methods
-                    .Where(x => x.Name == "CheckCodeUnit"
-                                && x.ReturnType.FullName == "System.Void"
-                                && x.HasBody))
-                {
-                    var body = m.Body;
-                    body.Instructions.Clear();
-                    body.Variables.Clear();
-                    body.ExceptionHandlers.Clear();
-                    var ilc = body.GetILProcessor();
-                    ilc.Append(ilc.Create(OpCodes.Ret));
-                    body.MaxStackSize = 0;
-                    Console.Error.WriteLine($"[Cecil] Rewrote ALTaskScheduler.{m.Name} → no-op");
-                }
+            // ALTaskScheduler.ALCanCreateTask + private CanCreateTask — both access
+            // session.Authenticator which NREs on the skeleton. The runner still has no
+            // scheduler, so guarded AL must continue to skip scheduling. InsertJobQueueData
+            // in WorkflowSetup.InitWorkflow relies on this false result to avoid entering
+            // service-tier-only job-queue state.
+            var canCreateTaskEntryPoints = new[]
+            {
+                ResolveTaskSchedulerEntryPoint(
+                    alTaskSchedulerType, "ALCanCreateTask", isPublic: true,
+                    "System.Boolean"),
+                ResolveTaskSchedulerEntryPoint(
+                    alTaskSchedulerType, "ALCanCreateTask", isPublic: true,
+                    "System.Boolean", "Microsoft.Dynamics.Nav.Runtime.NavSession"),
+                ResolveTaskSchedulerEntryPoint(
+                    alTaskSchedulerType, "CanCreateTask", isPublic: false,
+                    "System.Boolean", "Microsoft.Dynamics.Nav.Runtime.NavSession"),
+            };
+            foreach (var m in canCreateTaskEntryPoints)
+            {
+                var body = m.Body;
+                body.Instructions.Clear();
+                body.Variables.Clear();
+                body.ExceptionHandlers.Clear();
+                var ilc = body.GetILProcessor();
+                ilc.Append(ilc.Create(OpCodes.Ldc_I4_0));   // false
+                ilc.Append(ilc.Create(OpCodes.Ret));
+                body.MaxStackSize = 1;
+                Console.Error.WriteLine($"[Cecil] Rewrote ALTaskScheduler.{m.Name} → return false");
+            }
+
+            // CheckCodeUnit remains no-op only for the untouched async path. Its real metadata
+            // lookup cannot see freshly compiled test-bundle codeunits; the synchronous helper
+            // performs the corresponding validation through the runner's assembly index.
+            var checkCodeUnit = ResolveTaskSchedulerEntryPoint(
+                alTaskSchedulerType, "CheckCodeUnit", isPublic: false,
+                "System.Void", "Microsoft.Dynamics.Nav.Runtime.NavSession", "System.Int32");
+            {
+                var body = checkCodeUnit.Body;
+                body.Instructions.Clear();
+                body.Variables.Clear();
+                body.ExceptionHandlers.Clear();
+                var ilc = body.GetILProcessor();
+                ilc.Append(ilc.Create(OpCodes.Ret));
+                body.MaxStackSize = 0;
+                Console.Error.WriteLine("[Cecil] Rewrote ALTaskScheduler.CheckCodeUnit → no-op");
             }
         }
 

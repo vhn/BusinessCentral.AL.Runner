@@ -61,6 +61,7 @@ real thing for any test that only observes documented BC behaviour.
 | **`Page.Run` / `Page.RunModal` / report `[RequestPageHandler]`** | Real UI page or dialog | Looks up a registered page trap or `[PageHandler]` / `[ModalPageHandler]` / `[RequestPageHandler]` and calls it | Faithful for the handler and `TestPage.Trap()` dispatch contracts that test code relies on; no actual UI is rendered. |
 | **`[HttpClientHandler]` dispatch** | Intercepts an AL `HttpClient` request during a test | BC's in-process handler dispatcher supplies the test request and accepts the mocked response | Faithful when the handler returns `false`, meaning the request was handled. Returning `true` requests real delivery, which remains out of scope. |
 | **`RecordLink` (table 2000000068)** AL surface: `Rec.AddLink/HasLinks/DeleteLink/DeleteLinks/CopyLinks` | Stored in the platform Record Link table | The unmodified NCL implementation writes to the runner's in-memory Record Link table. | Faithful for AL-observable semantics, including reading the inserted row through `Record 2000000068`; table rows participate in normal test reset and install-baseline handling. |
+| **`TaskScheduler` pending-ID lifecycle** | Validates the codeunit ids, stores a task, exposes its lifecycle, and may later execute it | Runner-compiled AL validates codeunit ids against the loaded assembly index, retains a fresh opaque id, and answers `TaskExists`, `CancelTask`, and `SetTaskReady` from a process-local pending set; tasks are never executed | Faithful for opaque-id creation and membership observations within a configured test-isolation boundary. Codeunits known only through app metadata, but not loaded as CLR types, fail validation. The set is non-transactional within a test; readiness, `NotBefore`, company switching, timeout, failure execution, Scheduled Task rows, and background execution are not modelled. The runner deliberately reports `CanCreateTask = false` while allowing unguarded runner-compiled `CreateTask` calls to succeed—a combination real BC cannot produce—so guarded AL skips creation while unguarded AL receives an id. Precompiled apps use BC's untouched async creation path and retain BC's refusal behavior. |
 | **Query execution** | SQL projection, joins, grouping, and dataset export | In-memory projection over each table's `TempTableDataProvider`, with managed joins and provisional aggregation | Joins and dataset export are corpus-backed. Aggregate columns (`Sum`, `Count`, `Average`, `Min`, `Max`), aggregate `ColumnFilter`, and `ReverseSign` are implemented but remain provisional until matching corpus tests pass against a real BC service tier. |
 
 ---
@@ -145,10 +146,16 @@ invokes `OnInitReport` → `OnPreReport` → per-DataItem `OnPreDataItem` / `OnP
 
 ### §3.6. Background jobs / scheduling <a id="jobs"></a>
 
+The narrow §2 replacement retains pending task IDs so creation and membership lifecycle calls
+remain coherent. IDs created by a test survive until cancellation or the configured test-isolation
+reset. IDs created by install triggers are captured and restored with the install baseline at that
+boundary. `SetTaskReady` only confirms membership: it never dispatches a task or models `NotBefore`.
+
 | API | Reason |
 |---|---|
-| Task scheduling (`TaskScheduler.CreateTask`) | No scheduler. `ALTaskScheduler.CanCreateTask` returns **false** (faithful: the runner cannot schedule tasks). Guarded AL (`if TaskScheduler.CanCreateTask then …`) skips creation cleanly. Unguarded AL that calls `CreateTask` directly hits BC's own `NavCreateScheduledTasksNotAllowedException` (BC's real body throws it when `CanCreateTask` is false — we do not substitute behaviour). Tasks are never executed. |
 | Job Queue Entry execution against a scheduler | No scheduler — job-queue rows are not picked up and run. |
+| Task or failure-codeunit execution, timing, and Scheduled Task table integration | The pending-ID replacement has no dispatcher, clock, background session, or platform task table. |
+| `TaskScheduler.CreateTask` from precompiled MS / ISV apps | Precompiled callers use BC's untouched async creation path, which retains BC's own refusal behavior. The pending-ID creation seam applies to AL compiled by this runner. |
 | `IsolatedStorage` scoped to *real* session/user/company beyond the runner's flat in-memory bag | Possible TODO if needed; currently a single in-memory bag. |
 
 ### §3.7. Cryptography requiring external KMS / certificates <a id="crypto-external"></a>
