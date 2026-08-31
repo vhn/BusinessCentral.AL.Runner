@@ -29,6 +29,15 @@ internal sealed class FieldTriggerWiringTracker
 
 public static partial class RecordPatches
 {
+    private static readonly ParsedField[] _systemFields =
+    {
+        new(2_000_000_000, "SystemId",         "Guid",     0),
+        new(2_000_000_001, "SystemCreatedAt",  "DateTime", 0),
+        new(2_000_000_002, "SystemCreatedBy",  "Guid",     0),
+        new(2_000_000_003, "SystemModifiedAt", "DateTime", 0),
+        new(2_000_000_004, "SystemModifiedBy", "Guid",     0),
+    };
+
     // Positive-result cache: maps tableId → CLR Type for "Record<id>" subclasses of NavRecord.
     // The uncached form walks every loaded assembly's full type table on every call
     // (NavRecordHandle_CreateTarget fires it for every record handle materialization), which
@@ -131,11 +140,6 @@ public static partial class RecordPatches
             // SystemCreatedBy (2000000002), SystemModifiedAt (2000000003), SystemModifiedBy
             // (2000000004). These are required for system-field access via FieldRef and RecordRef.
             var timestampParsed       = new ParsedField(0,          "timestamp",         "BigInteger", 0);
-            var systemIdParsed        = new ParsedField(2000000000, "SystemId",          "Guid",       0);
-            var systemCreatedAtParsed = new ParsedField(2000000001, "SystemCreatedAt",   "DateTime",   0);
-            var systemCreatedByParsed = new ParsedField(2000000002, "SystemCreatedBy",   "Guid",       0);
-            var systemModifiedAtParsed= new ParsedField(2000000003, "SystemModifiedAt",  "DateTime",   0);
-            var systemModifiedByParsed= new ParsedField(2000000004, "SystemModifiedBy",  "Guid",       0);
             // Merge any tableextension fields for this base table.
             // De-duplicate by field id: precompiled .app SymbolReference.json sometimes lists
             // extension fields both in the base table's Tables[].Fields entry AND in
@@ -149,8 +153,7 @@ public static partial class RecordPatches
             var extFieldsNew = extFields.Where(f => !baseFieldIds.Contains(f.FieldId));
             var allParsed = new[] { timestampParsed }.Concat(parsed.Fields)
                 .Concat(extFieldsNew)
-                .Concat(new[] { systemIdParsed, systemCreatedAtParsed, systemCreatedByParsed,
-                                systemModifiedAtParsed, systemModifiedByParsed }).ToArray();
+                .Concat(_systemFields).ToArray();
             var fields = allParsed.Select((f, idx) =>
                 BuildMetaField(f, idx, parsed.PkFieldIds.Contains(f.FieldId), parsed)).ToArray();
 
@@ -791,7 +794,10 @@ public static partial class RecordPatches
             switch (filter.Kind)
             {
                 case ParsedCalcFilterKind.Field:
-                    var parentFilterField = parentTable.Fields.FirstOrDefault(f =>
+                    // SystemId and the audit fields are added to NCL metadata by this builder,
+                    // not present in ParsedTable.Fields. CalcFormula links may reference them,
+                    // so resolve against the same synthetic field set used by BuildNCLMetaTable.
+                    var parentFilterField = parentTable.Fields.Concat(_systemFields).FirstOrDefault(f =>
                         string.Equals(f.FieldName, filter.ParentFieldName, StringComparison.OrdinalIgnoreCase));
                     if (parentFilterField == null)
                     {
@@ -1548,7 +1554,8 @@ public static partial class RecordPatches
                 if (!byName.TryGetValue(pair.Value, out var entry)) continue;
                 try
                 {
-                    var meta = new AlEnumOptionMetadata(entry.Name, entry.Id, entry.Options, entry.Indexes, entry.Implementations);
+                    var meta = new AlEnumOptionMetadata(
+                        entry.Name, entry.Id, entry.Options, entry.Indexes, entry.Implementations, entry.Captions);
                     AlRunner.Infrastructure.FieldPoke.SetInstance(_fNCLMetaFieldFieldOptionMetadata, nclField, meta);
                 }
                 catch (Exception ex)

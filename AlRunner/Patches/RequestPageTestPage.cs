@@ -10,6 +10,8 @@
 //   What a request page actually offers a handler is:
 //     * one filter group per report DATA ITEM (`Rep.Header.SetFilter("No.", …)`), which is
 //       what NavTestPageBase.GetDataItem → ITestPage.GetDataItemFilter resolves, and
+//     * controls bound to report globals, resolved through the request page's own live
+//       NavForm.SourceExpressions table, and
 //     * the built-in OK / Cancel actions that close it.
 //
 //   Both are answered here directly against the report the request page belongs to: a
@@ -19,12 +21,6 @@
 //   into the parameters XML the AL under test receives, which is the entire purpose of
 //   Report.RunRequestPage.
 //
-// WHAT IS NOT ANSWERED HERE
-//   Request-page CONTROLS bound to report globals. Resolving one needs the request page's
-//   NavForm.SourceExpressions table, which the runner only populates for forms it opted
-//   into real initialisation (RunnerFormInit) — request pages are deliberately not among
-//   them today. GetField therefore refuses by name rather than silently answering an empty
-//   value, which would let a handler "set" an option the report never sees.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -39,7 +35,9 @@ internal sealed class RequestPageTestPage : MockITestPage
 {
     private readonly object _report;
     private readonly int _reportId;
+    private readonly RunnerPageInstance _page;
     private readonly Dictionary<string, ITestFilter> _dataItemFilters = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<int, ITestField> _fields = new();
     private FormResult _formResult = FormResult.None;
 
     private readonly Guid _formHandle;
@@ -48,6 +46,7 @@ internal sealed class RequestPageTestPage : MockITestPage
     {
         _report = report;
         _reportId = reportId;
+        _page = RunnerPageInstance.Adopt(requestPageForm, reportId);
         _formHandle = ReadProperty(requestPageForm, "Handle") is Guid handle ? handle : Guid.Empty;
     }
 
@@ -87,6 +86,9 @@ internal sealed class RequestPageTestPage : MockITestPage
     /// <summary>True once the handler confirmed with OK (or LookupOK).</summary>
     internal bool Confirmed => _formResult is FormResult.OK or FormResult.LookupOK;
 
+    /// <summary>The exact built-in action selected by the handler.</summary>
+    internal FormResult RequestedResult => _formResult;
+
     public override ITestAction GetBuiltInAction(FormResult formResult)
         => new RecordingBuiltInAction(this, formResult);
 
@@ -111,12 +113,18 @@ internal sealed class RequestPageTestPage : MockITestPage
     }
 
     public override ITestField GetField(int id)
-        => throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
-            $"TestRequestPage control {id} (report {_reportId})",
-            "request-page-control — request-page controls bound to report globals are not yet "
-            + "resolvable: they need the request page's NavForm.SourceExpressions table, which "
-            + "the runner only builds for forms it drives as a TestPage. Data-item filters and "
-            + "the built-in OK/Cancel actions are supported. See docs/scope.md");
+    {
+        if (_fields.TryGetValue(id, out var cached)) return cached;
+
+        var expression = _page.TryGetSourceExpression(id)
+            ?? throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                $"TestRequestPage control {id} (report {_reportId})",
+                "request-page-control-binding — the request page has no source expression for "
+                + "this control id, so the runner cannot bind it to the report global the AL "
+                + "handler expects. See docs/scope.md");
+
+        return _fields[id] = new PageVariableTestField(_page, expression, id);
+    }
 
     // ── report data items ─────────────────────────────────────────────────────
 

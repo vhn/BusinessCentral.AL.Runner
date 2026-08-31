@@ -19,7 +19,7 @@ namespace AlRunner.Infrastructure;
 
 public static class NclCecilRewrite
 {
-    private const int CACHE_VERSION = 137;
+    private const int CACHE_VERSION = 139;
     private const string ExternalHttpOosMessage =
         "out-of-scope: HttpClient.Send — external-http — see docs/scope.md#external-http";
 
@@ -5220,9 +5220,9 @@ public static class NclCecilRewrite
         //       requires a service tier the runner does not have. Tests rewrite these as
         //       `asserterror` + `Assert.ExpectedError('out-of-scope: NavReport.SaveAs')`.
         //
-        //   RunRequestPage (any sync overload, string return)
-        //     → throw NavNCLDialogException("out-of-scope: NavReport.RunRequestPage") —
-        //       request-page UI rendering requires a service tier.
+        //   RunRequestPage (known sync overloads, string return)
+        //     → NavReportSync.SyncRunRequestPage, which drives BC's generated request page
+        //       through the test's [RequestPageHandler] without rendering a client UI.
         //
         {
             var navReportT = asm.MainModule.Types
@@ -5384,9 +5384,9 @@ public static class NclCecilRewrite
                     // loud OOS throw. Cecil-own the body directly (like the instance
                     // Run/RunModal rewrite above) so the redirect is real IL, not a hook that
                     // can silently fail to bind. Missing trailing args get BC's own
-                    // documented defaults (RequestWindow=true, SystemPrinter=false) — inert
-                    // today since SyncStaticRun does not raise a dialog, but correct in case a
-                    // future implementation reads them.
+                    // documented defaults (RequestWindow=true, SystemPrinter=false).
+                    // SyncStaticRun uses RequestWindow to drive the generated request page;
+                    // SystemPrinter remains an AL-signature compatibility argument.
                     //
                     // The one shape NOT handled here is the ReportRunOptions overload
                     // (Run(ReportRunOptions) only — RunModal has no such overload): its single
@@ -5514,7 +5514,7 @@ public static class NclCecilRewrite
             // BC's own body only touches DataItemIterator state the runner already builds
             // (dataItems, TableViewRecord, TableViewIsSet), so there is nothing to stand in
             // for — the original is both correct and sufficient.
-            Console.Error.WriteLine($"[Cecil] Rewrote {reportRewrites} NavReport/DataItemIterator method(s) (Run/RunModal→SyncRun; Add→ReportAdd; RunRequestPage→OOS-throw)");
+            Console.Error.WriteLine($"[Cecil] Rewrote {reportRewrites} NavReport/DataItemIterator method(s) (Run/RunModal→SyncRun; Add→ReportAdd; RunRequestPage→SyncRunRequestPage)");
         }
 
         // NavXmlPort static Run(id[, requestWindow[, import[, record]]]) — #1800.
@@ -7837,6 +7837,46 @@ public static class NclCecilRewrite
             ReplaceBodyWithHelper(nclMod,
                 FindNclMethod(nclMod, Rt + "Media.NavMediaImage", "GetImageWithContentHeaderValidation", 1),
                 H(typeof(AlRunner.Patches.MediaPatches), "NavMediaImage_GetImageWithContentHeaderValidation"));
+
+            // With saveStream=true, the NST keeps the caller's original image stream and
+            // NavMediaImage.BytesAsync copies it verbatim. Preserve that behavior for a
+            // structurally valid PNG before BC constructs its fallback NavMediaBinaryFile,
+            // and retain image/png instead of application/octet-stream.
+            {
+                var processMediaObject = ByParams(
+                    Rt + "Media.NavMediaFactory", "ProcessMediaObject", "Stream", "Boolean", "String");
+                if (processMediaObject.HasThis)
+                    throw new InvalidOperationException(
+                        "[Cecil] NavMediaFactory.ProcessMediaObject is no longer static — "
+                        + "Ncl shape changed; do not commit");
+                var fallbackMimeLoads = processMediaObject.Body.Instructions.Where(instruction =>
+                    instruction.OpCode == OpCodes.Ldstr
+                    && Equals(instruction.Operand, "application/octet-stream")).ToList();
+                if (fallbackMimeLoads.Count != 1)
+                    throw new InvalidOperationException(
+                        "[Cecil] NavMediaFactory.ProcessMediaObject has " + fallbackMimeLoads.Count
+                        + " application/octet-stream fallback loads, expected exactly 1 — "
+                        + "Ncl shape changed; do not commit");
+
+                var loadFallbackMime = fallbackMimeLoads[0];
+                var storeMime = loadFallbackMime.Next;
+                if (storeMime == null
+                    || (storeMime.OpCode != OpCodes.Starg && storeMime.OpCode != OpCodes.Starg_S)
+                    || !ReferenceEquals(storeMime.Operand, processMediaObject.Parameters[2]))
+                    throw new InvalidOperationException(
+                        "[Cecil] NavMediaFactory.ProcessMediaObject no longer stores its fallback "
+                        + "MIME type into parameter 3 — Ncl shape changed; do not commit");
+
+                loadFallbackMime.OpCode = OpCodes.Ldarg;
+                loadFallbackMime.Operand = processMediaObject.Parameters[0];
+                var mimeHelper = nclMod.ImportReference(H(
+                    typeof(AlRunner.Patches.MediaPatches), "NavMedia_GetFallbackMimeType"));
+                var il = processMediaObject.Body.GetILProcessor();
+                var readMime = Instruction.Create(OpCodes.Call, mimeHelper);
+                il.InsertAfter(loadFallbackMime, readMime);
+                Console.Error.WriteLine(
+                    "[Cecil] Preserved structurally valid PNG media and image/png");
+            }
 
             // NavMediaImage's STATIC state has to go too, not just that one method. Its two
             // static fields are built from System.Drawing at class-init time:

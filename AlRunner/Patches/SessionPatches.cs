@@ -13,6 +13,9 @@ namespace AlRunner;
 public static partial class BcRuntime
 {
     private static string? _skeletonApplicationAreasBaseline;
+    private static FieldInfo? _skeletonAppIdField;
+    private static string? _skeletonAppIdBaseline;
+    private const string CloudTestApplicationId = "FIN";
 
     // NOTE: still consumed by NclCecilRewrite.cs to Cecil-rewrite NavSystemCodeunit.get_Session
     // (a different type from NavApplicationObjectBase.get_Session — its own JmpHook.Apply call
@@ -39,12 +42,13 @@ public static partial class BcRuntime
     /// The skeleton session comes from GetUninitializedObject, so the field is null and AL
     /// read back an empty string.
     ///
-    /// The value is not invented. BC's own <c>AppId</c> setter resolves an unspecified
+    /// The baseline value is not invented. BC's own <c>AppId</c> setter resolves an unspecified
     /// application id to <c>ServerUserSettings.Instance.DefaultApplicationId.Value</c>,
     /// upper-cased — that setting's declared default is "NAV". The runner opens its session
     /// without a client-supplied application id, so "NAV" is precisely what real BC would
-    /// have stored. Reading the setting rather than hardcoding keeps it correct if a future
-    /// BC build changes the default.
+    /// have stored outside a test. Test execution temporarily switches this field to "FIN":
+    /// System Application uses that application-family identifier for SaaS and compares "NAV"
+    /// to implement Environment Information.IsOnPrem().
     /// </summary>
     private static void SeedSkeletonAppId(Type sessType)
     {
@@ -79,12 +83,33 @@ public static partial class BcRuntime
                 return;
             }
 
-            AlRunner.Infrastructure.FieldPoke.SetInstance(fAppId, _skeletonSession!, value.ToUpperInvariant());
+            _skeletonAppIdField = fAppId;
+            _skeletonAppIdBaseline = value.ToUpperInvariant();
+            AlRunner.Infrastructure.FieldPoke.SetInstance(fAppId, _skeletonSession!, _skeletonAppIdBaseline);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[BcRuntime] WARN: appId seed failed: {ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    private static void EnterTestExecutionApplicationIdScope()
+    {
+        if (_skeletonSession == null || _skeletonAppIdField == null)
+            throw new InvalidOperationException(
+                "NavSession.appId was not seeded — Environment Information.IsOnPrem cannot model the SaaS test scope.");
+
+        AlRunner.Infrastructure.FieldPoke.SetInstance(
+            _skeletonAppIdField, _skeletonSession, CloudTestApplicationId);
+    }
+
+    private static void LeaveTestExecutionApplicationIdScope()
+    {
+        if (_skeletonSession == null || _skeletonAppIdField == null || _skeletonAppIdBaseline == null)
+            return;
+
+        AlRunner.Infrastructure.FieldPoke.SetInstance(
+            _skeletonAppIdField, _skeletonSession, _skeletonAppIdBaseline);
     }
 
     /// <summary>

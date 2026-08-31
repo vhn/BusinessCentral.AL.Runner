@@ -17,6 +17,9 @@
 // test exists so a regression in OUR OWN capture/serve pipeline fails loudly here,
 // in milliseconds, without needing the BC engine loaded a second time.
 
+using System.IO.Compression;
+using System.Text;
+using AlRunner.Patches;
 using Xunit;
 
 namespace AlRunner.Tests;
@@ -159,5 +162,67 @@ public sealed class EnumCaptionCaptureTests : IDisposable
         Assert.True(AlEnumMetadataRegistry.TryGet(90204, out var entry));
 
         Assert.Equal(new[] { 90203 }, Assert.Single(entry.Implementations));
+    }
+
+    [Fact]
+    public void AddBcAppPath_PreservesDependencyEnumCaptions()
+    {
+        const int enumId = 90205;
+        var appPath = Path.Combine(_root, "enum-caption-dependency.app");
+        using (var archive = ZipFile.Open(appPath, ZipArchiveMode.Create))
+        {
+            var entry = archive.CreateEntry("SymbolReference.json");
+            using var writer = new StreamWriter(entry.Open(), Encoding.UTF8);
+            writer.Write("""
+                {
+                  "RuntimeVersion": "17.0",
+                  "EnumTypes": [
+                    {
+                      "Id": 90205,
+                      "Name": "Dependency Caption Kind",
+                      "Values": [
+                        {
+                          "Ordinal": 0,
+                          "Name": "DISABLED",
+                          "Properties": [ { "Name": "Caption", "Value": "Disabled" } ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+                """);
+        }
+
+        RecordPatches.AddBcAppPath(appPath);
+
+        Assert.True(AlEnumMetadataRegistry.TryGet(enumId, out var metadata));
+        Assert.Equal("Disabled", Assert.Single(metadata.Captions!));
+    }
+
+    [Fact]
+    public void Register_RefreshesRuntimeMetadataAfterCaptionBecomesAvailable()
+    {
+        const int enumId = 90206;
+        AlEnumMetadataRegistry.Register(enumId, "Late Caption Kind", ["DISABLED"], [0]);
+
+        var before = BcRuntime.NCLEnumMetadata_CreateByIdAlAware(enumId);
+        Assert.Equal("DISABLED", before.GetCaptionFromIndex(0));
+
+        AlEnumMetadataRegistry.Register(enumId, "Late Caption Kind", ["DISABLED"], [0], captions: ["Disabled"]);
+
+        var after = BcRuntime.NCLEnumMetadata_CreateByIdAlAware(enumId);
+        Assert.Equal("Disabled", after.GetCaptionFromIndex(0));
+    }
+
+    [Fact]
+    public void StrSubstNoShim_UsesEnumCaptionForImplicitSubstitution()
+    {
+        var metadata = new AlEnumOptionMetadata(
+            "Substitution Kind", 90207, ["DISABLED"], [0], captions: ["Disabled"]);
+        var option = Microsoft.Dynamics.Nav.Runtime.NavOption.Create(metadata, 0);
+
+        var result = BcRuntime.ALSystemString_StrSubstNo("State: %1", [option]);
+
+        Assert.Equal("State: Disabled", result);
     }
 }

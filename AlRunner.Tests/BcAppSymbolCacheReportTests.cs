@@ -183,6 +183,43 @@ public class BcAppSymbolCacheReportTests
         }
     }
 
+    [Fact]
+    public void ProcessingOnlyLookup_UsesRegisteredDependencyReportSymbols()
+    {
+        const int processingOnlyReportId = 88220795;
+        const int layoutReportId = 88220796;
+        var dir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var appPath = WriteApp(dir, $$"""
+                {
+                  "RuntimeVersion": "15.1",
+                  "Reports": [
+                    {
+                      "Id": {{processingOnlyReportId}},
+                      "Name": "Dependency Processing Report",
+                      "Properties": [ { "Name": "ProcessingOnly", "Value": "1" } ]
+                    },
+                    {
+                      "Id": {{layoutReportId}},
+                      "Name": "Dependency Layout Report",
+                      "Properties": []
+                    }
+                  ]
+                }
+                """);
+            RecordPatches.AddBcAppPath(appPath);
+
+            Assert.True(RecordPatches.IsReportProcessingOnly(processingOnlyReportId));
+            Assert.False(RecordPatches.IsReportProcessingOnly(layoutReportId));
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
     // Negative: a symbol file with no Reports container at all must yield no reports —
     // not a fabricated entry, and not a crash. Every dependency that ships only tables
     // (and there are many) takes this path.

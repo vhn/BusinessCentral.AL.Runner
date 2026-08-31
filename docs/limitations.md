@@ -102,9 +102,9 @@ assembly for `[NavEventSubscriber]` methods at startup and calls matching subscr
 
 ### No UI rendering
 
-Pages are not rendered. There is no layout engine, no field visibility evaluation, and
-no report dataset. `TestPage` provides expanded field access, navigation, and handler
-dispatch, and report/request-page variables support a limited standalone surface, but:
+Pages are not rendered. There is no visual layout engine or interactive client.
+`TestPage` provides expanded field access, navigation, and handler dispatch, and
+report/request-page variables run against BC's generated metadata, but:
 
 - Field `Visible`, `Enabled`, and `Editable` ARE evaluated against real page metadata,
   live, including a control's `Visible` combined with every enclosing `group`'s `Visible`
@@ -131,24 +131,27 @@ dispatch, and report/request-page variables support a limited standalone surface
   `Codeunit 700 "Page Management"` code that routes through them). The handler's TestPage
   starts on the `SetRecord` row when it remains in the applied view, or on that view's first
   row when the source record is filtered but not positioned.
-- Request pages can be handled via `[RequestPageHandler]`, but this is handler dispatch
-  only, not real request-page rendering.
+- Request pages can be handled via `[RequestPageHandler]`. The handler sees the generated
+  request page's live control source expressions and data-item filters; no pixels or
+  interactive dialog are rendered.
 - Report variables support `Run()`, `RunRequestPage()`, `SetTableView()`, and
   helper procedures. Report triggers execute: `OnPreReport`, `OnPreDataItem`,
   `OnAfterGetRecord` (once per row in the in-memory table), `OnPostDataItem`, and
   `OnPostReport`. `Run()` drives BC's own data-item loop, so `SetTableView(Rec)`
   constrains the matching data item to the applied view, and `DataItemTableView`,
   `DataItemLink`, nested data items and `CurrReport.Skip`/`Break` behave as the
-  runtime engine defines them. Report layout/rendering is still not available.
+  runtime engine defines them. `TestRequestPage.SaveAsXml(parametersFile, datasetFile)`
+  uses BC's own XML result-set processor and data-item iterator, so request-page parameter
+  XML and report dataset XML are available even for temporary records. Visual report
+  layout rendering is still not available.
 - The static `Report.Run(id[, requestWindow[, systemPrinter[, record]]])` /
   `Report.RunModal(id, ...)` forms (called on the `Report` codeunit-like object, without
   first declaring a report variable) execute the report the same way the report-variable
   form does — construct the report from its id, then run the same trigger lifecycle.
-  `requestWindow` / `systemPrinter` are accepted but not acted on: no dialog is ever raised
-  from `Run`/`RunModal` (request pages are handler dispatch only, see above); a report that
-  needs its request page's `[RequestPageHandler]` to fire should call the static/instance
-  `RunRequestPage()` explicitly. The `Report.Run(ReportRunOptions)` overload is not
-  implemented and throws `out-of-scope: static NavReport.Run`.
+  `requestWindow = true` drives the generated request page through the matching
+  `[RequestPageHandler]`; `false` skips it. `systemPrinter` is accepted for signature
+  compatibility but cannot provide a physical printer. The `Report.Run(ReportRunOptions)`
+  overload is not implemented and throws `out-of-scope: static NavReport.Run`.
 
 ### No debugger infrastructure
 
@@ -296,6 +299,13 @@ If your AL under test depends on real SA behaviour to mean anything, the support
 2. **Test-only AL codeunit shadowing the SA call.** Add an AL codeunit in your `test/` directory with the same object ID and a hand-rolled implementation that returns the values your test expects. The runner will use your codeunit because it is in the compile unit; in real BC, your production code never sees it.
 
 Concrete example — `Image` codeunit (System Application). A test that asserts on image dimensions cannot rely on the runner's blank-shell `Image.GetWidth()` (which returns `0`). The fix is to write a small stub in your test project that parses a known fixture image, not to ask the runner to ship an `Image` implementation. If the AL pattern under test is widespread enough that everyone needs the same stub, file a runner-gap issue and we can discuss whether a shared stub belongs in `AlRunner/stubs/` (the bar is high — it must be test-automation infrastructure, not business logic).
+
+This differs from importing a value into a `Media` / `MediaSet` field. That path keeps BC's
+own media container and binary fallback. Because the NST image decoder is the Windows-only
+`System.Drawing` implementation, the runner additionally validates PNG structure and preserves
+the original bytes through BC's binary media container as described in
+[the scope contract](scope.md#media-image-decoding).
+Other image encodings fail loudly instead of producing guessed image metadata.
 
 ---
 

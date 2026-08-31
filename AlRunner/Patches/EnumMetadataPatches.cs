@@ -36,6 +36,8 @@ using NavList = Microsoft.Dynamics.Nav.Runtime.NavList<Microsoft.Dynamics.Nav.Ru
 using NavListInt = Microsoft.Dynamics.Nav.Runtime.NavList<int>;
 using NavOption = Microsoft.Dynamics.Nav.Runtime.NavOption;
 using NavText = Microsoft.Dynamics.Nav.Runtime.NavText;
+using NavValue = Microsoft.Dynamics.Nav.Runtime.NavValue;
+using ALSystemString = Microsoft.Dynamics.Nav.Runtime.ALSystemString;
 using ITreeObject = Microsoft.Dynamics.Nav.Runtime.ITreeObject;
 
 namespace AlRunner;
@@ -119,6 +121,7 @@ public static class AlEnumMetadataRegistry
         if (captions != null && captions.Length != options.Length)
             captions = null;
         _byId[id] = new Entry(id, name ?? string.Empty, options, indexes, implementations, captions);
+        BcRuntime.InvalidateAlEnumMetadata(id);
     }
 
     /// <summary>
@@ -147,9 +150,14 @@ public static class AlEnumMetadataRegistry
                 .ToImmutableList()
                 .Add(entry);
         }
+        BcRuntime.InvalidateAlEnumMetadata(targetId);
     }
 
-    public static void Remove(int id) => _byId.TryRemove(id, out _);
+    public static void Remove(int id)
+    {
+        if (_byId.TryRemove(id, out _))
+            BcRuntime.InvalidateAlEnumMetadata(id);
+    }
 
     public static void RemoveExtension(int targetId, string name)
     {
@@ -161,6 +169,7 @@ public static class AlEnumMetadataRegistry
                 .ToImmutableList();
             if (remaining.IsEmpty) _extByTargetId.TryRemove(targetId, out _);
             else _extByTargetId[targetId] = remaining;
+            BcRuntime.InvalidateAlEnumMetadata(targetId);
         }
     }
 
@@ -220,6 +229,7 @@ public static class AlEnumMetadataRegistry
     {
         _byId.Clear();
         _extByTargetId.Clear();
+        BcRuntime.ClearAlEnumMetadataCache();
     }
 
     public static int Count => _byId.Count;
@@ -277,61 +287,67 @@ public static class AlEnumMetadataRegistry
     }
 
     /// <summary>
-    /// Serialize the given enum ids' MERGED entries (base + enumextension values
-    /// already flattened by <see cref="TryGet"/>) to a sidecar file. Mirrors
-    /// Program.cs's bundle-level <c>SaveEnumRegistrySidecar</c> (schema v3), but
-    /// scoped to <paramref name="onlyIds"/> so the dependency-loader's per-dep
-    /// cache sidecar does not leak sibling-app/bundle entries into its own file —
-    /// same convention as <see cref="AlReportMetadataRegistry.SaveSidecar(string, IEnumerable{int})"/>.
-    /// Returns the number of entries written.
+    /// Serialize the given enum ids' raw base and enumextension registrations to a
+    /// dependency-cache sidecar. Keeping those two kinds separate is required: an
+    /// extension-only dependency must replay through <see cref="RegisterExtension"/>,
+    /// otherwise its target id is mistaken for a base enum and overwrites the real
+    /// base when multiple bundles share one runner process.
     /// </summary>
     public static int SaveSidecar(string path, IEnumerable<int> onlyIds)
     {
         var idSet = new HashSet<int>(onlyIds);
-        var entries = new List<Entry>(idSet.Count);
-        foreach (var id in idSet)
-            if (TryGet(id, out var merged))
-                entries.Add(merged);
-        entries = entries.OrderBy(e => e.Id).ToList();
+        var baseEntries = idSet
+            .Select(id => _byId.TryGetValue(id, out var entry) ? entry : null)
+            .Where(entry => entry != null)
+            .Cast<Entry>()
+            .OrderBy(entry => entry.Id)
+            .ToArray();
+        var extensionEntries = idSet
+            .SelectMany(id => _extByTargetId.TryGetValue(id, out var entries)
+                ? entries
+                : ImmutableList<Entry>.Empty)
+            .OrderBy(entry => entry.Id)
+            .ThenBy(entry => entry.Name, StringComparer.Ordinal)
+            .ToArray();
+
+        static object ToDto(Entry entry) => new
+        {
+            id = entry.Id,
+            name = entry.Name,
+            options = entry.Options,
+            indexes = entry.Indexes,
+            implementations = entry.Implementations,
+            captions = entry.Captions,
+        };
 
         var dto = new
         {
-            enums = entries.Select(e => new
-            {
-                id = e.Id,
-                name = e.Name,
-                options = e.Options,
-                indexes = e.Indexes,
-                implementations = e.Implementations,
-                captions = e.Captions,
-            }).ToArray(),
+            schema = 2,
+            baseEnums = baseEntries.Select(ToDto).ToArray(),
+            enumExtensions = extensionEntries.Select(ToDto).ToArray(),
         };
         var json = System.Text.Json.JsonSerializer.Serialize(dto);
         File.WriteAllText(path, json);
-        return entries.Count;
+        return baseEntries.Length + extensionEntries.Length;
     }
 
     /// <summary>
-    /// Replay entries from a sidecar written by <see cref="SaveSidecar"/>. Each
-    /// entry is already the merged base+extension set, so replay uses plain
-    /// <see cref="Register"/> (never <see cref="RegisterExtension"/>) — matching
-    /// how Program.cs's bundle-level sidecar replay works. Throws on corrupt JSON;
-    /// callers treat that as a cache MISS and rebuild. Returns replayed entry count.
+    /// Replay entries from a sidecar written by <see cref="SaveSidecar"/>. Legacy
+    /// flattened sidecars remain readable as base registrations; source-dependency
+    /// cache keys are versioned separately, so production never serves them after
+    /// the raw-registration schema is introduced.
     /// </summary>
     public static int LoadSidecar(string path)
     {
         var json = File.ReadAllText(path);
         using var doc = System.Text.Json.JsonDocument.Parse(json);
-        if (!doc.RootElement.TryGetProperty("enums", out var arr)
-            || arr.ValueKind != System.Text.Json.JsonValueKind.Array)
-            throw new InvalidDataException("enum-registry.json: missing 'enums' array");
-        int count = 0;
-        foreach (var e in arr.EnumerateArray())
+
+        static Entry ParseEntry(System.Text.Json.JsonElement element)
         {
-            int id = e.GetProperty("id").GetInt32();
-            string name = e.GetProperty("name").GetString() ?? string.Empty;
-            var optsEl = e.GetProperty("options");
-            var idxEl = e.GetProperty("indexes");
+            int id = element.GetProperty("id").GetInt32();
+            string name = element.GetProperty("name").GetString() ?? string.Empty;
+            var optsEl = element.GetProperty("options");
+            var idxEl = element.GetProperty("indexes");
             var opts = new string[optsEl.GetArrayLength()];
             int oi = 0;
             foreach (var o in optsEl.EnumerateArray()) opts[oi++] = o.GetString() ?? string.Empty;
@@ -339,7 +355,7 @@ public static class AlEnumMetadataRegistry
             int ii = 0;
             foreach (var x in idxEl.EnumerateArray()) idxs[ii++] = x.GetInt32();
             int[][] implementations = Array.Empty<int[]>();
-            if (e.TryGetProperty("implementations", out var implEl)
+            if (element.TryGetProperty("implementations", out var implEl)
                 && implEl.ValueKind == System.Text.Json.JsonValueKind.Array
                 && implEl.GetArrayLength() == opts.Length)
             {
@@ -360,7 +376,7 @@ public static class AlEnumMetadataRegistry
                 }
             }
             string?[]? captions = null;
-            if (e.TryGetProperty("captions", out var capEl)
+            if (element.TryGetProperty("captions", out var capEl)
                 && capEl.ValueKind == System.Text.Json.JsonValueKind.Array
                 && capEl.GetArrayLength() == opts.Length)
             {
@@ -369,7 +385,43 @@ public static class AlEnumMetadataRegistry
                 foreach (var c in capEl.EnumerateArray())
                     captions[ci++] = c.ValueKind == System.Text.Json.JsonValueKind.Null ? null : c.GetString();
             }
-            Register(id, name, opts, idxs, implementations, captions);
+            return new Entry(id, name, opts, idxs, implementations, captions);
+        }
+
+        int count = 0;
+        var hasBaseEnums = doc.RootElement.TryGetProperty("baseEnums", out var baseEnums);
+        var hasEnumExtensions = doc.RootElement.TryGetProperty("enumExtensions", out var enumExtensions);
+        if (hasBaseEnums || hasEnumExtensions)
+        {
+            if (!hasBaseEnums || !hasEnumExtensions
+                || baseEnums.ValueKind != System.Text.Json.JsonValueKind.Array
+                || enumExtensions.ValueKind != System.Text.Json.JsonValueKind.Array)
+                throw new InvalidDataException(
+                    "enum-registry.json: raw schema requires 'baseEnums' and 'enumExtensions' arrays");
+
+            foreach (var element in baseEnums.EnumerateArray())
+            {
+                var entry = ParseEntry(element);
+                Register(entry.Id, entry.Name, entry.Options, entry.Indexes, entry.Implementations, entry.Captions);
+                count++;
+            }
+            foreach (var element in enumExtensions.EnumerateArray())
+            {
+                var entry = ParseEntry(element);
+                RegisterExtension(entry.Id, entry.Name, entry.Options, entry.Indexes, entry.Implementations, entry.Captions);
+                count++;
+            }
+            return count;
+        }
+
+        if (!doc.RootElement.TryGetProperty("enums", out var legacyEnums)
+            || legacyEnums.ValueKind != System.Text.Json.JsonValueKind.Array)
+            throw new InvalidDataException(
+                "enum-registry.json: missing raw registration arrays or legacy 'enums' array");
+        foreach (var element in legacyEnums.EnumerateArray())
+        {
+            var entry = ParseEntry(element);
+            Register(entry.Id, entry.Name, entry.Options, entry.Indexes, entry.Implementations, entry.Captions);
             count++;
         }
         return count;
@@ -541,6 +593,25 @@ internal sealed class AlEnumOptionMetadata : NCLOptionMetadata
 public static partial class BcRuntime
 {
     private static readonly ConcurrentDictionary<int, NCLOptionMetadata> _alEnumCache = new();
+
+    internal static void InvalidateAlEnumMetadata(int id) => _alEnumCache.TryRemove(id, out _);
+
+    internal static void ClearAlEnumMetadataCache() => _alEnumCache.Clear();
+
+    public static string ALSystemString_StrSubstNo(string format, NavValue[] values)
+    {
+        NavValue[]? normalized = null;
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (values[i] is not NavOption option || !option.NavOptionMetadata.IsEnum)
+                continue;
+
+            normalized ??= values.ToArray();
+            normalized[i] = NavText.Create(option.NavOptionMetadata.GetCaptionFromIndex(option.Value));
+        }
+
+        return ALSystemString.ALStrSubstNo(format, normalized ?? values);
+    }
 
     /// <summary>
     /// Replacement for NCLEnumMetadata.Create(int).

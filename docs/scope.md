@@ -114,13 +114,20 @@ tier with SQL Server.
 |---|---|
 | `Report.Run(Print, ...)` / `SaveAsPdf` to a real printer or PDF | Requires renderer + driver. Report **callbacks** (`[ReportHandler]`, `[RequestPageHandler]`) fire — see §2. |
 
-### §3.5.1. Report rendering (layout + request page) <a id="report-rendering"></a>
+### §3.5.1. Report output (layout + request page) <a id="report-rendering"></a>
 
 | API | Reason |
 |---|---|
 | `Report.SaveAsPdf` / `SaveAsHtml` / `SaveAsExcel` / `SaveAsWord` / `SaveAsDocx` | No layout renderer. Cecil-rewritten to throw `InvalidOperationException("out-of-scope: NavReport.SaveAs* ...")`. Tests `asserterror` + `Assert.ExpectedError('out-of-scope: NavReport.SaveAs')`. |
-| `Report.RunRequestPage(...)` | No UI tier — request-page dialog can't be rendered or driven. Throws OOS at the sync wrapper before entering `RunReportAsync`. |
-| Static `Report.Run(id, ...)` / `Report.RunModal(id, ...)` | In-process construction from a metadata id is not yet wired; throws OOS with the reportId in the message. Construct the report as an AL variable and call instance `Run()` instead — that path executes triggers. |
+| `Report.RunRequestPage(...)` | In scope when a test supplies `[RequestPageHandler]`: BC's generated request-page form and handler dispatch run headlessly, and BC's own parameter serializer returns the resulting XML. With no matching handler, the client callback remains out of scope. |
+| Static `Report.Run(id, ...)` / `Report.RunModal(id, ...)` | In scope. The runner constructs the report from BC metadata and executes the same lifecycle as an AL report variable. `requestWindow = true` drives the generated request page through `[RequestPageHandler]`; `systemPrinter` cannot provide a physical printer. |
+
+`TestRequestPage.SaveAsXml(parametersFile, datasetFile)` is also in scope. The
+request-page control and data-item filter mutations are applied to the live report, then
+Microsoft's `ReportResultSetProcessorFactory`, `ReportSaveAsXmlRenderer`,
+`NavDataSetBuilder`, and `DataItemIterator` generate both XML files. This supports reports
+over the runner's in-memory records, including temporary records, without a database or a
+layout renderer. PDF, Word, Excel, HTML, and printer output remain out of scope.
 
 **Layout *selection* is in scope; layout *content* is not.** A report's
 `rendering { layout(Name) { Type; MimeType; LayoutFile; … } }` declarations are
@@ -138,11 +145,31 @@ source-compiled report, so a renderer that demands the layout content — includ
 a custom document merger reading `LayoutData` — gets nothing. Rendering itself is
 out of scope; only selection/resolution is supported.
 
-Instance `report.Run()` / `report.RunModal()` on an AL variable **does** run: the
-runner JmpHooks the sync wrapper into `NavReportSync.SyncRun`, which reflectively
-invokes `OnInitReport` → `OnPreReport` → per-DataItem `OnPreDataItem` / `OnPostDataItem`
-→ `OnPostReport`. DataItem row iteration is a follow-up (FindSet +
-`OnAfterGetRecord` per row).
+Instance `Run()` / `RunModal()` execute `OnInitReport` → `OnPreReport` → BC's data-item loop
+→ `OnPostReport`. The static overloads use the same lifecycle and, when `requestWindow = true`,
+insert the generated request page and `[RequestPageHandler]` between `OnInitReport` and
+`OnPreReport`. The data-item loop owns `DataItemTableView`, `DataItemLink`, nested items,
+per-row `OnAfterGetRecord`, and `CurrReport.Skip` / `Break`. A non-processing report still
+attempts layout output after the lifecycle unless `SaveAsXml` selected the dataset renderer.
+
+### §3.5.2. Media image decoding <a id="media-image-decoding"></a>
+
+BC's `NavMediaFactory` normally validates and decodes images through `System.Drawing`.
+`NavMediaImage` either retains the source stream (`saveStream = true`) or later encodes the
+decoded image. Those Microsoft NST types are retained for ordinary media storage, MIME
+handling, and the non-image binary fallback, but their image decoder cannot execute on Linux:
+current .NET treats `System.Drawing.Common` as Windows-only and rejects the call before BC can
+inspect the image.
+
+The runner therefore has one bounded portable image path: it validates PNG structure, critical
+chunk order, and chunk CRCs, then lets BC's own `NavMediaBinaryFile` store the original stream as
+`image/png`. Preserving the source bytes follows the same invariant as the NST's
+`saveStream = true` branch without fabricating a `System.Drawing.Image`. It does not claim to
+implement GDI+ transforms, metadata extraction, dimensions, or thumbnails. Non-image media still
+follows BC's own `application/octet-stream` fallback. Other image formats fail with the named
+`media-image-decode` out-of-scope error; they are never accepted as images without decoding.
+The PNG path validates the container and chunk integrity but does not inflate IDAT data, so it is
+not a claim of byte-for-byte GDI+ decoder equivalence for every corrupt pixel stream.
 
 ### §3.6. Background jobs / scheduling <a id="jobs"></a>
 

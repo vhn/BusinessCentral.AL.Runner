@@ -8,6 +8,13 @@ table 60706 "NCT Item"
     {
         field(1; "No."; Code[20]) { }
         field(2; Value; Integer) { }
+        field(3; "Owner Id"; Guid) { }
+        field(4; Amount; Decimal) { }
+        field(5; "Owned Amount"; Decimal)
+        {
+            FieldClass = FlowField;
+            CalcFormula = sum("NCT Item".Amount where("Owner Id" = field(SystemId)));
+        }
     }
 
     keys

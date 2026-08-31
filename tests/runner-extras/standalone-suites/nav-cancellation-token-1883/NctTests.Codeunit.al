@@ -108,4 +108,35 @@ codeunit 60707 "NCT Tests"
         if Item.FindSet() then
             Error('FindSet() on an empty table must return false');
     end;
+
+    [Test]
+    procedure FlowField_SystemIdLink_UsesParentSystemId()
+    var
+        ParentItem: Record "NCT Item";
+        ChildItem: Record "NCT Item";
+    begin
+        ParentItem.DeleteAll();
+
+        ParentItem.Init();
+        ParentItem."No." := 'PARENT';
+        ParentItem.Insert();
+
+        ChildItem.Init();
+        ChildItem."No." := 'OWNED';
+        ChildItem."Owner Id" := ParentItem.SystemId;
+        ChildItem.Amount := 20;
+        ChildItem.Insert();
+
+        ChildItem.Init();
+        ChildItem."No." := 'UNOWNED';
+        Clear(ChildItem."Owner Id");
+        ChildItem.Amount := 30;
+        ChildItem.Insert();
+
+        ParentItem.Get('PARENT');
+        ParentItem.CalcFields("Owned Amount");
+        if ParentItem."Owned Amount" <> 20 then
+            Error('FlowField used the wrong parent SystemId: expected 20, got %1', ParentItem."Owned Amount");
+    end;
+
 }

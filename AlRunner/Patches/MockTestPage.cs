@@ -462,6 +462,7 @@ internal class LiveNavTestPage : MockITestPage
             // table OnValidate triggers.
             InitializeBlankRecordBuffer(_record.OldRecord);
             InsertEmptyRow(beforeCurrent: false);
+            _pendingNewRowIsUntouchedModalDraft = true;
         }
     }
 
@@ -480,6 +481,7 @@ internal class LiveNavTestPage : MockITestPage
     private bool _pendingNewRow;
     private bool _pendingNewRowExistedWhenStarted;
     private bool _pendingEmptyMultipleLineBefore;
+    private bool _pendingNewRowIsUntouchedModalDraft;
 
     public override void InsertEmptyRow(bool beforeCurrent)
     {
@@ -514,6 +516,7 @@ internal class LiveNavTestPage : MockITestPage
         _pendingNewRowExistedWhenStarted = _record!.ExistsAsync(_record.ALRecordId)
             .AsTask().GetAwaiter().GetResult();
         _pendingNewRow = true;
+        _pendingNewRowIsUntouchedModalDraft = false;
     }
 
     private static void InitializeBlankRecordBuffer(NavRecord record)
@@ -536,6 +539,7 @@ internal class LiveNavTestPage : MockITestPage
             _pendingNewRow = false;
             _pendingNewRowExistedWhenStarted = false;
             _pendingEmptyMultipleLineBefore = false;
+            _pendingNewRowIsUntouchedModalDraft = false;
             if (persistEmptyMultipleLineBefore)
                 PersistEmptyMultipleLineBeforeCurrent();
             return;
@@ -543,6 +547,7 @@ internal class LiveNavTestPage : MockITestPage
         _pendingNewRow = false;
         _pendingNewRowExistedWhenStarted = false;
         _pendingEmptyMultipleLineBefore = false;
+        _pendingNewRowIsUntouchedModalDraft = false;
         // AutoSplitKey, in BC's own order: SplitKey, then OnInsertRecord, then the record's
         // Insert (NavForm.SaveRecordAsync / NavForm.InsertAsync(belowXRec) both do exactly
         // this). Skipping it left the last primary-key field at its Init() default, so a page
@@ -662,6 +667,7 @@ internal class LiveNavTestPage : MockITestPage
         _pendingNewRow = false;
         _pendingNewRowExistedWhenStarted = false;
         _pendingEmptyMultipleLineBefore = false;
+        _pendingNewRowIsUntouchedModalDraft = false;
         _pendingModify = false;
     }
 
@@ -942,7 +948,24 @@ internal class LiveNavTestPage : MockITestPage
     {
         // A new row is already going to be written by FlushPendingNewRow; marking it modified
         // as well would try to Modify a row that does not exist yet.
-        if (!_pendingNewRow) _pendingModify = true;
+        if (_pendingNewRow)
+            _pendingNewRowIsUntouchedModalDraft = false;
+        else
+            _pendingModify = true;
+    }
+
+    internal void FlushPendingNewRowOnClose()
+    {
+        // An empty insert-allowed modal page exposes a blank client draft to its handler, but
+        // merely returning from the handler does not save that untouched row. Explicit New(),
+        // editing the draft, invoking an action, or navigating away all use the normal flush.
+        if (_pendingNewRowIsUntouchedModalDraft)
+        {
+            DiscardPendingNewRow();
+            return;
+        }
+
+        FlushPendingNewRow();
     }
 
     internal void FlushPendingModify()
@@ -1031,7 +1054,8 @@ internal class LiveNavTestPage : MockITestPage
         try
         {
             FlushParts();
-            FlushRow();
+            FlushPendingNewRowOnClose();
+            FlushPendingModify();
             completed = true;
         }
         finally
@@ -1046,7 +1070,8 @@ internal class LiveNavTestPage : MockITestPage
         try
         {
             FlushParts();
-            FlushRow();
+            FlushPendingNewRowOnClose();
+            FlushPendingModify();
             completed = true;
         }
         finally { ReleaseClientForm(suppressErrors: !completed); }

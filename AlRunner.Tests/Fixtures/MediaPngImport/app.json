@@ -1,0 +1,13 @@
+{
+  "id": "68e36e74-9233-4c83-8c9d-38ae832de6ef",
+  "name": "Media PNG Import Fixture",
+  "publisher": "AL Runner",
+  "version": "1.0.0.0",
+  "dependencies": [],
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [
+    { "from": 72490, "to": 72499 }
+  ],
+  "runtime": "13.0"
+}
