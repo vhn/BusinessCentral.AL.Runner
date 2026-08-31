@@ -11,6 +11,7 @@ All notable changes to this project are documented here. Format based on
 - **runtime:** expand Business Central compatibility
 
 ### Fixed
+- **watch:** restore SystemPackage table metadata
 - **metadata:** preserve declared table captions
 - **http:** dispatch mocked client handlers
 - **ui:** dispatch non-modal page handlers
