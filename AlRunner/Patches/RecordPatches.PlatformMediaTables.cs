@@ -7,11 +7,10 @@
 //   application-database table, 2000000184 (Tenant Media) for everything else — then does an
 //   ordinary ALInsertAsync into it.
 //
-//   Those two tables are PLATFORM tables. They are not in any app's SymbolReference.json (the
-//   System app ships zero table definitions), and they have no AL source in any .app, so
-//   every source the runner's metadata builder knows about comes up empty and the record it
-//   hands BC has no table behind it — ALInsertAsync then NREs. That is why storing ANY media
-//   failed once the image-classification problem above it was fixed.
+//   Microsoft.BusinessCentral.SystemApp.dll's embedded SystemPackage normally supplies the
+//   authoritative definitions. These reduced shapes are the bootstrap fallback for hosts where
+//   that package cannot be loaded; without either source the record BC receives has no table
+//   behind it and ALInsertAsync NREs.
 //
 //   Declaring them as ordinary parsed tables is the whole fix: the existing pipeline builds
 //   the NCLMetaTable and the in-memory store holds the rows, exactly as for a table read from
@@ -32,8 +31,8 @@ public static partial class RecordPatches
     internal const int TenantMediaTableId = 2000000184;
 
     /// <summary>
-    /// The platform media tables, keyed by table id. Consulted before the .app scan in
-    /// TryPopulateParsedTableFromBcApps, because no .app can supply them.
+    /// Reduced platform media-table shapes used only when the embedded SystemPackage was not
+    /// published into the parsed-table set.
     /// </summary>
     private static ParsedTable? BuiltInPlatformTable(int tableId) => tableId switch
     {

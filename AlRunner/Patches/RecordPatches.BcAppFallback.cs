@@ -33,9 +33,16 @@ public static partial class RecordPatches
     private static readonly List<string> _bcAppPaths = new();
 
     // Temp .app file extracted from Microsoft.BusinessCentral.SystemApp.dll's embedded
-    // SystemPackage; persists for the lifetime of the runner process so the index can
-    // re-read its source on demand.
+    // SystemPackage; persists for the lifetime of the runner process so the ordinary BC
+    // dependency indexes can continue to resolve its metadata on demand.
     private static string? _systemAppTempPath;
+
+    // Exact Microsoft-owned table shapes captured once from the embedded SystemPackage.
+    // Watch/server reload clears bundle-derived parse state, then republishes this immutable
+    // snapshot. It must not rebuild the global BC indexes during reset: doing so also merges
+    // dependency tableextensions before the edited bundle is parsed and changes trigger order.
+    private static IReadOnlyDictionary<int, ParsedTable> _systemAppPackageTables =
+        new Dictionary<int, ParsedTable>();
 
     // Lazy fallback index: tableId → (appPath, alSource). Built only when symbols miss.
     private static Dictionary<int, (string AppPath, string Source)>? _bcTableIndex;
@@ -306,7 +313,15 @@ public static partial class RecordPatches
             AddBcAppPath(tempPath);
             Console.Error.WriteLine($"[RecordPatches] BcAppFallback: registered SystemPackage → {Path.GetFileName(tempPath)} ({new FileInfo(tempPath).Length:N0} bytes)");
 
-            EagerParseAllBcAppTables();
+            var packageTables = ReadSystemAppPackageTables(tempPath);
+            if (packageTables.Count == 0)
+                throw new InvalidOperationException(
+                    "Microsoft SystemPackage contains no readable table metadata.");
+
+            _systemAppPackageTables = packageTables;
+            RestoreSystemAppPackageTablesAfterReload();
+            Console.Error.WriteLine(
+                $"[RecordPatches] BcAppFallback: published {packageTables.Count} SystemPackage table(s)");
         }
         catch (Exception ex)
         {
@@ -316,45 +331,47 @@ public static partial class RecordPatches
     }
 
     /// <summary>
-    /// Walk every table the BC .app indexes discovered and materialise it in
-    /// _parsedTables. Symbols are preferred; AL source is only a fallback.
+    /// Read only the embedded SystemPackage. Symbols are authoritative; AL source is a
+    /// fallback for a package build that omits SymbolReference table entries.
     /// </summary>
-    internal static void EagerParseAllBcAppTables()
+    private static IReadOnlyDictionary<int, ParsedTable> ReadSystemAppPackageTables(string appPath)
     {
-        lock (_bcTableIndexLock)
+        var symbolTables = BcAppSymbolCache.Get(appPath).Tables;
+        if (symbolTables.Count > 0)
+            return symbolTables
+                .GroupBy(table => table.TableId)
+                .ToDictionary(group => group.Key, group => group.First());
+
+        var packageTables = new Dictionary<int, ParsedTable>();
+        foreach (var (_, source) in AlRunner.AppLoader.ExtractAl(appPath))
         {
-            int parsedNow = 0;
-            EnsureBcSymbolTableIndex();
-            if (_bcSymbolTableIndex != null)
-            {
-                foreach (var (id, entry) in _bcSymbolTableIndex)
-                {
-                    if (_parsedTables.ContainsKey(id)) continue;
-                    _parsedTables[id] = entry.Table;
-                    parsedNow++;
-                }
-            }
+            var candidateIds = _rxAnyTableId.Matches(source)
+                .Select(match => int.TryParse(match.Groups[1].Value, out var id) ? id : -1)
+                .Where(id => id >= 0)
+                .Distinct()
+                .ToArray();
+            if (candidateIds.Length == 0)
+                continue;
 
-            if (_bcSymbolTableIndex == null || _bcSymbolTableIndex.Count == 0)
-            {
-                EnsureBcTableIndex();
-                if (_bcTableIndex != null)
-                {
-                    var alreadySeenSources = new HashSet<string>(ReferenceEqualityComparer.Instance);
-                    foreach (var (id, entry) in _bcTableIndex)
-                    {
-                        if (_parsedTables.ContainsKey(id)) continue;
-                        if (!alreadySeenSources.Add(entry.Source)) continue;
-                        TryParseObjectCaptionFile(entry.Source);
-                        TryParseTableFile(entry.Source);
-                        if (_parsedTables.ContainsKey(id)) parsedNow++;
-                    }
-                }
-            }
-
-            if (parsedNow > 0)
-                Console.Error.WriteLine($"[RecordPatches] BcAppFallback: eager-parsed {parsedNow} BC table(s) into _parsedTables");
+            TryParseObjectCaptionFile(source);
+            TryParseTableFile(source);
+            foreach (var id in candidateIds)
+                if (_parsedTables.TryGetValue(id, out var table))
+                    packageTables.TryAdd(id, table);
         }
+
+        return packageTables;
+    }
+
+    /// <summary>
+    /// Re-publish the Microsoft SystemPackage tables after a watch/server reload clears the
+    /// bundle-derived parse dictionaries. This is deliberately a dictionary copy from the
+    /// one-time snapshot: reset must not rebuild dependency indexes or re-run AL extraction.
+    /// </summary>
+    internal static void RestoreSystemAppPackageTablesAfterReload()
+    {
+        foreach (var (id, table) in _systemAppPackageTables)
+            _parsedTables[id] = table;
     }
 
     private static void EnsureBcTableIndex()
