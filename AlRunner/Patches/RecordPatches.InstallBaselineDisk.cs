@@ -23,12 +23,13 @@
 //   AllObj (2000000038), AllObjWithCaption (2000000058), Field (2000000041) and their
 //   siblings are not install-trigger output at all: they are process-wide projections of the
 //   assemblies currently loaded, and RecordPatches.GetDataAccessForTableCore re-populates
-//   each of them on EVERY access as an idempotent top-up. Inside one process, letting a
-//   second app group inherit the first's rows is harmless precisely because of that top-up
-//   (see the #1867 field doc in TestExecutor.cs). Across processes it is not the same bet:
-//   the file would carry one bundle's object inventory into an unrelated bundle's run, keyed
-//   by a dependency-set key that says nothing about which test assemblies were loaded, and a
-//   top-up only ADDS rows — it never removes the foreign ones. So they are dropped on write
+//   each of them on EVERY access as an idempotent top-up. They are excluded from both the
+//   in-memory and disk baselines: a restored provider has fresh top-up bookkeeping, so
+//   restoring old projection rows before the normal top-up can retain stale rows or replay
+//   deterministic identities. Across processes, the file would additionally carry one
+//   bundle's object inventory into an unrelated bundle's run, keyed by a dependency-set key
+//   that says nothing about which test assemblies were loaded. A top-up only ADDS rows — it
+//   never removes the foreign ones. So they are dropped on write
 //   and rebuilt on demand after a disk restore, which is the same state the very first app
 //   group of an uncached process has. On the measured Base Application closure this also
 //   removes 23,367 of 23,645 rows from the file.
@@ -55,7 +56,7 @@ public static partial class RecordPatches
     // deserialises cleanly under new semantics is the one failure mode a cache cannot
     // detect for itself.
     private const uint InstallBaselineDiskMagic = 0x42494C41;
-    internal const int InstallBaselineDiskSchemaVersion = 3;
+    internal const int InstallBaselineDiskSchemaVersion = 4;
 
     // Pool-entry kinds. Kind is stored per DISTINCT NavValue instance, not per row slot.
     private const byte KindBytes = 1;       // NavValue.GetBytes() + NavValue.CreateNavValueFromBytes
@@ -64,8 +65,8 @@ public static partial class RecordPatches
 
     /// <summary>Table ids whose rows are a projection of the loaded-assembly set rather than
     /// install-trigger output, and which
-    /// <see cref="GetDataAccessForTableCore"/> re-populates on every access. Excluded from the
-    /// on-disk baseline — see the file header for why that is a correctness decision and not
+    /// <see cref="GetDataAccessForTableCore"/> re-populates on every access. Excluded from both
+    /// install baselines — see the file header for why that is a correctness decision and not
     /// just a size one.</summary>
     internal static bool IsSelfPopulatingVirtualTableId(int tableId) => tableId switch
     {
@@ -75,7 +76,7 @@ public static partial class RecordPatches
             or IntegerVirtualTableId or ReportLayoutListVirtualTableId
             or PageMetadataVirtualTableId or ReportMetadataVirtualTableId
             or ReportDataItemsVirtualTableId or PageControlFieldVirtualTableId
-            or TableMetadataVirtualTableId => true,
+            or TableMetadataVirtualTableId or CodeunitMetadataVirtualTableId => true,
         _ => false,
     };
 

@@ -250,11 +250,11 @@ public static partial class RecordPatches
 
     private const int TableTypesVirtualBit = 0x8;
     private static FieldInfo? _fNclMetaTableTableTypes;
-    private static readonly HashSet<int> _virtualBitCleared = new();
 
     private static void ClearVirtualBit(NCLMetaTable fieldMetaTable)
     {
-        if (_virtualBitCleared.Contains(FieldVirtualTableId)) return;
+        // Watch reload replaces metadata objects, and several virtual-table paths share this
+        // helper. Check the actual instance so one table cannot latch the others as cleared.
         _fNclMetaTableTableTypes ??= fieldMetaTable.GetType()
             .GetField("tableTypes", BindingFlags.NonPublic | BindingFlags.Instance);
         if (_fNclMetaTableTableTypes == null) return;
@@ -263,10 +263,9 @@ public static partial class RecordPatches
         if (cur == null) return;
         // tableTypes is the [Flags] enum NCLMetaTable.TableTypes (underlying int).
         var curInt = Convert.ToInt32(cur);
-        if ((curInt & TableTypesVirtualBit) == 0) { _virtualBitCleared.Add(FieldVirtualTableId); return; }
+        if ((curInt & TableTypesVirtualBit) == 0) return;
         var cleared = Enum.ToObject(_fNclMetaTableTableTypes.FieldType, curInt & ~TableTypesVirtualBit);
         FieldPoke.SetInstance(_fNclMetaTableTableTypes, fieldMetaTable, cleared);
-        _virtualBitCleared.Add(FieldVirtualTableId);
     }
 
     private static void EnsureDataAccessProviderReflection(object dataAccess)

@@ -160,11 +160,10 @@ public sealed class TestExecutor
     // into the process-lifetime snapshot — this matters more here than for the
     // CaptureInstallBaseline singleton this is modelled on, because one aliased row here
     // would corrupt every subsequent app group sharing this dep key, not just one. And the
-    // virtual/system metadata tables (Field, AllObj, AllObjWithCaption, table id ≥
-    // 2,000,000,000) that grow monotonically as more test assemblies load in-process are not
-    // a staleness hazard for a HIT either: GetDataAccessForTableCore re-populates them on
-    // EVERY access as an idempotent top-up, so restoring an earlier app group's narrower
-    // subset self-corrects on the next read.
+    // loaded-metadata projections recognized by IsSelfPopulatingVirtualTableId (including
+    // Field, AllObj, AllObjWithCaption, and CodeUnit Metadata) are not captured at all:
+    // GetDataAccessForTableCore rebuilds them on demand from the currently loaded metadata.
+    // This prevents stale projection rows from crossing app-group boundaries.
     //
     // NOT cached here: the bundle's OWN test assembly's Install triggers
     // (InstallTriggerRunner.RunTestAssemblyOnly, genuinely per-app-group, always re-run) and

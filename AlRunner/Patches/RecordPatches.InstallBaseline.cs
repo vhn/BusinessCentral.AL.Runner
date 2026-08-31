@@ -94,6 +94,13 @@ public static partial class RecordPatches
             var tables = new List<BaselineTable>();
             foreach (var (tableId, dataAccess) in perTable)
             {
+                // These rows are projections of the currently loaded metadata, not
+                // committed install state. Restoring them into a fresh provider before its
+                // normal top-up can retain stale rows or replay deterministic identities.
+                // Rebuild them on demand instead, as the disk baseline already does.
+                if (IsSelfPopulatingVirtualTableId(tableId))
+                    continue;
+
                 var provider = GetDataProvider(dataAccess);
                 if (provider == null)
                     continue;
@@ -157,24 +164,12 @@ public static partial class RecordPatches
     /// result.
     ///
     /// #1867 root-cause note: two DIFFERENT digests for the same conceptual dependency
-    /// closure are EXPECTED and do not indicate drift. Two known, faithful sources of
-    /// non-determinism guarantee it:
-    ///   1. System/virtual metadata tables (id >= 2,000,000,000, e.g. Field 2000000041)
-    ///      are process-wide caches of loaded-assembly schema by design (see the
-    ///      Field-virtual-table comment above GetDataAccessForTableCore) — they grow
-    ///      monotonically as more test assemblies load into the process, independent of
-    ///      install-trigger/company-init business logic.
-    ///   2. Business rows carry BC-native SystemId (a GUID) and SystemCreatedAt/
-    ///      SystemModifiedAt (wall-clock) fields assigned by the unmodified BC Insert path
-    ///      at insert time (precompiled-dll-respect.md — we don't touch that). A fresh
-    ///      re-run of the exact same AL Install trigger body legitimately gets a NEW
-    ///      SystemId/timestamp every time, on real BC as much as here. Comparing digests
-    ///      across two independently-fresh computations (as opposed to a cache HIT, which
-    ///      reuses the same captured objects and is trivially identical) will therefore
-    ///      differ even when every business-meaningful field is unchanged. Verified via a
-    ///      per-table row-COUNT breakdown during the #1867 investigation: counts for real
-    ///      business tables were stable across app groups; only the two known-volatile
-    ///      sources above accounted for the digest churn.</summary>
+    /// closure are EXPECTED and do not indicate drift. Business rows carry BC-native
+    /// SystemId (a GUID) and SystemCreatedAt/SystemModifiedAt (wall-clock) fields assigned by
+    /// the unmodified BC Insert path at insert time (precompiled-dll-respect.md — we don't
+    /// touch that). A fresh re-run of the exact same AL Install trigger body legitimately
+    /// gets a new SystemId/timestamp every time, on real BC as much as here. The loaded-object
+    /// metadata projections are excluded before this digest is computed.</summary>
     private static string ComputeContentDigest(IReadOnlyList<BaselineSource> sources)
     {
         var lines = new List<string>();
