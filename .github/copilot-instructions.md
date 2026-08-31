@@ -147,6 +147,6 @@ Flag these patterns:
 
 ## Scope
 
-In scope: anything the runner can execute in-process against the real MS / ISV DLLs — records, codeunits, events, test toolkit, RecordRef/FieldRef, BLOB/streams, JSON/XML, in-process crypto, IsolatedStorage, synchronous TaskScheduler dispatch.
+In scope: anything the runner can execute in-process against the real MS / ISV DLLs — records, codeunits, events, test toolkit, RecordRef/FieldRef, BLOB/streams, JSON/XML, in-process crypto, IsolatedStorage, and TaskScheduler's pending-ID lifecycle without task execution.
 
 Out of scope (must throw `RunnerOutOfScopeException`): SMTP, HTTP egress, external file I/O, OData/SOAP publishing, physical printers, real job-queue scheduling, page/report rendering (handler callbacks fire; layout does not). See `docs/scope.md` for the precise list.

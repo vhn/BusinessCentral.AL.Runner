@@ -266,6 +266,10 @@ public sealed class BcAssembler
         // ordinal arithmetic for any enum value that callers create with NavOption.Create.
         ("NCLEnumMetadata.Create(",
          "global::AlRunnerShim.NavRuntimeHelpersShim.NCLEnumMetadataCreate("),
+        // StrSubstNo formats AL enums by caption. The skeleton Ncl formatter calls
+        // NavOption.ToString(), which returns the member identifier instead.
+        ("ALSystemString.ALStrSubstNo(",
+         "global::AlRunnerShim.NavRuntimeHelpersShim.ALSystemString_StrSubstNo("),
         // ALDebugger methods all throw NavObsoleteMethodException and have value-type params
         // (DataError enum) — redirect at source level to avoid JMP-hook ABI issues.
         ("ALDebugger.ALActivate(",     "global::AlRunnerShim.NavRuntimeHelpersShim.ALDebugger_ALActivate("),
@@ -493,6 +497,10 @@ namespace AlRunnerShim
         // captured at AL emit time.
         public static Microsoft.Dynamics.Nav.Runtime.NCLOptionMetadata NCLEnumMetadataCreate(int id)
             => global::AlRunner.BcRuntime.NCLEnumMetadata_CreateByIdAlAware(id);
+
+        public static string ALSystemString_StrSubstNo(
+            string format, params Microsoft.Dynamics.Nav.Runtime.NavValue[] values)
+            => global::AlRunner.BcRuntime.ALSystemString_StrSubstNo(format, values);
 
         // ALDebugger — all classic-debugger methods are obsolete stubs that throw.
         // Shims return false / no-op so Debugger.IsActive, .Activate, .Deactivate work in tests.

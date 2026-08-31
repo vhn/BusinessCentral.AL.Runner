@@ -123,13 +123,18 @@ public static partial class RecordPatches
     }
 
     /// <summary>
-    /// AL-source-derived ProcessingOnly for the given report ID. Returns
-    /// <c>false</c> when the report is unknown — matches the AL default and
-    /// causes the runner to throw an out-of-scope error at Run time (no
-    /// rendering pipeline available without a service tier).
+    /// ProcessingOnly for the given report ID. Runner-compiled source is
+    /// authoritative; precompiled dependency symbols fill IDs that are not
+    /// present in the source index. Unknown reports keep AL's default false,
+    /// which makes the runner reject their layout path at Run time.
     /// </summary>
-    public static bool IsReportProcessingOnly(int reportId) =>
-        _parsedReports.TryGetValue(reportId, out var p) && p.ProcessingOnly;
+    public static bool IsReportProcessingOnly(int reportId)
+    {
+        if (_parsedReports.TryGetValue(reportId, out var parsed))
+            return parsed.ProcessingOnly;
+
+        return FindDependencyReportSymbol(reportId)?.Report.ProcessingOnly ?? false;
+    }
 }
 
 internal record ParsedReport(int Id, string Name, bool IsExtension, bool ProcessingOnly = false)

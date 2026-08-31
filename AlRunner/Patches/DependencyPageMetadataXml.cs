@@ -22,8 +22,8 @@
 //   SymbolReference.json alone (via BcAppSymbolCache.PageSymbol) — the same typed slice
 //   #1769/#1779 already parse for the Page Metadata virtual table. Nothing here is inferred
 //   from behaviour or defaulted to something convenient: Id / Name / PageType / Caption /
-//   Editable / SourceObject (SourceTable + SourceTableTemporary) come straight off the
-//   symbol file's own Properties array.
+//   Editable / SourceObject (SourceTable + SourceTableTemporary + AutoSplitKey +
+//   MultipleNewLines) come straight off the symbol file's own Properties array.
 //
 // WHAT IS DELIBERATELY OMITTED, AND WHY THAT IS SAFE HERE
 //   Content/Controls, ActionContainers, ViewContainers, AnalysisViewContainers — the page's
@@ -117,6 +117,8 @@ public static partial class RecordPatches
                     page.SourceTableId.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 if (page.SourceTableTemporary)
                     w.WriteAttributeString("SourceTableTemporary", "1");
+                if (page.AutoSplitKey) w.WriteAttributeString("AutoSplitKey", "1");
+                if (page.MultipleNewLines) w.WriteAttributeString("MultipleNewLines", "1");
                 if (!page.InsertAllowed) w.WriteAttributeString("InsertAllowed", "0");
                 if (!page.ModifyAllowed) w.WriteAttributeString("ModifyAllowed", "0");
                 if (!page.DeleteAllowed) w.WriteAttributeString("DeleteAllowed", "0");

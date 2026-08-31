@@ -10,9 +10,9 @@
 //
 // WHAT THIS DOES
 //   Install triggers run ONCE. The resulting rows are snapshotted out of the in-memory
-//   TempTableDataProviders (plus isolated storage and the auto-increment counters, which
-//   are equally part of committed install state), and each codeunit
-//   boundary restores that snapshot instead of re-running AL.
+//   TempTableDataProviders (plus isolated storage, auto-increment counters, and pending task
+//   ids, which are equally part of committed install state), and each codeunit boundary restores
+//   that snapshot instead of re-running AL.
 //
 //   Rows are deep-copied on both capture and restore, so a test mutating a restored row
 //   cannot corrupt the baseline for the next codeunit.
@@ -49,11 +49,13 @@ public static partial class RecordPatches
     internal sealed record InstallBaselineSnapshot(
         IReadOnlyList<BaselineSource> Sources,
         object? IsolatedStorage,
-        IReadOnlyDictionary<int, long>? AutoIncrement);
+        IReadOnlyDictionary<int, long>? AutoIncrement,
+        IReadOnlyList<Guid> PendingTaskIds);
 
     private static IReadOnlyList<BaselineSource>? _installBaseline;
     private static object? _isolatedStorageBaseline;
     private static IReadOnlyDictionary<int, long>? _autoIncrementBaseline;
+    private static IReadOnlyList<Guid>? _pendingTaskIdsBaseline;
     private static ConstructorInfo? _ibMutableBufferCtor;
 
     public static void CaptureInstallBaseline()
@@ -62,6 +64,7 @@ public static partial class RecordPatches
         _installBaseline = snapshot.Sources;
         _isolatedStorageBaseline = snapshot.IsolatedStorage;
         _autoIncrementBaseline = snapshot.AutoIncrement;
+        _pendingTaskIdsBaseline = snapshot.PendingTaskIds;
         BcRuntime.CaptureSkeletonApplicationAreaBaseline();
     }
 
@@ -71,7 +74,10 @@ public static partial class RecordPatches
         if (_installBaseline == null)
             return;
         RestoreInstallBaselineSnapshot(new InstallBaselineSnapshot(
-            _installBaseline, _isolatedStorageBaseline, _autoIncrementBaseline),
+            _installBaseline,
+            _isolatedStorageBaseline,
+            _autoIncrementBaseline,
+            _pendingTaskIdsBaseline ?? Array.Empty<Guid>()),
             resetFirst: false);
     }
 
@@ -128,7 +134,8 @@ public static partial class RecordPatches
         var snapshot = new InstallBaselineSnapshot(
             sources,
             TenantStoragePatches.CaptureInstallBaseline(),
-            BcRuntime.CaptureAutoIncrementBaseline());
+            BcRuntime.CaptureAutoIncrementBaseline(),
+            BcRuntime.TaskScheduler_CaptureInstallBaseline());
         PerfTrace.Log($"InstallBaseline.Capture {sources.Sum(s => s.Tables.Count)} table(s), " +
                       $"{sources.Sum(s => s.Tables.Sum(t => t.Rows.Length))} row(s)" +
                       // #1867: a content digest, not just counts — lets a diagnostic run compare
@@ -230,6 +237,7 @@ public static partial class RecordPatches
 
         TenantStoragePatches.RestoreInstallBaseline(snapshot.IsolatedStorage);
         BcRuntime.RestoreAutoIncrementBaseline(snapshot.AutoIncrement);
+        BcRuntime.TaskScheduler_RestoreInstallBaseline(snapshot.PendingTaskIds);
         PerfTrace.Log($"InstallBaseline.Restore {restoredRows} row(s)");
     }
 

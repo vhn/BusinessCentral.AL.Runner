@@ -489,7 +489,7 @@ public static partial class BcRuntime
         if (self == null) return;
         var testPageField = FindInstanceField(self.GetType(), "testPage");
         if (testPageField?.GetValue(self) is LiveNavTestPage live)
-            live.FlushPendingNewRow();
+            live.FlushPendingNewRowOnClose();
     }
 
     private static int GetPageIdFromTestPage(object self)

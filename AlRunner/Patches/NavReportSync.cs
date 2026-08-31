@@ -16,12 +16,10 @@
 //   semantics are silently dropped: trigger code authored in AL still runs.
 //
 // Runner policy (documented in docs/scope.md):
-//   The runner has no service tier and cannot render report layouts. All
-//   reports execute as if `ProcessingOnly = true`. Layout-rendering APIs that
-//   would produce a rendered artifact (SaveAsPdf / SaveAsHtml / SaveAsWord /
-//   SaveAsExcel / SaveAsDocx / RunRequestPage) throw an AL-observable
-//   NavNCLDialogException with the "out-of-scope:" prefix — tests rewrite
-//   those calls as `asserterror`.
+//   The runner has no layout renderer. Headless request pages are supported when a
+//   [RequestPageHandler] can answer them, and TestRequestPage.SaveAsXml uses Ncl's own
+//   dataset processor. PDF, Word, Excel, HTML, printer output, and an unanswered request
+//   page remain explicit out-of-scope failures.
 //
 // Data-item iteration:
 //   The row loop is NOT re-implemented here. InvokeDataItems drives BC's own
@@ -36,6 +34,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using Microsoft.Dynamics.Nav.Types;
 
 namespace AlRunner;
 
@@ -311,14 +310,14 @@ public static class NavReportSync
                 "not-yet-implemented — the runner could not construct report " + reportId +
                 " to run its request page. See docs/scope.md");
 
-        var confirmed = RunRequestPageForHandler(report, reportId, parameters);
+        var outcome = RunRequestPageForHandler(report, reportId, parameters);
 
         // BC's own RunRequestPageAsync reaches GetReportParameters through
         // RunReportAsync(…, ReportIntent.Parameters, …), which sets NavReport.success when
         // the request page is confirmed. GetReportParameters returns string.Empty unless it
         // is set, which is precisely how "the user cancelled" is reported to AL. The runner
         // drives the request page directly, so it has to record the same fact.
-        SetReportSuccess(report, confirmed);
+        SetReportSuccess(report, outcome.Confirmed);
 
         // Shape-tolerant: BC declares `GetReportParameters(bool requireSuccess = true)`, so a
         // Type.EmptyTypes lookup finds nothing — the optional parameter is still a parameter.
@@ -337,7 +336,9 @@ public static class NavReportSync
             : new object?[] { true };
         var result = Invoke(getParams, report, getParamsArgs) as string ?? string.Empty;
         if (Environment.GetEnvironmentVariable("AL_RUNNER_DIAG_RP") == "1")
-            Console.Error.WriteLine($"[NavReportSync] RunRequestPage({reportId}) confirmed={confirmed} params={result}");
+            Console.Error.WriteLine(
+                $"[NavReportSync] RunRequestPage({reportId}) confirmed={outcome.Confirmed} "
+                + $"formResult={outcome.Result} params={result}");
         return result;
     }
 
@@ -421,11 +422,12 @@ public static class NavReportSync
     /// same approach already proven by <see cref="CreateReportForRequestPage"/> for the
     /// static RunRequestPage overloads.
     ///
-    /// <paramref name="requestWindow"/> / <paramref name="systemPrinter"/> are accepted for
-    /// AL-signature compatibility but not acted on: no dialog is ever raised here, matching
-    /// the existing instance-form limitation (docs/limitations.md — request pages are
-    /// handler-dispatch only via explicit RunRequestPage(), not real rendering during
-    /// Run/RunModal). <paramref name="record"/>, present on the 4-arg overloads, applies the
+    /// When <paramref name="requestWindow"/> is true, the generated request page is driven
+    /// through BC's own test-handler dispatch. A handler can confirm/cancel it, set its live
+    /// controls and data-item filters, or select <c>TestRequestPage.SaveAsXml</c>. The latter
+    /// uses BC's own XML result-set processor and never enters layout rendering.
+    /// <paramref name="systemPrinter"/> remains signature-only because printing requires a
+    /// service tier. <paramref name="record"/>, present on the 4-arg overloads, applies the
     /// AL <c>SetTableView(Rec)</c> filter before the report runs — BC's own
     /// DataItemIterator.SetTableView body is kept unmodified (see the Cecil-rewrite comment
     /// for DataItemIterator.SetTableView) so this reuses real BC filtering logic.
@@ -453,7 +455,25 @@ public static class NavReportSync
                 Invoke(setTableView, instance, new[] { record });
         }
 
-        SyncRun(instance);
+        if (requestWindow)
+            SyncRunWithRequestPage(instance, reportId);
+        else
+            SyncRun(instance);
+    }
+
+    private readonly struct RequestPageOutcome
+    {
+        internal RequestPageOutcome(bool hasPage, FormResult result)
+        {
+            HasPage = hasPage;
+            Result = result;
+        }
+
+        internal bool HasPage { get; }
+        internal FormResult Result { get; }
+        internal bool Confirmed => !HasPage || Result is FormResult.OK or FormResult.LookupOK;
+        internal bool Dismissed => HasPage && Result is FormResult.None or FormResult.Cancel or FormResult.LookupCancel;
+        internal bool SaveAsXmlRequested => HasPage && Result == FormResult.Xml;
     }
 
     /// <summary>
@@ -464,17 +484,28 @@ public static class NavReportSync
     /// parameters are simply whatever the report already carries; it counts as confirmed,
     /// because there was no dialog for anyone to cancel.
     ///
-    /// Returns whether the page was CONFIRMED (the handler invoked OK), which is what
-    /// decides whether BC hands the caller parameters or an empty string.
+    /// Returns the exact built-in action selected by the handler. This distinction matters
+    /// for TestRequestPage.SaveAsXml: FormResult.Xml is neither OK nor Cancel, and is how BC
+    /// carries the XML-output intent out of the handler.
     /// </summary>
-    private static bool RunRequestPageForHandler(object report, int reportId, string? parameters)
+    private static RequestPageOutcome RunRequestPageForHandler(object report, int reportId, string? parameters)
     {
         var pRequestPage = FindProperty(report.GetType(), "RequestOptionsPage");
-        if (pRequestPage == null) return true;
+        if (pRequestPage == null)
+            throw new InvalidOperationException(
+                "NavReport.RequestOptionsPage not found — Ncl shape changed; do not commit");
         object? requestPage;
         try { requestPage = pRequestPage.GetValue(report); }
-        catch (TargetInvocationException) { return true; }
-        if (requestPage == null) return true;
+        catch (TargetInvocationException ex)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                .Capture(ex.InnerException ?? ex)
+                .Throw();
+            throw;
+        }
+        if (requestPage == null) return new RequestPageOutcome(false, FormResult.None);
+
+        EnsureRequestPageInitialized(requestPage, reportId);
 
         if (parameters != null)
             TrySetParameterSet(requestPage, parameters);
@@ -506,7 +537,9 @@ public static class NavReportSync
         var runModal = requestPage.GetType().GetMethod("RunModal",
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null, types: Type.EmptyTypes, modifiers: null);
-        if (runModal == null) return true;
+        if (runModal == null)
+            throw new InvalidOperationException(
+                "NavForm.RunModal() not found on the report request page — Ncl shape changed; do not commit");
         try
         {
             Invoke(runModal, requestPage, Array.Empty<object?>());
@@ -529,7 +562,33 @@ public static class NavReportSync
                 + "'real request page for report N could not be built'). See docs/scope.md");
         }
 
-        return testPage.Confirmed;
+        return new RequestPageOutcome(true, testPage.RequestedResult);
+    }
+
+    /// <summary>
+    /// The request-page instance was constructed while NavForm initialization was guarded,
+    /// so its first InitializeComponent pass intentionally registered nothing. Opt in this
+    /// exact instance and replay that generated method once. This is narrower than enabling
+    /// every request page constructed as a report side effect, including requestWindow=false.
+    /// </summary>
+    private static void EnsureRequestPageInitialized(object requestPage, int reportId)
+    {
+        if (AlRunner.Patches.RunnerFormInit.ShouldRunRealFormInit(requestPage)) return;
+
+        AlRunner.Patches.RunnerFormInit.MarkRealInit(requestPage);
+        for (Type? type = requestPage.GetType(); type != null; type = type.BaseType)
+        {
+            var initialize = type.GetMethod("InitializeComponent",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly,
+                binder: null, types: Type.EmptyTypes, modifiers: null);
+            if (initialize == null) continue;
+            Invoke(initialize, requestPage, Array.Empty<object?>());
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Request page for report {reportId} has no InitializeComponent() method — "
+            + "Ncl/generated report shape changed; do not commit");
     }
 
     /// <summary>Register a form with the skeleton company, ignoring an already-registered one.</summary>
@@ -584,9 +643,17 @@ public static class NavReportSync
     }
 
     public static void SyncRun(object navReport)
+        => SyncRunCore(navReport, requestPageReportId: null);
+
+    private static void SyncRunWithRequestPage(object navReport, int reportId)
+        => SyncRunCore(navReport, reportId);
+
+    private static void SyncRunCore(object navReport, int? requestPageReportId)
     {
         if (Environment.GetEnvironmentVariable("AL_RUNNER_DIAG_IC") == "1")
-            Console.Error.WriteLine($"[NavReportSync] SyncRun entry: type={navReport?.GetType().FullName}");
+            Console.Error.WriteLine(
+                $"[NavReportSync] SyncRun entry: type={navReport?.GetType().FullName} "
+                + $"requestPageReportId={requestPageReportId?.ToString() ?? "none"}");
         if (navReport == null) return;
 
         var t = navReport.GetType();
@@ -623,20 +690,47 @@ public static class NavReportSync
                 null, Type.EmptyTypes, null);
         }
 
-        TryRunOrControlFlow(navReport, navReportBase);
+        TryRunOrControlFlow(navReport, navReportBase, requestPageReportId);
     }
 
-    // Runs the full lifecycle (OnInitReport → OnPreReport → DataItems →
-    // OnPostReport → layout). Catches NavControlException (Skip/Quit/etc.)
-    // as control-flow termination, not error.
-    private static bool TryRunOrControlFlow(object navReport, Type navReportBase)
+    // Runs the full lifecycle (OnInitReport → optional request page → OnPreReport →
+    // DataItems → OnPostReport → layout/output). Catches NavControlException
+    // (Skip/Quit/etc.) as control-flow termination, not error.
+    private static bool TryRunOrControlFlow(
+        object navReport,
+        Type navReportBase,
+        int? requestPageReportId)
     {
         try
         {
             InvokeVirtual(_onInitReport, navReport);
             ApplyCallerTableViewBeforePreReport(navReport);
+
+            var saveAsXml = false;
+            if (requestPageReportId is int reportId)
+            {
+                var outcome = RunRequestPageForHandler(navReport, reportId, parameters: null);
+                if (outcome.SaveAsXmlRequested)
+                {
+                    InstallTestXmlResultSetProcessor(navReport);
+                    saveAsXml = true;
+                }
+                else if (outcome.Dismissed)
+                {
+                    return true;
+                }
+                else if (!outcome.Confirmed)
+                {
+                    throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                        $"TestRequestPage output action {outcome.Result} for report {reportId}",
+                        "report-request-page-output — headless report execution currently supports "
+                        + "OK, Cancel, and SaveAsXml. PDF, Word, and Excel output still require "
+                        + "layout rendering. See docs/scope.md");
+                }
+            }
+
             InvokeVirtual(_onPreReport, navReport);
-            InvokeDataItems(navReport);
+            InvokeDataItems(navReport, completeResultSetProcessor: saveAsXml);
             InvokeVirtual(_onPostReport, navReport);
 
             // Strict AL semantics: when the AL source declares `ProcessingOnly =
@@ -648,7 +742,7 @@ public static class NavReportSync
             // rewritten to throw an OOS InvalidOperationException on
             // ThrowError). The error therefore originates from the actual
             // layout-resolution code path, not from a guard at the top of Run.
-            if (!IsProcessingOnly(navReport, navReportBase))
+            if (!saveAsXml && !IsProcessingOnly(navReport, navReportBase))
                 InvokeLayoutForReport(navReport, navReportBase);
             return false;
         }
@@ -819,6 +913,93 @@ public static class NavReportSync
     private static Type? _nullResultSetProcessorType;     // Runtime.NullResultSetProcessor
 
     /// <summary>
+    /// Install the same test XML renderer BC's report factory selects after
+    /// TestRequestPage.SaveAsXml. The handler has already stored both filenames on the live
+    /// NavTestExecution; the factory consumes and clears that state and builds the dataset
+    /// from the report's real MetaReport via NavDataSetBuilder.
+    /// </summary>
+    private static void InstallTestXmlResultSetProcessor(object navReport)
+    {
+        Type? iteratorType = navReport.GetType();
+        while (iteratorType != null && iteratorType.Name != "DataItemIterator")
+            iteratorType = iteratorType.BaseType;
+        if (iteratorType == null)
+            throw new InvalidOperationException(
+                "NavReport has no DataItemIterator base — Ncl shape changed; do not commit");
+
+        var ncl = iteratorType.Assembly;
+        var parametersType = ncl.GetType("Microsoft.Dynamics.Nav.Runtime.Report.ReportParameters")
+            ?? throw new InvalidOperationException(
+                "Report.ReportParameters not found in Ncl — Ncl shape changed; do not commit");
+        var factoryType = ncl.GetType(
+                "Microsoft.Dynamics.Nav.Runtime.Report.ReportResultSetProcessorFactory")
+            ?? throw new InvalidOperationException(
+                "ReportResultSetProcessorFactory not found in Ncl — Ncl shape changed; do not commit");
+
+        var parameters = Activator.CreateInstance(parametersType, nonPublic: true)
+            ?? throw new InvalidOperationException("Could not construct ReportParameters");
+        var runOptionsProperty = parametersType.GetProperty(
+                "RunOptions", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException(
+                "ReportParameters.RunOptions not found — Ncl shape changed; do not commit");
+        var runOptions = Activator.CreateInstance(runOptionsProperty.PropertyType, nonPublic: true)
+            ?? throw new InvalidOperationException("Could not construct ReportRunOptions");
+        var testModeProperty = runOptionsProperty.PropertyType.GetProperty(
+                "TestMode", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException(
+                "ReportRunOptions.TestMode not found — report-base shape changed; do not commit");
+        testModeProperty.SetValue(runOptions, true);
+        runOptionsProperty.SetValue(parameters, runOptions);
+
+        var targetFormatProperty = parametersType.GetProperty(
+                "ReportTargetFormat", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException(
+                "ReportParameters.ReportTargetFormat not found — Ncl shape changed; do not commit");
+        var targetFormatType = targetFormatProperty.PropertyType;
+        if (!targetFormatType.IsEnum || !Enum.IsDefined(targetFormatType, "Xml"))
+            throw new InvalidOperationException(
+                "NavReportFormat.Xml not found — Ncl shape changed; do not commit");
+        targetFormatProperty.SetValue(parameters, Enum.Parse(targetFormatType, "Xml"));
+
+        var constructor = factoryType.GetConstructors(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .SingleOrDefault(c =>
+            {
+                var p = c.GetParameters();
+                return p.Length == 3
+                       && p[0].ParameterType.IsInstanceOfType(navReport)
+                       && p[1].ParameterType == parametersType
+                       && p[2].ParameterType.Name == "NavRecord";
+            })
+            ?? throw new InvalidOperationException(
+                "ReportResultSetProcessorFactory(NavReport, ReportParameters, NavRecord) not found — "
+                + "Ncl shape changed; do not commit");
+
+        object factory;
+        try { factory = constructor.Invoke(new object?[] { navReport, parameters, null }); }
+        catch (TargetInvocationException tie) when (tie.InnerException != null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+            throw;
+        }
+
+        var create = factoryType.GetMethod(
+                "CreateInstance", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null, types: Type.EmptyTypes, modifiers: null)
+            ?? throw new InvalidOperationException(
+                "ReportResultSetProcessorFactory.CreateInstance() not found — Ncl shape changed; do not commit");
+        var processor = Invoke(create, factory, Array.Empty<object?>())
+            ?? throw new InvalidOperationException(
+                "ReportResultSetProcessorFactory returned no processor for TestRequestPage.SaveAsXml");
+        if (processor.GetType().Name != "ReportSaveAsXmlRenderer")
+            throw new InvalidOperationException(
+                "TestRequestPage.SaveAsXml selected " + processor.GetType().FullName
+                + " instead of BC's ReportSaveAsXmlRenderer — Ncl behavior changed; do not commit");
+
+        SetResultSetProcessor(navReport, iteratorType, processor);
+    }
+
+    /// <summary>
     /// Execute the report's data items through BC's OWN loop.
     ///
     /// This deliberately does not re-implement row iteration. It calls
@@ -840,13 +1021,13 @@ public static class NavReportSync
     /// faithful shape for the runner's non-rendering Run(). Only installed when the report
     /// does not already carry a processor.
     /// </summary>
-    private static void InvokeDataItems(object navReport)
+    private static void InvokeDataItems(object navReport, bool completeResultSetProcessor = false)
     {
         Type? iter = navReport.GetType();
         while (iter != null && iter.Name != "DataItemIterator") iter = iter.BaseType;
         if (iter == null) return;
 
-        EnsureResultSetProcessor(navReport, iter);
+        var processor = EnsureResultSetProcessor(navReport, iter);
 
         _applyDataItemTableView ??= iter.GetMethod("ApplyDataItemTableViewAndRequestFormFilters",
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
@@ -858,10 +1039,33 @@ public static class NavReportSync
             throw new InvalidOperationException(
                 "DataItemIterator.LoopRootDataItemsAsync() not found — Ncl shape changed; do not commit");
 
-        if (_applyDataItemTableView != null)
-            Invoke(_applyDataItemTableView, navReport, Array.Empty<object?>());
+        var startAttempted = false;
+        var finished = false;
+        try
+        {
+            if (completeResultSetProcessor)
+            {
+                startAttempted = true;
+                InvokeResultSetProcessor(processor, "StartAsync");
+            }
 
-        AwaitValueTask(Invoke(_loopRootDataItems, navReport, Array.Empty<object?>()));
+            if (_applyDataItemTableView != null)
+                Invoke(_applyDataItemTableView, navReport, Array.Empty<object?>());
+
+            AwaitValueTask(Invoke(_loopRootDataItems, navReport, Array.Empty<object?>()));
+
+            if (completeResultSetProcessor)
+            {
+                InvokeResultSetProcessor(processor, "FinishAsync");
+                finished = true;
+            }
+        }
+        catch
+        {
+            if (startAttempted && !finished)
+                TryAbortResultSetProcessor(processor);
+            throw;
+        }
     }
 
     /// <summary>
@@ -869,22 +1073,58 @@ public static class NavReportSync
     /// <c>NullResultSetProcessor</c> is BC's own discard implementation, chosen by BC's
     /// factory for a layout-less report, so using it here is not a runner stand-in.
     /// </summary>
-    private static void EnsureResultSetProcessor(object navReport, Type dataItemIteratorType)
+    private static object EnsureResultSetProcessor(object navReport, Type dataItemIteratorType)
     {
         _resultSetProcessorProp ??= dataItemIteratorType.GetProperty("ResultSetProcessor",
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (_resultSetProcessorProp == null) return;
-        if (_resultSetProcessorProp.GetValue(navReport) != null) return;
+        if (_resultSetProcessorProp == null)
+            throw new InvalidOperationException(
+                "DataItemIterator.ResultSetProcessor not found — Ncl shape changed; do not commit");
+        if (_resultSetProcessorProp.GetValue(navReport) is { } existing) return existing;
 
         _nullResultSetProcessorType ??= dataItemIteratorType.Assembly
             .GetType("Microsoft.Dynamics.Nav.Runtime.NullResultSetProcessor")
             ?? throw new InvalidOperationException(
                 "NullResultSetProcessor not found in Ncl — Ncl shape changed; do not commit");
 
-        var setter = _resultSetProcessorProp.GetSetMethod(nonPublic: true)
+        var processor = Activator.CreateInstance(_nullResultSetProcessorType)
+            ?? throw new InvalidOperationException("Could not construct NullResultSetProcessor");
+        SetResultSetProcessor(navReport, dataItemIteratorType, processor);
+        return processor;
+    }
+
+    private static void SetResultSetProcessor(
+        object navReport,
+        Type dataItemIteratorType,
+        object processor)
+    {
+        _resultSetProcessorProp ??= dataItemIteratorType.GetProperty("ResultSetProcessor",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        var setter = _resultSetProcessorProp?.GetSetMethod(nonPublic: true)
             ?? throw new InvalidOperationException(
                 "DataItemIterator.ResultSetProcessor has no setter — Ncl shape changed; do not commit");
-        setter.Invoke(navReport, new[] { Activator.CreateInstance(_nullResultSetProcessorType) });
+        Invoke(setter, navReport, new[] { processor });
+    }
+
+    private static void InvokeResultSetProcessor(object processor, string methodName)
+    {
+        var method = processor.GetType().GetMethod(
+                methodName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null, types: Type.EmptyTypes, modifiers: null)
+            ?? throw new InvalidOperationException(
+                $"{processor.GetType().FullName}.{methodName}() not found — Ncl shape changed; do not commit");
+        AwaitValueTask(Invoke(method, processor, Array.Empty<object?>()));
+    }
+
+    private static void TryAbortResultSetProcessor(object processor)
+    {
+        try { InvokeResultSetProcessor(processor, "AbortAsync"); }
+        catch (Exception ex)
+        {
+            if (Environment.GetEnvironmentVariable("AL_RUNNER_DIAG_IC") == "1")
+                Console.Error.WriteLine(
+                    $"[NavReportSync] XML processor abort failed: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     /// <summary>

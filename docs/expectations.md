@@ -4,11 +4,9 @@ The runner consumes tests from the `tests/al-language` submodule
 (`StefanMaron/BusinessCentral.AL.Language.Tests`). That corpus is the canonical
 spec of AL language behaviour against a real BC service tier. By design, some
 tests in the corpus exercise surfaces the runner cannot — and will never —
-support in-process (report rendering, SMTP, HTTP egress, etc.), and on a few
-surfaces the runner deliberately answers differently from BC (the task
-scheduler, `docs/scope.md` §3.6). The runner does not modify the corpus to make
-those tests pass; instead it declares its expectations about them in this
-directory.
+support in-process (report rendering, SMTP, HTTP egress, etc.). The runner does
+not modify the corpus to make those tests pass; instead it declares its
+expectations about them in this directory.
 
 ## Activation
 
@@ -133,8 +131,7 @@ starts lying:
 - **`expect-divergence`** means *settled*: the runner behaves differently on
   purpose and nobody is going to change it. There is no issue to link (linking one
   is rejected at load time), so the entry carries `Doc` instead — a pointer to
-  where the decision is written down, e.g. `docs/scope.md#jobs` for the task
-  scheduler.
+  where the decision is written down.
 - **`expect-oos`** means the runner refuses the surface outright and says so with
   an out-of-scope signal. A test declared `expect-divergence` that *does* raise
   one fails with "declare it expect-oos instead", so divergence cannot quietly
@@ -173,7 +170,6 @@ Tests:         1945 total
   pass:        1945
     pass-oos:        2
     pass-known-gap:  3
-    pass-divergence: 1
   fail:        0
 ```
 

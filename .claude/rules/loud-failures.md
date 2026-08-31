@@ -34,6 +34,9 @@ surface is unsupported and where to look.
 - Reports/forms to the extent of firing the test's `[RequestPageHandler]` /
   `[ReportHandler]` / `[MessageHandler]` etc. (rendering is out of scope;
   callback dispatch is in scope).
+- `TaskScheduler.CreateTask` and its membership lifecycle: validate the requested
+  codeunit IDs, retain a fresh opaque ID in the process-local pending set, and answer
+  `TaskExists`, `CancelTask`, and `SetTaskReady` from that set. No task is executed.
 
 ## What's permanently out of scope, must throw
 
@@ -42,7 +45,8 @@ surface is unsupported and where to look.
 - File I/O against blob storage, external filesystems, network shares.
 - OData / SOAP / web service *publishing* endpoints.
 - Printing to physical printers.
-- Background job scheduling, NAS, job queue execution against a real scheduler.
+- Background task execution, timing, NAS, and job queue execution against a real
+  scheduler. The narrow pending-ID lifecycle above is the only supported substitute.
 - Anything else that requires a process or service outside the runner's
   in-process world.
 
@@ -61,10 +65,12 @@ return a default. This is so the developer notices and can either:
 
 ## Audit obligation
 
-Any new patch under `AlRunner/Patches/` (or anywhere else that
-substitutes BC method behaviour) must justify in a code comment why its return
-value is **observably equivalent** to the real BC behaviour for in-scope test
-code. If it isn't, it throws `RunnerOutOfScopeException` instead.
+Any new patch under `AlRunner/Patches/` (or anywhere else that substitutes BC
+method behaviour) must justify in a code comment why its return value is
+**observably equivalent** to the real BC behaviour for in-scope test code. A
+deliberately bounded in-memory state machine is allowed only when `docs/scope.md`
+names its observable boundary and unsupported effects cannot be mistaken for
+having happened. Otherwise, it throws `RunnerOutOfScopeException`.
 
 Existing patches predate this rule. A `SCOPE-AUDIT.md` exercise classifies
 each one as faithful / silent-fake / TODO; silent-fakes are converted to

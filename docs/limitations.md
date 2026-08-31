@@ -102,9 +102,9 @@ assembly for `[NavEventSubscriber]` methods at startup and calls matching subscr
 
 ### No UI rendering
 
-Pages are not rendered. There is no layout engine, no field visibility evaluation, and
-no report dataset. `TestPage` provides expanded field access, navigation, and handler
-dispatch, and report/request-page variables support a limited standalone surface, but:
+Pages are not rendered. There is no visual layout engine or interactive client.
+`TestPage` provides expanded field access, navigation, and handler dispatch, and
+report/request-page variables run against BC's generated metadata, but:
 
 - Field `Visible`, `Enabled`, and `Editable` ARE evaluated against real page metadata,
   live, including a control's `Visible` combined with every enclosing `group`'s `Visible`
@@ -117,36 +117,41 @@ dispatch, and report/request-page variables support a limited standalone surface
   `Rec` that is already in the table, with the page's `AutoSplitKey` field assigned
   (BC's own `NavForm.SplitKey`, in 10000 increments). A plain `SetValue` still does not
   save: the row is written when something leaves it (a cursor move, an action, or close).
-  The `AutoSplitKey` *values* are not yet BC's: the runner has no client cursor to take an
-  insertion point from, so an empty grid starts at 10000 where BC starts at 20000, and a
-  line appended to a grid numbered from something other than 10000 does not continue from
-  the last row. Tracked in
-  [#1755](https://github.com/StefanMaron/BusinessCentral.AL.Runner/issues/1755).
+  `AutoSplitKey` uses the page's filtered cursor and BC's client-side draft intervals for
+  empty grids, appends, and insertion between existing rows. On a `MultipleNewLines` page,
+  saving the first explicit row also persists the untouched predecessor draft through BC's
+  empty-line path, without running the table insert trigger. Unsupported key-field types fail
+  explicitly instead of receiving a guessed key.
 - Static `Page.Run()` dispatches to `[PageHandler]` or attaches to a preceding
   `TestPage.Trap()` during a test; without either it throws the documented non-modal UI
   out-of-scope error. `Page.RunModal()` dispatches to
   `[ModalPageHandler]` if registered, otherwise throws — both the page-variable form
   (`P.SetRecord(Rec); P.RunModal();`) and the static-by-id forms
   (`Page.RunModal(id, Record)`, `Page.RunModal(Page::"X", Record)`, and Base App
-  `Codeunit 700 "Page Management"` code that routes through them).
-- Request pages can be handled via `[RequestPageHandler]`, but this is handler dispatch
-  only, not real request-page rendering.
+  `Codeunit 700 "Page Management"` code that routes through them). The handler's TestPage
+  starts on the `SetRecord` row when it remains in the applied view, or on that view's first
+  row when the source record is filtered but not positioned.
+- Request pages can be handled via `[RequestPageHandler]`. The handler sees the generated
+  request page's live control source expressions and data-item filters; no pixels or
+  interactive dialog are rendered.
 - Report variables support `Run()`, `RunRequestPage()`, `SetTableView()`, and
   helper procedures. Report triggers execute: `OnPreReport`, `OnPreDataItem`,
   `OnAfterGetRecord` (once per row in the in-memory table), `OnPostDataItem`, and
   `OnPostReport`. `Run()` drives BC's own data-item loop, so `SetTableView(Rec)`
   constrains the matching data item to the applied view, and `DataItemTableView`,
   `DataItemLink`, nested data items and `CurrReport.Skip`/`Break` behave as the
-  runtime engine defines them. Report layout/rendering is still not available.
+  runtime engine defines them. `TestRequestPage.SaveAsXml(parametersFile, datasetFile)`
+  uses BC's own XML result-set processor and data-item iterator, so request-page parameter
+  XML and report dataset XML are available even for temporary records. Visual report
+  layout rendering is still not available.
 - The static `Report.Run(id[, requestWindow[, systemPrinter[, record]]])` /
   `Report.RunModal(id, ...)` forms (called on the `Report` codeunit-like object, without
   first declaring a report variable) execute the report the same way the report-variable
   form does — construct the report from its id, then run the same trigger lifecycle.
-  `requestWindow` / `systemPrinter` are accepted but not acted on: no dialog is ever raised
-  from `Run`/`RunModal` (request pages are handler dispatch only, see above); a report that
-  needs its request page's `[RequestPageHandler]` to fire should call the static/instance
-  `RunRequestPage()` explicitly. The `Report.Run(ReportRunOptions)` overload is not
-  implemented and throws `out-of-scope: static NavReport.Run`.
+  `requestWindow = true` drives the generated request page through the matching
+  `[RequestPageHandler]`; `false` skips it. `systemPrinter` is accepted for signature
+  compatibility but cannot provide a physical printer. The `Report.Run(ReportRunOptions)`
+  overload is not implemented and throws `out-of-scope: static NavReport.Run`.
 
 ### No debugger infrastructure
 
@@ -164,17 +169,23 @@ The runner executes in a single .NET process with no attached BC debugger. Debug
 
 `Debugger.Activate()`, `Debugger.Deactivate()`, and `Debugger.IsActive()` are supported — they are stripped or return `false`.
 
-### Task scheduler — synchronous dispatch
+### Task scheduler — pending-ID lifecycle without execution
 
-`TaskScheduler.CreateTask()` dispatches the target codeunit **synchronously, inline**,
-before returning — the same pattern as `StartSession`. The implications:
+`TaskScheduler.CanCreateTask()` returns `false` because the runner has no background
+scheduler. Guarded AL therefore skips scheduling. In AL compiled by this runner, an unguarded
+`CreateTask()` call validates requested codeunit ids against the loaded assembly index, returns
+a fresh non-empty GUID, and retains that GUID in a process-local pending set. A codeunit known
+only through app metadata, but not loaded as a CLR type, fails that validation. `TaskExists()`,
+`CancelTask()`, and `SetTaskReady()` answer from membership; `SetTaskReady()` never dispatches
+the task.
 
-- `TaskExists()` always returns `false` — the task already completed before the call returned.
-- `CancelTask()` and `SetTaskReady()` are no-ops — the task has already run.
-- `CanCreateTask()` returns `false` — there is no background job queue.
-- `NotBefore` and `CompanyName` parameters are accepted but ignored — the codeunit runs immediately in the current company context.
-
-AL that tests the *logic* around task creation (what codeunit runs, what state it produces) works here. AL that tests the *scheduling contract* (task still pending, NotBefore delay, cancellation before execution) cannot work here because there is no background scheduler.
+Test-created ids are cleared at the configured test-isolation boundary; ids created by install
+triggers are restored with the install baseline. The set is not transactional within a test, so AL
+rollback does not undo membership changes. The runner does not model readiness,
+`NotBefore`, company switching, timeout handling, Scheduled Task rows, task execution, or
+failure-codeunit execution. The same `CreateTask()` statement in a precompiled MS / ISV app uses
+BC's untouched async runtime path and retains BC's refusal behavior. AL that depends on
+scheduling effects requires a real Business Central service tier.
 
 ### No DotNet interop
 
@@ -288,6 +299,13 @@ If your AL under test depends on real SA behaviour to mean anything, the support
 2. **Test-only AL codeunit shadowing the SA call.** Add an AL codeunit in your `test/` directory with the same object ID and a hand-rolled implementation that returns the values your test expects. The runner will use your codeunit because it is in the compile unit; in real BC, your production code never sees it.
 
 Concrete example — `Image` codeunit (System Application). A test that asserts on image dimensions cannot rely on the runner's blank-shell `Image.GetWidth()` (which returns `0`). The fix is to write a small stub in your test project that parses a known fixture image, not to ask the runner to ship an `Image` implementation. If the AL pattern under test is widespread enough that everyone needs the same stub, file a runner-gap issue and we can discuss whether a shared stub belongs in `AlRunner/stubs/` (the bar is high — it must be test-automation infrastructure, not business logic).
+
+This differs from importing a value into a `Media` / `MediaSet` field. That path keeps BC's
+own media container and binary fallback. Because the NST image decoder is the Windows-only
+`System.Drawing` implementation, the runner additionally validates PNG structure and preserves
+the original bytes through BC's binary media container as described in
+[the scope contract](scope.md#media-image-decoding).
+Other image encodings fail loudly instead of producing guessed image metadata.
 
 ---
 
