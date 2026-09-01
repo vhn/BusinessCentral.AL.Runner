@@ -6,40 +6,6 @@ All notable changes to this project are documented here. Format based on
 
 ## [Unreleased]
 
-### Added
-- **runtime:** extend headless Business Central parity
-- **runtime:** extend headless Business Central parity
-- **tasks:** model pending task lifecycle
-- **runtime:** expand Business Central compatibility
-
-### Fixed
-- **watch:** rebuild virtual metadata after baseline restore
-- **watch:** restore SystemPackage table metadata
-- **watch:** restore SystemPackage table metadata
-- **transactions:** record write state before freshness
-- **testpage:** materialize implicit page drafts
-- **execution:** match source scopes exactly
-- **metadata:** preserve declared table captions
-- **metadata:** preserve declared table captions
-- **http:** dispatch mocked client handlers
-- **http:** dispatch mocked client handlers
-- **ui:** dispatch non-modal page handlers
-- **ui:** dispatch non-modal page handlers
-- **testpage:** dispatch source field lookup triggers
-- **testpage:** evaluate negated boolean bindings
-- **testpage:** dispatch source field lookup triggers
-- **testpage:** evaluate negated boolean bindings
-
-### Documentation
-- update runtime compatibility scope
-
-### Changed
-- Merge remote-tracking branch 'origin/main' into agent/21g0dqbh/issue-0
-- Merge remote-tracking branch 'origin/main' into agent/21g0dqbh/issue-0
-- Merge remote-tracking branch 'origin/main' into agent/21g0dqbh/issue-0
-- **expectations:** match HttpClient dispatch boundary
-- Merge branch 'main' into test
-
 ## [2.2.0] - 2026-08-17
 
 ### Added
