@@ -82,11 +82,14 @@ public static class ALDatabasePatches
     /// <summary>
     /// Start the transaction owned by a GUARDED <c>Codeunit.Run</c> (<c>Ok := Codeunit.Run(...)</c>).
     /// Only that form is a transaction boundary — BC takes BeginTransactionWorldAndTransaction
-    /// on it, which refuses to start inside a write transaction and otherwise opens an
-    /// independently committable world. The runner does not model the refusal: it makes the
-    /// caller's current state durable and then records the inner codeunit's writes against
-    /// that point. The statement form must NOT call this: it nests inside the caller's
-    /// transaction and commits nothing.
+    /// on it, which refuses to start inside a write transaction (TransactionManager
+    /// .ThrowIfWriteTransactionStarted) and otherwise opens an independently committable world.
+    /// KNOWN DIVERGENCE, not a design choice: the refusal is not modelled here, so AL that BC
+    /// rejects with "Codeunit.Run is allowed in write transactions only if the return value is
+    /// not used" runs green in the runner. Upstream closed this; see docs/limitations.md.
+    /// Until then this makes the caller's current state durable and records the inner
+    /// codeunit's writes against that point. The statement form must NOT call this: it nests
+    /// inside the caller's transaction and commits nothing.
     /// </summary>
     internal static void BeginCodeunitRunTransaction()
     {
@@ -142,6 +145,15 @@ public static class ALDatabasePatches
 
     /// <summary>Clear write-transaction state at the per-test isolation boundary, so one
     /// test's uncommitted write cannot make the next test start "in a transaction".</summary>
+    /// <summary>
+    /// End the write transaction without touching nesting or the commit point. BC's
+    /// TransactionManager.Rollback ends the write transaction (CommitImpl(false) resets
+    /// TransactionOpenForWrites), so Database.IsInWriteTransaction() answers false after an
+    /// AL error is caught — RollbackToCommitPoint calls this to match.
+    /// </summary>
+    internal static void ClearWriteTransaction()
+        => System.Threading.Volatile.Write(ref _inWriteTransaction, false);
+
     public static void ResetWriteTransactionState()
     {
         System.Threading.Volatile.Write(ref _inWriteTransaction, false);

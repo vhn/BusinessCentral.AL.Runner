@@ -1,30 +1,19 @@
 // CodeunitRunCommitPointTests — pins WHICH Codeunit.Run form is a commit point.
 //
-// The regression this guards: RunCodeunitInTransaction bracketed EVERY Codeunit.Run with
-// ALDatabasePatches.Begin/EndCodeunitRunTransaction. Those reach
-// RecordPatches.NoteTransactionBegin/End, which call MarkCommitPoint() at the outermost
-// frame, and MarkCommitPoint() clears _txCommitPoint — so every write made BEFORE the call
-// stopped being restorable and wrongly survived a later, unrelated asserterror.
+// BC branches on DataError: the GUARDED form (`Ok := Codeunit.Run(...)`) takes
+// BeginTransactionWorldAndTransaction and is a real transaction boundary; the STATEMENT form
+// takes the plain BeginTransaction branch, which inside a test method only bumps
+// TransactionCount on the already-open transaction and commits nothing. The runner bracketed
+// both, so a write made before a statement-form run wrongly survived a later asserterror.
 //
-// BC-observable claim, verified against a live BC 28.2 service tier (Test Runner -
-// Isol. Codeunit 130450): a row inserted before a STATEMENT-FORM Codeunit.Run whose OnRun is
-// empty is rolled back by a later asserterror, identically to the control with no Run at all;
-// a row written by the callee is rolled back too. BC's DoRunAsync branches on DataError —
-// the statement form (ThrowError) takes the plain BeginTransaction branch, where a nested
-// begin is only a TransactionCount bump and EndTransaction at depth > 0 merely pops it, so
-// nothing is committed.
+// Both claims are adjudicated upstream in the al-language corpus (see
+// docs/upstream-corpus-workflow.md); these fixtures are the runner-side pin for the gating in
+// CodeunitPatches.RunCodeunitInTransaction, kept local because they must fail fast on the
+// mechanism rather than wait for a corpus pin bump.
 //
-// The GUARDED form is the contrast, and the second test is deliberately asymmetric: on real
-// BC `Ok := Codeunit.Run(...)` inside an open write transaction THROWS
-// (TransactionManager.ThrowIfWriteTransactionStarted) rather than committing. The runner does
-// not model that refusal — it is lenient and makes the caller's pending writes durable
-// instead. That leniency is pre-existing and out of scope here; what matters is that the
-// guarded form remains a commit boundary. The two tests together pin the gate from both
-// sides: revert the gating to unconditional and the first fails; drop the bracketing
-// altogether and the second fails.
-//
-// Runs as a self-contained fixture (no Base App, no dependencies) so it costs a couple of
-// seconds and cannot be perturbed by corpus or artifact drift.
+// Every scenario here is BC-legal: no test enters a guarded run with an uncommitted write,
+// which BC refuses via ThrowIfWriteTransactionStarted and the runner does not yet model
+// (docs/limitations.md). That keeps these fixtures green when the refusal is eventually ported.
 
 using System.Diagnostics;
 using System.Text;
@@ -88,6 +77,30 @@ public sealed class CodeunitRunCommitPointTests : IDisposable
             end;
         }
         """);
+        File.WriteAllText(Path.Combine(dir, "MarkerWriter.Codeunit.al"), """
+        codeunit 62733 "Codeunit Run Marker Writer"
+        {
+            trigger OnRun()
+            var
+                Marker: Record "Codeunit Run Commit Marker";
+            begin
+                Marker.Id := 3;
+                Marker.Insert();
+            end;
+        }
+        """);
+        File.WriteAllText(Path.Combine(dir, "MarkerWriter2.Codeunit.al"), """
+        codeunit 62734 "Codeunit Run Marker Writer2"
+        {
+            trigger OnRun()
+            var
+                Marker: Record "Codeunit Run Commit Marker";
+            begin
+                Marker.Id := 5;
+                Marker.Insert();
+            end;
+        }
+        """);
         // Each [Test] PASSES when the runner matches BC, and fails with a distinctive
         // REGRESSION message otherwise, so a failure names the defect rather than a diff.
         File.WriteAllText(Path.Combine(dir, "CommitPointTests.Codeunit.al"), """
@@ -120,20 +133,55 @@ public sealed class CodeunitRunCommitPointTests : IDisposable
                     Error('REGRESSION: a statement-form Codeunit.Run marked a commit point, so the earlier write survived asserterror. Real BC rolls it back.');
             end;
 
+            // The instance spelling enters through NavCodeunit_DoRunAsync, the static one
+            // through NavCodeunit_RunCodeunit. Both funnel into RunCodeunitInTransaction today;
+            // pinning both stops a per-entry-point refactor from regressing one silently.
+            [Test]
+            procedure StatementFormInstanceRun_IsNotACommitPoint()
+            var
+                Marker: Record "Codeunit Run Commit Marker";
+                EmptyOnRun: Codeunit "Codeunit Run Empty OnRun";
+            begin
+                Marker.Id := 4;
+                Marker.Insert();
+                EmptyOnRun.Run();
+                asserterror Error('intentional');
+                if Marker.Get(4) then
+                    Error('REGRESSION: a statement-form instance Codeunit.Run marked a commit point, so the earlier write survived asserterror. Real BC rolls it back.');
+            end;
+
+            // BC-legal: nothing is pending when the guarded run starts, so BC does not refuse
+            // it. The callee writes INSIDE the world, so that write is committed and a later
+            // asserterror must not undo it. Drop the bracketing entirely and the callee's row
+            // is snapshotted against the test-start commit point and rolled back instead.
+            // Pinned on both spellings for the same reason as the statement form above.
             [Test]
             procedure GuardedFormRun_IsACommitPoint()
             var
                 Marker: Record "Codeunit Run Commit Marker";
                 Ok: Boolean;
             begin
-                Marker.Id := 3;
-                Marker.Insert();
-                Ok := Codeunit.Run(Codeunit::"Codeunit Run Empty OnRun");
+                Ok := Codeunit.Run(Codeunit::"Codeunit Run Marker Writer");
                 if not Ok then
-                    Error('REGRESSION: guarded Codeunit.Run on an empty OnRun returned false.');
+                    Error('REGRESSION: guarded Codeunit.Run returned false.');
                 asserterror Error('intentional');
                 if not Marker.Get(3) then
                     Error('REGRESSION: the guarded Codeunit.Run stopped being a commit point.');
+            end;
+
+            [Test]
+            procedure GuardedFormInstanceRun_IsACommitPoint()
+            var
+                Marker: Record "Codeunit Run Commit Marker";
+                MarkerWriter: Codeunit "Codeunit Run Marker Writer2";
+                Ok: Boolean;
+            begin
+                Ok := MarkerWriter.Run();
+                if not Ok then
+                    Error('REGRESSION: guarded instance Codeunit.Run returned false.');
+                asserterror Error('intentional');
+                if not Marker.Get(5) then
+                    Error('REGRESSION: the guarded instance Codeunit.Run stopped being a commit point.');
             end;
         }
         """);
@@ -177,11 +225,11 @@ public sealed class CodeunitRunCommitPointTests : IDisposable
 
         var (output, exitCode) = RunRunner();
 
-        // Assert.True with the whole output as the message, not Assert.DoesNotContain: xunit
-        // clips the matched substring, which would hide the REGRESSION sentence naming the
-        // defect. On failure CI should print the diagnosis, not a re-run instruction.
+        // Assert.True with the whole output as the message, not Assert.DoesNotContain /
+        // Assert.Contains: xunit clips the matched string, which would hide both the REGRESSION
+        // sentence naming the defect and any AL compiler diagnostic behind a compile failure.
         Assert.True(!output.Contains("REGRESSION:"), output);
-        Assert.Contains("3P/0F/0E across 3 tests", output);
-        Assert.Equal(0, exitCode);
+        Assert.True(output.Contains("5P/0F/0E across 5 tests"), output);
+        Assert.True(exitCode == 0, output);
     }
 }

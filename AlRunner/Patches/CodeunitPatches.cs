@@ -98,28 +98,28 @@ public static partial class BcRuntime
         Microsoft.Dynamics.Nav.Runtime.RecordState? recordState = null;
         bool result = false;
 
-        // Only the GUARDED form (`Ok := Codeunit.Run(...)`, DataError.TrapError) owns a
-        // transaction. BC's DoRunAsync takes BeginTransactionWorldAndTransaction on that
-        // branch: it refuses to start while the caller has an uncommitted write
-        // (TransactionManager.ThrowIfWriteTransactionStarted) and otherwise opens a fresh,
-        // independently committable transaction world. The runner is deliberately lenient
-        // here — it makes the caller's pending writes durable instead of refusing — but
-        // either way the guarded entry is a transaction boundary. The statement form
-        // (DataError.ThrowError) takes BC's plain BeginTransaction branch: it nests inside
-        // the caller's transaction and commits nothing, so it must not be bracketed.
-        // Bracketing it marked a commit point, so a write made before an unguarded
-        // Codeunit.Run wrongly survived a later asserterror. Mirrors upstream's `if (guarded)`
-        // gating. Same bug class as upstream AlRunner#2413, which covers the Cecil-hooked
-        // plain BeginTransaction/EndTransaction (Query.Open, statement-form XmlPort.Import) —
-        // still unported here, see NclCecilRewrite section 8g.
+        // Only the GUARDED form (`Ok := Codeunit.Run(...)`, DataError.TrapError) is a
+        // transaction boundary: BC's DoRunAsync takes BeginTransactionWorldAndTransaction on
+        // that branch. The statement form (DataError.ThrowError) takes BC's plain
+        // BeginTransaction branch, which inside a test method only bumps TransactionCount on
+        // the already-open transaction and commits nothing — so bracketing it marked a commit
+        // point and a write made before an unguarded Codeunit.Run wrongly survived a later
+        // asserterror. Mirrors upstream's `if (guarded)` gating.
+        // See ALDatabasePatches.BeginCodeunitRunTransaction for what the guarded bracket does
+        // and does not model, and docs/limitations.md for the remaining divergences.
         if (trap)
         {
-            ALDatabasePatches.BeginCodeunitRunTransaction();
+            // Back the record up BEFORE opening the transaction. BackupTableAndRecordHandle()
+            // can throw on the skeleton session, and a throw between Begin and the try would
+            // leak a _logicalTransactionFrames frame that nothing pops — AssertError only
+            // rolls back to the commit point, it does not reset nesting — silently disabling
+            // commit points for the rest of the codeunit.
             if (record != null)
             {
                 recordState = record.CreateRecordState();
                 recordState.BackupTableAndRecordHandle();
             }
+            ALDatabasePatches.BeginCodeunitRunTransaction();
         }
 
         try

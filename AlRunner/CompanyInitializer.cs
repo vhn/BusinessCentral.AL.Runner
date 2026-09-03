@@ -42,10 +42,20 @@ internal static class CompanyInitializer
         if (BcRuntime.FindCodeunitTypePublic(CompanyInitializeCodeunitId) == null)
             return; // no Base App in this bundle — nothing to initialize.
 
+        // Codeunit 2 runs at the ROOT, outside any test method, and the statement form is only
+        // "not a transaction boundary" INSIDE one: BC's plain BeginTransaction bumps
+        // TransactionCount when a transaction is already active, but at the root none is, so it
+        // commits and pushes a fresh one and EndTransaction(false) rolls it back. Codeunit.Run's
+        // own bracket is now guarded-only (CodeunitPatches.RunCodeunitInTransaction), so bracket
+        // this call explicitly — otherwise a partially-failing Company-Initialize leaves its rows
+        // standing and CaptureInstallBaseline persists them under the dependency cache key.
+        bool initialized = false;
+        Patches.ALDatabasePatches.BeginCodeunitRunTransaction();
         try
         {
             BcRuntime.NavCodeunit_RunCodeunit(
                 Microsoft.Dynamics.Nav.Types.DataError.ThrowError, CompanyInitializeCodeunitId, null);
+            initialized = true;
             PerfTrace.Log("CompanyInitializer: ran codeunit 2 Company-Initialize");
         }
         catch (Exception ex)
@@ -57,6 +67,10 @@ internal static class CompanyInitializer
                 $"[CompanyInitializer] codeunit 2 \"Company-Initialize\" did not complete: " +
                 $"{inner.GetType().Name}: {inner.Message} — the company is PARTIALLY initialized; " +
                 $"setup tables it had not reached yet are missing, and AL that reads them will fail.");
+        }
+        finally
+        {
+            Patches.ALDatabasePatches.EndCodeunitRunTransaction(initialized);
         }
     }
 }
