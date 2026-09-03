@@ -98,11 +98,28 @@ public static partial class BcRuntime
         Microsoft.Dynamics.Nav.Runtime.RecordState? recordState = null;
         bool result = false;
 
-        ALDatabasePatches.BeginCodeunitRunTransaction();
-        if (trap && record != null)
+        // Only the GUARDED form (`Ok := Codeunit.Run(...)`, DataError.TrapError) owns a
+        // transaction. BC's DoRunAsync takes BeginTransactionWorldAndTransaction on that
+        // branch: it refuses to start while the caller has an uncommitted write
+        // (TransactionManager.ThrowIfWriteTransactionStarted) and otherwise opens a fresh,
+        // independently committable transaction world. The runner is deliberately lenient
+        // here — it makes the caller's pending writes durable instead of refusing — but
+        // either way the guarded entry is a transaction boundary. The statement form
+        // (DataError.ThrowError) takes BC's plain BeginTransaction branch: it nests inside
+        // the caller's transaction and commits nothing, so it must not be bracketed.
+        // Bracketing it marked a commit point, so a write made before an unguarded
+        // Codeunit.Run wrongly survived a later asserterror. Mirrors upstream's `if (guarded)`
+        // gating. Same bug class as upstream AlRunner#2413, which covers the Cecil-hooked
+        // plain BeginTransaction/EndTransaction (Query.Open, statement-form XmlPort.Import) —
+        // still unported here, see NclCecilRewrite section 8g.
+        if (trap)
         {
-            recordState = record.CreateRecordState();
-            recordState.BackupTableAndRecordHandle();
+            ALDatabasePatches.BeginCodeunitRunTransaction();
+            if (record != null)
+            {
+                recordState = record.CreateRecordState();
+                recordState.BackupTableAndRecordHandle();
+            }
         }
 
         try
@@ -125,7 +142,8 @@ public static partial class BcRuntime
         finally
         {
             recordState?.Dispose();
-            ALDatabasePatches.EndCodeunitRunTransaction(result);
+            if (trap)
+                ALDatabasePatches.EndCodeunitRunTransaction(result);
         }
     }
 

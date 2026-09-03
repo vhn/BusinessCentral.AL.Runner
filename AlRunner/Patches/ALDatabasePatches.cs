@@ -80,10 +80,13 @@ public static class ALDatabasePatches
     }
 
     /// <summary>
-    /// Start the transaction owned by <c>Codeunit.Run</c>. The service tier establishes a
-    /// fresh transaction boundary before invoking the codeunit; in the runner's write-through
-    /// store that means making the caller's current state durable before recording the inner
-    /// codeunit's first write.
+    /// Start the transaction owned by a GUARDED <c>Codeunit.Run</c> (<c>Ok := Codeunit.Run(...)</c>).
+    /// Only that form is a transaction boundary — BC takes BeginTransactionWorldAndTransaction
+    /// on it, which refuses to start inside a write transaction and otherwise opens an
+    /// independently committable world. The runner does not model the refusal: it makes the
+    /// caller's current state durable and then records the inner codeunit's writes against
+    /// that point. The statement form must NOT call this: it nests inside the caller's
+    /// transaction and commits nothing.
     /// </summary>
     internal static void BeginCodeunitRunTransaction()
     {
@@ -92,8 +95,10 @@ public static class ALDatabasePatches
     }
 
     /// <summary>
-    /// Finish the transaction owned by <c>Codeunit.Run</c>. This is an implicit platform
-    /// transaction boundary, so it is deliberately independent of AL's CommitBehavior setting.
+    /// Finish the transaction owned by a GUARDED <c>Codeunit.Run</c>. This is an implicit
+    /// platform transaction boundary, so it is deliberately independent of AL's CommitBehavior
+    /// setting. Paired with <see cref="BeginCodeunitRunTransaction"/>; both are skipped for the
+    /// statement form.
     /// </summary>
     internal static void EndCodeunitRunTransaction(bool commit)
     {
