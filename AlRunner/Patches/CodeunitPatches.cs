@@ -98,11 +98,39 @@ public static partial class BcRuntime
         Microsoft.Dynamics.Nav.Runtime.RecordState? recordState = null;
         bool result = false;
 
-        ALDatabasePatches.BeginCodeunitRunTransaction();
-        if (trap && record != null)
+        // Only the GUARDED form (`Ok := Codeunit.Run(...)`, DataError.TrapError) is a
+        // transaction boundary: BC's DoRunAsync takes BeginTransactionWorldAndTransaction on
+        // that branch. The statement form (DataError.ThrowError) takes BC's plain
+        // BeginTransaction branch, which inside a test method only bumps TransactionCount on
+        // the already-open transaction and commits nothing — so bracketing it marked a commit
+        // point and a write made before an unguarded Codeunit.Run wrongly survived a later
+        // asserterror. Mirrors upstream's `if (guarded)` gating.
+        // See ALDatabasePatches.BeginCodeunitRunTransaction for what the guarded bracket does
+        // and does not model, and docs/limitations.md for the remaining divergences.
+        if (trap)
         {
-            recordState = record.CreateRecordState();
-            recordState.BackupTableAndRecordHandle();
+            // Back the record up BEFORE opening the transaction. BackupTableAndRecordHandle()
+            // can throw on the skeleton session, and a throw between Begin and the try would
+            // leak a _logicalTransactionFrames frame that nothing pops — AssertError only
+            // rolls back to the commit point, it does not reset nesting — silently disabling
+            // commit points for the rest of the codeunit.
+            if (record != null)
+            {
+                recordState = record.CreateRecordState();
+                try
+                {
+                    recordState.BackupTableAndRecordHandle();
+                }
+                catch
+                {
+                    // Nothing below has run yet, so the finally that would dispose this is
+                    // unreachable — dispose here rather than leak the handle.
+                    recordState.Dispose();
+                    recordState = null;
+                    throw;
+                }
+            }
+            ALDatabasePatches.BeginCodeunitRunTransaction();
         }
 
         try
@@ -125,7 +153,8 @@ public static partial class BcRuntime
         finally
         {
             recordState?.Dispose();
-            ALDatabasePatches.EndCodeunitRunTransaction(result);
+            if (trap)
+                ALDatabasePatches.EndCodeunitRunTransaction(result);
         }
     }
 

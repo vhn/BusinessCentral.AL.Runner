@@ -80,10 +80,16 @@ public static class ALDatabasePatches
     }
 
     /// <summary>
-    /// Start the transaction owned by <c>Codeunit.Run</c>. The service tier establishes a
-    /// fresh transaction boundary before invoking the codeunit; in the runner's write-through
-    /// store that means making the caller's current state durable before recording the inner
-    /// codeunit's first write.
+    /// Start the transaction owned by a GUARDED <c>Codeunit.Run</c> (<c>Ok := Codeunit.Run(...)</c>).
+    /// Only that form is a transaction boundary — BC takes BeginTransactionWorldAndTransaction
+    /// on it, which refuses to start inside a write transaction (TransactionManager
+    /// .ThrowIfWriteTransactionStarted) and otherwise opens an independently committable world.
+    /// KNOWN DIVERGENCE, not a design choice: the refusal is not modelled here, so AL that BC
+    /// rejects with "Codeunit.Run is allowed in write transactions only if the return value is
+    /// not used" runs green in the runner. Upstream closed this; see docs/limitations.md.
+    /// Until then this makes the caller's current state durable and records the inner
+    /// codeunit's writes against that point. The statement form must NOT call this: it nests
+    /// inside the caller's transaction and commits nothing.
     /// </summary>
     internal static void BeginCodeunitRunTransaction()
     {
@@ -92,8 +98,10 @@ public static class ALDatabasePatches
     }
 
     /// <summary>
-    /// Finish the transaction owned by <c>Codeunit.Run</c>. This is an implicit platform
-    /// transaction boundary, so it is deliberately independent of AL's CommitBehavior setting.
+    /// Finish the transaction owned by a GUARDED <c>Codeunit.Run</c>. This is an implicit
+    /// platform transaction boundary, so it is deliberately independent of AL's CommitBehavior
+    /// setting. Paired with <see cref="BeginCodeunitRunTransaction"/>; both are skipped for the
+    /// statement form.
     /// </summary>
     internal static void EndCodeunitRunTransaction(bool commit)
     {
@@ -134,6 +142,17 @@ public static class ALDatabasePatches
             return new InvalidOperationException(fallback);
         }
     }
+
+    /// <summary>
+    /// End the write transaction without touching nesting or the commit point. BC ends the
+    /// write transaction on both a commit and a rollback (TransactionManager.CommitImpl resets
+    /// TransactionOpenForWrites either way), so Database.IsInWriteTransaction() answers false
+    /// after an AL error is caught AND after the per-test-method commit. RollbackToCommitPoint
+    /// and TestExecutor's per-test commit point both call this to match; deliberately narrower
+    /// than <see cref="ResetWriteTransactionState"/>, which also resets nesting.
+    /// </summary>
+    internal static void ClearWriteTransaction()
+        => System.Threading.Volatile.Write(ref _inWriteTransaction, false);
 
     /// <summary>Clear write-transaction state at the per-test isolation boundary, so one
     /// test's uncommitted write cannot make the next test start "in a transaction".</summary>
