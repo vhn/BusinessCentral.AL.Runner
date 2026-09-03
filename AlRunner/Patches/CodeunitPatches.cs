@@ -117,7 +117,18 @@ public static partial class BcRuntime
             if (record != null)
             {
                 recordState = record.CreateRecordState();
-                recordState.BackupTableAndRecordHandle();
+                try
+                {
+                    recordState.BackupTableAndRecordHandle();
+                }
+                catch
+                {
+                    // Nothing below has run yet, so the finally that would dispose this is
+                    // unreachable — dispose here rather than leak the handle.
+                    recordState.Dispose();
+                    recordState = null;
+                    throw;
+                }
             }
             ALDatabasePatches.BeginCodeunitRunTransaction();
         }

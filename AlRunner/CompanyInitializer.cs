@@ -49,6 +49,11 @@ internal static class CompanyInitializer
         // own bracket is now guarded-only (CodeunitPatches.RunCodeunitInTransaction), so bracket
         // this call explicitly — otherwise a partially-failing Company-Initialize leaves its rows
         // standing and CaptureInstallBaseline persists them under the dependency cache key.
+        // NB this reuses the guarded-run helper for a STATEMENT-FORM root call. Both need the
+        // same thing here — mark a commit point, push a frame, restore it on failure — but if
+        // BC's ThrowIfWriteTransactionStarted refusal is ever ported into
+        // BeginCodeunitRunTransaction (see its doc comment), this call site must NOT inherit it:
+        // give the root its own entry point first.
         bool initialized = false;
         Patches.ALDatabasePatches.BeginCodeunitRunTransaction();
         try
@@ -65,8 +70,9 @@ internal static class CompanyInitializer
             var inner = ex is TargetInvocationException tie && tie.InnerException != null ? tie.InnerException : ex;
             Console.Error.WriteLine(
                 $"[CompanyInitializer] codeunit 2 \"Company-Initialize\" did not complete: " +
-                $"{inner.GetType().Name}: {inner.Message} — the company is PARTIALLY initialized; " +
-                $"setup tables it had not reached yet are missing, and AL that reads them will fail.");
+                $"{inner.GetType().Name}: {inner.Message} — the partial writes were rolled back, so the " +
+                $"company is NOT initialized and AL that reads any setup table will fail. This " +
+                $"result is cached under the dependency key: later processes reuse it silently.");
         }
         finally
         {

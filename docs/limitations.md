@@ -75,9 +75,21 @@ brackets only the guarded form, so a write made before a statement-form
 `Ok := MyCodeunit.Run()` entered while the caller has an uncommitted write is
 *refused* (`TransactionManager.ThrowIfWriteTransactionStarted`, "Codeunit.Run is
 allowed in write transactions only if the return value is not used"). The runner is
-lenient: it commits the caller's pending writes and proceeds. AL that BC rejects
-therefore runs green here. Upstream models the refusal; porting it is outstanding
+lenient: at depth 0 it commits the caller's pending writes and proceeds; deeper, it neither
+commits nor refuses them and they ride in the enclosing frame. AL that BC rejects therefore
+runs green here. Upstream models the refusal; porting it is outstanding
 work in this fork.
+
+**Known divergence — a nested guarded run's commit is not durable.** BC's
+`EndTransactionWorldAndTransaction` pops the world's own transaction and issues a real commit
+at ANY nesting depth. The runner only marks a commit point when the frame stack empties, so a
+successful guarded `Codeunit.Run` nested inside another guarded run (or inside any hooked
+frame) is durable on BC but restorable here: if the outer run then fails, or any `asserterror`
+follows, the inner callee's committed rows are rolled back. Concretely, a test doing
+`Ok := Codeunit.Run(Posting)` where the posting code internally does
+`if Codeunit.Run(Helper) then ...` and later fails loses the helper's rows. Fixing this means
+distinguishing world frames from plain frames and marking the commit point at any depth for a
+world — upstream's `PushTransactionWorldScope` / `PopTransactionWorldScope` shape.
 
 **Known divergence — other BC APIs still over-commit.** The commit point is marked
 whenever the runner's logical-transaction depth is zero, but the runner never pushes
@@ -85,12 +97,20 @@ a frame for the test method's own transaction, which BC's `ExecuteTestMethodAsyn
 always opens. Inside a test, every *plain* nested `BeginTransaction`/`EndTransaction`
 therefore looks outermost and is treated as a commit point. `Codeunit.Run` no longer
 reaches that path, but the Cecil hooks in `NclCecilRewrite` section 8g still do, so
-these are commit points in the runner and are not on BC:
+these are commit points in the runner and are not on BC. The list is illustrative, not
+exhaustive — it includes at least:
 
 - `Query.Open()` (via `RunOnBeforeOpenTriggerAsync`)
 - statement-form `XmlPort.Import(...)`
 - `XmlPort.Export(...)` in every shape
 - `Report.Run` / `RunModal` (via `RunReportInternalCoreAsync`)
+- `XmlPort.CallRequestForm` / `FireOnInitXmlPort`, `NavRecord.ValidateFieldsAsync` (which the
+  runner itself invokes on `TestPage.OpenNew`), isolated event dispatch, and the `NavForm`
+  open/insert/modify/delete/close family
+
+Note the 8g hook set covers `BeginTransaction` and `BeginTransactionWorldAndTransaction` but
+not `BeginTransactionWorld`, which is what `NavForm.RunModalAsync` and
+`NavReport.RunReportCoreAsync` use.
 
 Symptom: a row written before one of these survives a later `asserterror` here and
 is rolled back on BC. The fix is to narrow the section 8g hooks to the

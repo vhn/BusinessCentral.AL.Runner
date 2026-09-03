@@ -143,17 +143,19 @@ public static class ALDatabasePatches
         }
     }
 
-    /// <summary>Clear write-transaction state at the per-test isolation boundary, so one
-    /// test's uncommitted write cannot make the next test start "in a transaction".</summary>
     /// <summary>
-    /// End the write transaction without touching nesting or the commit point. BC's
-    /// TransactionManager.Rollback ends the write transaction (CommitImpl(false) resets
-    /// TransactionOpenForWrites), so Database.IsInWriteTransaction() answers false after an
-    /// AL error is caught — RollbackToCommitPoint calls this to match.
+    /// End the write transaction without touching nesting or the commit point. BC ends the
+    /// write transaction on both a commit and a rollback (TransactionManager.CommitImpl resets
+    /// TransactionOpenForWrites either way), so Database.IsInWriteTransaction() answers false
+    /// after an AL error is caught AND after the per-test-method commit. RollbackToCommitPoint
+    /// and TestExecutor's per-test commit point both call this to match; deliberately narrower
+    /// than <see cref="ResetWriteTransactionState"/>, which also resets nesting.
     /// </summary>
     internal static void ClearWriteTransaction()
         => System.Threading.Volatile.Write(ref _inWriteTransaction, false);
 
+    /// <summary>Clear write-transaction state at the per-test isolation boundary, so one
+    /// test's uncommitted write cannot make the next test start "in a transaction".</summary>
     public static void ResetWriteTransactionState()
     {
         System.Threading.Volatile.Write(ref _inWriteTransaction, false);

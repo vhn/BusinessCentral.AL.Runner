@@ -115,6 +115,8 @@ public sealed class CodeunitRunCommitPointTests : IDisposable
             begin
                 Marker.Id := 1;
                 Marker.Insert();
+                if not Marker.Get(1) then
+                    Error('SETUP: the row was never written, so "rolled back" below would prove nothing.');
                 asserterror Error('intentional');
                 if Marker.Get(1) then
                     Error('REGRESSION: asserterror did not roll back a plain write.');
@@ -127,6 +129,8 @@ public sealed class CodeunitRunCommitPointTests : IDisposable
             begin
                 Marker.Id := 2;
                 Marker.Insert();
+                if not Marker.Get(2) then
+                    Error('SETUP: the row was never written, so "rolled back" below would prove nothing.');
                 Codeunit.Run(Codeunit::"Codeunit Run Empty OnRun");
                 asserterror Error('intentional');
                 if Marker.Get(2) then
@@ -144,6 +148,8 @@ public sealed class CodeunitRunCommitPointTests : IDisposable
             begin
                 Marker.Id := 4;
                 Marker.Insert();
+                if not Marker.Get(4) then
+                    Error('SETUP: the row was never written, so "rolled back" below would prove nothing.');
                 EmptyOnRun.Run();
                 asserterror Error('intentional');
                 if Marker.Get(4) then
@@ -167,6 +173,25 @@ public sealed class CodeunitRunCommitPointTests : IDisposable
                 asserterror Error('intentional');
                 if not Marker.Get(3) then
                     Error('REGRESSION: the guarded Codeunit.Run stopped being a commit point.');
+            end;
+
+            // BC's test framework commits between test methods, and a commit ends the write
+            // transaction. These two run in declaration order: the first deliberately leaves an
+            // uncommitted write behind, the second asserts the next method does not inherit it.
+            [Test]
+            procedure LeaveUncommittedWriteForTheNextTest()
+            var
+                Marker: Record "Codeunit Run Commit Marker";
+            begin
+                Marker.Id := 6;
+                Marker.Insert();
+            end;
+
+            [Test]
+            procedure NextTestStartsOutsideAWriteTransaction()
+            begin
+                if Database.IsInWriteTransaction() then
+                    Error('REGRESSION: an uncommitted write in the previous test method left the session in a write transaction; the per-test commit must end it, as BC does.');
             end;
 
             [Test]
@@ -229,7 +254,7 @@ public sealed class CodeunitRunCommitPointTests : IDisposable
         // Assert.Contains: xunit clips the matched string, which would hide both the REGRESSION
         // sentence naming the defect and any AL compiler diagnostic behind a compile failure.
         Assert.True(!output.Contains("REGRESSION:"), output);
-        Assert.True(output.Contains("5P/0F/0E across 5 tests"), output);
+        Assert.True(output.Contains("7P/0F/0E across 7 tests"), output);
         Assert.True(exitCode == 0, output);
     }
 }
