@@ -6,6 +6,9 @@ All notable changes to this project are documented here. Format based on
 
 ## [Unreleased]
 
+### Fixed
+- **rollback:** a statement-form Codeunit.Run is not a commit point
+
 ## [2.2.0] - 2026-08-17
 
 ### Added
