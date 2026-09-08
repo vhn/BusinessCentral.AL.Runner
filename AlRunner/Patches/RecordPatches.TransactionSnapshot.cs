@@ -188,6 +188,10 @@ public static partial class RecordPatches
     /// </summary>
     public static void RollbackToCommitPoint(object? session)
     {
+        // BC's Rollback ends the write transaction whether or not anything was snapshotted,
+        // so clear the flag first — Database.IsInWriteTransaction() must answer false after an
+        // AL error is caught, exactly as it does on a service tier.
+        ALDatabasePatches.ClearWriteTransaction();
         if (_txCommitPoint.Count == 0) return;
         RestoreSnapshot(_txCommitPoint);
         // The rolled-back work is gone; the commit point itself still stands, so the next

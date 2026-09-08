@@ -794,6 +794,13 @@ public sealed class TestExecutor
         // restores what the PREVIOUS test method left rather than the state the codeunit
         // started with — see RecordPatches.TransactionSnapshot.
         AlRunner.Patches.RecordPatches.MarkCommitPoint();
+        // ...and that commit ends the write transaction, exactly as ALDatabase_ALCommit does.
+        // Without this, an uncommitted write in test N leaves _inWriteTransaction set, so test
+        // N+1 sees Database.IsInWriteTransaction() = true before writing anything and a
+        // `Database.CurrentTransactionType := Update` there raises BC's CannotChangeTransaction
+        // Type, which BC would not. Before Codeunit.Run's bracket became guarded-only, any
+        // statement-form run happened to clear the flag and hid this.
+        AlRunner.Patches.ALDatabasePatches.ClearWriteTransaction();
         // Clear any AL call stack captured from a previous test on this thread.
         AlRunner.Infrastructure.AlCallStackCapture.Clear();
         // Enter BC's own "in test" scope for the duration of this test (mirrors
