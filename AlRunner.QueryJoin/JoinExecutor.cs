@@ -575,11 +575,15 @@ public static class JoinExecutor
         var dataItems = ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>();
         foreach (var dataItem in dataItems)
         {
-            // Step 3 already produced the final value, but BC stamps the synthesized column with
-            // the metadata its own sub-query would have used. Re-applying it double-derives:
-            // ReverseSign flips a `-sum(...)` back to positive (BC passes NegateResult as
-            // ReverseSign AND the calc core negates from the same flag); Aggregation re-aggregates.
-            var isFlowFieldSubQuery = _pDataItemSourceFlowField?.GetValue(dataItem) != null;
+            // BC stamps the synthesized column with the QUERY AUTHOR's Method and (author
+            // ReverseSign XOR CalcFormula.NegateResult), swapping Min<->Max when negated
+            // (NCLMetaQuery.CreateSubQueryForFlowFieldCalculation). The calc core already applied
+            // NegateResult to the value, so undo only that half — XOR ReverseSign back and
+            // un-swap Min/Max — and keep the author's aggregation. Clearing it wholesale drops
+            // an aggregation the author asked for: `Method = Sum` then returns one owner's value
+            // instead of the total, silently.
+            var sourceFlowField = _pDataItemSourceFlowField?.GetValue(dataItem);
+            bool negated = sourceFlowField != null && FlowFieldNegateResult(sourceFlowField);
             var columns = ((IEnumerable?)_pDataItemQueryColumns!.GetValue(dataItem))?.Cast<object>()
                 ?? Enumerable.Empty<object>();
             foreach (var column in columns)
@@ -588,19 +592,35 @@ public static class JoinExecutor
                 var slot = (int)_pColColumnIndex!.GetValue(column)!;
                 if (slot < 0) continue;
                 plan.SlotCount = Math.Max(plan.SlotCount, slot + 1);
+                var aggregation = _pColAggregationType!.GetValue(column)?.ToString() ?? "None";
+                var reverseSign = (bool)_pColReverseSign!.GetValue(column)!;
+                if (negated)
+                {
+                    reverseSign = !reverseSign;
+                    aggregation = aggregation switch { "Min" => "Max", "Max" => "Min", _ => aggregation };
+                }
                 plan.Columns.Add(new FinalColumn
                 {
                     Metadata = column,
                     Slot = slot,
-                    IsAggregated = !isFlowFieldSubQuery && (bool)_pColIsAggregated!.GetValue(column)!,
-                    Aggregation = isFlowFieldSubQuery
-                        ? "None"
-                        : _pColAggregationType!.GetValue(column)?.ToString() ?? "None",
-                    ReverseSign = !isFlowFieldSubQuery && (bool)_pColReverseSign!.GetValue(column)!,
+                    IsAggregated = aggregation != "None",
+                    Aggregation = aggregation,
+                    ReverseSign = reverseSign,
                 });
             }
         }
         return plan;
+    }
+
+    private static PropertyInfo? _pFieldCalcFormula;
+    private static PropertyInfo? _pCalcFormulaNegateResult;
+    private static bool FlowFieldNegateResult(object flowFieldMeta)
+    {
+        _pFieldCalcFormula ??= flowFieldMeta.GetType().GetProperty("CalculationFormula", F);
+        var formula = _pFieldCalcFormula?.GetValue(flowFieldMeta);
+        if (formula == null) return false;
+        _pCalcFormulaNegateResult ??= formula.GetType().GetProperty("NegateResult", F);
+        return _pCalcFormulaNegateResult?.GetValue(formula) is true;
     }
 
     private static List<object?[]> ProjectFinalRows(
