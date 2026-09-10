@@ -575,13 +575,9 @@ public static class JoinExecutor
         var dataItems = ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>();
         foreach (var dataItem in dataItems)
         {
-            // BC stamps the synthesized column with the QUERY AUTHOR's Method and (author
-            // ReverseSign XOR CalcFormula.NegateResult), swapping Min<->Max when negated
-            // (NCLMetaQuery.CreateSubQueryForFlowFieldCalculation). The calc core already applied
-            // NegateResult to the value, so undo only that half — XOR ReverseSign back and
-            // un-swap Min/Max — and keep the author's aggregation. Clearing it wholesale drops
-            // an aggregation the author asked for: `Method = Sum` then returns one owner's value
-            // instead of the total, silently.
+            // The stamped Method/ReverseSign are the QUERY AUTHOR's, XOR'd with
+            // CalcFormula.NegateResult and Min<->Max swapped when negated. Keep the author's;
+            // undo only the NegateResult half, already applied to the value by the calc core.
             var sourceFlowField = _pDataItemSourceFlowField?.GetValue(dataItem);
             bool negated = sourceFlowField != null && FlowFieldNegateResult(sourceFlowField);
             var columns = ((IEnumerable?)_pDataItemQueryColumns!.GetValue(dataItem))?.Cast<object>()

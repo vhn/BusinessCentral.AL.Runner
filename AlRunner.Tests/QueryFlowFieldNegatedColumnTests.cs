@@ -4,20 +4,9 @@ using Xunit;
 
 namespace AlRunner.Tests;
 
-/// A FlowField whose CalcFormula is NEGATED (`-sum(...)`) must read the SAME value through a
-/// query column that Record.CalcFields gives.
-///
-/// BC carries the negation twice, and a runner that honours both applies it twice. BC's
-/// CreateSubqueryForFlowField passes `CalculationFormula.NegateResult` as the synthesized
-/// outer column's REVERSE-SIGN constructor argument, while the calculation core itself already
-/// negates the computed value from the same `NegateResult` flag. On the real service tier the
-/// sub-query returns the UN-negated sum and the outer ReverseSign supplies the only negation;
-/// in this runner the value arrives already negated from CalcOneFlowFieldForQueryRow, so
-/// re-applying ReverseSign in ProjectFinalRows/AggregateColumn flips it back.
-///
-/// The failure is silent: a wrong SIGN, not a crash, on a query that opens and returns the
-/// expected number of rows. The parent commit throws the #2300 metadata NRE here instead, so
-/// this is the shape where a fix can turn a loud failure into a wrong answer.
+/// A negated FlowField (`-sum(...)`) read through a query column. BC carries the negation
+/// twice — the calc core negates from `NegateResult`, and BC also stamps it as the synthesized
+/// column's ReverseSign — so honouring both flips the sign back, silently.
 ///
 /// Spawns the real runner; needs the BC artifact cache. Skips (no-op) when absent.
 /// </summary>
@@ -94,6 +83,16 @@ public class QueryFlowFieldNegatedColumnTests
                     FieldClass = FlowField;
                     CalcFormula = -sum("QFN Line".Amount where("Header No." = field("No.")));
                 }
+                field(3; HasLines; Boolean)
+                {
+                    FieldClass = FlowField;
+                    CalcFormula = exist("QFN Line" where("Header No." = field("No.")));
+                }
+                field(4; NoLines; Boolean)
+                {
+                    FieldClass = FlowField;
+                    CalcFormula = -exist("QFN Line" where("Header No." = field("No.")));
+                }
             }
             keys { key(PK; "No.") { Clustered = true; } }
         }
@@ -109,6 +108,8 @@ public class QueryFlowFieldNegatedColumnTests
                 {
                     column(No; "No.") { }
                     column(NegTotal; "Neg Total") { }
+                    column(HasLines; HasLines) { }
+                    column(NoLines; NoLines) { }
                 }
             }
         }
@@ -148,6 +149,40 @@ public class QueryFlowFieldNegatedColumnTests
                 if FromQuery <> FromRecord then
                     Error('query column gave %1, record gave %2 — the sign was applied a different number of times', FromQuery, FromRecord);
             end;
+
+            // Asserted against LITERALS, not Record.CalcFields: the record path shared the same
+            // bug, so an oracle comparison passed with both sides wrong.
+            [Test]
+            procedure NegatedExistFlowFieldColumn_IsInverted()
+            var
+                QfnHeader: Record "QFN Header";
+                QfnLine: Record "QFN Line";
+                Q: Query "QFN Header Negated";
+            begin
+                QfnHeader.Init(); QfnHeader."No." := 'E1'; QfnHeader.Insert();
+                QfnLine.Init(); QfnLine."Entry No." := 11; QfnLine."Header No." := 'E1'; QfnLine.Amount := 1; QfnLine.Insert();
+                QfnHeader.Init(); QfnHeader."No." := 'E2'; QfnHeader.Insert();
+
+                // E1 HAS lines: exist = true, so -exist must be FALSE.
+                Q.SetRange(No, 'E1');
+                Q.Open();
+                if not Q.Read() then Error('expected a row for E1');
+                if not Q.HasLines then
+                    Error('E1 has a line, so exist() must be true');
+                if Q.NoLines then
+                    Error('E1 has a line, so -exist() must be FALSE — the negation was not applied to the Boolean');
+                Q.Close();
+
+                // E2 has NO lines: exist = false, so -exist must be TRUE.
+                Q.SetRange(No, 'E2');
+                Q.Open();
+                if not Q.Read() then Error('expected a row for E2');
+                if Q.HasLines then
+                    Error('E2 has no lines, so exist() must be false');
+                if not Q.NoLines then
+                    Error('E2 has no lines, so -exist() must be TRUE — the negation was not applied to the Boolean');
+                Q.Close();
+            end;
         }
         """);
 
@@ -164,6 +199,6 @@ public class QueryFlowFieldNegatedColumnTests
 
         Assert.DoesNotContain("EMIT-EXCLUDED", output);
         Assert.DoesNotContain("COMPILE FAIL", output);
-        Assert.Contains("1P/0F/0E", output);
+        Assert.Contains("2P/0F/0E", output);
     }
 }

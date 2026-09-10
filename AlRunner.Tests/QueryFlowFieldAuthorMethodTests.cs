@@ -4,13 +4,9 @@ using Xunit;
 
 namespace AlRunner.Tests;
 
-/// BC stamps the synthesized FlowField sub-query column with the QUERY AUTHOR's `Method` and
-/// `ReverseSign` — not the CalcFormula's own method — XOR-ing in `NegateResult` and swapping
-/// Min/Max when the formula is negated
-/// (<c>NCLMetaQuery.CreateSubQueryForFlowFieldCalculation</c>). Discarding that metadata drops
-/// an aggregation the author asked for, silently: a `Method = Sum` over several owners returns
-/// one owner's value instead of the total, and a `ReverseSign` column comes back with the wrong
-/// sign. npcore queries 6014429 and ItemSalesPostings declare exactly this shape.
+/// BC stamps the synthesized FlowField column with the QUERY AUTHOR's `Method` and
+/// `ReverseSign`, not the CalcFormula's. Discarding them silently drops an aggregation the
+/// author asked for — npcore 6014429 and ItemSalesPostings declare this shape.
 ///
 /// Spawns the real runner; needs the BC artifact cache. Skips (no-op) when absent.
 /// </summary>
@@ -182,7 +178,6 @@ public class QueryFlowFieldAuthorMethodTests
                 L.Init(); L."Entry No." := 2; L."Header No." := 'A2'; L.Amount := 20; L.Insert();
             end;
 
-            // The author asked the QUERY to Sum the FlowField across both owners.
             [Test]
             procedure AuthorMethodSum_OnFlowFieldColumn_SumsAcrossOwners()
             var
@@ -204,7 +199,6 @@ public class QueryFlowFieldAuthorMethodTests
                     Error('Expected 15 + 20 = 35, got %1 — the author''s Method was dropped', Got);
             end;
 
-            // ReverseSign declared by the author on a (non-negated) FlowField column.
             [Test]
             procedure AuthorReverseSign_OnFlowFieldColumn_IsHonoured()
             var
@@ -221,10 +215,8 @@ public class QueryFlowFieldAuthorMethodTests
                     Error('Expected -15 (ReverseSign on a +15 FlowField), got %1', Got);
             end;
 
-            // BC swaps Min<->Max on the synthesized column when the formula is negated, so the
-            // runner must swap them BACK: the calc core already returned the negated values
-            // (-15 and -20), and Min of those is -20. Reading the stamped "Max" literally would
-            // return -15 — right shape, wrong row, and no crash to notice it by.
+            // BC swaps Min<->Max when the formula is negated, so the runner swaps back: the
+            // values are already -15 and -20, so Min is -20.
             [Test]
             procedure AuthorMethodMin_OnNegatedFlowField_IsTheTrueMinimum()
             var
@@ -257,7 +249,6 @@ public class QueryFlowFieldAuthorMethodTests
                     Error('Expected -15 (max of -15 and -20), got %1 — the Min/Max swap was not undone', Got);
             end;
 
-            // Author ReverseSign XOR CalcFormula NegateResult: both set cancel out.
             [Test]
             procedure AuthorReverseSign_OnNegatedFlowField_CancelsOut()
             var

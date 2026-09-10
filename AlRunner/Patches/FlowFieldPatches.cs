@@ -829,7 +829,9 @@ public static class FlowFieldPatches
             if (Equals(calcMethod, _cmCount))
                 result = NavValue.CreateNavValueFromObject((NCLMetaField)fieldObj, matchCount);
             else if (Equals(calcMethod, _cmExist))
-                result = NavValue.CreateNavValueFromObject((NCLMetaField)fieldObj, anyMatch);
+                // BC inverts here, not in NegateValue (numeric-only):
+                // CalcExistsAsync builds `NegateResult ? !exists : exists`.
+                result = NavValue.CreateNavValueFromObject((NCLMetaField)fieldObj, negate ? !anyMatch : anyMatch);
             else if (Equals(calcMethod, _cmSum))
                 result = NavValue.CreateNavValueFromObject((NCLMetaField)fieldObj, CoerceSumResult(sum));
             else if (Equals(calcMethod, _cmAverage))
