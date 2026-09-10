@@ -42,11 +42,8 @@ public sealed class JoinContext
     public required Func<object /*field*/, object?> TypedDefaultForField;
 
     /// <summary>
-    /// Computes ONE FlowField's value for one already-read row: (rowBuffer, flowFieldMeta) =&gt;
-    /// NavValue?. A FlowField query column has no stored slot to read — BC computes it in a
-    /// synthesized sub-query that this runner has no SQL to execute — so the join projection
-    /// calls this with the row of the FlowField's OWN table (its CalcFormula's field()
-    /// where-conditions resolve against that row) instead of reading a buffer slot.
+    /// (rowBuffer, flowFieldMeta) =&gt; NavValue?. A FlowField column has no stored slot; the row
+    /// passed is the FlowField's own table row, which its where-conditions resolve against.
     /// </summary>
     public required Func<object /*rowBuffer*/, object /*flowFieldMeta*/, object?> CalcFlowFieldForRow;
 

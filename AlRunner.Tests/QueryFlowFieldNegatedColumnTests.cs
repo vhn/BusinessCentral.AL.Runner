@@ -51,7 +51,7 @@ public class QueryFlowFieldNegatedColumnTests
 
     private static string WriteBundle()
     {
-        var root = TestScratch.Dir("al-runner-query-flowfield-negated");
+        var root = Path.Combine(Path.GetTempPath(), "al-runner-query-flowfield-negated", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
 
         File.WriteAllText(Path.Combine(root, "app.json"), """

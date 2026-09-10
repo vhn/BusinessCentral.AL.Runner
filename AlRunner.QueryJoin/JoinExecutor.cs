@@ -34,13 +34,8 @@ public static class JoinExecutor
     private static PropertyInfo? _pDataItemLinkType;
     private static PropertyInfo? _pDataItemName;
     private static PropertyInfo? _pDataItemSubQueryDefinition;
-    // #2423: NCLMetaQueryDataItem.SourceFlowField — non-null on the synthesized dataitem
-    // (SubQueryDefinition != null) only when it is specifically a FlowField-calculation
-    // sub-query, which is what tells that shape apart from BC's other synthesized sub-items.
+    // Non-null only on BC's FlowField-calculation sub-dataitem — the shape discriminator.
     private static PropertyInfo? _pDataItemSourceFlowField;
-    // NCLMetaField.Parent (owning NCLMetaTable) and NCLMetaTable.TableId — used to find which
-    // REAL dataitem owns the FlowField's table. BC puts no DataItemLink back to the owner on
-    // the synthesized item, so the table id is the only way across.
     private static PropertyInfo? _pFieldParent;
     private static PropertyInfo? _pTableTableId;
     private static PropertyInfo? _pDataItemQueryColumns;
@@ -177,17 +172,8 @@ public static class JoinExecutor
         var perItem = new List<DataItemRows>();
         foreach (var di in dataItems)
         {
-            // #2423: BC does not project a FlowField column from the base dataitem. It builds a
-            // SYNTHESIZED sub-dataitem per FlowField group and joins it with an Apply so SQL can
-            // compute the value in a sub-query. This runner has no SQL and computes the column
-            // directly in step 3 below, so the synthesized item carries no row to read — and it
-            // must be skipped BEFORE MetaTable is read, because its table resolves to id 0 on
-            // this runner's metadata and reading it throws before any join-shape check runs.
-            //
-            // SourceFlowField is what identifies that shape. A synthesized dataitem WITHOUT it
-            // (SubQueryDefinition != null, SourceFlowField == null — BC's own aggregation-filter
-            // sub-dataitems) is a different, unimplemented shape and must throw rather than be
-            // silently dropped.
+            // BC's FlowField sub-dataitem carries no row this runner needs (step 3 computes the
+            // column). Skip BEFORE MetaTable is read: its table resolves to id 0 and throws.
             if (_pDataItemSourceFlowField?.GetValue(di) != null) continue;
             if (_pDataItemSubQueryDefinition!.GetValue(di) != null)
                 throw ctx.OutOfScope(
@@ -249,15 +235,11 @@ public static class JoinExecutor
             var fields = new object?[plan.SlotCount];
             foreach (var col in plan.Columns)
             {
-                // #2423: a FlowField column has no TableSlot to read — BC computes it in a
-                // synthesized sub-query this runner has no SQL for, so compute it directly
-                // from the row of the FlowField's OWN table (its CalcFormula's field()
-                // where-conditions resolve against that row).
+                // No TableSlot to read — compute from the row of the FlowField's own table.
                 if (col.FlowFieldMeta != null)
                 {
                     if (!combo.TryGetValue(col.OwnerName, out var ownerBuf) || ownerBuf == null)
-                        // LeftOuterJoin unmatched owner → the FlowField's typed default, the
-                        // same way an unmatched stored field projects its typed default below.
+                        // Unmatched owner → typed default, as for a stored field below.
                         fields[col.QuerySlot] = ctx.TypedDefaultForField(col.FlowFieldMeta);
                     else
                         fields[col.QuerySlot] = ctx.CalcFlowFieldForRow(ownerBuf, col.FlowFieldMeta);
@@ -435,10 +417,7 @@ public static class JoinExecutor
         public string OwnerName = "";
         public int TableSlot = -1;
         public object? SourceField; // NCLMetaField (object) — for typed left-outer defaults
-        // #2423: non-null when this column is the FlowField-calculation sub-dataitem's own
-        // result column. Computed via ctx.CalcFlowFieldForRow against OwnerName's row in the
-        // combo instead of read off TableSlot, which stays -1 for it: its SourceTableField
-        // resolves to a field on the FlowField's SOURCE table, which this join never reads.
+        // Set for BC's FlowField sub-dataitem column: computed from OwnerName's row, TableSlot -1.
         public object? FlowFieldMeta;
     }
     private sealed class JoinProjectionPlan
@@ -461,8 +440,7 @@ public static class JoinExecutor
         var plan = new JoinProjectionPlan();
         int maxSlot = -1;
         var dataItems = ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>().ToList();
-        // The REAL dataitems — the ones Execute actually read rows for. A FlowField column's
-        // owner must be found among these, never among the synthesized items.
+        // A FlowField column's owner must be one of these, never a synthesized item.
         var realDataItems = dataItems
             .Where(di => _pDataItemSourceFlowField?.GetValue(di) == null
                       && _pDataItemSubQueryDefinition!.GetValue(di) == null)
@@ -472,8 +450,6 @@ public static class JoinExecutor
         foreach (var di in dataItems)
         {
             var name = (string)_pDataItemName!.GetValue(di)!;
-            // #2423: on a FlowField-calculation sub-dataitem, the column stands for the FlowField
-            // and is projected from the row of the dataitem that OWNS the FlowField's table.
             var flowFieldMeta = _pDataItemSourceFlowField?.GetValue(di);
             var flowFieldOwnerName = flowFieldMeta != null
                 ? ResolveFlowFieldOwnerName(ctx, realDataItems, flowFieldMeta)
@@ -483,8 +459,7 @@ public static class JoinExecutor
             {
                 if (IsFilterOnlyColumn(col))
                 {
-                    // #2423: a filter-only column ON a FlowField sub-dataitem would be evaluated
-                    // in pass 2 against a slot this runner never fills. Refuse it loudly.
+                    // Pass 2 would evaluate it against a slot this runner never fills.
                     if (flowFieldMeta != null)
                         throw ctx.OutOfScope(
                             "NavQuery (multi-dataitem join with a FlowField column)",
@@ -532,10 +507,8 @@ public static class JoinExecutor
     }
 
     /// <summary>
-    /// Which REAL dataitem in the join owns the FlowField's table. BC leaves no DataItemLink
-    /// from the synthesized sub-dataitem back to its owner, so the owning table's id is the
-    /// only way across. Throws rather than guess when it is absent (0 matches) or ambiguous
-    /// (a self-join on that table, >1 matches).
+    /// Which real dataitem owns the FlowField's table. BC leaves no DataItemLink back to the
+    /// owner, so the table id is the only way across. Throws on 0 or >1 matches.
     /// </summary>
     private static string ResolveFlowFieldOwnerName(JoinContext ctx, List<object> realDataItems, object flowFieldMeta)
     {
@@ -602,23 +575,10 @@ public static class JoinExecutor
         var dataItems = ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>();
         foreach (var dataItem in dataItems)
         {
-            // #2423: a FlowField-calculation sub-dataitem's column is ALREADY FINAL by the time
-            // finalization runs — Execute step 3 filled its slot from
-            // FlowFieldPatches.CalcOneFlowFieldForQueryRow, which returns exactly what
-            // Record.CalcFields returns. BC stamps that synthesized column with the metadata its
-            // OWN sub-query would have needed to produce the value in SQL, and applying that
-            // metadata a second time here re-derives a value that is already derived:
-            //
-            //   ReverseSign  — BC passes CalculationFormula.NegateResult as the synthesized
-            //                  column's reverse-sign ctor argument (SqlTableDataProviderHelper.
-            //                  CreateSubqueryForFlowField), and the calculation core negates from
-            //                  that SAME flag. Honouring both flips a `-sum(...)` FlowField back
-            //                  to positive: a silent wrong SIGN on a query that opens and returns
-            //                  the right number of rows.
-            //   Aggregation  — the Sum/Count/etc. belongs to the sub-query BC would have run;
-            //                  re-applying it would aggregate an already-aggregated value.
-            //
-            // Neutralise both, exactly as upstream does at the equivalent site.
+            // Step 3 already produced the final value, but BC stamps the synthesized column with
+            // the metadata its own sub-query would have used. Re-applying it double-derives:
+            // ReverseSign flips a `-sum(...)` back to positive (BC passes NegateResult as
+            // ReverseSign AND the calc core negates from the same flag); Aggregation re-aggregates.
             var isFlowFieldSubQuery = _pDataItemSourceFlowField?.GetValue(dataItem) != null;
             var columns = ((IEnumerable?)_pDataItemQueryColumns!.GetValue(dataItem))?.Cast<object>()
                 ?? Enumerable.Empty<object>();

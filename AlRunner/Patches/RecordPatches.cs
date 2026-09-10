@@ -413,22 +413,12 @@ public static partial class RecordPatches
                 ?.SetValue(sqlDbProps, new object());
             tSqlDbProps.GetField("databasePropertiesReady", BindingFlags.NonPublic | BindingFlags.Instance)
                 ?.SetValue(sqlDbProps, true);
-            // #2300: NavSqlDatabaseProperties.InvalidIdentifierChars is read by
-            // NavSqlStatementHelper.ConvertToSqlIdentifier (via NCLMetaTable.SqlTableName),
-            // which a Query with a FlowField column reaches while naming the FlowField's
-            // synthesized sub-dataitem (NCLMetaQuery.CreateSubQueryForFlowFieldCalculation
-            // → SqlTableDataProviderHelper.CreateDataItemFromFlowField). GetUninitializedObject
-            // leaves the private `invalidIdentifierChars` field null, and ConvertToSqlIdentifier
-            // iterates it unconditionally — NRE before any row is read, regardless of whether the
-            // identifier it's naming actually contains an invalid character. Populate it from BC's
-            // own internal constant (read via reflection, not restated as a literal, so a future
-            // BC version's different default is picked up automatically rather than silently
-            // diverging) — the same value the real ctor assigns before any SQL round-trip.
+            // ConvertToSqlIdentifier iterates this unconditionally (via NCLMetaTable.SqlTableName),
+            // so a Query with a FlowField column NREs before any row is read. #2300.
             var fDefaultInvalidChars = tSqlDbProps.GetField("DefaultInvalidIdentifierChars",
                 BindingFlags.NonPublic | BindingFlags.Static);
-            // Read BC's own constant rather than restating the literal, so a future BC default is
-            // picked up instead of silently diverging. If it cannot be read, say so — a hardcoded
-            // fallback here would be a silent guess about SQL identifier escaping.
+            // BC's own constant, not a restated literal: a hardcoded fallback would be a silent
+            // guess about SQL identifier escaping.
             var defaultInvalidChars = fDefaultInvalidChars?.GetRawConstantValue() as string
                 ?? throw new InvalidOperationException(
                     "NavSqlDatabaseProperties.DefaultInvalidIdentifierChars could not be read from "

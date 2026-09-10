@@ -364,10 +364,7 @@ public static partial class RecordPatches
     private static bool IsFilterOnlyColumnQ(object col)
         => _pColColumnTypeQ?.GetValue(col)?.ToString() == "FilterOnly";
 
-    /// <summary>
-    /// True when a query column's source field is a FlowFilter — a filter INPUT to a FlowField
-    /// calculation, never a projected value, so it has no meaningful projection slot.
-    /// </summary>
+    /// <summary>Source field is a FlowFilter: an input to a FlowField, never a projected value.</summary>
     private static bool IsFlowFilterColumnQ(object col)
     {
         try
@@ -781,15 +778,8 @@ public static partial class RecordPatches
                     "NavQuery (projected filter)",
                     "query-filter-unresolved-column — a query filter's column could not be " +
                     "located in the query's own DataItems/QueryColumns; see docs/scope.md");
-            // #2925: a FlowFilter column is NOT a projected value — it is an input to a
-            // FlowField's CalcFormula (`where(... = field("X Filter"))`). BC applies it inside
-            // the FlowField sub-query; this runner would have to hand it to
-            // FlowFieldPatches.CalcOneFlowFieldForQueryRow's flowFiltersAndMarks parameter,
-            // which nothing currently populates. Its projection slot is therefore never
-            // written, and evaluating a filter against it dereferences a null NavValue deep in
-            // BC (RangeFilterExpression.Evaluate -> FilterExpressionContext.Compare ->
-            // ArgumentNullException 'x'), which is an unnamed crash rather than a refusal.
-            // Refuse by name until the flow filters are threaded through (upstream #2947).
+            // A FlowFilter feeds a FlowField's CalcFormula; nothing writes its projection slot,
+            // so evaluating a filter against it NREs inside BC. Refuse until #2947 is threaded.
             if (IsFlowFilterColumnQ(key))
                 throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
                     "NavQuery (FlowField column with a flow filter)",
@@ -862,17 +852,9 @@ public static partial class RecordPatches
         public (int querySlot, int tableSlot)[] Map = Array.Empty<(int, int)>();
     }
 
-    // #2423: this single-dataitem path deliberately carries NO FlowField branch. BC synthesizes
-    // an extra sub-dataitem for every FlowField column, so IsMultiDataItem (which counts the RAW
-    // dataitem list) always sees >= 2 and routes a FlowField query to JoinExecutor — even when
-    // the AL declares one dataitem. The FlowField computation therefore lives in exactly one
-    // place, JoinExecutor's projection, rather than in a second copy here that nothing reaches.
-    //
-    // Upstream instead counts only the REAL dataitems (GetRealDataItems), which sends the
-    // single-real-dataitem case down this path; that is a routing difference this fork has not
-    // adopted, and adopting it would require this branch to come back — keyed on
-    // ParentDataItem.SourceFlowField, NOT on SourceTableField.FieldClass, which never matches a
-    // synthesized column (its source field is a Normal field on the FlowField's SOURCE table).
+    // No FlowField branch here on purpose: BC synthesizes an extra sub-dataitem per FlowField
+    // column, so IsMultiDataItem always routes those to JoinExecutor. Upstream counts only real
+    // dataitems (GetRealDataItems) and does send them here — a routing difference not adopted.
     private static IEnumerable<ReadOnlyRecordBuffer> ProjectQueryRows(object nclMetaQuery, IEnumerable<ReadOnlyRecordBuffer> rows)
     {
         var plan = _projectionPlans.GetValue(nclMetaQuery, BuildProjectionPlan);

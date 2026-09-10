@@ -857,42 +857,17 @@ public static class FlowFieldPatches
         }
     }
 
-    // ── query-level FlowField columns (upstream #2422/#2925) ─────────────────
-    //
-    // Ported from upstream rather than reimplemented: it is a thin wrapper over this
-    // file's own CalcFlowFieldValuesCore, whose signature here is identical, so the
-    // borrowed part is the ENTRY POINT for a query row -- not upstream's query-projection
-    // rewrite, which this fork deliberately does not adopt (its own projection and
-    // aggregation model in RecordPatches.QueryProjection.cs / JoinExecutor.cs stays).
+    // Ported from upstream: a thin wrapper over this file's own CalcFlowFieldValuesCore.
+    // Upstream's query-projection rewrite is deliberately NOT adopted — see QueryProjection.cs.
 
     /// <summary>
-    /// Computes ONE FlowField for one already-read query row, against the in-memory store
-    /// instead of BC's synthesized SQL sub-query.
-    ///
-    /// <paramref name="rowBuffer"/> is the QUERY row
-    /// (<c>ReadOnlyRecordBuffer</c>, boxed as <c>object</c> since QueryProjection.cs isn't allowed
-    /// to hand a typed reference across the same isolation boundary that keeps AlRunner.QueryJoin
-    /// Ncl-free) — it satisfies BC's own <c>IRecordBuffer</c> the same as a record's
-    /// <c>MutableRecordBuffer</c> does, which is what <c>GetFilterFromMetaFilterCollection</c>
-    /// actually requires (its parameter type is the interface, not the concrete buffer type), so
-    /// CalcFlowFieldValuesCore needs no changes to accept it.
-    ///
-    /// #2925 — <paramref name="flowFiltersAndMarks"/> carries the QUERY's own flow filters (an
-    /// AL <c>filter(Name; "Some Flow Filter")</c> element, or a static <c>ColumnFilter</c> on
-    /// one), keyed by the FlowFilter <c>NCLMetaField</c>, exactly the way a record's
-    /// <c>FiltersAndMarks</c> carries the ones <c>Record.SetRange("Date Filter", ...)</c> sets.
-    /// It is what BC's own <c>FlowFieldsHelper.GetFilterFromMetaFilterCollection</c>
-    /// dereferences UNGUARDED for a <c>FieldClass.FlowFilter</c> where-condition
-    /// (<c>GetFlowFilterBasedFilter(metaFilter, filtersAndMarks.Filters, session)</c>), so
-    /// passing null here — which this method used to do — NREs inside BC for every CalcFormula
-    /// carrying a flow-filter condition (e.g. <c>Cust. Ledger Entry."Remaining Amt. (LCY)"</c>,
-    /// whose formula reads <c>upperlimit("Date Filter")</c>).
-    ///
-    /// A null argument means "this query set no flow filter", and is answered with BC's own
-    /// <c>FiltersAndMarks.Empty</c> — whose <c>Filters</c> is itself null, which is precisely
-    /// the input <c>GetFlowFilterBasedFilter</c> reads as "flow filter unset → contributes no
-    /// constraint" (it returns null, and the caller's <c>IsNullOrConstantTrue()</c> skips it).
-    /// So the unset case is decided by BC's code, not by a runner-side assumption about it.
+    /// Computes ONE FlowField for one already-read query row, in memory instead of via BC's
+    /// synthesized SQL sub-query. <paramref name="rowBuffer"/> is the query row, boxed as
+    /// <c>object</c> to keep AlRunner.QueryJoin free of Ncl types; it satisfies BC's
+    /// <c>IRecordBuffer</c> as a record's buffer does, so the core needs no change.
+    /// <paramref name="flowFiltersAndMarks"/> carries the query's own flow filters (#2925);
+    /// null means "none set" and resolves to BC's <c>FiltersAndMarks.Empty</c>, which BC itself
+    /// reads as "unset → no constraint". Nothing populates it yet — see docs/scope.md.
     /// </summary>
     internal static NavValue? CalcOneFlowFieldForQueryRow(
         object rowBuffer, NCLMetaField flowFieldMeta, object? flowFiltersAndMarks = null)

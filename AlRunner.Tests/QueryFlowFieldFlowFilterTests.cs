@@ -81,7 +81,7 @@ public class QueryFlowFieldFlowFilterTests
 
     private static string WriteBundle()
     {
-        var root = TestScratch.Dir("al-runner-query-flowfilter-2925");
+        var root = Path.Combine(Path.GetTempPath(), "al-runner-query-flowfilter-2925", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
 
         File.WriteAllText(Path.Combine(root, "app.json"), """

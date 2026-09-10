@@ -133,10 +133,7 @@ public static partial class RecordPatches
     // nullSupport:false). NCLMetaField implements INavValueMetadata, so it IS the metadata
     // argument. We call that same factory by reflection so the LeftOuter slot carries a real,
     // correctly-typed NavValue (never a null slot, which NREs NavQuery.GetColumnValue).
-    // #2423: the join assembly is isolated from the patches assembly, so the FlowField
-    // computation is handed across as a JoinContext delegate. The work itself is
-    // FlowFieldPatches.CalcOneFlowFieldForQueryRow — the same entry point the single-dataitem
-    // projection path uses, so both paths compute a query FlowField column identically.
+    // Handed across the assembly boundary as a JoinContext delegate.
     private static object? Join_CalcFlowFieldForRow(object rowBuffer, object flowFieldMeta)
         => FlowFieldPatches.CalcOneFlowFieldForQueryRow(
             rowBuffer, (Microsoft.Dynamics.Nav.Runtime.NCLMetaField)flowFieldMeta);
