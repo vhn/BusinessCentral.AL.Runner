@@ -33,6 +33,11 @@ public static class JoinExecutor
     private static PropertyInfo? _pDataItemLinks;
     private static PropertyInfo? _pDataItemLinkType;
     private static PropertyInfo? _pDataItemName;
+    private static PropertyInfo? _pDataItemSubQueryDefinition;
+    // Non-null only on BC's FlowField-calculation sub-dataitem — the shape discriminator.
+    private static PropertyInfo? _pDataItemSourceFlowField;
+    private static PropertyInfo? _pFieldParent;
+    private static PropertyInfo? _pTableTableId;
     private static PropertyInfo? _pDataItemQueryColumns;
     private static PropertyInfo? _pLinkLinkType;
     private static PropertyInfo? _pLinkSourceColumn;
@@ -72,6 +77,9 @@ public static class JoinExecutor
         _pDataItemLinks = tDataItem.GetProperty("DataItemLinks", F)!;
         _pDataItemLinkType = tDataItem.GetProperty("DataItemLinkType", F)!;
         _pDataItemName = tDataItem.GetProperty("Name", F)!;
+        _pDataItemSubQueryDefinition = tDataItem.GetProperty("SubQueryDefinition", F)!;
+        _pDataItemSourceFlowField = tDataItem.GetProperty("SourceFlowField", F);
+        _pTableTableId = asm.GetType(rt + "NCLMetaTable")!.GetProperty("TableId", F);
         _pDataItemQueryColumns = tDataItem.GetProperty("QueryColumns", F)!;
         _pLinkLinkType = tLink.GetProperty("LinkType", F)!;
         _pLinkSourceColumn = tLink.GetProperty("SourceColumn", F)!;
@@ -164,6 +172,15 @@ public static class JoinExecutor
         var perItem = new List<DataItemRows>();
         foreach (var di in dataItems)
         {
+            // BC's FlowField sub-dataitem carries no row this runner needs (step 3 computes the
+            // column). Skip BEFORE MetaTable is read: its table resolves to id 0 and throws.
+            if (_pDataItemSourceFlowField?.GetValue(di) != null) continue;
+            if (_pDataItemSubQueryDefinition!.GetValue(di) != null)
+                throw ctx.OutOfScope(
+                    "NavQuery (multi-dataitem join)",
+                    "query-join-synthesized-subquery-not-implemented — a synthesized sub-dataitem " +
+                    "(SubQueryDefinition != null) that is not a FlowField-calculation sub-query");
+
             var table = _pDataItemMetaTable!.GetValue(di)!;
             var name = (string)_pDataItemName!.GetValue(di)!;
             var rows = ReadDataItemRows(ctx, dataAccessSource, di, table);
@@ -218,6 +235,16 @@ public static class JoinExecutor
             var fields = new object?[plan.SlotCount];
             foreach (var col in plan.Columns)
             {
+                // No TableSlot to read — compute from the row of the FlowField's own table.
+                if (col.FlowFieldMeta != null)
+                {
+                    if (!combo.TryGetValue(col.OwnerName, out var ownerBuf) || ownerBuf == null)
+                        // Unmatched owner → typed default, as for a stored field below.
+                        fields[col.QuerySlot] = ctx.TypedDefaultForField(col.FlowFieldMeta);
+                    else
+                        fields[col.QuerySlot] = ctx.CalcFlowFieldForRow(ownerBuf, col.FlowFieldMeta);
+                    continue;
+                }
                 if (col.TableSlot < 0) continue; // unsupported column → default
                 if (!combo.TryGetValue(col.OwnerName, out var buf) || buf == null)
                 {
@@ -390,6 +417,8 @@ public static class JoinExecutor
         public string OwnerName = "";
         public int TableSlot = -1;
         public object? SourceField; // NCLMetaField (object) — for typed left-outer defaults
+        // Set for BC's FlowField sub-dataitem column: computed from OwnerName's row, TableSlot -1.
+        public object? FlowFieldMeta;
     }
     private sealed class JoinProjectionPlan
     {
@@ -411,18 +440,41 @@ public static class JoinExecutor
         var plan = new JoinProjectionPlan();
         int maxSlot = -1;
         var dataItems = ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>().ToList();
+        // A FlowField column's owner must be one of these, never a synthesized item.
+        var realDataItems = dataItems
+            .Where(di => _pDataItemSourceFlowField?.GetValue(di) == null
+                      && _pDataItemSubQueryDefinition!.GetValue(di) == null)
+            .ToList();
 
         // Pass 1: genuinely-projected (non-filter-only) columns get their real ColumnIndex slot.
         foreach (var di in dataItems)
         {
             var name = (string)_pDataItemName!.GetValue(di)!;
+            var flowFieldMeta = _pDataItemSourceFlowField?.GetValue(di);
+            var flowFieldOwnerName = flowFieldMeta != null
+                ? ResolveFlowFieldOwnerName(ctx, realDataItems, flowFieldMeta)
+                : null;
             var cols = ((IEnumerable?)_pDataItemQueryColumns!.GetValue(di))?.Cast<object>() ?? Enumerable.Empty<object>();
             foreach (var col in cols)
             {
-                if (IsFilterOnlyColumn(col)) continue; // handled in pass 2 below.
+                if (IsFilterOnlyColumn(col))
+                {
+                    // Pass 2 would evaluate it against a slot this runner never fills.
+                    if (flowFieldMeta != null)
+                        throw ctx.OutOfScope(
+                            "NavQuery (multi-dataitem join with a FlowField column)",
+                            "query-join-flowfield-filter-only-column-not-implemented — a column on a " +
+                            "FlowField-calculation sub-dataitem that is referenced only via filter()");
+                    continue; // handled in pass 2 below.
+                }
                 int querySlot = (int)_pColColumnIndex!.GetValue(col)!;
                 if (querySlot < 0) continue; // defensive: shouldn't happen for a non-filter-only column.
                 if (querySlot > maxSlot) maxSlot = querySlot;
+                if (flowFieldMeta != null)
+                {
+                    plan.Columns.Add(new JoinColumn { QuerySlot = querySlot, OwnerName = flowFieldOwnerName!, TableSlot = -1, SourceField = null, FlowFieldMeta = flowFieldMeta });
+                    continue;
+                }
                 plan.Columns.Add(new JoinColumn { QuerySlot = querySlot, OwnerName = name, TableSlot = ResolveTableSlot(col, out var srcField), SourceField = srcField });
             }
         }
@@ -452,6 +504,40 @@ public static class JoinExecutor
 
         plan.SlotCount = Math.Max(maxSlot + 1, nextExtraSlot);
         return plan;
+    }
+
+    /// <summary>
+    /// Which real dataitem owns the FlowField's table. BC leaves no DataItemLink back to the
+    /// owner, so the table id is the only way across. Throws on 0 or >1 matches.
+    /// </summary>
+    private static string ResolveFlowFieldOwnerName(JoinContext ctx, List<object> realDataItems, object flowFieldMeta)
+    {
+        _pFieldParent ??= flowFieldMeta.GetType().GetProperty("Parent", F);
+        var owningTable = _pFieldParent?.GetValue(flowFieldMeta);
+        if (owningTable == null)
+            throw ctx.OutOfScope(
+                "NavQuery (multi-dataitem join with a FlowField column)",
+                "query-join-flowfield-owner-unresolved — NCLMetaField.Parent did not resolve a table " +
+                "for the FlowField column; cannot locate its owning dataitem in the join");
+        var ownerTableId = _pTableTableId?.GetValue(owningTable);
+
+        string? matchName = null;
+        int matches = 0;
+        foreach (var di in realDataItems)
+        {
+            var table = _pDataItemMetaTable!.GetValue(di);
+            var tableId = table == null ? null : _pTableTableId?.GetValue(table);
+            if (tableId == null || ownerTableId == null || !tableId.Equals(ownerTableId)) continue;
+            matches++;
+            matchName = (string)_pDataItemName!.GetValue(di)!;
+        }
+        if (matches != 1)
+            throw ctx.OutOfScope(
+                "NavQuery (multi-dataitem join with a FlowField column)",
+                $"query-join-flowfield-owner-ambiguous — found {matches} real dataitem(s) whose table " +
+                "matches the FlowField's owning table (0 = not in this join; >1 = a self-join on that " +
+                "table); cannot unambiguously pick the FlowField's owner row");
+        return matchName!;
     }
 
     private static int ResolveTableSlot(object col, out object? srcField)
@@ -489,6 +575,11 @@ public static class JoinExecutor
         var dataItems = ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>();
         foreach (var dataItem in dataItems)
         {
+            // The stamped Method/ReverseSign are the QUERY AUTHOR's, XOR'd with
+            // CalcFormula.NegateResult and Min<->Max swapped when negated. Keep the author's;
+            // undo only the NegateResult half, already applied to the value by the calc core.
+            var sourceFlowField = _pDataItemSourceFlowField?.GetValue(dataItem);
+            bool negated = sourceFlowField != null && FlowFieldNegateResult(sourceFlowField);
             var columns = ((IEnumerable?)_pDataItemQueryColumns!.GetValue(dataItem))?.Cast<object>()
                 ?? Enumerable.Empty<object>();
             foreach (var column in columns)
@@ -497,17 +588,35 @@ public static class JoinExecutor
                 var slot = (int)_pColColumnIndex!.GetValue(column)!;
                 if (slot < 0) continue;
                 plan.SlotCount = Math.Max(plan.SlotCount, slot + 1);
+                var aggregation = _pColAggregationType!.GetValue(column)?.ToString() ?? "None";
+                var reverseSign = (bool)_pColReverseSign!.GetValue(column)!;
+                if (negated)
+                {
+                    reverseSign = !reverseSign;
+                    aggregation = aggregation switch { "Min" => "Max", "Max" => "Min", _ => aggregation };
+                }
                 plan.Columns.Add(new FinalColumn
                 {
                     Metadata = column,
                     Slot = slot,
-                    IsAggregated = (bool)_pColIsAggregated!.GetValue(column)!,
-                    Aggregation = _pColAggregationType!.GetValue(column)?.ToString() ?? "None",
-                    ReverseSign = (bool)_pColReverseSign!.GetValue(column)!,
+                    IsAggregated = aggregation != "None",
+                    Aggregation = aggregation,
+                    ReverseSign = reverseSign,
                 });
             }
         }
         return plan;
+    }
+
+    private static PropertyInfo? _pFieldCalcFormula;
+    private static PropertyInfo? _pCalcFormulaNegateResult;
+    private static bool FlowFieldNegateResult(object flowFieldMeta)
+    {
+        _pFieldCalcFormula ??= flowFieldMeta.GetType().GetProperty("CalculationFormula", F);
+        var formula = _pFieldCalcFormula?.GetValue(flowFieldMeta);
+        if (formula == null) return false;
+        _pCalcFormulaNegateResult ??= formula.GetType().GetProperty("NegateResult", F);
+        return _pCalcFormulaNegateResult?.GetValue(formula) is true;
     }
 
     private static List<object?[]> ProjectFinalRows(

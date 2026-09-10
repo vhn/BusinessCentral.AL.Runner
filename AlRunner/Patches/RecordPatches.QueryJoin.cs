@@ -87,6 +87,7 @@ public static partial class RecordPatches
         Set("MakeReadOnlyRecordBuffer", FieldType("MakeReadOnlyRecordBuffer"), nameof(Join_MakeReadOnlyRecordBuffer));
         Set("ToNavValueArray", FieldType("ToNavValueArray"), nameof(Join_ToNavValueArray));
         Set("TypedDefaultForField", FieldType("TypedDefaultForField"), nameof(Join_TypedDefaultForField));
+        Set("CalcFlowFieldForRow", FieldType("CalcFlowFieldForRow"), nameof(Join_CalcFlowFieldForRow));
         Set("Log", FieldType("Log"), nameof(Join_Log));
         Set("OutOfScope", FieldType("OutOfScope"), nameof(Join_OutOfScope));
         return ctx;
@@ -132,6 +133,11 @@ public static partial class RecordPatches
     // nullSupport:false). NCLMetaField implements INavValueMetadata, so it IS the metadata
     // argument. We call that same factory by reflection so the LeftOuter slot carries a real,
     // correctly-typed NavValue (never a null slot, which NREs NavQuery.GetColumnValue).
+    // Handed across the assembly boundary as a JoinContext delegate.
+    private static object? Join_CalcFlowFieldForRow(object rowBuffer, object flowFieldMeta)
+        => FlowFieldPatches.CalcOneFlowFieldForQueryRow(
+            rowBuffer, (Microsoft.Dynamics.Nav.Runtime.NCLMetaField)flowFieldMeta);
+
     private static MethodInfo? _mGetDefaultNavValue;
     private static object? Join_TypedDefaultForField(object field)
     {

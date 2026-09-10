@@ -829,7 +829,9 @@ public static class FlowFieldPatches
             if (Equals(calcMethod, _cmCount))
                 result = NavValue.CreateNavValueFromObject((NCLMetaField)fieldObj, matchCount);
             else if (Equals(calcMethod, _cmExist))
-                result = NavValue.CreateNavValueFromObject((NCLMetaField)fieldObj, anyMatch);
+                // BC inverts here, not in NegateValue (numeric-only):
+                // CalcExistsAsync builds `NegateResult ? !exists : exists`.
+                result = NavValue.CreateNavValueFromObject((NCLMetaField)fieldObj, negate ? !anyMatch : anyMatch);
             else if (Equals(calcMethod, _cmSum))
                 result = NavValue.CreateNavValueFromObject((NCLMetaField)fieldObj, CoerceSumResult(sum));
             else if (Equals(calcMethod, _cmAverage))
@@ -855,6 +857,67 @@ public static class FlowFieldPatches
             if (result != null)
                 results.Add(Tuple.Create((INavFieldMetadata)(NCLMetaField)fieldObj, result));
         }
+    }
+
+    // Ported from upstream: a thin wrapper over this file's own CalcFlowFieldValuesCore.
+    // Upstream's query-projection rewrite is deliberately NOT adopted — see QueryProjection.cs.
+
+    /// <summary>
+    /// Computes ONE FlowField for one already-read query row, in memory instead of via BC's
+    /// synthesized SQL sub-query. <paramref name="rowBuffer"/> is the query row, boxed as
+    /// <c>object</c> to keep AlRunner.QueryJoin free of Ncl types; it satisfies BC's
+    /// <c>IRecordBuffer</c> as a record's buffer does, so the core needs no change.
+    /// <paramref name="flowFiltersAndMarks"/> carries the query's own flow filters (#2925);
+    /// null means "none set" and resolves to BC's <c>FiltersAndMarks.Empty</c>, which BC itself
+    /// reads as "unset → no constraint". Nothing populates it yet — see docs/scope.md.
+    /// </summary>
+    internal static NavValue? CalcOneFlowFieldForQueryRow(
+        object rowBuffer, NCLMetaField flowFieldMeta, object? flowFiltersAndMarks = null)
+    {
+        // NavCurrentThread.Session must resolve on every real test run (CalcFlowFieldValuesCore
+        // below is unreachable without it, and every other FlowField entry point in this file —
+        // RecordImpl_CalcFieldsAsync_3 above — relies on the SAME static resolving). Swallowing
+        // a reflection failure here and returning null would silently read a query FlowField
+        // column as unset/default instead of its calculated value — the loud-failures.md silent
+        // default this file exists to avoid everywhere else. Fail loudly instead, naming the
+        // surface and the field, so a genuine artifact incompatibility is visible rather than
+        // read back as "the value is 0/empty".
+        var tNCT = flowFieldMeta.GetType().Assembly.GetType("Microsoft.Dynamics.Nav.Runtime.NavCurrentThread")
+            ?? throw new InvalidOperationException(
+                $"CalcOneFlowFieldForQueryRow('{flowFieldMeta.FieldName}' on "
+                + $"'{flowFieldMeta.Parent?.TableName}'): Microsoft.Dynamics.Nav.Runtime.NavCurrentThread "
+                + "type not found in the Ncl assembly — cannot resolve the current NavSession to "
+                + "compute this query FlowField column.");
+        var pSess = tNCT.GetProperty("Session", BindingFlags.Public | BindingFlags.Static)
+            ?? throw new InvalidOperationException(
+                $"CalcOneFlowFieldForQueryRow('{flowFieldMeta.FieldName}' on "
+                + $"'{flowFieldMeta.Parent?.TableName}'): NavCurrentThread.Session property not "
+                + "found — cannot resolve the current NavSession to compute this query FlowField column.");
+        var session = pSess.GetValue(null)
+            ?? throw new InvalidOperationException(
+                $"CalcOneFlowFieldForQueryRow('{flowFieldMeta.FieldName}' on "
+                + $"'{flowFieldMeta.Parent?.TableName}'): NavCurrentThread.Session returned null — "
+                + "no current session to compute this query FlowField column against.");
+
+        // The runner is single-company; token 0 is the runner's own unnamed company (see
+        // RecordPatches.cs's companyTokens skeleton-state comment) — the same value every other
+        // FlowField/query code path in this runner uses when no per-record company token is
+        // available.
+        // #2925: never null — see the summary above. Resolving FiltersAndMarks.Empty is part of
+        // Register(); if THAT failed, say so instead of handing BC a null it dereferences (the
+        // NRE this parameter exists to remove) or silently answering with an unfiltered total.
+        var parentFm = flowFiltersAndMarks ?? _emptyFm
+            ?? throw new InvalidOperationException(
+                $"CalcOneFlowFieldForQueryRow('{flowFieldMeta.FieldName}' on "
+                + $"'{flowFieldMeta.Parent?.TableName}'): Microsoft.Dynamics.Nav.Runtime."
+                + "FiltersAndMarks.Empty could not be resolved on this artifact, so the "
+                + "FlowField's where-conditions cannot be evaluated against BC's own helper.");
+
+        var results = new List<Tuple<INavFieldMetadata, NavValue>>();
+        CalcFlowFieldValuesCore(session, companyToken: 0, rowBuffer,
+            parentFiltersAndMarks: parentFm, securityFiltering: null, alIsolationLevel: null,
+            new NCLMetaField[] { flowFieldMeta }, recursionLevel: 0, results);
+        return results.Count > 0 ? results[0].Item2 : null;
     }
 
     // ── BC recursion guards ──────────────────────────────────────────────────

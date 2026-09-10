@@ -41,6 +41,12 @@ public sealed class JoinContext
     /// </summary>
     public required Func<object /*field*/, object?> TypedDefaultForField;
 
+    /// <summary>
+    /// (rowBuffer, flowFieldMeta) =&gt; NavValue?. A FlowField column has no stored slot; the row
+    /// passed is the FlowField's own table row, which its where-conditions resolve against.
+    /// </summary>
+    public required Func<object /*rowBuffer*/, object /*flowFieldMeta*/, object?> CalcFlowFieldForRow;
+
     /// <summary>Diagnostic log sink (al-runner's QLog).</summary>
     public required Action<string> Log;
 

@@ -413,6 +413,20 @@ public static partial class RecordPatches
                 ?.SetValue(sqlDbProps, new object());
             tSqlDbProps.GetField("databasePropertiesReady", BindingFlags.NonPublic | BindingFlags.Instance)
                 ?.SetValue(sqlDbProps, true);
+            // ConvertToSqlIdentifier iterates this unconditionally (via NCLMetaTable.SqlTableName),
+            // so a Query with a FlowField column NREs before any row is read. #2300.
+            var fDefaultInvalidChars = tSqlDbProps.GetField("DefaultInvalidIdentifierChars",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            // BC's own constant, not a restated literal: a hardcoded fallback would be a silent
+            // guess about SQL identifier escaping.
+            var defaultInvalidChars = fDefaultInvalidChars?.GetRawConstantValue() as string
+                ?? throw new InvalidOperationException(
+                    "NavSqlDatabaseProperties.DefaultInvalidIdentifierChars could not be read from "
+                    + "this BC artifact, so the skeleton's invalidIdentifierChars cannot be seeded "
+                    + "faithfully; a query with a FlowField column would NRE in "
+                    + "NavSqlStatementHelper.ConvertToSqlIdentifier.");
+            tSqlDbProps.GetField("invalidIdentifierChars", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?.SetValue(sqlDbProps, defaultInvalidChars);
             fSqlDbProps.SetValue(_skeletonDatabase, sqlDbProps);
         }
         // companyTokens — BC's own NavDatabase ctor does `companyTokens = new CompanyTokens(this)`,
