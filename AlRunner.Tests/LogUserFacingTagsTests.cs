@@ -66,6 +66,9 @@ public sealed class LogUserFacingTagsTests
     // printed, just silently dropped before reaching stdout (same failure shape as the
     // [bc] swallow above).
     [InlineData("[dap] listening on 127.0.0.1:4711 — waiting for a debug client to connect...")]
+    // A refused key field changes results: the key is built short and the run later dies in
+    // NCL naming neither key nor field, so suppressing the one explanatory line hid the bug.
+    [InlineData("[TableKey] REFUSED Sales Header.ByCreatedAt: unknown field 'SystemRowVersion'")]
     public void UserFacingTags_SurviveTheDefaultFilter(string line)
     {
         Assert.Contains(line, FilterOnce(line, verbose: false));

@@ -38,6 +38,60 @@ public static partial class RecordPatches
         new(2_000_000_004, "SystemModifiedBy", "Guid",     0),
     };
 
+    /// <summary>
+    /// BC's sixth system field. The AL compiler synthesizes it at <b>field id 0</b> under the
+    /// metadata name <c>timestamp</c> (<c>SynthesizedFieldHelper.AppendSystemFields</c>), which
+    /// <c>BuildNCLMetaTable</c> already materialises on every table.
+    ///
+    /// <para>So it belongs here, resolvable, and NOT in <see cref="_systemFields"/>, which the
+    /// builder APPENDS: appending it would put id 0 in the field layout twice and corrupt the
+    /// offsets R2R-precompiled BC code holds.</para>
+    /// </summary>
+    private static readonly ParsedField _systemRowVersionField =
+        new(0, "SystemRowVersion", "BigInteger", 0);
+
+    /// <summary>
+    /// Resolve a field NAME stated by a table KEY to the field id the built NCLMetaTable carries:
+    /// declared fields first (safe - AL0155 forbids a declared field shadowing a system name),
+    /// then <see cref="_systemFields"/>, then <see cref="_systemRowVersionField"/>.
+    ///
+    /// <para>False for an unknown name, so callers refuse loudly instead of shortening the key.
+    /// BC matches a key field-by-field, so a short key matches nothing: <c>CurrentKeyIndex</c>
+    /// answers -1 and NCL throws an out-of-bounds exception naming neither key nor field.</para>
+    ///
+    /// <para>Shared with <c>BcAppSymbolCache</c>, which had the same defect. Deliberately pure -
+    /// it reads no mutable registration state, because the AL-source extractor memoizes on
+    /// source content plus defines.</para>
+    /// </summary>
+    internal static bool TryResolveKeyFieldId(IEnumerable<ParsedField> declaredFields, string? fieldName,
+        out int fieldId)
+    {
+        fieldId = -1;
+        if (string.IsNullOrWhiteSpace(fieldName)) return false;
+
+        foreach (var f in declaredFields)
+            if (string.Equals(f.FieldName, fieldName, StringComparison.OrdinalIgnoreCase))
+            {
+                fieldId = f.FieldId;
+                return true;
+            }
+
+        foreach (var f in _systemFields)
+            if (string.Equals(f.FieldName, fieldName, StringComparison.OrdinalIgnoreCase))
+            {
+                fieldId = f.FieldId;
+                return true;
+            }
+
+        if (string.Equals(_systemRowVersionField.FieldName, fieldName, StringComparison.OrdinalIgnoreCase))
+        {
+            fieldId = _systemRowVersionField.FieldId;
+            return true;
+        }
+
+        return false;
+    }
+
     // Positive-result cache: maps tableId → CLR Type for "Record<id>" subclasses of NavRecord.
     // The uncached form walks every loaded assembly's full type table on every call
     // (NavRecordHandle_CreateTarget fires it for every record handle materialization), which

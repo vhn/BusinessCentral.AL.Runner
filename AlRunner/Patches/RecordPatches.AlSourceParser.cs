@@ -674,9 +674,13 @@ public static partial class RecordPatches
                     foreach (var kf in k.Fields)
                     {
                         var kn = IdentText(kf as NavSyntax.IdentifierNameSyntax);
-                        var f = fields.FirstOrDefault(x =>
-                            string.Equals(x.FieldName, kn, StringComparison.OrdinalIgnoreCase));
-                        if (f != null) keyFieldIds.Add(f.FieldId);
+                        if (RecordPatches.TryResolveKeyFieldId(fields, kn, out var keyFieldId))
+                            keyFieldIds.Add(keyFieldId);
+                        else
+                            Console.Error.WriteLine(
+                                $"[TableKey] REFUSED {tableName}.{keyName}: unknown field "
+                                + $"'{(string.IsNullOrEmpty(kn) ? kf?.ToString() ?? "<null>" : kn)}' - "
+                                + "key left short, sorting on it will not match");
                     }
                     if (firstKey)
                     {
