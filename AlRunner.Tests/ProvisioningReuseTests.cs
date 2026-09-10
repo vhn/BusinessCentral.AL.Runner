@@ -737,6 +737,56 @@ public sealed class ProvisioningReuseTests : IDisposable
         Assert.Equal(0, exit);
     }
 
+    /// <summary>
+    /// EnsureTestToolkitProvisioned's reuse loop accepts a warm toolkit on a neighbouring
+    /// same-minor patch and returns without creating the exact-version dir. The platform
+    /// decision must still find the Microsoft dependency edges then — they are the only thing
+    /// revealing a transitive Application Test Library need. The edge-bearing manifest lives
+    /// ONLY in the neighbouring dir, so this cannot go green from another edge source.
+    /// </summary>
+    [Fact]
+    public void Provision_WarmToolkitReusedFromANeighbouringPatch_StillSeesTheEdgeImpliedPlatformNeed()
+    {
+        const string neighbourVersion = "98.7.9.9";
+
+        var artifacts = Path.Combine(_root, "artifacts");
+        Directory.CreateDirectory(artifacts);
+        var emptyCache = Path.Combine(_root, "pkgcache");
+        Directory.CreateDirectory(emptyCache);
+        var bundle = Path.Combine(_root, "neighbour-toolkit-bundle");
+        WriteEmptyMicrosoftBundle(bundle, "Tests-TestLibraries");
+        var fx = new Fixture(artifacts, bundle, emptyCache);
+
+        WriteSyntheticEngine(fx, SyntheticEngineVersion);
+        // WriteSyntheticEngine seeds the sentinel at the exact version; drop it so only the
+        // neighbour can satisfy the toolkit.
+        Directory.Delete(ProvisioningCheck.TestAppsDirFor(artifacts, SyntheticEngineVersion), true);
+
+        var neighbourTestApps = ProvisioningCheck.TestAppsDirFor(artifacts, neighbourVersion);
+        WriteApp(neighbourTestApps, ProvisioningCheck.TestToolkitSentinelApp, neighbourVersion, r2r: false);
+        WriteAppWithDependencies(neighbourTestApps, "Tests-TestLibraries", neighbourVersion,
+            "System Application Test Library", "Permissions Mock", "Application Test Library");
+
+        // Complete EXCEPT Application Test Library, so only the edge distinguishes
+        // "needs the platform set" from "needs nothing".
+        WriteCompleteSelectedPlatformSet(
+            ProvisioningCheck.PlatformAppsDirFor(artifacts, SyntheticEngineVersion),
+            SyntheticEngineVersion,
+            includeApplicationTestLibrary: false);
+
+        var (output, exit) = RunRunner(fx,
+            $"provision \"{fx.Bundle}\" --bc-version {SyntheticEngineVersion}",
+            blockNetwork: true);
+
+        // Pins that the reuse branch is the path under test, not another route to green.
+        Assert.Contains("reusing (no download)", output);
+        Assert.Contains(neighbourTestApps, output);
+        Assert.Contains(
+            $"fetching Microsoft platform R2R apps for BC {SyntheticEngineVersion}", output);
+        Assert.DoesNotContain("do not need the platform R2R apps set", output);
+        Assert.NotEqual(0, exit);
+    }
+
     [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]

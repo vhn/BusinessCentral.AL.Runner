@@ -1365,14 +1365,9 @@ if (!provisionSubcommand)
         Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit for selected BC " +
             $"{mm} at {runnerOwnedTestAppsDir} (no download).");
 
-    // Issue #2103: the TOOLKIT set is adjudicated first, for the same reason the download
-    // blocks below are ordered that way — the Microsoft dependency edges the platform
-    // decision walks live in the test-toolkit packages' own NavxManifest.xml, so a platform
-    // scan that runs before the toolkit dir is attached asks its question with "no edges
-    // known" and answers "needs nothing". That answer skipped this scan entirely, and the
-    // re-derivation further down then found the real need with no warm set attached --
-    // a bundle whose warm platform apps were right there would refuse to run.
-    // NeedsTestApps is a DIRECT membership test, so it is already correct without edges.
+    // Toolkit first: the edges the platform decision walks live in the test-toolkit packages'
+    // manifests, so a platform scan run before the toolkit dir is attached asks with "no edges
+    // known" and wrongly answers "needs nothing". NeedsTestApps is direct membership.
     if (decision.ShouldDownloadTest)
     {
         foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
@@ -7520,12 +7515,26 @@ static int RunProvisioning(string? bcVersionArg, string? artifactPathArg,
     return 0;
 }
 
-// Issue #2103: DecideManifestProvisioning reads its dependency edges from the SAME dirs it
-// checks for presence, so a caller that omits the test-apps dir gets "no edges known" and a
-// decision degraded to direct membership. Folding it in is presence-safe — the no-fallback
-// platform apps ship in the w1 Extensions set, never in the test-apps set.
-static List<string> WithEdgeSources(IEnumerable<string> searchDirs, string testAppsDir)
-    => searchDirs.Append(testAppsDir).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+// Presence-safe: the no-fallback platform apps ship in the w1 Extensions set, never in a
+// test-apps set, so widening the search cannot make the platform set look falsely complete.
+static List<string> WithEdgeSources(
+    IEnumerable<string> searchDirs, IEnumerable<string> edgeSourceDirs)
+    => searchDirs.Concat(edgeSourceDirs).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+// The exact-version dir may never exist: EnsureTestToolkitProvisioned can satisfy the toolkit
+// from a neighbouring same-minor patch and return without writing. Same-minor only, so a
+// foreign-version edge shape can never be read in.
+static List<string> TestAppsEdgeSourceDirs(string artifactsRoot, string fullVersion)
+{
+    var dirs = new List<string>
+    {
+        AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(artifactsRoot, fullVersion),
+    };
+    if (Version.TryParse(fullVersion, out var selected))
+        dirs.AddRange(AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
+            artifactsRoot, $"{selected.Major}.{selected.Minor}", null));
+    return dirs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+}
 
 // Ensure the manifest-required platform set for the selected full BC version. A warm
 // same-minor set is reused only after the same manifest decision that triggered the
@@ -7537,18 +7546,9 @@ static bool EnsurePlatformAppsProvisioned(string selectedFullVersion, List<strin
     var roots = ScanManifestDependencyRoots(bundles);
     var initialReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
         selectedFullVersion, bundleDirs);
-    // Issue #2103: include the runner-owned test-apps dir in what the decision may READ.
-    // EnsureTestToolkitProvisioned has just populated it, and those packages' own manifests
-    // are where the real Microsoft dependency edges come from — the per-version fact that
-    // decides whether this bundle needs the platform set at all. Adding it cannot make the
-    // platform set look falsely complete: Application Test Library ships in the w1
-    // Extensions set, never in the test-apps set. Every DecideManifestProvisioning call in
-    // this function folds it in for that reason — a warm-candidate or post-download check
-    // that could not see the edges would answer "needs nothing" and skip a real download.
-    var testAppsDir = AlRunner.Infrastructure.ProvisioningCheck.TestAppsDirFor(
-        artifactsRoot, selectedFullVersion);
+    var edgeSourceDirs = TestAppsEdgeSourceDirs(artifactsRoot, selectedFullVersion);
     var initialDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
-        roots, initialReport, WithEdgeSources(bundleDirs, testAppsDir));
+        roots, initialReport, WithEdgeSources(bundleDirs, edgeSourceDirs));
     foreach (var badPkg in initialDecision.UnreadablePackages)
         Console.Error.WriteLine(
             $"[provision] warning: could not read the manifest of '{badPkg}' — its Microsoft " +
@@ -7577,7 +7577,7 @@ static bool EnsurePlatformAppsProvisioned(string selectedFullVersion, List<strin
         var candidateReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
             selectedFullVersion, searchDirs);
         var candidateDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
-            roots, candidateReport, WithEdgeSources(searchDirs, testAppsDir));
+            roots, candidateReport, WithEdgeSources(searchDirs, edgeSourceDirs));
         if (!candidateDecision.ShouldDownloadPlatform)
         {
             Console.Error.WriteLine($"[provision] platform apps already complete at {candidate}; " +
@@ -7617,7 +7617,7 @@ static bool EnsurePlatformAppsProvisioned(string selectedFullVersion, List<strin
     var finalReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
         selectedFullVersion, finalDirs);
     var finalDecision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
-        roots, finalReport, WithEdgeSources(finalDirs, testAppsDir));
+        roots, finalReport, WithEdgeSources(finalDirs, edgeSourceDirs));
     if (finalDecision.ShouldDownloadPlatform)
     {
         Console.Error.WriteLine(
