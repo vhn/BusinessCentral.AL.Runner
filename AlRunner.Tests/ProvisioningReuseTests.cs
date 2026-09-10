@@ -99,6 +99,46 @@ public sealed class ProvisioningReuseTests : IDisposable
             Navx(Guid.NewGuid().ToString(), name, publisher, version, r2r));
     }
 
+    /// <summary>
+    /// Writes the BC 28.x test-toolkit packages whose NavxManifest.xml carries the real
+    /// &lt;Dependencies&gt; — the edge source ScanDependencyEdges reads (issue #2103). Edges
+    /// as measured from the shipped 28.3.52162.54172 Microsoft_Tests-TestLibraries.app.
+    /// </summary>
+    private string WriteBc28TestToolkitManifests()
+    {
+        var dir = Path.Combine(_root, "edge-source-28");
+        Directory.CreateDirectory(dir);
+        WriteAppWithDependencies(dir, "Tests-TestLibraries", "28.1.49838.50794",
+            "System Application Test Library", "Permissions Mock", "Application Test Library");
+        return dir;
+    }
+
+    private static void WriteAppWithDependencies(
+        string dir, string name, string version, params string[] dependencyNames)
+    {
+        Directory.CreateDirectory(dir);
+        var deps = string.Concat(dependencyNames.Select(d =>
+            $"""    <Dependency Id="{Guid.NewGuid()}" Name="{d}" Publisher="Microsoft" MinVersion="{version}" />{"\n"}"""));
+        var xml = $"""
+            <?xml version="1.0" encoding="utf-8"?>
+            <Package xmlns="http://schemas.microsoft.com/navx/2015/manifest">
+              <App Id="{Guid.NewGuid()}" Name="{name}" Publisher="Microsoft" Version="{version}"/>
+              <Dependencies>
+            {deps}  </Dependencies>
+            </Package>
+            """;
+        using var ms = new MemoryStream();
+        using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
+        using (var es = zip.CreateEntry("NavxManifest.xml").Open())
+            es.Write(Encoding.UTF8.GetBytes(xml));
+        var zipBytes = ms.ToArray();
+        var result = new byte[8 + zipBytes.Length];
+        result[0] = (byte)'N'; result[1] = (byte)'A'; result[2] = (byte)'V'; result[3] = (byte)'X';
+        BitConverter.TryWriteBytes(result.AsSpan(4, 4), (uint)8);
+        zipBytes.CopyTo(result, 8);
+        File.WriteAllBytes(Path.Combine(dir, $"Microsoft_{name}_{version}.app"), result);
+    }
+
     /// <summary>The three platform runtime apps, as R2R packages, in one directory.</summary>
     private static void WriteR2RPlatformSet(string dir, string version)
     {
@@ -183,14 +223,21 @@ public sealed class ProvisioningReuseTests : IDisposable
         var dest = ProvisioningCheck.PlatformAppsDirFor(_root, "28.1.49838.50794");
         WriteCompleteSelectedPlatformSet(dest, "28.1.49838.50794",
             includeApplicationTestLibrary: false);
+        // Issue #2103: the Tests-TestLibraries -> Application Test Library edge is now READ
+        // from that package's own manifest rather than assumed from a hand table, so the
+        // decision has to be given a dir that actually carries it — on 28.x the test-apps
+        // set, which the caller downloads first for exactly this reason. Without it the
+        // honest answer is "no edges known", not the 28.x shape.
+        var edgeDir = WriteBc28TestToolkitManifests();
+        var searchDirs = new[] { dest, edgeDir };
 
         var report = ProvisioningCheck.CheckPlatformApps("28.1.49838.50794", new[] { dest });
-        Assert.True(ProvisioningCheck.DecideManifestProvisioning(roots, report, new[] { dest })
+        Assert.True(ProvisioningCheck.DecideManifestProvisioning(roots, report, searchDirs)
             .ShouldDownloadPlatform);
 
         WriteApp(dest, "Application Test Library", "28.1.49838.50794", r2r: true);
         report = ProvisioningCheck.CheckPlatformApps("28.1.49838.50794", new[] { dest });
-        Assert.False(ProvisioningCheck.DecideManifestProvisioning(roots, report, new[] { dest })
+        Assert.False(ProvisioningCheck.DecideManifestProvisioning(roots, report, searchDirs)
             .ShouldDownloadPlatform);
     }
 
@@ -800,6 +847,61 @@ public sealed class ProvisioningReuseTests : IDisposable
         Assert.Equal(0, exit);
     }
 
+    /// <summary>
+    /// Issue #2103 ordering regression. The selected build has NO Microsoft app sets of its
+    /// own; a neighbouring build of the same minor has both, and the ONLY record of the
+    /// "Tests-TestLibraries needs Application Test Library" edge is inside the warm toolkit
+    /// set's own manifests. Since the edges are now read off disk instead of guessed from a
+    /// table, the warm-toolkit set has to be adjudicated BEFORE the warm-platform scan --
+    /// otherwise that scan asks "do we need the platform set?" with no edges in hand, hears
+    /// "no", skips itself, and the re-derivation further down then reports an unmet need
+    /// while a complete warm platform set was sitting right there unattached.
+    /// </summary>
+    [SkippableFact]
+    public void WarmPlatformSetOnANeighbouringBuild_IsStillReusedWhenOnlyTheToolkitManifestsCarryTheEdge()
+    {
+        TestArtifacts.SkipIfMissing();
+        var built = BcArtifacts.EngineBuiltVersion();
+        TestArtifacts.SkipIf(built == null, "engine built version is not baked into this build");
+        var engineDir = BcArtifacts.ArtifactDirFor(built!.ToString());
+        TestArtifacts.SkipIfDirectoryMissing(engineDir, "the built engine's artifact dir");
+
+        var artifacts = Path.Combine(_root, "artifacts");
+        var bundle = Path.Combine(_root, "toolkit-edge-bundle");
+        WriteEmptyMicrosoftBundle(bundle, "Tests-TestLibraries");
+        var emptyCache = Path.Combine(_root, "empty-package-cache");
+        Directory.CreateDirectory(emptyCache);
+        var fx = new Fixture(artifacts, bundle, emptyCache);
+        try
+        {
+            LinkRealEngineClosure(fx, built.ToString(), engineDir);
+        }
+        catch (Exception ex)
+        {
+            throw new SkipException($"engine-closure symlinks unavailable: {ex.Message}");
+        }
+
+        // Neighbouring same-minor build carrying both warm sets. The selected build gets
+        // neither, so both have to come through the warm-candidate scans.
+        var neighbour = $"{built.Major}.{built.Minor}.999999.999999";
+        WriteCompleteSelectedPlatformSet(
+            ProvisioningCheck.PlatformAppsDirFor(artifacts, neighbour), neighbour,
+            includeApplicationTestLibrary: true);
+        var warmTestApps = ProvisioningCheck.TestAppsDirFor(artifacts, neighbour);
+        WriteApp(warmTestApps, ProvisioningCheck.TestToolkitSentinelApp, neighbour, r2r: false);
+        WriteAppWithDependencies(warmTestApps, "Tests-TestLibraries", neighbour,
+            "System Application Test Library", "Permissions Mock", "Application Test Library");
+
+        var (output, _) = RunRunner(fx,
+            $"\"{fx.Bundle}\" --package-cache \"{fx.EmptyPackageCache}\" --no-auto-provision",
+            blockNetwork: true);
+
+        Assert.Contains("reusing already-provisioned MS test toolkit for selected BC", output);
+        Assert.Contains("reusing already-provisioned platform apps for selected BC", output);
+        Assert.DoesNotContain(
+            "declares Microsoft dependencies that were not found", output);
+    }
+
     [SkippableFact]
     public void AutoProvision_FailedPlatformFetch_IsAttemptedOnlyOncePerInvocation()
     {
@@ -818,6 +920,13 @@ public sealed class ProvisioningReuseTests : IDisposable
         {
             throw new SkipException($"engine-closure symlinks unavailable: {ex.Message}");
         }
+
+        // Issue #2103 reordered provisioning so the test-toolkit set is fetched BEFORE the
+        // platform set (its manifests carry the dependency edges the platform decision
+        // reads). Satisfy the toolkit half at the exact version under test, or the run
+        // aborts on that download and never reaches the platform fetch this test is about.
+        WriteApp(ProvisioningCheck.TestAppsDirFor(fx.ArtifactsRoot, unavailableVersion),
+            ProvisioningCheck.TestToolkitSentinelApp, unavailableVersion, r2r: false);
 
         var (output, exit) = RunRunner(fx,
             $"\"{fx.Bundle}\" --bc-version {unavailableVersion} " +

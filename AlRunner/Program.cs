@@ -1365,6 +1365,34 @@ if (!provisionSubcommand)
         Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit for selected BC " +
             $"{mm} at {runnerOwnedTestAppsDir} (no download).");
 
+    // Issue #2103: the TOOLKIT set is adjudicated first, for the same reason the download
+    // blocks below are ordered that way — the Microsoft dependency edges the platform
+    // decision walks live in the test-toolkit packages' own NavxManifest.xml, so a platform
+    // scan that runs before the toolkit dir is attached asks its question with "no edges
+    // known" and answers "needs nothing". That answer skipped this scan entirely, and the
+    // re-derivation further down then found the real need with no warm set attached --
+    // a bundle whose warm platform apps were right there would refuse to run.
+    // NeedsTestApps is a DIRECT membership test, so it is already correct without edges.
+    if (decision.ShouldDownloadTest)
+    {
+        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
+                     AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, mm, minVersion: null))
+        {
+            var candidateDirs = PlatformCheckDirs().Append(candidate)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (!AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(candidateDirs, versionFloors))
+                continue;
+
+            if (!packageCacheDirs.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                packageCacheDirs.Add(candidate);
+            Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit for selected BC " +
+                $"{mm} at {candidate} (no download).");
+            decision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
+                manifestDependencyRoots, platformReport, PlatformCheckDirs());
+            break;
+        }
+    }
+
     // An exact-build cache is preferred above. If it is incomplete, a complete neighboring
     // build of the same minor is still a valid warm source, but only after the same
     // manifest/floor checks that govern a fresh download accept it. Attach platform and
@@ -1390,26 +1418,6 @@ if (!provisionSubcommand)
                 $"{mm} at {candidate} (no download).");
             platformReport = AlRunner.Infrastructure.ProvisioningCheck.CheckPlatformApps(
                 version, PlatformCheckDirs());
-            decision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
-                manifestDependencyRoots, platformReport, PlatformCheckDirs());
-            break;
-        }
-    }
-
-    if (decision.ShouldDownloadTest)
-    {
-        foreach (var candidate in AlRunner.Infrastructure.ProvisioningCheck.FindProvisionedTestAppsDirs(
-                     AlRunner.Infrastructure.BcArtifacts.ArtifactsRootDir, mm, minVersion: null))
-        {
-            var candidateDirs = PlatformCheckDirs().Append(candidate)
-                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            if (!AlRunner.Infrastructure.ProvisioningCheck.TestToolkitPresent(candidateDirs, versionFloors))
-                continue;
-
-            if (!packageCacheDirs.Contains(candidate, StringComparer.OrdinalIgnoreCase))
-                packageCacheDirs.Add(candidate);
-            Console.Error.WriteLine($"[provision] reusing already-provisioned MS test toolkit for selected BC " +
-                $"{mm} at {candidate} (no download).");
             decision = AlRunner.Infrastructure.ProvisioningCheck.DecideManifestProvisioning(
                 manifestDependencyRoots, platformReport, PlatformCheckDirs());
             break;
