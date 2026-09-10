@@ -827,6 +827,13 @@ public static partial class RecordPatches
         // map[i] = (queryResultSlot, tableFieldSlot); a value of -1 tableFieldSlot means
         // the column has no NCLMetaField source (aggregate/const) → leave at default.
         public (int querySlot, int tableSlot)[] Map = Array.Empty<(int, int)>();
+        // #2300: FlowField columns, kept OUT of Map. A FlowField has no stored slot in the
+        // row buffer — SourceTableField.ColumnIndex points at storage nothing ever wrote — so
+        // reading it through Map yields whatever that slot happens to hold rather than the
+        // calculated value. These are computed per row instead, the same way BC computes them
+        // via a synthesized sub-query this runner has no SQL to execute.
+        public (int querySlot, NCLMetaField meta)[] FlowFields =
+            Array.Empty<(int, NCLMetaField)>();
     }
 
     private static IEnumerable<ReadOnlyRecordBuffer> ProjectQueryRows(object nclMetaQuery, IEnumerable<ReadOnlyRecordBuffer> rows)
@@ -840,6 +847,12 @@ public static partial class RecordPatches
                 if (tableSlot < 0 || tableSlot >= row.FieldCount) continue; // unsupported column → default
                 fields[querySlot] = row[tableSlot];
             }
+            // #2300: compute each FlowField column from this row rather than reading a buffer
+            // slot that was never written. The row buffer IS the parent record the formula's
+            // where-conditions resolve field() references against, which is why this happens
+            // here and not in BuildProjectionPlan.
+            foreach (var (querySlot, meta) in plan.FlowFields)
+                fields[querySlot] = FlowFieldPatches.CalcOneFlowFieldForQueryRow(row, meta);
             // ReadOnlyRecordBuffer(NCLMetaApplicationObject, params NavValue[])
             yield return (ReadOnlyRecordBuffer)_ctorReadOnlyRecordBuffer!.Invoke(
                 new object?[] { nclMetaQuery, ToNavValueArray(fields) });
@@ -865,6 +878,7 @@ public static partial class RecordPatches
             .GetValue(queryDef)!;
 
         var map = new List<(int, int)>();
+        var flowFields = new List<(int, NCLMetaField)>();
         int maxSlot = -1;
         foreach (var col in columns)
         {
@@ -879,11 +893,25 @@ public static partial class RecordPatches
             {
                 var srcField = ct.GetProperty("SourceTableField", BindingFlags.Public | BindingFlags.Instance)!.GetValue(col);
                 if (srcField != null)
+                {
+                    // #2300: a FlowField column is computed, not read. Route it to FlowFields
+                    // and keep it out of Map entirely — its ColumnIndex names unwritten storage.
+                    if (srcField is NCLMetaField fieldMeta && fieldMeta.FieldClass == Microsoft.Dynamics.Nav.Types.Metadata.FieldClass.FlowField)
+                    {
+                        flowFields.Add((querySlot, fieldMeta));
+                        continue;
+                    }
                     tableSlot = (int)srcField.GetType().GetProperty("ColumnIndex", BindingFlags.Public | BindingFlags.Instance)!.GetValue(srcField)!;
+                }
             }
             catch { tableSlot = -1; }
             map.Add((querySlot, tableSlot));
         }
-        return new ProjectionPlan { SlotCount = maxSlot + 1, Map = map.ToArray() };
+        return new ProjectionPlan
+        {
+            SlotCount = maxSlot + 1,
+            Map = map.ToArray(),
+            FlowFields = flowFields.ToArray(),
+        };
     }
 }

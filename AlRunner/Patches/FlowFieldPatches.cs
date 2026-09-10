@@ -857,6 +857,88 @@ public static class FlowFieldPatches
         }
     }
 
+    // ── query-level FlowField columns (upstream #2422/#2925) ─────────────────
+    //
+    // Ported from upstream rather than reimplemented: it is a thin wrapper over this
+    // file's own CalcFlowFieldValuesCore, whose signature here is identical, so the
+    // borrowed part is the ENTRY POINT for a query row -- not upstream's query-projection
+    // rewrite, which this fork deliberately does not adopt (its own projection and
+    // aggregation model in RecordPatches.QueryProjection.cs / JoinExecutor.cs stays).
+
+    /// against the in-memory store instead. <paramref name="rowBuffer"/> is the QUERY row
+    /// (<c>ReadOnlyRecordBuffer</c>, boxed as <c>object</c> since QueryProjection.cs isn't allowed
+    /// to hand a typed reference across the same isolation boundary that keeps AlRunner.QueryJoin
+    /// Ncl-free) — it satisfies BC's own <c>IRecordBuffer</c> the same as a record's
+    /// <c>MutableRecordBuffer</c> does, which is what <c>GetFilterFromMetaFilterCollection</c>
+    /// actually requires (its parameter type is the interface, not the concrete buffer type), so
+    /// CalcFlowFieldValuesCore needs no changes to accept it.
+    ///
+    /// #2925 — <paramref name="flowFiltersAndMarks"/> carries the QUERY's own flow filters (an
+    /// AL <c>filter(Name; "Some Flow Filter")</c> element, or a static <c>ColumnFilter</c> on
+    /// one), keyed by the FlowFilter <c>NCLMetaField</c>, exactly the way a record's
+    /// <c>FiltersAndMarks</c> carries the ones <c>Record.SetRange("Date Filter", ...)</c> sets.
+    /// It is what BC's own <c>FlowFieldsHelper.GetFilterFromMetaFilterCollection</c>
+    /// dereferences UNGUARDED for a <c>FieldClass.FlowFilter</c> where-condition
+    /// (<c>GetFlowFilterBasedFilter(metaFilter, filtersAndMarks.Filters, session)</c>), so
+    /// passing null here — which this method used to do — NREs inside BC for every CalcFormula
+    /// carrying a flow-filter condition (e.g. <c>Cust. Ledger Entry."Remaining Amt. (LCY)"</c>,
+    /// whose formula reads <c>upperlimit("Date Filter")</c>).
+    ///
+    /// A null argument means "this query set no flow filter", and is answered with BC's own
+    /// <c>FiltersAndMarks.Empty</c> — whose <c>Filters</c> is itself null, which is precisely
+    /// the input <c>GetFlowFilterBasedFilter</c> reads as "flow filter unset → contributes no
+    /// constraint" (it returns null, and the caller's <c>IsNullOrConstantTrue()</c> skips it).
+    /// So the unset case is decided by BC's code, not by a runner-side assumption about it.
+    /// </summary>
+    internal static NavValue? CalcOneFlowFieldForQueryRow(
+        object rowBuffer, NCLMetaField flowFieldMeta, object? flowFiltersAndMarks = null)
+    {
+        // NavCurrentThread.Session must resolve on every real test run (CalcFlowFieldValuesCore
+        // below is unreachable without it, and every other FlowField entry point in this file —
+        // RecordImpl_CalcFieldsAsync_3 above — relies on the SAME static resolving). Swallowing
+        // a reflection failure here and returning null would silently read a query FlowField
+        // column as unset/default instead of its calculated value — the loud-failures.md silent
+        // default this file exists to avoid everywhere else. Fail loudly instead, naming the
+        // surface and the field, so a genuine artifact incompatibility is visible rather than
+        // read back as "the value is 0/empty".
+        var tNCT = flowFieldMeta.GetType().Assembly.GetType("Microsoft.Dynamics.Nav.Runtime.NavCurrentThread")
+            ?? throw new InvalidOperationException(
+                $"CalcOneFlowFieldForQueryRow('{flowFieldMeta.FieldName}' on "
+                + $"'{flowFieldMeta.Parent?.TableName}'): Microsoft.Dynamics.Nav.Runtime.NavCurrentThread "
+                + "type not found in the Ncl assembly — cannot resolve the current NavSession to "
+                + "compute this query FlowField column.");
+        var pSess = tNCT.GetProperty("Session", BindingFlags.Public | BindingFlags.Static)
+            ?? throw new InvalidOperationException(
+                $"CalcOneFlowFieldForQueryRow('{flowFieldMeta.FieldName}' on "
+                + $"'{flowFieldMeta.Parent?.TableName}'): NavCurrentThread.Session property not "
+                + "found — cannot resolve the current NavSession to compute this query FlowField column.");
+        var session = pSess.GetValue(null)
+            ?? throw new InvalidOperationException(
+                $"CalcOneFlowFieldForQueryRow('{flowFieldMeta.FieldName}' on "
+                + $"'{flowFieldMeta.Parent?.TableName}'): NavCurrentThread.Session returned null — "
+                + "no current session to compute this query FlowField column against.");
+
+        // The runner is single-company; token 0 is the runner's own unnamed company (see
+        // RecordPatches.cs's companyTokens skeleton-state comment) — the same value every other
+        // FlowField/query code path in this runner uses when no per-record company token is
+        // available.
+        // #2925: never null — see the summary above. Resolving FiltersAndMarks.Empty is part of
+        // Register(); if THAT failed, say so instead of handing BC a null it dereferences (the
+        // NRE this parameter exists to remove) or silently answering with an unfiltered total.
+        var parentFm = flowFiltersAndMarks ?? _emptyFm
+            ?? throw new InvalidOperationException(
+                $"CalcOneFlowFieldForQueryRow('{flowFieldMeta.FieldName}' on "
+                + $"'{flowFieldMeta.Parent?.TableName}'): Microsoft.Dynamics.Nav.Runtime."
+                + "FiltersAndMarks.Empty could not be resolved on this artifact, so the "
+                + "FlowField's where-conditions cannot be evaluated against BC's own helper.");
+
+        var results = new List<Tuple<INavFieldMetadata, NavValue>>();
+        CalcFlowFieldValuesCore(session, companyToken: 0, rowBuffer,
+            parentFiltersAndMarks: parentFm, securityFiltering: null, alIsolationLevel: null,
+            new NCLMetaField[] { flowFieldMeta }, recursionLevel: 0, results);
+        return results.Count > 0 ? results[0].Item2 : null;
+    }
+
     // ── BC recursion guards ──────────────────────────────────────────────────
     // FlowFieldsHelper's own constant, and its own exception. Both guards are BC's, not the
     // runner's: a self-referencing or mutually-referencing CalcFormula must produce exactly
