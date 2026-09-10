@@ -47,8 +47,12 @@ public static class Log
     // `[bc]`/`[reexec]` above. Caught by DapClient's own test harness timing out waiting
     // for a line that was actually printed, just silently dropped before reaching
     // stdout — the same failure shape the `[bc]` comment above describes.
+    //
+    // `[TableKey]` is a result: a refused key field means the key is built short, so a
+    // SetCurrentKey over it later dies in NCL with a message naming neither. Same
+    // "readiness, not diagnostic" class as `[bc]` above.
     private static readonly Regex ComponentTag =
-        new(@"^\[(?!(?:layered|watch|provision|bc|dep|expectations|reexec|dap)\])[A-Za-z][A-Za-z0-9._+]*\]",
+        new(@"^\[(?!(?:layered|watch|provision|bc|dep|expectations|reexec|dap|TableKey)\])[A-Za-z][A-Za-z0-9._+]*\]",
             RegexOptions.Compiled);
 
     public static void Install()

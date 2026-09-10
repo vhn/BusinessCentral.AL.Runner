@@ -69,7 +69,9 @@ internal static partial class BcAppSymbolCache
     // v20: PageSymbol retains AutoSplitKey and MultipleNewLines so reconstructed dependency
     // page metadata preserves BC's client-side multi-line draft semantics. A v19 payload
     // deserialises both as false, silently disabling those semantics on affected pages.
-    private const int CacheVersion = 20;
+    // v21: table keys now resolve system field names too. A v20 payload came from the
+    // declared-fields-only parse and replays keys that are truncated or missing.
+    private const int CacheVersion = 21;
     private static readonly ConcurrentDictionary<string, AppSymbols> ProcessCache = new(StringComparer.OrdinalIgnoreCase);
     // Issue #1820 — path -> content-hash memo. ComputeAppContentHash needs to read the
     // WHOLE .app to hash it (unlike the FileInfo.Length/LastWriteTimeUtc stat it replaced,
@@ -843,9 +845,15 @@ internal static partial class BcAppSymbolCache
                     foreach (var fieldNameJson in fieldNames.EnumerateArray())
                     {
                         var fieldName = fieldNameJson.GetString();
-                        var field = fields.FirstOrDefault(f =>
-                            string.Equals(f.FieldName, fieldName, StringComparison.OrdinalIgnoreCase));
-                        if (field != null) ids.Add(field.FieldId);
+                        // System fields are never in this table's `Fields` array, so resolve
+                        // them the same way the AL-source key parser does.
+                        if (RecordPatches.TryResolveKeyFieldId(fields, fieldName, out var keyFieldId))
+                            ids.Add(keyFieldId);
+                        else
+                            Console.Error.WriteLine(
+                                $"[TableKey] REFUSED {tableName}.{keyName}: unknown field "
+                                + $"'{fieldName}' in symbol metadata - key left short, sorting on "
+                                + "it will not match");
                     }
                 }
                 if (first)
