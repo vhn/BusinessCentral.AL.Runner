@@ -364,6 +364,23 @@ public static partial class RecordPatches
     private static bool IsFilterOnlyColumnQ(object col)
         => _pColColumnTypeQ?.GetValue(col)?.ToString() == "FilterOnly";
 
+    /// <summary>
+    /// True when a query column's source field is a FlowFilter — a filter INPUT to a FlowField
+    /// calculation, never a projected value, so it has no meaningful projection slot.
+    /// </summary>
+    private static bool IsFlowFilterColumnQ(object col)
+    {
+        try
+        {
+            var srcField = col.GetType()
+                .GetProperty("SourceTableField", BindingFlags.Public | BindingFlags.Instance)?
+                .GetValue(col);
+            return srcField is NCLMetaField f
+                && f.FieldClass == Microsoft.Dynamics.Nav.Types.Metadata.FieldClass.FlowFilter;
+        }
+        catch { return false; }
+    }
+
     private static bool IsAggregatedColumnQ(object col)
         => _pColIsAggregatedQ?.GetValue(col) is true;
 
@@ -764,6 +781,22 @@ public static partial class RecordPatches
                     "NavQuery (projected filter)",
                     "query-filter-unresolved-column — a query filter's column could not be " +
                     "located in the query's own DataItems/QueryColumns; see docs/scope.md");
+            // #2925: a FlowFilter column is NOT a projected value — it is an input to a
+            // FlowField's CalcFormula (`where(... = field("X Filter"))`). BC applies it inside
+            // the FlowField sub-query; this runner would have to hand it to
+            // FlowFieldPatches.CalcOneFlowFieldForQueryRow's flowFiltersAndMarks parameter,
+            // which nothing currently populates. Its projection slot is therefore never
+            // written, and evaluating a filter against it dereferences a null NavValue deep in
+            // BC (RangeFilterExpression.Evaluate -> FilterExpressionContext.Compare ->
+            // ArgumentNullException 'x'), which is an unnamed crash rather than a refusal.
+            // Refuse by name until the flow filters are threaded through (upstream #2947).
+            if (IsFlowFilterColumnQ(key))
+                throw new AlRunner.Infrastructure.RunnerOutOfScopeException(
+                    "NavQuery (FlowField column with a flow filter)",
+                    "query-flowfilter-not-threaded — a filter targets a FlowFilter column, whose "
+                    + "value feeds a FlowField's CalcFormula rather than being projected; this "
+                    + "runner does not yet pass the query's flow filters into the FlowField "
+                    + "calculation, so the filter cannot be honoured");
             conds.Add((slot, expr));
         }
         if (conds.Count == 0) return rows;
@@ -827,15 +860,19 @@ public static partial class RecordPatches
         // map[i] = (queryResultSlot, tableFieldSlot); a value of -1 tableFieldSlot means
         // the column has no NCLMetaField source (aggregate/const) → leave at default.
         public (int querySlot, int tableSlot)[] Map = Array.Empty<(int, int)>();
-        // #2300: FlowField columns, kept OUT of Map. A FlowField has no stored slot in the
-        // row buffer — SourceTableField.ColumnIndex points at storage nothing ever wrote — so
-        // reading it through Map yields whatever that slot happens to hold rather than the
-        // calculated value. These are computed per row instead, the same way BC computes them
-        // via a synthesized sub-query this runner has no SQL to execute.
-        public (int querySlot, NCLMetaField meta)[] FlowFields =
-            Array.Empty<(int, NCLMetaField)>();
     }
 
+    // #2423: this single-dataitem path deliberately carries NO FlowField branch. BC synthesizes
+    // an extra sub-dataitem for every FlowField column, so IsMultiDataItem (which counts the RAW
+    // dataitem list) always sees >= 2 and routes a FlowField query to JoinExecutor — even when
+    // the AL declares one dataitem. The FlowField computation therefore lives in exactly one
+    // place, JoinExecutor's projection, rather than in a second copy here that nothing reaches.
+    //
+    // Upstream instead counts only the REAL dataitems (GetRealDataItems), which sends the
+    // single-real-dataitem case down this path; that is a routing difference this fork has not
+    // adopted, and adopting it would require this branch to come back — keyed on
+    // ParentDataItem.SourceFlowField, NOT on SourceTableField.FieldClass, which never matches a
+    // synthesized column (its source field is a Normal field on the FlowField's SOURCE table).
     private static IEnumerable<ReadOnlyRecordBuffer> ProjectQueryRows(object nclMetaQuery, IEnumerable<ReadOnlyRecordBuffer> rows)
     {
         var plan = _projectionPlans.GetValue(nclMetaQuery, BuildProjectionPlan);
@@ -847,12 +884,6 @@ public static partial class RecordPatches
                 if (tableSlot < 0 || tableSlot >= row.FieldCount) continue; // unsupported column → default
                 fields[querySlot] = row[tableSlot];
             }
-            // #2300: compute each FlowField column from this row rather than reading a buffer
-            // slot that was never written. The row buffer IS the parent record the formula's
-            // where-conditions resolve field() references against, which is why this happens
-            // here and not in BuildProjectionPlan.
-            foreach (var (querySlot, meta) in plan.FlowFields)
-                fields[querySlot] = FlowFieldPatches.CalcOneFlowFieldForQueryRow(row, meta);
             // ReadOnlyRecordBuffer(NCLMetaApplicationObject, params NavValue[])
             yield return (ReadOnlyRecordBuffer)_ctorReadOnlyRecordBuffer!.Invoke(
                 new object?[] { nclMetaQuery, ToNavValueArray(fields) });
@@ -878,7 +909,6 @@ public static partial class RecordPatches
             .GetValue(queryDef)!;
 
         var map = new List<(int, int)>();
-        var flowFields = new List<(int, NCLMetaField)>();
         int maxSlot = -1;
         foreach (var col in columns)
         {
@@ -893,25 +923,11 @@ public static partial class RecordPatches
             {
                 var srcField = ct.GetProperty("SourceTableField", BindingFlags.Public | BindingFlags.Instance)!.GetValue(col);
                 if (srcField != null)
-                {
-                    // #2300: a FlowField column is computed, not read. Route it to FlowFields
-                    // and keep it out of Map entirely — its ColumnIndex names unwritten storage.
-                    if (srcField is NCLMetaField fieldMeta && fieldMeta.FieldClass == Microsoft.Dynamics.Nav.Types.Metadata.FieldClass.FlowField)
-                    {
-                        flowFields.Add((querySlot, fieldMeta));
-                        continue;
-                    }
                     tableSlot = (int)srcField.GetType().GetProperty("ColumnIndex", BindingFlags.Public | BindingFlags.Instance)!.GetValue(srcField)!;
-                }
             }
             catch { tableSlot = -1; }
             map.Add((querySlot, tableSlot));
         }
-        return new ProjectionPlan
-        {
-            SlotCount = maxSlot + 1,
-            Map = map.ToArray(),
-            FlowFields = flowFields.ToArray(),
-        };
+        return new ProjectionPlan { SlotCount = maxSlot + 1, Map = map.ToArray() };
     }
 }

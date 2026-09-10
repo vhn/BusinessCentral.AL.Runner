@@ -426,7 +426,15 @@ public static partial class RecordPatches
             // diverging) — the same value the real ctor assigns before any SQL round-trip.
             var fDefaultInvalidChars = tSqlDbProps.GetField("DefaultInvalidIdentifierChars",
                 BindingFlags.NonPublic | BindingFlags.Static);
-            var defaultInvalidChars = fDefaultInvalidChars?.GetRawConstantValue() as string ?? ".\"\\/'%][";
+            // Read BC's own constant rather than restating the literal, so a future BC default is
+            // picked up instead of silently diverging. If it cannot be read, say so — a hardcoded
+            // fallback here would be a silent guess about SQL identifier escaping.
+            var defaultInvalidChars = fDefaultInvalidChars?.GetRawConstantValue() as string
+                ?? throw new InvalidOperationException(
+                    "NavSqlDatabaseProperties.DefaultInvalidIdentifierChars could not be read from "
+                    + "this BC artifact, so the skeleton's invalidIdentifierChars cannot be seeded "
+                    + "faithfully; a query with a FlowField column would NRE in "
+                    + "NavSqlStatementHelper.ConvertToSqlIdentifier.");
             tSqlDbProps.GetField("invalidIdentifierChars", BindingFlags.NonPublic | BindingFlags.Instance)
                 ?.SetValue(sqlDbProps, defaultInvalidChars);
             fSqlDbProps.SetValue(_skeletonDatabase, sqlDbProps);

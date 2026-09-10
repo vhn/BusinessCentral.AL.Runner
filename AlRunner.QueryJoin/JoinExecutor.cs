@@ -193,8 +193,7 @@ public static class JoinExecutor
                 throw ctx.OutOfScope(
                     "NavQuery (multi-dataitem join)",
                     "query-join-synthesized-subquery-not-implemented — a synthesized sub-dataitem " +
-                    "(SubQueryDefinition != null) that is not a FlowField-calculation sub-query; " +
-                    "see docs/scope.md");
+                    "(SubQueryDefinition != null) that is not a FlowField-calculation sub-query");
 
             var table = _pDataItemMetaTable!.GetValue(di)!;
             var name = (string)_pDataItemName!.GetValue(di)!;
@@ -315,19 +314,6 @@ public static class JoinExecutor
     }
 
     private enum JoinKind { Inner, LeftOuter }
-
-    /// <summary>True when any projected column of the query declares an aggregation.</summary>
-    private static bool HasAggregatedColumn(object queryDef)
-    {
-        foreach (var di in ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>())
-        {
-            if (_pDataItemSourceFlowField?.GetValue(di) != null) continue; // the sub-query's own Sum is not the query's
-            var cols = ((IEnumerable?)_pDataItemQueryColumns!.GetValue(di))?.Cast<object>() ?? Enumerable.Empty<object>();
-            foreach (var col in cols)
-                if (_pColIsAggregated != null && (bool)_pColIsAggregated.GetValue(col)!) return true;
-        }
-        return false;
-    }
 
     private static JoinKind JoinKindOf(JoinContext ctx, object dataItem)
     {
@@ -503,8 +489,7 @@ public static class JoinExecutor
                         throw ctx.OutOfScope(
                             "NavQuery (multi-dataitem join with a FlowField column)",
                             "query-join-flowfield-filter-only-column-not-implemented — a column on a " +
-                            "FlowField-calculation sub-dataitem that is referenced only via filter(); " +
-                            "see docs/scope.md");
+                            "FlowField-calculation sub-dataitem that is referenced only via filter()");
                     continue; // handled in pass 2 below.
                 }
                 int querySlot = (int)_pColColumnIndex!.GetValue(col)!;
@@ -542,17 +527,6 @@ public static class JoinExecutor
             }
         }
 
-        // #2423: a FlowField column alongside an aggregated column means the query also has an
-        // implicit GROUP BY, and this runner's grouping (Finalize) has no FlowField branch — it
-        // would read TableSlot = -1 as a default and group on it. npcore query 6014429
-        // (Method = Sum ON the FlowField) and 6014555 (a Count sibling) are exactly this shape;
-        // neither has a test, and upstream refuses it too. Refuse rather than answer wrongly.
-        if (plan.Columns.Any(c => c.FlowFieldMeta != null) && HasAggregatedColumn(queryDef))
-            throw ctx.OutOfScope(
-                "NavQuery (multi-dataitem join with a FlowField column)",
-                "query-join-flowfield-with-aggregate-not-implemented — a FlowField column combined " +
-                "with an aggregated column (implicit GROUP BY); see docs/scope.md");
-
         plan.SlotCount = Math.Max(maxSlot + 1, nextExtraSlot);
         return plan;
     }
@@ -571,7 +545,7 @@ public static class JoinExecutor
             throw ctx.OutOfScope(
                 "NavQuery (multi-dataitem join with a FlowField column)",
                 "query-join-flowfield-owner-unresolved — NCLMetaField.Parent did not resolve a table " +
-                "for the FlowField column; cannot locate its owning dataitem in the join; see docs/scope.md");
+                "for the FlowField column; cannot locate its owning dataitem in the join");
         var ownerTableId = _pTableTableId?.GetValue(owningTable);
 
         string? matchName = null;
@@ -589,7 +563,7 @@ public static class JoinExecutor
                 "NavQuery (multi-dataitem join with a FlowField column)",
                 $"query-join-flowfield-owner-ambiguous — found {matches} real dataitem(s) whose table " +
                 "matches the FlowField's owning table (0 = not in this join; >1 = a self-join on that " +
-                "table); cannot unambiguously pick the FlowField's owner row; see docs/scope.md");
+                "table); cannot unambiguously pick the FlowField's owner row");
         return matchName!;
     }
 
@@ -628,6 +602,24 @@ public static class JoinExecutor
         var dataItems = ((IEnumerable)_pQueryDefDataItems!.GetValue(queryDef)!).Cast<object>();
         foreach (var dataItem in dataItems)
         {
+            // #2423: a FlowField-calculation sub-dataitem's column is ALREADY FINAL by the time
+            // finalization runs — Execute step 3 filled its slot from
+            // FlowFieldPatches.CalcOneFlowFieldForQueryRow, which returns exactly what
+            // Record.CalcFields returns. BC stamps that synthesized column with the metadata its
+            // OWN sub-query would have needed to produce the value in SQL, and applying that
+            // metadata a second time here re-derives a value that is already derived:
+            //
+            //   ReverseSign  — BC passes CalculationFormula.NegateResult as the synthesized
+            //                  column's reverse-sign ctor argument (SqlTableDataProviderHelper.
+            //                  CreateSubqueryForFlowField), and the calculation core negates from
+            //                  that SAME flag. Honouring both flips a `-sum(...)` FlowField back
+            //                  to positive: a silent wrong SIGN on a query that opens and returns
+            //                  the right number of rows.
+            //   Aggregation  — the Sum/Count/etc. belongs to the sub-query BC would have run;
+            //                  re-applying it would aggregate an already-aggregated value.
+            //
+            // Neutralise both, exactly as upstream does at the equivalent site.
+            var isFlowFieldSubQuery = _pDataItemSourceFlowField?.GetValue(dataItem) != null;
             var columns = ((IEnumerable?)_pDataItemQueryColumns!.GetValue(dataItem))?.Cast<object>()
                 ?? Enumerable.Empty<object>();
             foreach (var column in columns)
@@ -640,9 +632,11 @@ public static class JoinExecutor
                 {
                     Metadata = column,
                     Slot = slot,
-                    IsAggregated = (bool)_pColIsAggregated!.GetValue(column)!,
-                    Aggregation = _pColAggregationType!.GetValue(column)?.ToString() ?? "None",
-                    ReverseSign = (bool)_pColReverseSign!.GetValue(column)!,
+                    IsAggregated = !isFlowFieldSubQuery && (bool)_pColIsAggregated!.GetValue(column)!,
+                    Aggregation = isFlowFieldSubQuery
+                        ? "None"
+                        : _pColAggregationType!.GetValue(column)?.ToString() ?? "None",
+                    ReverseSign = !isFlowFieldSubQuery && (bool)_pColReverseSign!.GetValue(column)!,
                 });
             }
         }

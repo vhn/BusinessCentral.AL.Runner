@@ -865,7 +865,11 @@ public static class FlowFieldPatches
     // rewrite, which this fork deliberately does not adopt (its own projection and
     // aggregation model in RecordPatches.QueryProjection.cs / JoinExecutor.cs stays).
 
-    /// against the in-memory store instead. <paramref name="rowBuffer"/> is the QUERY row
+    /// <summary>
+    /// Computes ONE FlowField for one already-read query row, against the in-memory store
+    /// instead of BC's synthesized SQL sub-query.
+    ///
+    /// <paramref name="rowBuffer"/> is the QUERY row
     /// (<c>ReadOnlyRecordBuffer</c>, boxed as <c>object</c> since QueryProjection.cs isn't allowed
     /// to hand a typed reference across the same isolation boundary that keeps AlRunner.QueryJoin
     /// Ncl-free) — it satisfies BC's own <c>IRecordBuffer</c> the same as a record's
